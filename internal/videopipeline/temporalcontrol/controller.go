@@ -44,6 +44,31 @@ func (c *Controller) StartEpisode(
 	if workflowID == "" {
 		workflowID = "episode-production-" + operation.OperationID
 	}
+	var postProduction *orchestration.PostProductionConfig
+	if command.PostProduction != nil {
+		post := command.PostProduction
+		postProduction = &orchestration.PostProductionConfig{
+			Enabled:  post.Enabled,
+			Evidence: post.Evidence,
+			SpeechRoute: providercontract.ModelSnapshot{
+				CapabilityAlias: post.SpeechRouteSnapshot.CapabilityAlias,
+				Provider:        post.SpeechRouteSnapshot.Provider,
+				ModelID:         post.SpeechRouteSnapshot.ModelID,
+				EndpointID:      post.SpeechRouteSnapshot.EndpointID,
+				RouteVersion:    post.SpeechRouteSnapshot.RouteVersion,
+				CapabilityHash:  post.SpeechRouteSnapshot.CapabilityHash,
+				Verification:    "control_plane_capability_snapshot",
+			},
+			SpeechProviderProfileID:       post.SpeechRouteSnapshot.ProviderProfileID,
+			SpeechBudgetApprovalID:        post.SpeechBudgetApprovalID,
+			SpeechBudgetMaximumMicros:     post.SpeechBudgetLimit.AmountMicros,
+			SpeechBudgetCurrency:          post.SpeechBudgetLimit.Currency,
+			SubtitleLanguage:              post.SubtitleLanguage,
+			BurnSubtitles:                 post.BurnSubtitles,
+			BackgroundAudioAssetVersionID: post.BackgroundAudioAssetVersionID,
+			EnforcePoCDuration:            post.EnforcePoCDuration,
+		}
+	}
 	run, err := c.client.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
 		ID:                                       workflowID,
 		TaskQueue:                                c.taskQueue,
@@ -74,6 +99,7 @@ func (c *Controller) StartEpisode(
 		TraceID:             operation.TraceID,
 		RequireShotApproval: true,
 		PersistProductTruth: true,
+		PostProduction:      postProduction,
 	})
 	if err != nil {
 		return controlplane.WorkflowStart{}, fmt.Errorf("start episode workflow: %w", err)

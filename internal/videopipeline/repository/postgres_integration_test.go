@@ -25,6 +25,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/temporalcontrol"
 	"github.com/google/uuid"
@@ -272,7 +273,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	seriesID, episodeID, episodeRevisionID := uuid.New(), uuid.New(), uuid.New()
 	sceneID, shotID := uuid.New(), uuid.New()
 	scriptID, storyboardID, shotRevisionID := uuid.New(), uuid.New(), uuid.New()
-	gate2ID, budgetID := uuid.New(), uuid.New()
+	gate1ID, gate2ID, budgetID := uuid.New(), uuid.New(), uuid.New()
 	providerProfileID, capabilityID := uuid.New(), uuid.New()
 	safetyEvidenceArtifactID := uuid.New()
 	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
@@ -353,6 +354,14 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		gate2ID, seriesID, episodeID,
 	)
 	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.approval_decisions
+			(id, series_id, episode_id, gate, decision, reason_code,
+			 actor_id, actor_role, trace_id)
+		VALUES ($1, $2, $3, 'G1', 'APPROVED', 'integration',
+		        'art-director', 'ART_DIRECTOR', 'workflow-projection')`,
+		gate1ID, seriesID, episodeID,
+	)
+	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.episode_script_revisions
 			(id, episode_id, revision, status, schema_version, payload, content_hash, created_by)
 		VALUES ($1, $2, 1, 'APPROVED', 'v1', '{}'::jsonb, $3, 'integration')`,
@@ -373,7 +382,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 gate2_decision_id, content_hash, created_by)
 		VALUES ($1, $2, $3, 1, 'READY', 'FRESH',
 		        5000, '16:9_720P24', 24, 1280, 720, 1,
-		        1, '{"action":"walk"}', '{}', $4,
+		        1, '{"action":"walk","dialogue":[{"id":"line-1","speaker":"A","text":"Hello fixture","startMillis":500,"endMillis":2000}]}', '{}', $4,
 		        $5, '{}'::jsonb, '{}'::jsonb, $6, $7, $8, 'integration')`,
 		shotRevisionID, shotID, storyboardID, contextIDs,
 		effectiveHash, profileID, gate2ID, shotHash,
@@ -385,6 +394,12 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			($1, 'EPISODE_REVISION', $2, $3),
 			($1, 'SHOT_SPEC_REVISION', $4, $5)`,
 		gate2ID, episodeRevisionID, episodeHash, shotRevisionID, shotHash,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.approval_bindings
+			(decision_id, object_type, revision_id, content_hash)
+		VALUES ($1, 'EPISODE_REVISION', $2, $3)`,
+		gate1ID, episodeRevisionID, episodeHash,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.review_tasks
@@ -794,10 +809,127 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		t.Fatalf("stored artifact spec = size:%d %dx%d", storedSize, storedWidth, storedHeight)
 	}
 
+	step.ActivityID, step.ActivityType = "post-production", orchestration.ActivityFinalizeEpisode
+	finalizeInput := orchestration.FinalizeEpisodeInput{
+		EpisodeRevisionID: episodeRevisionID.String(),
+		RunIDs:            []string{run.RunID},
+		Config: orchestration.PostProductionConfig{
+			Enabled:  true,
+			Evidence: postproduction.EvidenceMockOnly,
+			SpeechRoute: providercontract.ModelSnapshot{
+				CapabilityAlias: string(providercontract.CapabilitySpeech),
+				Provider:        "MOCK",
+				ModelID:         "fixture-speech-v1",
+				RouteVersion:    "route-v1",
+				CapabilityHash:  capabilityHash,
+				Verification:    "mock_only",
+			},
+			SpeechProviderProfileID:   providerProfileID.String(),
+			SpeechBudgetApprovalID:    budgetID.String(),
+			SpeechBudgetMaximumMicros: 1_000,
+			SpeechBudgetCurrency:      "CNY",
+			SubtitleLanguage:          "en",
+		},
+		TraceID: step.TraceID,
+	}
+	postRequest, err := store.PrepareEpisodePostProduction(ctx, step, finalizeInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(postRequest.Clips) != 1 || len(postRequest.Subtitle.Cues) != 1 {
+		t.Fatalf("prepared post-production request = %#v", postRequest)
+	}
+	if postRequest.Subtitle.Cues[0].StartMillis != 500 ||
+		postRequest.Subtitle.Cues[0].EndMillis != 2_000 {
+		t.Fatalf("prepared cue timing = %#v", postRequest.Subtitle.Cues[0])
+	}
+	liveInput := finalizeInput
+	liveInput.Config.Evidence = postproduction.EvidenceLive
+	liveInput.Config.SpeechRoute.Verification = "live_provider_call"
+	_, err = store.PrepareEpisodePostProduction(ctx, step, liveInput)
+	var voicePolicy *controlplane.DomainError
+	if !errors.As(err, &voicePolicy) || voicePolicy.Code != controlplane.CodeConsentRequired {
+		t.Fatalf("live unbound voice error = %#v, want %s", err, controlplane.CodeConsentRequired)
+	}
+	putPostArtifact := func(
+		kind, mediaType, payload string,
+		duration int64,
+		width, height, fps int,
+	) postproduction.Artifact {
+		t.Helper()
+		committed, err := cas.Put(ctx, strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return postproduction.Artifact{
+			Kind: kind, Digest: committed.Digest, URI: committed.URI,
+			MediaType: mediaType, SizeBytes: committed.Size,
+			DurationMillis: duration, Width: width, Height: height, FPS: fps,
+		}
+	}
+	postManifest := putPostArtifact(
+		"postproduction_manifest",
+		"application/vnd.video-series.postproduction-manifest+json",
+		`{"schemaVersion":"v1","evidence":"mock_only"}`,
+		0, 0, 0, 0,
+	)
+	serviceBOM := putPostArtifact(
+		"service_bom",
+		"application/vnd.video-series.service-bom+json",
+		`{"schemaVersion":"v1","evidence":"mock_only","components":[]}`,
+		0, 0, 0, 0,
+	)
+	postResult := postproduction.Result{
+		SchemaVersion:     postproduction.SchemaVersion,
+		Evidence:          postproduction.EvidenceMockOnly,
+		EpisodeRevisionID: episodeRevisionID.String(),
+		Subtitle: putPostArtifact(
+			"subtitle_srt", "application/x-subrip; charset=utf-8",
+			"1\n00:00:00,500 --> 00:00:02,000\nHello fixture\n\n",
+			5_000, 0, 0, 0,
+		),
+		Dialogue: putPostArtifact(
+			"dialogue_audio", "audio/wav", "fixture dialogue",
+			5_000, 0, 0, 0,
+		),
+		FinalVideo: putPostArtifact(
+			"final_video", "video/mp4", "fixture final video",
+			5_000, 1280, 720, 24,
+		),
+		Manifest:        postManifest,
+		ServiceBOM:      serviceBOM,
+		CommandPlanHash: strings.Repeat("d", 64),
+		ManifestHash:    postManifest.Digest,
+		ServiceBOMHash:  serviceBOM.Digest,
+		QC: postproduction.QCReport{
+			State: "STRUCTURAL_PASSED", ActualDurationMillis: 5_000,
+			ManualTimingRequired: true, MeasurementEvidence: postproduction.EvidenceMockOnly,
+		},
+	}
+	if err := store.CommitEpisodePostProduction(ctx, step, finalizeInput, postResult); err != nil {
+		t.Fatal(err)
+	}
+	var linkedPostArtifacts int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.run_artifacts ra
+		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+		WHERE ra.generation_run_id = $1
+		  AND a.media_spec->>'postProductionManifestHash' = $2`,
+		run.RunID, postResult.ManifestHash,
+	).Scan(&linkedPostArtifacts); err != nil {
+		t.Fatal(err)
+	}
+	if linkedPostArtifacts != 5 {
+		t.Fatalf("linked post-production artifacts = %d, want 5", linkedPostArtifacts)
+	}
+
 	step.ActivityID, step.ActivityType = "manifest", orchestration.ActivityCreateGate3
 	gate3Input := orchestration.CreateGate3Input{
 		EpisodeRevisionID: episodeRevisionID.String(), RunIDs: []string{run.RunID},
-		TraceID: step.TraceID, PersistProductTruth: true,
+		PostProductionManifestHash: postResult.ManifestHash,
+		TraceID:                    step.TraceID,
+		PersistProductTruth:        true,
 	}
 	manifestPayload, err := store.BuildEpisodeManifest(ctx, step, gate3Input)
 	if err != nil {

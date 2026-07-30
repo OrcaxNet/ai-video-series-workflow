@@ -813,8 +813,42 @@ components:
           format: uuid
         executionPolicy:
           $ref: "#/components/schemas/ExecutionPolicy"
+        postProduction:
+          $ref: "#/components/schemas/PostProductionRequest"
         actor:
           $ref: "#/components/schemas/Actor"
+    PostProductionRequest:
+      type: object
+      additionalProperties: false
+      required:
+        [enabled, evidence, speechRouteSnapshot, speechBudgetApprovalId, speechBudgetLimit, subtitleLanguage, burnSubtitles, enforcePoCDuration]
+      properties:
+        enabled:
+          type: boolean
+        evidence:
+          type: string
+          enum: [mock_only, live_provider_call, pending_key]
+          description: pending_key fails closed before any paid speech submission.
+        speechRouteSnapshot:
+          allOf:
+            - $ref: "#/components/schemas/ModelRouteSnapshot"
+          description: Frozen speech.primary provider capability; credentials remain runtime-only.
+        speechBudgetApprovalId:
+          type: string
+          format: uuid
+        speechBudgetLimit:
+          $ref: "#/components/schemas/BudgetLimit"
+        subtitleLanguage:
+          type: string
+          minLength: 1
+        burnSubtitles:
+          type: boolean
+        backgroundAudioAssetVersionId:
+          type: string
+          format: uuid
+        enforcePoCDuration:
+          type: boolean
+          description: Rejects a total shot duration outside 45-60 seconds.
     CreateGenerationRunRequest:
       type: object
       additionalProperties: false

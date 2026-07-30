@@ -755,6 +755,31 @@ func (p *Postgres) PrepareProduction(
 		if err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
+		if command.PostProduction != nil && command.PostProduction.Enabled {
+			post := command.PostProduction
+			if post.SpeechRouteSnapshot.CapabilityAlias != "speech.primary" {
+				return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+					controlplane.CodeCapability,
+					"post-production route is not speech.primary",
+					"freeze a current speech capability snapshot",
+				)
+			}
+			if _, _, err := validateRouteSnapshot(
+				ctx, tx, post.SpeechRouteSnapshot, now,
+			); err != nil {
+				return controlplane.Stored[controlplane.Operation]{}, err
+			}
+			if err := requirePostProductionEvidenceMode(
+				ctx, tx, post.SpeechRouteSnapshot.ProviderProfileID, post.Evidence,
+			); err != nil {
+				return controlplane.Stored[controlplane.Operation]{}, err
+			}
+			if err := requireBudgetApproval(
+				ctx, tx, post.SpeechBudgetApprovalID, seriesID, episodeID,
+			); err != nil {
+				return controlplane.Stored[controlplane.Operation]{}, err
+			}
+		}
 
 		planRecord, err := readPlan(ctx, tx, command.GenerationPlanID)
 		if err != nil {
@@ -849,6 +874,7 @@ func (p *Postgres) PrepareProduction(
 				"generationPlanId":  command.GenerationPlanID,
 				"shotCount":         len(shotIDs),
 				"executionPolicy":   command.ExecutionPolicy,
+				"postProduction":    command.PostProduction,
 			}, now); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
@@ -2067,6 +2093,7 @@ func eventTypeForAction(action string) (string, error) {
 		"manifest.locked":                      "video.manifest.locked.v1",
 		"dependency.stale":                     "video.dependency.stale.v1",
 		"workflow_step.completed":              "video.workflow-step.completed.v1",
+		"episode.postproduction.completed":     "video.episode.postproduction-completed.v1",
 	}
 	eventType, ok := eventTypes[action]
 	if !ok {
@@ -2194,6 +2221,56 @@ func validateRouteSnapshot(
 		version = *pricingVersion
 	}
 	return version, limits, nil
+}
+
+func requirePostProductionEvidenceMode(
+	ctx context.Context,
+	tx pgx.Tx,
+	profileIDRaw string,
+	evidence string,
+) error {
+	profileID, err := uuid.Parse(profileIDRaw)
+	if err != nil {
+		return controlplane.NewPolicyError(
+			controlplane.CodeCapability,
+			"post-production provider profile identifier is invalid",
+			"select the frozen speech capability profile",
+		)
+	}
+	var mode, health string
+	if err := tx.QueryRow(ctx, `
+		SELECT mode, health
+		FROM video_pipeline.provider_profiles
+		WHERE id = $1
+		FOR SHARE`,
+		profileID,
+	).Scan(&mode, &health); err != nil {
+		return fmt.Errorf("read post-production provider mode: %w", err)
+	}
+	if err := validatePostProductionEvidenceMode(evidence, mode, health); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validatePostProductionEvidenceMode(evidence, mode, health string) error {
+	valid := false
+	switch evidence {
+	case "mock_only":
+		valid = mode == "MOCK"
+	case "live_provider_call":
+		valid = mode == "LIVE" && health == "READY"
+	case "pending_key":
+		valid = mode == "DRY_RUN" || mode == "LIVE"
+	}
+	if valid {
+		return nil
+	}
+	return controlplane.NewPolicyError(
+		controlplane.CodeCapability,
+		"post-production evidence does not match the provider profile mode",
+		"use MOCK only for mock_only, LIVE/READY only for live evidence, and DRY_RUN/LIVE for pending_key",
+	)
 }
 
 func requireApprovedDecision(

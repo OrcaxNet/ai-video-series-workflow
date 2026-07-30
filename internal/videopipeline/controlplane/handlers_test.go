@@ -141,6 +141,91 @@ func TestServer_CreateSeriesRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+func TestValidateStartProductionPostProductionBoundary(t *testing.T) {
+	t.Parallel()
+	valid := func() StartProductionCommand {
+		return StartProductionCommand{
+			SchemaVersion:               "v1",
+			EpisodeRevisionID:           uuid.NewString(),
+			ShotSpecRevisionIDs:         []string{uuid.NewString()},
+			GenerationProfileRevisionID: uuid.NewString(),
+			Gate2DecisionID:             uuid.NewString(),
+			GenerationPlanID:            uuid.NewString(),
+			RouteSnapshot: ModelRouteSnapshot{
+				CapabilityAlias: "video.primary", ProviderProfileID: uuid.NewString(),
+				Provider: "mock", ModelID: "video-v1", RouteVersion: "route-v1",
+				CapabilityHash: strings.Repeat("a", 64),
+			},
+			BudgetApprovalID: uuid.NewString(),
+			ExecutionPolicy: ExecutionPolicy{
+				TargetTerritory: "CN", ProductForm: "INTERNAL_PREVIEW",
+				ContentSafetyPolicyVersion: "safety-v1",
+				ContentSafetyDecisionID:    uuid.NewString(),
+			},
+			PostProduction: &PostProductionCommand{
+				Enabled: true, Evidence: "mock_only",
+				SpeechRouteSnapshot: ModelRouteSnapshot{
+					CapabilityAlias: "speech.primary", ProviderProfileID: uuid.NewString(),
+					Provider: "mock", ModelID: "speech-v1", RouteVersion: "route-v1",
+					CapabilityHash: strings.Repeat("b", 64),
+				},
+				SpeechBudgetApprovalID: uuid.NewString(),
+				SpeechBudgetLimit:      BudgetLimit{AmountMicros: 100, Currency: "CNY"},
+				SubtitleLanguage:       "zh-CN",
+			},
+			Actor: Actor{ActorID: "operator", Role: "OPERATOR"},
+		}
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*StartProductionCommand)
+		wantErr bool
+	}{
+		{name: "valid mock boundary"},
+		{
+			name: "valid pending key boundary",
+			mutate: func(command *StartProductionCommand) {
+				command.PostProduction.Evidence = "pending_key"
+			},
+		},
+		{
+			name: "rejects evidence promotion typo",
+			mutate: func(command *StartProductionCommand) {
+				command.PostProduction.Evidence = "live"
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejects non-speech route",
+			mutate: func(command *StartProductionCommand) {
+				command.PostProduction.SpeechRouteSnapshot.CapabilityAlias = "video.primary"
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejects zero paid budget",
+			mutate: func(command *StartProductionCommand) {
+				command.PostProduction.SpeechBudgetLimit.AmountMicros = 0
+			},
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			command := valid()
+			if test.mutate != nil {
+				test.mutate(&command)
+			}
+			err := validateStartProduction(command)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateStartProduction() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestAuthorizeApprovalDoesNotLetAdminBypassGateRole(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

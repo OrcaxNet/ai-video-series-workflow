@@ -682,6 +682,37 @@ func validateStartProduction(command StartProductionCommand) error {
 	if err := validateExecutionPolicy(command.ExecutionPolicy); err != nil {
 		return err
 	}
+	if command.PostProduction != nil && command.PostProduction.Enabled {
+		post := command.PostProduction
+		if post.Evidence != "mock_only" && post.Evidence != "live_provider_call" &&
+			post.Evidence != "pending_key" {
+			return validationError("postProduction.evidence is invalid")
+		}
+		if err := validateSpeechRoute(post.SpeechRouteSnapshot); err != nil {
+			return err
+		}
+		if err := validateUUID(
+			"postProduction.speechBudgetApprovalId",
+			post.SpeechBudgetApprovalID,
+		); err != nil {
+			return err
+		}
+		if post.SpeechBudgetLimit.AmountMicros <= 0 ||
+			!currencyPattern.MatchString(post.SpeechBudgetLimit.Currency) {
+			return validationError("postProduction.speechBudgetLimit requires a positive amountMicros and ISO currency")
+		}
+		if strings.TrimSpace(post.SubtitleLanguage) == "" {
+			return validationError("postProduction.subtitleLanguage is required")
+		}
+		if post.BackgroundAudioAssetVersionID != "" {
+			if err := validateUUID(
+				"postProduction.backgroundAudioAssetVersionId",
+				post.BackgroundAudioAssetVersionID,
+			); err != nil {
+				return err
+			}
+		}
+	}
 	return authorize(ActionStartProduction, command.Actor)
 }
 

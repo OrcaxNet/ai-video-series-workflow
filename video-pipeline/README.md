@@ -10,6 +10,7 @@
 - 四类能力别名：`text.primary`、`image.primary`、`video.primary`、`speech.primary`；
 - 无密钥状态发现、确定性估算/任务、幂等 replay、polling、取消竞态与回调去重；
 - Episode/Shot Workflow：G2 精确绑定、逐镜头远程任务、结构 QC、Q1/G3 人工复核、pause/resume/cancel 与 Provider 取消补偿；
+- 单集后期：独立 `speech.primary` 预算/路由、不可变 UTF-8 SRT、CPU FFmpeg 响度/同步/烧录、外挂字幕、独立对白轨、成片 Manifest/Service BOM，并在 G3 前 fail closed；
 - 入队前 fail-closed：冻结目标地区、产品形态、内容安全策略和 Provider 剩余配额；阻断路径不会启动 Workflow/Provider；
 - Activity journal：稳定 workflow/activity ID、输入/输出 hash、可重放结果、审计与 outbox；
 - 产品投影：Activity 将 Prompt/Run/ProviderJob/QC/Q1/G3 写入规范化表，产物和 Manifest 进入本地 CAS；
@@ -58,6 +59,8 @@ make video-up-tools
 ```bash
 make video-test
 make video-secret-scan
+make video-postproduction-integration-test
+make video-flo104-mock-evidence
 go test ./...
 go vet ./...
 ```
@@ -86,6 +89,7 @@ internal/videopipeline/
   controlplane/                 REST handler、policy、RFC7807
   mockprovider/                 场景注入、异步任务、callback/cancel
   orchestration/                持久流程、预算确认、provider reconciliation
+  postproduction/               Provider-neutral TTS、字幕 revision、确定性 FFmpeg
   repository/                   pgx 数据层、幂等/audit/outbox/谱系
   runtimeconfig/                仅显式环境变量配置
   temporalcontrol/              REST command 到 Workflow/signal/cancel
@@ -95,6 +99,7 @@ video-pipeline/
   contracts/                    OpenAPI / AsyncAPI
   db/migrations/                `video_pipeline` PostgreSQL schema
   docs/                         架构、状态、ER、ADR、追踪和运维
+  docs/flo-104-postproduction.md 音频/字幕/成片证据与真实 Key 执行单
   scripts/smoke.sh              无 GPU/无 Key E2E
 ```
 
