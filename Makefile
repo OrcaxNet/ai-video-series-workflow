@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-secret-scan video-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-secret-scan video-test web-build web-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -36,3 +36,9 @@ video-test:
 	docker compose --env-file video-pipeline/.env.video.example -f video-pipeline/compose.yaml config --quiet
 	./scripts/flo110-preflight.sh
 	./video-pipeline/scripts/check-secrets.sh
+
+web-build:
+	cd web && npm ci && npm run build
+
+web-test:
+	cd web && npm ci && npx playwright install chromium && npm run test

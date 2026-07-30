@@ -1,0 +1,85 @@
+# UI 状态、权限与回滚边界
+
+本文定义 FLO-101 操作台如何读取 FLO-108 OpenAPI/AsyncAPI。PostgreSQL/control-plane projection 是业务真相，Temporal history 与 Provider SDK 不是 UI 查询源。
+
+## 1. 人工闸门
+
+产品界面呈现三道创作者闸门：
+
+| UI | API Gate | 可审核前置 | 决策绑定 |
+|---|---|---|---|
+| 内容与资产 | G1 | 内容结构、资产、许可/同意快照齐全 | world/character/asset revision + content hash |
+| 剧本与分镜 | G2 | G1 APPROVED，脚本、分镜、Prompt/context snapshot 无 stale | episode script/storyboard/prompt revision + content hash |
+| 成片锁版 | G3 | G2 APPROVED，镜头与 QC 完成，字幕/音轨/标识/Manifest 就绪 | episode cut/subtitle/Manifest revision + content hash |
+
+后端的 Q1 是逐镜头质量复核，UI 在任务/QC 视图中显示，但不替代三道剧集级闸门。任何角色都不能绕过许可、stale 或预算策略。
+
+审批按钮只在前置完成时可用；这只是即时反馈，控制面仍必须再次执行 RBAC、Gate、freshness、license、budget 和 ETag 校验。409/422 显示稳定 `errorCode`、建议动作与 `traceId`，不回显上游错误体。
+
+## 2. Provider 与运行状态
+
+| 后端状态/事实 | UI 文案 | 可执行动作 |
+|---|---|---|
+| QUEUED | 排队中 | 取消 |
+| RUNNING | 生成中 | 查看进度、取消 |
+| retryable error + scheduled retry | 重试中 | 查看 Retry-After；达到 3 次前沿用同 Job ID |
+| CANCEL_REQUESTED | 取消确认中 | 等待 poll/callback 对账；不宣称已取消 |
+| CANCELLED | 已取消 | 查看可能费用与 orphan 产物 |
+| FAILED | 失败 | 按稳定类别修复；创意问题创建新 attempt |
+| SUCCEEDED | 已完成 | 查看 CAS、QC、Manifest |
+| UNKNOWN / RECONCILING | 状态未知 / 对账中 | 复用 upstream task ID；禁止盲目新 submit |
+| REQUIRES_ACTION | 需要处理 | 按 auth/permission/quota/budget/content/region/model 类别处理 |
+
+派生的 `RETRYING` 和 `CANCEL_REQUESTED` 是面向用户的本地 projection，不改写冻结 ProviderJob enum；来源分别是错误+调度信息与 GenerationRun/Operation 的取消状态。
+
+## 3. 错误映射
+
+| HTTP/错误 | UI 行为 |
+|---|---|
+| 401 `unauthenticated` | 提示在服务端配置 Secret；不提供浏览器 Key 输入 |
+| 403 `forbidden` | 提示核对模型、Endpoint 与区域权限 |
+| 429 `rate_limited` | 显示 Retry-After，同 Job ID 退避 |
+| 5xx `provider_unavailable` | 最多 3 次基础设施重试，不新建创作 attempt |
+| timeout | 进入 UNKNOWN/reconciliation，保留 task ID |
+| quota/budget | 阻断 submit，重新规划或批准预算 |
+| content safety | 人工修改输入并创建新 attempt |
+| duplicate callback | applied=false，不重复提示、不重复结算 |
+| out-of-order callback | ignored，终态和序列不得回退 |
+| cancel race | 最先确认的合法终态优先，费用继续对账 |
+
+## 4. 证据标签
+
+- `mock_only`：固定 fixture；只证明契约和编排行为。
+- `pending_key` / `pending_key_validation`：真实账号测试尚未完成；不得展示真实 SLA 或价格结论。
+- `live_provider_call`：必须同时有 provider/model/request/task、输入输出 hash、usage/cost 与测试时间窗证据。
+- `verified=false`：金额是估算或 Provider 未返回可核实账单，不能呈现为实付。
+
+Mock 任务即使 SUCCEEDED 也保持 `mock_only`，不会升级为真实质量证据。
+
+## 5. Revision、diff 与回滚
+
+1. 上游内容、资产、上下文和 Prompt 都只新增 revision。
+2. Gate decision 精确绑定 revision ID 和 content hash。
+3. 新 revision 通过 dependency graph 将消费者标为 stale，不覆盖已批准 revision。
+4. Prompt/资产“选择”创建新的业务引用；锁定只对后续新运行生效。
+5. 回滚选择历史 revision，不删除较新 revision、CAS artifact、cost ledger、audit 或 Manifest。
+6. 已提交 ProviderJob 不随应用回滚而撤销；reconciliation 继续使用原 task ID。
+7. G3 锁版后的修改产生新的 episode cut/Manifest revision，旧导出仍可验证。
+
+## 6. 浏览器安全边界
+
+浏览器允许：
+
+- bearer 会话由部署层提供时的受控 API 请求；
+- 非敏感 ID、mask/fingerprint、状态、稳定错误、trace、hash 与费用投影；
+- 本地内存中的表单草稿。
+
+浏览器禁止：
+
+- Provider Key、Authorization、secret store value；
+- 读取开发者目录或本地 Agent 配置；
+- 把 Secret 写入 localStorage/sessionStorage/IndexedDB；
+- 记录原始 Provider 请求/错误体、cookie 或临时签名地址；
+- 直接调用 Provider、PostgreSQL、Temporal 或 CAS 文件卷。
+
+PoC API client 明确使用 `credentials: "omit"`，且没有任何持久化调用。生产鉴权集成时由同源控制面负责会话和 CSRF 策略，仍不把 Provider Secret 发往前端。
