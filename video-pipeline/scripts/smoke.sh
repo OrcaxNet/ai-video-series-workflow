@@ -43,6 +43,9 @@ VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.
 VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
 VIDEO_TEST_TEMPORAL_ADDRESS="127.0.0.1:7233" \
 VIDEO_TEST_PROVIDER_URL="${provider_url}" \
+VIDEO_TEST_PROVIDER_CONTAINER="${VIDEO_MOCK_PROVIDER_CONTAINER:-ai-video-series-workflow-mock-provider-1}" \
+VIDEO_TEST_WORKER_CONTAINER="${VIDEO_WORKER_CONTAINER:-ai-video-series-workflow-orchestrator-worker-1}" \
+VIDEO_TEST_COMPOSE_TASK_QUEUE="video-production-v1" \
   go test -count=1 -tags=integration \
     -run TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage \
     ./internal/videopipeline/repository

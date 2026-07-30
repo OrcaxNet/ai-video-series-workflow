@@ -175,13 +175,15 @@ func ShotProductionWorkflow(
 	status.Shots[input.ShotSpecRevisionID] = shot
 	generated, err := executeProviderWithControls(ctx, controls, status, options, dispatch)
 	if err != nil {
-		if temporal.IsCanceledError(err) {
+		if workflowCancellationRequested(ctx, err) {
 			cancelled := cancelShotAfterWorkflowCancellation(ctx, input, dispatch)
 			status.State = cancelled.State
 			shot.State = cancelled.State
 			shot.FailureCode = cancelled.ErrorCode
 			status.Shots[input.ShotSpecRevisionID] = shot
-			return ShotProductionResult{State: cancelled.State, Run: input.Run}, err
+			return ShotProductionResult{
+				State: cancelled.State, Run: input.Run,
+			}, workflowCancellationError(ctx, err)
 		}
 		if finalizeErr := finalizeShot(ctx, options, FinalizeShotRunInput{
 			OperationID: input.OperationID, RunID: input.Run.RunID, State: "FAILED",
@@ -209,9 +211,11 @@ func ShotProductionWorkflow(
 			PersistProductTruth: input.PersistProductTruth,
 		},
 	).Get(ctx, &qc); err != nil {
-		if temporal.IsCanceledError(err) {
+		if workflowCancellationRequested(ctx, err) {
 			cancelled := cancelShotAfterWorkflowCancellation(ctx, input, dispatch)
-			return ShotProductionResult{State: cancelled.State, Run: input.Run, Provider: generated}, err
+			return ShotProductionResult{
+				State: cancelled.State, Run: input.Run, Provider: generated,
+			}, workflowCancellationError(ctx, err)
 		}
 		if finalizeErr := finalizeShot(ctx, qcOptions, FinalizeShotRunInput{
 			OperationID: input.OperationID, RunID: input.Run.RunID, State: "FAILED",
@@ -357,6 +361,22 @@ func executeProviderWithControls(
 		}
 		return result, activityErr
 	}
+}
+
+// A cancelled Activity normally resolves with CanceledError, but a real
+// provider outage can race the cancellation acknowledgement. Temporal then
+// returns the provider ActivityFailure with RetryState=CancelRequested while
+// the Workflow context is already cancelled. The Workflow cancellation is the
+// authoritative control-plane intent in both forms.
+func workflowCancellationRequested(ctx workflow.Context, activityErr error) bool {
+	return temporal.IsCanceledError(activityErr) || ctx.Err() != nil
+}
+
+func workflowCancellationError(ctx workflow.Context, activityErr error) error {
+	if cancellationErr := ctx.Err(); cancellationErr != nil {
+		return cancellationErr
+	}
+	return activityErr
 }
 
 func waitForExactShotDecision(

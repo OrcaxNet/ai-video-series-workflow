@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -79,6 +80,36 @@ func TestShotProductionWorkflowCancellationRunsProviderCompensation(t *testing.T
 	}
 	if cancelCalls != 1 {
 		t.Fatalf("cancel compensation calls = %d, want 1", cancelCalls)
+	}
+}
+
+func TestShotProductionWorkflowCancellationWinsProviderNetworkFailure(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	var finalized FinalizeShotRunInput
+	cancelCalls := 0
+	registerShotActivities(env, &finalized, &cancelCalls)
+	env.OnActivity(
+		ActivityExecuteProviderJob,
+		mock.Anything,
+		mock.Anything,
+	).Return(func(ctx context.Context, _ ExecuteProviderJobInput) (ProviderResult, error) {
+		<-ctx.Done()
+		return ProviderResult{}, errors.New("lookup mock-provider: no such host")
+	})
+	env.RegisterDelayedCallback(env.CancelWorkflow, time.Second)
+
+	env.ExecuteWorkflow(ShotProductionWorkflow, shotWorkflowTestInput())
+
+	workflowErr := env.GetWorkflowError()
+	if workflowErr == nil || !temporal.IsCanceledError(workflowErr) {
+		t.Fatalf("workflow error = %v, want cancellation", workflowErr)
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("cancel compensation calls = %d, want 1", cancelCalls)
+	}
+	if finalized.State != "" {
+		t.Fatalf("ordinary failure finalization ran after cancellation: %#v", finalized)
 	}
 }
 

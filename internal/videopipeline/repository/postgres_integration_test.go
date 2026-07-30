@@ -7,10 +7,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,12 +30,35 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/activity"
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 )
+
+type cancelRequestedProviderFailureTransport struct {
+	base    http.RoundTripper
+	enabled *atomic.Bool
+	started chan struct{}
+	once    sync.Once
+}
+
+func (t *cancelRequestedProviderFailureTransport) RoundTrip(
+	request *http.Request,
+) (*http.Response, error) {
+	if request.Method == http.MethodGet &&
+		strings.HasPrefix(request.URL.Path, "/v1/jobs/") &&
+		t.enabled.Load() {
+		t.once.Do(func() { close(t.started) })
+		<-request.Context().Done()
+		return nil, &net.DNSError{
+			Err: "no such host", Name: "mock-provider", IsNotFound: true,
+		}
+	}
+	return t.base.RoundTrip(request)
+}
 
 func TestPostgres_CreateSeriesIdempotencyAndAtomicEvidence(t *testing.T) {
 	dsn := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
@@ -233,7 +259,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if dsn == "" {
 		t.Skip("VIDEO_TEST_POSTGRES_DSN is not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -592,10 +618,17 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	var temporalPauseShotID string
 	var temporalPauseCommand controlplane.CreateGenerationRunCommand
+	var composeOutageShotID string
+	var composeOutageCommand controlplane.CreateGenerationRunCommand
 	if os.Getenv("VIDEO_TEST_TEMPORAL_ADDRESS") != "" {
 		temporalPauseShotID, temporalPauseCommand = cloneIntegrationShotCommand(
 			t, ctx, pool, store, shotID.String(), publicCommand,
 		)
+		if os.Getenv("VIDEO_TEST_PROVIDER_CONTAINER") != "" {
+			composeOutageShotID, composeOutageCommand = cloneIntegrationShotCommand(
+				t, ctx, pool, store, shotID.String(), publicCommand,
+			)
+		}
 	}
 	model := providercontract.ModelSnapshot{
 		CapabilityAlias: "video.primary", Provider: "MOCK", ModelID: "fixture-video-v1",
@@ -839,6 +872,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			publicCommand,
 			temporalPauseShotID,
 			temporalPauseCommand,
+			composeOutageShotID,
+			composeOutageCommand,
 		)
 		return
 	}
@@ -1022,6 +1057,8 @@ func testHTTPTemporalRecoveryAndPause(
 	command controlplane.CreateGenerationRunCommand,
 	pauseShotID string,
 	pauseCommand controlplane.CreateGenerationRunCommand,
+	composeOutageShotID string,
+	composeOutageCommand controlplane.CreateGenerationRunCommand,
 ) {
 	t.Helper()
 	temporalClient, err := temporalclient.Dial(temporalclient.Options{
@@ -1053,6 +1090,8 @@ func testHTTPTemporalRecoveryAndPause(
 	firstPollStarted := make(chan struct{})
 	releaseFirstPoll := make(chan struct{})
 	var firstPollOnce sync.Once
+	var interruptOutagePoll atomic.Bool
+	outagePollInterrupted := make(chan struct{})
 	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !providerUp.Load() {
 			hijacker, ok := w.(http.Hijacker)
@@ -1091,6 +1130,13 @@ func testHTTPTemporalRecoveryAndPause(
 			workflow.RegisterOptions{Name: orchestration.ShotReconciliationWorkflowName},
 		)
 		activities := orchestration.NewProductionActivities(providerServer.URL, store, store, artifacts)
+		baseTransport := activities.HTTPClient.Transport
+		if baseTransport == nil {
+			baseTransport = http.DefaultTransport
+		}
+		activities.HTTPClient.Transport = &cancelRequestedProviderFailureTransport{
+			base: baseTransport, enabled: &interruptOutagePoll, started: outagePollInterrupted,
+		}
 		temporalWorker.RegisterActivityWithOptions(
 			activities.ExecuteProviderJob,
 			activity.RegisterOptions{Name: orchestration.ActivityExecuteProviderJob},
@@ -1266,32 +1312,23 @@ func testHTTPTemporalRecoveryAndPause(
 		t.Fatalf("pause workflow cleanup error = %v, want Canceled", err)
 	}
 
-	// Real network interruption after ProviderJob preparation. Cancellation
-	// closes the original Workflow with UNKNOWN; a replacement worker and a
-	// stable reconciliation Workflow settle provider/run/all operations once
-	// the provider is restored.
-	providerUp.Store(false)
+	// Submit the provider job while the adapter is healthy, then interrupt its
+	// first poll and let Temporal observe the retryable network failure before
+	// cancellation. This reproduces the production history shape where an
+	// ActivityFailure with RetryState=CancelRequested carries the provider
+	// network error instead of a CanceledError.
+	interruptOutagePoll.Store(true)
 	createOperation := createRun(shotID, command)
-	providerJobDeadline := time.Now().Add(10 * time.Second)
-	for {
-		var count int
-		if err := pool.QueryRow(ctx, `
-			SELECT COUNT(*)
-			FROM video_pipeline.provider_jobs pj
-			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
-			WHERE ga.generation_run_id = $1`,
-			createOperation.AggregateID,
-		).Scan(&count); err != nil {
-			t.Fatal(err)
-		}
-		if count == 1 {
-			break
-		}
-		if time.Now().After(providerJobDeadline) {
-			t.Fatal("provider job was not durably prepared before network cancellation")
-		}
-		time.Sleep(50 * time.Millisecond)
+	select {
+	case <-outagePollInterrupted:
+	case <-ctx.Done():
+		t.Fatalf("provider job was not submitted and polled before network cancellation: %v", ctx.Err())
 	}
+	// The submitted job is now blocked in its provider poll. Make every
+	// compensation request fail as well; cancelling the Workflow releases the
+	// poll with a DNS error, which Temporal records as ActivityFailure with
+	// RetryState=CancelRequested rather than CanceledError.
+	providerUp.Store(false)
 	cancelBody := []byte(
 		`{"actor":{"actorId":"operator","role":"OPERATOR"},"reasonCode":"NETWORK_CANCEL"}`,
 	)
@@ -1319,6 +1356,28 @@ func testHTTPTemporalRecoveryAndPause(
 	if err := workflowRun.Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
 		t.Fatalf("workflow completion error = %v, want Canceled", err)
 	}
+	history := temporalClient.GetWorkflowHistory(
+		ctx,
+		createOperation.TemporalWorkflowID,
+		"",
+		false,
+		enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT,
+	)
+	sawCancelRequestedActivityFailure := false
+	for history.HasNext() {
+		event, historyErr := history.Next()
+		if historyErr != nil {
+			t.Fatalf("read cancelled workflow history: %v", historyErr)
+		}
+		failed := event.GetActivityTaskFailedEventAttributes()
+		if failed != nil && failed.RetryState == enumspb.RETRY_STATE_CANCEL_REQUESTED {
+			sawCancelRequestedActivityFailure = true
+			break
+		}
+	}
+	if !sawCancelRequestedActivityFailure {
+		t.Fatal("workflow history did not retain ActivityFailure with RetryState=CancelRequested")
+	}
 	unknownRun, err := store.GetGenerationRun(ctx, createOperation.AggregateID)
 	if err != nil {
 		t.Fatal(err)
@@ -1337,6 +1396,7 @@ func testHTTPTemporalRecoveryAndPause(
 		t.Fatalf("start replacement Temporal worker: %v", err)
 	}
 	defer replacementWorker.Stop()
+	interruptOutagePoll.Store(false)
 	providerUp.Store(true)
 	reconcileBody := []byte(
 		`{"actor":{"actorId":"operator","role":"OPERATOR"},"recoveryMode":"RECONCILE_HISTORY"}`,
@@ -1417,6 +1477,274 @@ func testHTTPTemporalRecoveryAndPause(
 		t.Fatalf(
 			"recovery duplicated durable facts: providerJobs=%d recoveryOperations=%d",
 			providerJobs, recoveryOperations,
+		)
+	}
+	if os.Getenv("VIDEO_TEST_PROVIDER_CONTAINER") != "" {
+		testComposeProviderPollingCancellation(
+			t,
+			ctx,
+			pool,
+			store,
+			temporalClient,
+			composeOutageShotID,
+			composeOutageCommand,
+		)
+	}
+}
+
+func testComposeProviderPollingCancellation(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	store *Postgres,
+	temporalClient temporalclient.Client,
+	composeShotID string,
+	composeCommand controlplane.CreateGenerationRunCommand,
+) {
+	t.Helper()
+	providerContainer := os.Getenv("VIDEO_TEST_PROVIDER_CONTAINER")
+	workerContainer := os.Getenv("VIDEO_TEST_WORKER_CONTAINER")
+	taskQueue := os.Getenv("VIDEO_TEST_COMPOSE_TASK_QUEUE")
+	if taskQueue == "" {
+		taskQueue = "video-production-v1"
+	}
+	startProvider := func(commandContext context.Context) error {
+		output, err := exec.CommandContext(
+			commandContext, "docker", "start", providerContainer,
+		).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("docker start %s: %w: %s", providerContainer, err, output)
+		}
+		return nil
+	}
+	t.Cleanup(func() {
+		cleanupContext, cleanupCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cleanupCancel()
+		if err := startProvider(cleanupContext); err != nil {
+			t.Errorf("restore Compose provider: %v", err)
+		}
+	})
+	if err := startProvider(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	controller, err := temporalcontrol.New(temporalClient, taskQueue, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := httptest.NewServer(
+		controlplane.NewWithRuntime(
+			runtimeconfig.ControlPlane{},
+			nil,
+			store,
+			controller,
+			nil,
+		).Handler(),
+	)
+	defer api.Close()
+	createBody, err := json.Marshal(composeCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createResponse := executeIntegrationRequest(
+		t,
+		http.MethodPost,
+		api.URL+controlplane.APIBase+"/shots/"+composeShotID+"/runs",
+		createBody,
+		map[string]string{
+			"Idempotency-Key": uuid.NewString(),
+			"If-Match":        `"1"`,
+		},
+	)
+	if createResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf(
+			"Compose create status=%d body=%s",
+			createResponse.StatusCode,
+			createResponse.Body,
+		)
+	}
+	var createOperation controlplane.Operation
+	if err := json.Unmarshal(createResponse.Body, &createOperation); err != nil {
+		t.Fatalf("decode Compose create operation: %v", err)
+	}
+	providerJobDeadline := time.Now().Add(15 * time.Second)
+	for {
+		var providerJobs int
+		if err := pool.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM video_pipeline.provider_jobs pj
+			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+			WHERE ga.generation_run_id = $1`,
+			createOperation.AggregateID,
+		).Scan(&providerJobs); err != nil {
+			t.Fatal(err)
+		}
+		if providerJobs == 1 {
+			break
+		}
+		if time.Now().After(providerJobDeadline) {
+			t.Fatal("Compose worker did not prepare the provider job")
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	// PrepareProviderJob precedes the provider POST. The mock POST is local and
+	// immediate; stopping after this short window leaves the Activity in its
+	// mandatory 500 ms poll delay with an already-submitted stable JobID.
+	time.Sleep(150 * time.Millisecond)
+	stopOutput, err := exec.CommandContext(
+		ctx, "docker", "stop", "--time", "1", providerContainer,
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("stop Compose provider: %v: %s", err, stopOutput)
+	}
+	// Let the worker enter the failed poll/retry path before cancellation.
+	time.Sleep(750 * time.Millisecond)
+
+	cancelBody := []byte(
+		`{"actor":{"actorId":"operator","role":"OPERATOR"},"reasonCode":"COMPOSE_DNS_CANCEL"}`,
+	)
+	cancelKey := uuid.NewString()
+	var cancelOperation controlplane.Operation
+	for attempt := 1; attempt <= 2; attempt++ {
+		response := executeIntegrationRequest(
+			t,
+			http.MethodPost,
+			api.URL+controlplane.APIBase+"/runs/"+createOperation.AggregateID+"/cancel",
+			cancelBody,
+			map[string]string{
+				"Idempotency-Key": cancelKey,
+				"If-Match":        `"1"`,
+			},
+		)
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf(
+				"Compose cancel attempt %d status=%d body=%s",
+				attempt,
+				response.StatusCode,
+				response.Body,
+			)
+		}
+		if err := json.Unmarshal(response.Body, &cancelOperation); err != nil {
+			t.Fatalf("decode Compose cancel operation: %v", err)
+		}
+	}
+	if err := temporalClient.GetWorkflow(
+		ctx, createOperation.TemporalWorkflowID, "",
+	).Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
+		t.Fatalf("Compose outage workflow completion = %v, want Canceled", err)
+	}
+	unknownRun, err := store.GetGenerationRun(ctx, createOperation.AggregateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknownRun.State != "UNKNOWN" ||
+		unknownRun.FailureCode != "CANCEL_NOT_CONFIRMED" {
+		t.Fatalf("Compose outage cancellation run = %#v", unknownRun)
+	}
+
+	if workerContainer != "" {
+		restartOutput, restartErr := exec.CommandContext(
+			ctx, "docker", "restart", workerContainer,
+		).CombinedOutput()
+		if restartErr != nil {
+			t.Fatalf("restart Compose worker: %v: %s", restartErr, restartOutput)
+		}
+	}
+	if err := startProvider(ctx); err != nil {
+		t.Fatal(err)
+	}
+	reconcileBody := []byte(
+		`{"actor":{"actorId":"operator","role":"OPERATOR"},"recoveryMode":"RECONCILE_HISTORY"}`,
+	)
+	reconcileKey := uuid.NewString()
+	var reconcileOperation controlplane.Operation
+	for attempt := 1; attempt <= 2; attempt++ {
+		response := executeIntegrationRequest(
+			t,
+			http.MethodPost,
+			api.URL+controlplane.APIBase+"/runs/"+createOperation.AggregateID+"/resume",
+			reconcileBody,
+			map[string]string{
+				"Idempotency-Key": reconcileKey,
+				"If-Match":        `"1"`,
+			},
+		)
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf(
+				"Compose reconcile attempt %d status=%d body=%s",
+				attempt,
+				response.StatusCode,
+				response.Body,
+			)
+		}
+		if err := json.Unmarshal(response.Body, &reconcileOperation); err != nil {
+			t.Fatalf("decode Compose reconcile operation: %v", err)
+		}
+	}
+	recoveryDeadline := time.Now().Add(30 * time.Second)
+	for {
+		run, getErr := store.GetGenerationRun(ctx, createOperation.AggregateID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		createState, cancelState, recoveryState, providerState := "", "", "", ""
+		if err := pool.QueryRow(ctx, `
+			SELECT
+			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $1),
+			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $2),
+			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $3),
+			  (SELECT pj.state FROM video_pipeline.provider_jobs pj
+			   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+			   WHERE ga.generation_run_id = $4)`,
+			createOperation.OperationID,
+			cancelOperation.OperationID,
+			reconcileOperation.OperationID,
+			createOperation.AggregateID,
+		).Scan(&createState, &cancelState, &recoveryState, &providerState); err != nil {
+			t.Fatal(err)
+		}
+		if run.State == "CANCELLED" &&
+			createState == "CANCELLED" &&
+			cancelState == "SUCCEEDED" &&
+			recoveryState == "SUCCEEDED" &&
+			providerState == "CANCELLED" {
+			if run.FailureClass != "" || run.FailureCode != "" {
+				t.Fatalf("Compose reconciled run retained failure = %#v", run)
+			}
+			break
+		}
+		if time.Now().After(recoveryDeadline) {
+			t.Fatalf(
+				"Compose recovery did not converge: run=%#v create=%s cancel=%s recovery=%s provider=%s",
+				run,
+				createState,
+				cancelState,
+				recoveryState,
+				providerState,
+			)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	var providerJobs, cancelOperations, recoveryOperations int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+		   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.operation_requests
+		   WHERE aggregate_id = $1 AND operation_type = 'CANCEL_GENERATION_RUN'),
+		  (SELECT COUNT(*) FROM video_pipeline.operation_requests
+		   WHERE aggregate_id = $1 AND operation_type = 'RESUME_GENERATION_RUN')`,
+		createOperation.AggregateID,
+	).Scan(&providerJobs, &cancelOperations, &recoveryOperations); err != nil {
+		t.Fatal(err)
+	}
+	if providerJobs != 1 || cancelOperations != 1 || recoveryOperations != 1 {
+		t.Fatalf(
+			"Compose recovery duplicated durable facts: providerJobs=%d cancelOperations=%d recoveryOperations=%d",
+			providerJobs,
+			cancelOperations,
+			recoveryOperations,
 		)
 	}
 }
