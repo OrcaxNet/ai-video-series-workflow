@@ -26,6 +26,46 @@ type approvalHandlerStore struct {
 	createCalls int
 }
 
+type generationMainlineHandlerStore struct {
+	Store
+	compilationCalls int
+	publicationCalls int
+}
+
+func (s *generationMainlineHandlerStore) Ping(context.Context) error { return nil }
+
+func (s *generationMainlineHandlerStore) StartContentCompilation(
+	_ context.Context,
+	sourceRevisionID string,
+	_ StartContentCompilationCommand,
+	_ Idempotency,
+	traceID string,
+) (Stored[Operation], error) {
+	s.compilationCalls++
+	now := time.Now().UTC()
+	return Stored[Operation]{Value: Operation{
+		OperationID: uuid.NewString(), OperationType: "START_CONTENT_COMPILATION",
+		AggregateType: "SOURCE_REVISION", AggregateID: sourceRevisionID,
+		State: "ACCEPTED", TraceID: traceID, CreatedAt: now, UpdatedAt: now,
+	}}, nil
+}
+
+func (s *generationMainlineHandlerStore) LockPublication(
+	_ context.Context,
+	runID string,
+	command LockPublicationCommand,
+	_ Idempotency,
+	_ string,
+) (Stored[PublicationLock], error) {
+	s.publicationCalls++
+	return Stored[PublicationLock]{Value: PublicationLock{
+		PublicationLockID: uuid.NewString(), RunID: runID,
+		ManifestID: command.ManifestID, ManifestHash: command.ManifestHash,
+		QCReportID: command.QCReportID, QCReportHash: command.QCReportHash,
+		Gate3DecisionID: command.Gate3DecisionID, LockedAt: time.Now().UTC(),
+	}}, nil
+}
+
 func (s *approvalHandlerStore) Ping(context.Context) error { return nil }
 
 func (s *approvalHandlerStore) CreateApprovalDecision(
@@ -65,6 +105,88 @@ func (s *handlerStore) CreateSeries(
 	traceID string,
 ) (Stored[Operation], error) {
 	return s.createSeries(ctx, command, idempotency, traceID)
+}
+
+func TestServer_GenerationMainlineV6Endpoints(t *testing.T) {
+	t.Parallel()
+	hash := strings.Repeat("a", 64)
+	profileID := uuid.NewString()
+	capabilityHash := strings.Repeat("b", 64)
+	tests := []struct {
+		name       string
+		path       string
+		body       string
+		wantStatus int
+		wantCalls  func(*generationMainlineHandlerStore) int
+	}{
+		{
+			name: "content compilation",
+			path: APIBase + "/sources/" + uuid.NewString() + "/compilations",
+			body: `{
+				"schemaVersion":"v1",
+				"sourceHash":"` + hash + `",
+				"stages":["STRUCTURE","EPISODES","SCENES","SHOTS"],
+				"textRouteSnapshot":{
+					"capabilityAlias":"text.primary",
+					"providerProfileId":"` + profileID + `",
+					"provider":"MOCK",
+					"modelId":"fixture-text-v1",
+					"routeVersion":"route-v1",
+					"capabilityHash":"` + capabilityHash + `"
+				},
+				"actor":{"actorId":"producer","role":"PRODUCER"}
+			}`,
+			wantStatus: http.StatusAccepted,
+			wantCalls: func(store *generationMainlineHandlerStore) int {
+				return store.compilationCalls
+			},
+		},
+		{
+			name: "publication lock",
+			path: APIBase + "/runs/" + uuid.NewString() + "/publication-lock",
+			body: `{
+				"schemaVersion":"v1",
+				"manifestId":"` + uuid.NewString() + `",
+				"manifestHash":"` + hash + `",
+				"qcReportId":"` + uuid.NewString() + `",
+				"qcReportHash":"` + hash + `",
+				"gate3DecisionId":"` + uuid.NewString() + `",
+				"actor":{"actorId":"director","role":"DIRECTOR"}
+			}`,
+			wantStatus: http.StatusCreated,
+			wantCalls: func(store *generationMainlineHandlerStore) int {
+				return store.publicationCalls
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			store := &generationMainlineHandlerStore{}
+			server := NewWithRuntime(
+				runtimeconfig.ControlPlane{}, nil, store, nil, nil,
+			)
+			request := httptest.NewRequest(
+				http.MethodPost, test.path, strings.NewReader(test.body),
+			)
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Idempotency-Key", uuid.NewString())
+			recorder := httptest.NewRecorder()
+
+			server.Handler().ServeHTTP(recorder, request)
+
+			if recorder.Code != test.wantStatus {
+				t.Fatalf(
+					"status = %d, want %d, body=%s",
+					recorder.Code, test.wantStatus, recorder.Body.String(),
+				)
+			}
+			if calls := test.wantCalls(store); calls != 1 {
+				t.Fatalf("store calls = %d, want 1", calls)
+			}
+		})
+	}
 }
 
 func TestServer_CreateSeriesValidatesAndForwardsIdempotency(t *testing.T) {

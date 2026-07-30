@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -18,6 +19,11 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+type immutableProviderRequest struct {
+	Input    orchestration.ExecuteProviderJobInput `json:"input"`
+	Prepared orchestration.PreparedProviderJob     `json:"prepared"`
+}
 
 // CompilePromptSnapshot materializes the exact four-level context resolution
 // and immutable prompt used by a workflow Activity.
@@ -152,6 +158,12 @@ func (p *Postgres) CompilePromptSnapshot(
 			shotID, promptHash,
 		).Scan(&promptID); err != nil {
 			return orchestration.PromptSnapshotRef{}, fmt.Errorf("resolve prompt snapshot: %w", err)
+		}
+		if err := persistPromptLineage(
+			ctx, tx, promptID, shotID, profileID, shotHash, profileHash,
+			contextIDs, assets,
+		); err != nil {
+			return orchestration.PromptSnapshotRef{}, err
 		}
 		if tag.RowsAffected() == 1 {
 			for _, contextID := range contextIDs {
@@ -327,12 +339,221 @@ func loadExactPromptSnapshot(
 			"prompt snapshot execution fields are incomplete",
 		)
 	}
+	if err := verifyPromptLineage(
+		ctx, tx, promptID, shotID, profileID, shotHash, profileHash,
+		contextIDs, contextHashes, assetIDs, assets,
+	); err != nil {
+		return orchestration.PromptSnapshotRef{}, err
+	}
 	return orchestration.PromptSnapshotRef{
 		ID: promptID.String(), Digest: contentHash,
 		PositivePrompt: positivePrompt, NegativePrompt: negativePrompt,
 		Context: contextRefs, Assets: assets, Output: output,
 		InputRevisionHashes: storedInputRevisionHashes,
 	}, nil
+}
+
+func persistPromptLineage(
+	ctx context.Context,
+	tx pgx.Tx,
+	promptID, shotID, profileID uuid.UUID,
+	shotHash, profileHash string,
+	contextIDs []uuid.UUID,
+	assets []providercontract.AssetRef,
+) error {
+	inputs := []struct {
+		inputType      string
+		revisionID     uuid.UUID
+		hash           string
+		dependencyRole string
+	}{
+		{
+			inputType: "SHOT_SPEC", revisionID: shotID,
+			hash: shotHash, dependencyRole: "primary-shot",
+		},
+		{
+			inputType: "GENERATION_PROFILE", revisionID: profileID,
+			hash: profileHash, dependencyRole: "generation-profile",
+		},
+	}
+	for _, contextID := range contextIDs {
+		var scope, hash string
+		if err := tx.QueryRow(ctx, `
+			SELECT scope_type, content_hash
+			FROM video_pipeline.context_revisions
+			WHERE id = $1
+			FOR SHARE`,
+			contextID,
+		).Scan(&scope, &hash); err != nil {
+			return fmt.Errorf("read Prompt context lineage: %w", err)
+		}
+		inputs = append(inputs, struct {
+			inputType      string
+			revisionID     uuid.UUID
+			hash           string
+			dependencyRole string
+		}{
+			inputType: "CONTEXT", revisionID: contextID,
+			hash: hash, dependencyRole: "context:" + strings.ToLower(scope),
+		})
+	}
+	for _, input := range inputs {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.prompt_snapshot_inputs
+				(prompt_snapshot_id, input_type, input_revision_id, input_hash, dependency_role)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT DO NOTHING`,
+			promptID, input.inputType, input.revisionID, input.hash, input.dependencyRole,
+		); err != nil {
+			return fmt.Errorf("insert Prompt input lineage: %w", err)
+		}
+	}
+	for index, asset := range assets {
+		assetVersionID, err := uuid.Parse(asset.Revision)
+		if err != nil {
+			return fmt.Errorf("parse Prompt asset lineage revision: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.prompt_snapshot_assets
+				(prompt_snapshot_id, alias, asset_version_id, asset_hash, provider_role)
+			VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT DO NOTHING`,
+			promptID, fmt.Sprintf("asset-%03d", index+1),
+			assetVersionID, asset.SHA256, string(asset.Role),
+		); err != nil {
+			return fmt.Errorf("insert Prompt asset lineage: %w", err)
+		}
+	}
+	return nil
+}
+
+func verifyPromptLineage(
+	ctx context.Context,
+	tx pgx.Tx,
+	promptID, shotID, profileID uuid.UUID,
+	shotHash, profileHash string,
+	contextIDs []uuid.UUID,
+	contextHashes map[string]string,
+	assetIDs []uuid.UUID,
+	assets []providercontract.AssetRef,
+) error {
+	var exactInputs int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.prompt_snapshot_inputs
+		WHERE prompt_snapshot_id = $1`,
+		promptID,
+	).Scan(&exactInputs); err != nil {
+		return fmt.Errorf("count Prompt input lineage: %w", err)
+	}
+	if exactInputs != 2+len(contextIDs) {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"Prompt input lineage is incomplete or contains unexpected dependencies",
+		)
+	}
+	expectedInputs := []struct {
+		inputType string
+		id        uuid.UUID
+		hash      string
+		role      string
+	}{
+		{"SHOT_SPEC", shotID, shotHash, "primary-shot"},
+		{"GENERATION_PROFILE", profileID, profileHash, "generation-profile"},
+	}
+	contextByID := map[string]string{
+		"series":  "",
+		"episode": "",
+		"scene":   "",
+		"shot":    "",
+	}
+	for key, hash := range contextHashes {
+		contextByID[strings.TrimPrefix(key, "context:")] = hash
+	}
+	for _, contextID := range contextIDs {
+		var scope string
+		if err := tx.QueryRow(ctx, `
+			SELECT scope_type
+			FROM video_pipeline.context_revisions
+			WHERE id = $1
+			FOR SHARE`,
+			contextID,
+		).Scan(&scope); err != nil {
+			return fmt.Errorf("read Prompt context lineage scope: %w", err)
+		}
+		scope = strings.ToLower(scope)
+		expectedInputs = append(expectedInputs, struct {
+			inputType string
+			id        uuid.UUID
+			hash      string
+			role      string
+		}{
+			"CONTEXT", contextID, contextByID[scope], "context:" + scope,
+		})
+	}
+	for _, expected := range expectedInputs {
+		var exists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+			  SELECT 1
+			  FROM video_pipeline.prompt_snapshot_inputs
+			  WHERE prompt_snapshot_id = $1
+			    AND input_type = $2
+			    AND input_revision_id = $3
+			    AND input_hash = $4
+			    AND dependency_role = $5
+			)`,
+			promptID, expected.inputType, expected.id, expected.hash, expected.role,
+		).Scan(&exists); err != nil {
+			return fmt.Errorf("verify Prompt input lineage: %w", err)
+		}
+		if !exists {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"Prompt input lineage differs from its immutable producers",
+			)
+		}
+	}
+	var exactAssets int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.prompt_snapshot_assets
+		WHERE prompt_snapshot_id = $1`,
+		promptID,
+	).Scan(&exactAssets); err != nil {
+		return fmt.Errorf("count Prompt asset lineage: %w", err)
+	}
+	if exactAssets != len(assetIDs) || len(assetIDs) != len(assets) {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"Prompt asset lineage is incomplete or contains unexpected dependencies",
+		)
+	}
+	for index, assetID := range assetIDs {
+		var exists bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+			  SELECT 1
+			  FROM video_pipeline.prompt_snapshot_assets
+			  WHERE prompt_snapshot_id = $1
+			    AND alias = $2
+			    AND asset_version_id = $3
+			    AND asset_hash = $4
+			    AND provider_role = $5
+			)`,
+			promptID, fmt.Sprintf("asset-%03d", index+1), assetID,
+			assets[index].SHA256, string(assets[index].Role),
+		).Scan(&exists); err != nil {
+			return fmt.Errorf("verify Prompt asset lineage: %w", err)
+		}
+		if !exists {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"Prompt asset lineage differs from its immutable producers",
+			)
+		}
+	}
+	return nil
 }
 
 func workflowPromptHash(
@@ -355,6 +576,40 @@ func workflowPromptHash(
 		"output":                    output,
 		"inputRevisionHashes":       inputRevisionHashes,
 	})
+}
+
+func generationRunSpecDigest(
+	shotSpecRevisionID string,
+	promptSnapshotID string,
+	promptHash string,
+	generationProfileID string,
+	generationPlanID string,
+	route providercontract.ModelSnapshot,
+	creativeAttempt int,
+) (string, error) {
+	return digestValue(map[string]any{
+		"shotSpecRevisionId": shotSpecRevisionID,
+		"promptSnapshotId":   promptSnapshotID,
+		"promptHash":         promptHash,
+		"profileId":          generationProfileID,
+		"generationPlanId":   generationPlanID,
+		"route":              route,
+		"creativeAttempt":    creativeAttempt,
+	})
+}
+
+func providerRouteSnapshot(
+	route controlplane.ModelRouteSnapshot,
+) providercontract.ModelSnapshot {
+	return providercontract.ModelSnapshot{
+		CapabilityAlias: route.CapabilityAlias,
+		Provider:        route.Provider,
+		ModelID:         route.ModelID,
+		EndpointID:      route.EndpointID,
+		RouteVersion:    route.RouteVersion,
+		CapabilityHash:  route.CapabilityHash,
+		Verification:    "control_plane_capability_snapshot",
+	}
 }
 
 func loadPromptContextEvidence(
@@ -645,15 +900,15 @@ func (p *Postgres) CreateWorkflowRun(
 		); err != nil {
 			return orchestration.GenerationRunRef{}, err
 		}
-		runDigest, err := digestValue(map[string]any{
-			"shotSpecRevisionId": input.ShotSpecRevisionID,
-			"promptSnapshotId":   input.PromptSnapshot.ID,
-			"promptHash":         promptHash,
-			"profileId":          input.GenerationProfileRef,
-			"generationPlanId":   input.GenerationPlanID,
-			"route":              input.Route,
-			"creativeAttempt":    input.CreativeAttempt,
-		})
+		runDigest, err := generationRunSpecDigest(
+			input.ShotSpecRevisionID,
+			input.PromptSnapshot.ID,
+			promptHash,
+			input.GenerationProfileRef,
+			input.GenerationPlanID,
+			input.Route,
+			input.CreativeAttempt,
+		)
 		if err != nil {
 			return orchestration.GenerationRunRef{}, err
 		}
@@ -729,26 +984,34 @@ func (p *Postgres) PrepareProviderJob(
 	ctx context.Context,
 	step orchestration.WorkflowStep,
 	input orchestration.ExecuteProviderJobInput,
-) error {
+) (orchestration.PreparedProviderJob, error) {
 	runID, err := uuid.Parse(input.Run.RunID)
 	if err != nil {
-		return errors.New("runId must be a UUID")
+		return orchestration.PreparedProviderJob{}, errors.New("runId must be a UUID")
 	}
 	providerProfileID, err := uuid.Parse(input.ProviderProfileID)
 	if err != nil {
-		return errors.New("providerProfileId must be a UUID")
+		return orchestration.PreparedProviderJob{}, errors.New("providerProfileId must be a UUID")
 	}
-	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
-		var attemptID uuid.UUID
+	prepared, err := withSerializable(ctx, p.pool, func(
+		tx pgx.Tx,
+	) (orchestration.PreparedProviderJob, error) {
+		var attemptID, promptID, shotID, profileID uuid.UUID
 		var seriesID, episodeID uuid.UUID
 		var runDigest, runState, persistedBudgetApprovalID, generationPlanID string
+		var promptHash string
+		var creativeAttempt int
+		var persistedRouteJSON []byte
 		if err := tx.QueryRow(ctx, `
-			SELECT ga.id, gr.run_spec_digest, gr.state, gr.budget_approval_id,
+			SELECT ga.id, gr.prompt_snapshot_id, gr.shot_spec_revision_id,
+			       gr.generation_profile_id, gr.creative_attempt,
+			       gr.run_spec_digest, gr.state, gr.budget_approval_id,
 			       COALESCE(audit.payload->>'generationPlanId', ''),
-			       ep.series_id, ep.id
+			       ep.series_id, ep.id, ps.content_hash, ga.model_snapshot
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.generation_attempts ga
 			  ON ga.generation_run_id = gr.id AND ga.sequence = 1
+			JOIN video_pipeline.prompt_snapshots ps ON ps.id = gr.prompt_snapshot_id
 			JOIN video_pipeline.shot_spec_revisions ssr
 			  ON ssr.id = gr.shot_spec_revision_id
 			JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
@@ -767,56 +1030,148 @@ func (p *Postgres) PrepareProviderJob(
 			FOR UPDATE OF gr, ga`,
 			runID,
 		).Scan(
-			&attemptID, &runDigest, &runState, &persistedBudgetApprovalID,
-			&generationPlanID, &seriesID, &episodeID,
+			&attemptID, &promptID, &shotID, &profileID, &creativeAttempt,
+			&runDigest, &runState, &persistedBudgetApprovalID,
+			&generationPlanID, &seriesID, &episodeID, &promptHash,
+			&persistedRouteJSON,
 		); err != nil {
-			return struct{}{}, fmt.Errorf("lock provider run: %w", err)
+			return orchestration.PreparedProviderJob{}, fmt.Errorf("lock provider run: %w", err)
 		}
 		if runDigest != input.Run.RunSpecDigest {
-			return struct{}{}, controlplane.NewConflictError(
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
 				controlplane.CodeRevisionConflict,
 				"provider dispatch digest differs from the persisted run",
 			)
 		}
+		if runState == "CANCELLED" || runState == "FAILED" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a terminal generation run cannot create or replay a paid Provider job",
+			)
+		}
 		if generationPlanID == "" {
-			return struct{}{}, controlplane.NewPolicyError(
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
 				controlplane.CodeBudgetExceeded,
 				"generation run has no immutable generation plan binding",
 				"create a new run from the exact approved plan",
 			)
 		}
 		if input.BudgetApprovalID != persistedBudgetApprovalID {
-			return struct{}{}, controlplane.NewPolicyError(
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
 				controlplane.CodeBudgetExceeded,
 				"provider dispatch budget approval differs from the persisted run",
 				"use the exact approval frozen when the run was created",
 			)
 		}
+		var persistedRoute providercontract.ModelSnapshot
+		if err := json.Unmarshal(persistedRouteJSON, &persistedRoute); err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"decode persisted Provider route: %w", err,
+			)
+		}
+		if persistedRoute != input.Route {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"provider dispatch route differs from the route frozen for the run",
+			)
+		}
+		exactPrompt, err := loadExactPromptSnapshot(ctx, tx, promptID)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if input.Prompt.ID != promptID.String() ||
+			input.Prompt.Digest != promptHash ||
+			!reflect.DeepEqual(input.Prompt, exactPrompt) {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"provider dispatch prompt differs from the prompt frozen for the run",
+			)
+		}
 		plan, err := readPlan(ctx, tx, generationPlanID)
 		if err != nil {
-			return struct{}{}, err
+			return orchestration.PreparedProviderJob{}, err
 		}
 		if input.BudgetMaximumMicros != plan.BudgetLimit.AmountMicros ||
 			input.BudgetCurrency != plan.BudgetLimit.Currency {
-			return struct{}{}, controlplane.NewPolicyError(
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
 				controlplane.CodeBudgetExceeded,
 				"provider dispatch budget differs from the immutable generation plan",
 				"use the exact VIDEO amount and currency frozen by the plan",
+			)
+		}
+		workflowRoute := controlplane.ModelRouteSnapshot{
+			CapabilityAlias:   input.Route.CapabilityAlias,
+			ProviderProfileID: input.ProviderProfileID,
+			Provider:          input.Route.Provider, ModelID: input.Route.ModelID,
+			EndpointID: input.Route.EndpointID, RouteVersion: input.Route.RouteVersion,
+			CapabilityHash: input.Route.CapabilityHash,
+		}
+		if !sameRoute(plan.Plan.RouteSnapshot, workflowRoute) {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"provider dispatch route differs from the immutable generation plan",
+			)
+		}
+		recomputedDigest, err := generationRunSpecDigest(
+			shotID.String(),
+			promptID.String(),
+			promptHash,
+			profileID.String(),
+			generationPlanID,
+			persistedRoute,
+			creativeAttempt,
+		)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if recomputedDigest != runDigest {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"persisted generation run digest no longer matches its frozen inputs",
 			)
 		}
 		if err := requireBudgetApproval(
 			ctx, tx, persistedBudgetApprovalID, seriesID, episodeID,
 			generationPlanID, "VIDEO", plan.BudgetLimit,
 		); err != nil {
-			return struct{}{}, err
+			return orchestration.PreparedProviderJob{}, err
 		}
-		if runState == "SUCCEEDED" {
-			return struct{}{}, nil
+		approvalID, err := uuid.Parse(persistedBudgetApprovalID)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"budget approval identifier is invalid",
+				"approve the exact immutable generation plan budget",
+			)
+		}
+		var approvedMicros int64
+		var approvedCurrency string
+		if err := tx.QueryRow(ctx, `
+			SELECT budget_limit_micros, budget_currency
+			FROM video_pipeline.review_tasks
+			WHERE id = $1 AND state = 'APPROVED'
+			FOR UPDATE`,
+			approvalID,
+		).Scan(&approvedMicros, &approvedCurrency); err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"lock cumulative budget approval: %w", err,
+			)
+		}
+		if approvedMicros != plan.BudgetLimit.AmountMicros ||
+			approvedCurrency != plan.BudgetLimit.Currency {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"locked budget approval differs from the immutable generation plan",
+				"approve the exact plan amount and currency",
+			)
 		}
 		var capabilityID uuid.UUID
 		var pricingVersion string
+		var capabilityLimitsJSON []byte
+		var capabilityProvider, capabilityModel, capabilityRouteVersion string
 		if err := tx.QueryRow(ctx, `
-			SELECT pcs.id, COALESCE(pcs.pricing_rule_version, 'unpriced')
+			SELECT pcs.id, COALESCE(pcs.pricing_rule_version, ''),
+			       pcs.limits, pp.provider, pcs.model_id, pcs.route_version
 			FROM video_pipeline.provider_capability_snapshots pcs
 			JOIN video_pipeline.provider_profiles pp ON pp.id = pcs.provider_profile_id
 			WHERE pp.id = $1
@@ -827,35 +1182,220 @@ func (p *Postgres) PrepareProviderJob(
 			  AND pcs.status = 'ACTIVE'
 			FOR SHARE`,
 			providerProfileID, input.Route.CapabilityHash,
-		).Scan(&capabilityID, &pricingVersion); err != nil {
-			return struct{}{}, controlplane.NewPolicyError(
-				controlplane.CodeCapability,
-				"the frozen provider capability is no longer dispatchable",
-				"refresh the generation plan and provider route",
+		).Scan(
+			&capabilityID, &pricingVersion, &capabilityLimitsJSON,
+			&capabilityProvider, &capabilityModel, &capabilityRouteVersion,
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+					controlplane.CodeCapability,
+					"the frozen provider capability is no longer dispatchable",
+					"refresh the generation plan and provider route",
+				)
+			}
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"read frozen provider capability: %w", err,
+			)
+		}
+		if capabilityProvider != input.Route.Provider ||
+			capabilityModel != input.Route.ModelID ||
+			capabilityRouteVersion != input.Route.RouteVersion {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"provider dispatch model differs from the frozen capability snapshot",
+			)
+		}
+		var capabilityLimits map[string]any
+		if err := json.Unmarshal(capabilityLimitsJSON, &capabilityLimits); err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"decode Provider capability pricing limits: %w", err,
+			)
+		}
+		unitPrice, priced := numericLimit(capabilityLimits, "unitPriceMicros")
+		if !priced || unitPrice <= 0 || pricingVersion == "" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"the frozen Provider route has no executable unit-price snapshot",
+				"refresh pricing and approve a fully priced generation plan",
+			)
+		}
+		estimatedMicros := saturatingMicros(
+			float64(exactPrompt.Output.DurationMillis)/1000,
+			unitPrice,
+		)
+		if estimatedMicros <= 0 {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"the per-run Provider estimate is not positive",
+				"refresh the Prompt output duration and pricing snapshot",
 			)
 		}
 		reservationID := uuid.NewSHA1(runID, []byte("budget-reservation"))
+		budget := providercontract.BudgetEnvelope{
+			EstimatedCostMicros: estimatedMicros,
+			MaxCostMicros:       estimatedMicros,
+			MaxAttempts:         1,
+		}
+		bindReservation := func() (orchestration.PreparedProviderJob, error) {
+			reservation, err := providercontract.BindBudgetReservation(
+				providercontract.BudgetReservation{
+					ReservationID: reservationID.String(),
+					Currency:      approvedCurrency, AmountMicros: estimatedMicros,
+					PricingVersion: pricingVersion,
+					ConfirmedBy:    persistedBudgetApprovalID,
+				},
+				providercontract.BudgetBindingInput{
+					RunID: input.Run.RunID, InputHash: runDigest,
+					Model: persistedRoute, Budget: budget,
+				},
+			)
+			if err != nil {
+				return orchestration.PreparedProviderJob{}, fmt.Errorf(
+					"bind durable Provider budget reservation: %w", err,
+				)
+			}
+			return orchestration.PreparedProviderJob{
+				Budget: budget, BudgetReservation: reservation,
+			}, nil
+		}
+		prepared, err := bindReservation()
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		jobID := uuid.NewSHA1(runID, []byte("provider-job"))
+		jobKey := "provider-job-" + input.Run.RunID
+		requestEnvelope := immutableProviderRequest{
+			Input: input, Prepared: prepared,
+		}
+		requestHash, err := digestValue(requestEnvelope)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		requestSnapshot, err := json.Marshal(requestEnvelope)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"encode provider request snapshot: %w", err,
+			)
+		}
+		verifyPreparedJob := func() error {
+			var storedJobID, storedAttemptID, storedCapabilityID, storedReservationID uuid.UUID
+			var storedRequestHash string
+			var storedRequestSnapshot []byte
+			if err := tx.QueryRow(ctx, `
+				SELECT id, generation_attempt_id, capability_snapshot_id,
+				       budget_reservation_id, request_hash, request_snapshot
+				FROM video_pipeline.provider_jobs
+				WHERE provider_profile_id = $1 AND idempotency_key = $2
+				FOR SHARE`,
+				providerProfileID, jobKey,
+			).Scan(
+				&storedJobID, &storedAttemptID, &storedCapabilityID,
+				&storedReservationID, &storedRequestHash, &storedRequestSnapshot,
+			); err != nil {
+				return fmt.Errorf("read prepared immutable Provider job: %w", err)
+			}
+			var storedEnvelope immutableProviderRequest
+			if err := json.Unmarshal(storedRequestSnapshot, &storedEnvelope); err != nil {
+				return fmt.Errorf("decode prepared immutable Provider job: %w", err)
+			}
+			if storedJobID != jobID ||
+				storedAttemptID != attemptID ||
+				storedCapabilityID != capabilityID ||
+				storedReservationID != reservationID ||
+				storedRequestHash != requestHash ||
+				!reflect.DeepEqual(storedEnvelope, requestEnvelope) {
+				return controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"existing Provider job differs from the exact frozen Run request",
+				)
+			}
+			return nil
+		}
+		var existingAmount int64
+		var existingCurrency, existingPricing, existingStatus string
+		existingErr := tx.QueryRow(ctx, `
+			SELECT amount_micros, currency, pricing_rule_version, status
+			FROM video_pipeline.budget_reservations
+			WHERE id = $1
+			FOR UPDATE`,
+			reservationID,
+		).Scan(
+			&existingAmount, &existingCurrency, &existingPricing, &existingStatus,
+		)
+		if existingErr == nil {
+			if existingAmount != estimatedMicros ||
+				existingCurrency != approvedCurrency ||
+				existingPricing != pricingVersion ||
+				(existingStatus != "RESERVED" && existingStatus != "SETTLED") {
+				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"existing Provider reservation differs from the frozen run allocation",
+				)
+			}
+			if err := verifyPreparedJob(); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+			return prepared, nil
+		}
+		if !errors.Is(existingErr, pgx.ErrNoRows) {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"read durable Provider reservation: %w", existingErr,
+			)
+		}
+		var allocatedMicros int64
+		if err := tx.QueryRow(ctx, `
+			SELECT COALESCE(SUM(
+			  CASE br.status
+			    WHEN 'RESERVED' THEN br.amount_micros
+			    WHEN 'SETTLED' THEN COALESCE(actual.amount_micros, br.amount_micros)
+			    ELSE 0
+			  END
+			), 0)
+			FROM video_pipeline.budget_reservations br
+			JOIN video_pipeline.generation_runs gr ON gr.id = br.generation_run_id
+			LEFT JOIN LATERAL (
+			  SELECT cl.amount_micros
+			  FROM video_pipeline.cost_ledger cl
+			  WHERE cl.budget_reservation_id = br.id
+			    AND cl.entry_type = 'ACTUAL'
+			  ORDER BY cl.created_at DESC
+			  LIMIT 1
+			) actual ON true
+			WHERE gr.budget_approval_id = $1
+			  AND br.status IN ('RESERVED', 'SETTLED')`,
+			persistedBudgetApprovalID,
+		).Scan(&allocatedMicros); err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"read cumulative Provider budget allocation: %w", err,
+			)
+		}
+		if estimatedMicros > approvedMicros ||
+			allocatedMicros > approvedMicros-estimatedMicros {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"the cumulative Provider reservation exceeds the approved generation plan",
+				"release or settle earlier runs, reduce candidates, or approve a new plan",
+			)
+		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO video_pipeline.budget_reservations
 				(id, generation_run_id, amount_micros, currency, pricing_rule_version,
 				 estimate_payload, status, confirmed_by, confirmed_at)
 			VALUES ($1, $2, $3, $4, $5, $6, 'RESERVED', $7, now())
 			ON CONFLICT (id) DO NOTHING`,
-			reservationID, runID, input.BudgetMaximumMicros, input.BudgetCurrency,
-			pricingVersion, map[string]any{"maximumMicros": input.BudgetMaximumMicros},
+			reservationID, runID, estimatedMicros, approvedCurrency,
+			pricingVersion, map[string]any{
+				"generationPlanId":  generationPlanID,
+				"budgetApprovalId":  persistedBudgetApprovalID,
+				"estimatedMicros":   estimatedMicros,
+				"planMaximumMicros": approvedMicros,
+				"promptSnapshotId":  promptID.String(),
+				"runSpecDigest":     runDigest,
+				"modelSnapshot":     persistedRoute,
+			},
 			input.BudgetApprovalID,
 		); err != nil {
-			return struct{}{}, fmt.Errorf("reserve workflow budget: %w", err)
-		}
-		jobID := uuid.NewSHA1(runID, []byte("provider-job"))
-		jobKey := "provider-job-" + input.Run.RunID
-		requestHash, err := digestValue(input)
-		if err != nil {
-			return struct{}{}, err
-		}
-		requestSnapshot, err := json.Marshal(input)
-		if err != nil {
-			return struct{}{}, fmt.Errorf("encode provider request snapshot: %w", err)
+			return orchestration.PreparedProviderJob{}, fmt.Errorf("reserve workflow budget: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO video_pipeline.provider_jobs
@@ -867,7 +1407,23 @@ func (p *Postgres) PrepareProviderJob(
 			jobID, attemptID, providerProfileID, capabilityID, reservationID,
 			jobKey, requestHash, requestSnapshot,
 		); err != nil {
-			return struct{}{}, fmt.Errorf("insert provider job: %w", err)
+			return orchestration.PreparedProviderJob{}, fmt.Errorf("insert provider job: %w", err)
+		}
+		if err := verifyPreparedJob(); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'RESERVATION', $4, $5, $6, true)
+			ON CONFLICT (id) DO NOTHING`,
+			uuid.NewSHA1(jobID, []byte("reservation-cost")),
+			jobID, reservationID, estimatedMicros, approvedCurrency, pricingVersion,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf(
+				"insert Provider reservation ledger entry: %w", err,
+			)
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE video_pipeline.generation_runs
@@ -875,7 +1431,7 @@ func (p *Postgres) PrepareProviderJob(
 			WHERE id = $1 AND state IN ('VALIDATED', 'UNKNOWN', 'RECONCILING')`,
 			runID,
 		); err != nil {
-			return struct{}{}, fmt.Errorf("queue generation run: %w", err)
+			return orchestration.PreparedProviderJob{}, fmt.Errorf("queue generation run: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE video_pipeline.generation_attempts
@@ -883,11 +1439,11 @@ func (p *Postgres) PrepareProviderJob(
 			WHERE id = $1 AND state IN ('VALIDATED', 'UNKNOWN', 'RECONCILING')`,
 			attemptID,
 		); err != nil {
-			return struct{}{}, fmt.Errorf("queue generation attempt: %w", err)
+			return orchestration.PreparedProviderJob{}, fmt.Errorf("queue generation attempt: %w", err)
 		}
-		return struct{}{}, nil
+		return prepared, nil
 	})
-	return err
+	return prepared, err
 }
 
 // CompleteProviderJob atomically commits provider provenance, CAS metadata,
@@ -905,106 +1461,104 @@ func (p *Postgres) CompleteProviderJob(
 	if result.ArtifactURI != "cas://sha256/"+result.ArtifactDigest {
 		return errors.New("provider artifact URI does not match its content hash")
 	}
-	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+	type completionOutcome struct {
+		budgetExceeded bool
+	}
+	outcome, err := withSerializable(ctx, p.pool, func(
+		tx pgx.Tx,
+	) (completionOutcome, error) {
 		var jobID, attemptID, reservationID uuid.UUID
-		var state string
+		var runState, attemptState, jobState string
+		var reservedMicros int64
+		var reservedCurrency, reservedPricing, reservationStatus string
+		var requestHash string
+		var requestSnapshot []byte
 		if err := tx.QueryRow(ctx, `
-			SELECT pj.id, pj.generation_attempt_id, pj.budget_reservation_id, gr.state
+			SELECT pj.id, pj.generation_attempt_id, pj.budget_reservation_id,
+			       gr.state, ga.state, pj.state,
+			       br.amount_micros, br.currency, br.pricing_rule_version,
+			       br.status, pj.request_hash, pj.request_snapshot
 			FROM video_pipeline.provider_jobs pj
 			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
 			JOIN video_pipeline.generation_runs gr ON gr.id = ga.generation_run_id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
 			WHERE gr.id = $1
-			FOR UPDATE OF pj, ga, gr`,
+			FOR UPDATE OF pj, ga, gr, br`,
 			runID,
-		).Scan(&jobID, &attemptID, &reservationID, &state); err != nil {
-			return struct{}{}, fmt.Errorf("lock provider completion: %w", err)
-		}
-		artifactID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("artifact:"+result.ArtifactDigest))
-		mediaType := result.MediaType
-		if mediaType == "" {
-			mediaType = "video/mp4"
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO video_pipeline.artifacts
-				(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
-			VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE')
-			ON CONFLICT (content_hash) DO NOTHING`,
-			artifactID, result.ArtifactDigest, result.ArtifactURI, mediaType, result.ArtifactSize,
-			map[string]any{
-				"width": result.Width, "height": result.Height,
-				"durationMillis": result.DurationMillis,
-				"modelSnapshot":  result.Model, "usage": result.Usage, "cost": result.Cost,
-			},
+		).Scan(
+			&jobID, &attemptID, &reservationID,
+			&runState, &attemptState, &jobState,
+			&reservedMicros, &reservedCurrency, &reservedPricing,
+			&reservationStatus, &requestHash, &requestSnapshot,
 		); err != nil {
-			return struct{}{}, fmt.Errorf("insert provider artifact: %w", err)
+			return completionOutcome{}, fmt.Errorf("lock provider completion: %w", err)
 		}
-		if err := tx.QueryRow(ctx,
-			`SELECT id
-			 FROM video_pipeline.artifacts
-			 WHERE content_hash = $1 AND status = 'ACTIVE'
-			 FOR SHARE`,
-			result.ArtifactDigest,
-		).Scan(&artifactID); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return struct{}{}, controlplane.NewConflictError(
-					controlplane.CodeConflict,
-					"provider artifact hash is bound to a non-ACTIVE CAS record",
-				)
-			}
-			return struct{}{}, fmt.Errorf("resolve ACTIVE provider artifact: %w", err)
+		var preparedSnapshot immutableProviderRequest
+		if err := json.Unmarshal(requestSnapshot, &preparedSnapshot); err != nil {
+			return completionOutcome{}, fmt.Errorf(
+				"decode immutable Provider request snapshot: %w", err,
+			)
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO video_pipeline.run_artifacts
-				(generation_run_id, artifact_id, role)
-			VALUES ($1, $2, 'OUTPUT')
-			ON CONFLICT DO NOTHING`,
-			runID, artifactID,
-		); err != nil {
-			return struct{}{}, fmt.Errorf("link provider artifact: %w", err)
+		recomputedRequestHash, err := digestValue(preparedSnapshot)
+		if err != nil {
+			return completionOutcome{}, err
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE video_pipeline.provider_jobs
-			SET upstream_task_id = $2, upstream_request_id = $3, state = 'SUCCEEDED',
-			    progress = 100, updated_at = now(), terminal_at = now(), error_code = NULL,
-			    error_snapshot = NULL
-			WHERE id = $1`,
-			jobID, result.UpstreamTaskID, result.RequestID,
-		); err != nil {
-			return struct{}{}, fmt.Errorf("complete provider job: %w", err)
+		if !reflect.DeepEqual(preparedSnapshot.Input, input) {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"provider completion input differs from the prepared immutable request",
+			)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE video_pipeline.generation_attempts
-			SET state = 'SUCCEEDED', heartbeat_at = now(),
-			    started_at = COALESCE(started_at, now()), finished_at = now()
-			WHERE id = $1`,
-			attemptID,
-		); err != nil {
-			return struct{}{}, fmt.Errorf("complete generation attempt: %w", err)
+		if recomputedRequestHash != requestHash ||
+			preparedSnapshot.Prepared.Budget.EstimatedCostMicros != reservedMicros ||
+			preparedSnapshot.Prepared.Budget.MaxCostMicros != reservedMicros ||
+			preparedSnapshot.Prepared.BudgetReservation.ReservationID != reservationID.String() ||
+			preparedSnapshot.Prepared.BudgetReservation.AmountMicros != reservedMicros ||
+			preparedSnapshot.Prepared.BudgetReservation.Currency != reservedCurrency ||
+			preparedSnapshot.Prepared.BudgetReservation.PricingVersion != reservedPricing ||
+			preparedSnapshot.Prepared.BudgetReservation.ValidateFor(
+				providercontract.BudgetBindingInput{
+					RunID: input.Run.RunID, InputHash: input.Run.RunSpecDigest,
+					Model: input.Route, Budget: preparedSnapshot.Prepared.Budget,
+				},
+			) != nil {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"provider completion reservation differs from the prepared immutable request",
+			)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE video_pipeline.generation_runs
-			SET state = CASE WHEN state = 'PAUSED' THEN 'PAUSED' ELSE 'SUCCEEDED' END,
-			    failure_class = CASE WHEN state = 'PAUSED' THEN failure_class ELSE NULL END,
-			    failure_code = CASE WHEN state = 'PAUSED' THEN failure_code ELSE NULL END,
-			    started_at = COALESCE(started_at, now()), finished_at = now()
-			WHERE id = $1`,
-			runID,
-		); err != nil {
-			return struct{}{}, fmt.Errorf("complete generation run: %w", err)
+		if result.Model != preparedSnapshot.Input.Route {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"provider completion model differs from the prepared immutable route",
+			)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE video_pipeline.shot_spec_revisions ssr
-			SET lifecycle_state = 'QC_PENDING'
-			FROM video_pipeline.generation_runs gr
-			WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
-			runID,
-		); err != nil {
-			return struct{}{}, fmt.Errorf("advance shot to QC: %w", err)
+		if runState == "CANCELLED" || runState == "FAILED" ||
+			jobState == "CANCELLED" || jobState == "FAILED" ||
+			attemptState == "CANCELLED" || attemptState == "FAILED" {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a late Provider success cannot reverse a terminal generation outcome",
+			)
+		}
+		if reservationStatus != "RESERVED" && reservationStatus != "SETTLED" {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"provider completion has no active or settled budget reservation",
+			)
 		}
 		actualMicros := result.Cost.EstimatedMicros
 		if result.Cost.ActualMicros != nil {
 			actualMicros = *result.Cost.ActualMicros
 		}
+		budgetExceeded := result.Cost.ActualMicros == nil ||
+			!result.Cost.Verified ||
+			result.Cost.EstimatedMicros < 0 ||
+			actualMicros < 0 ||
+			result.Cost.EstimatedMicros > reservedMicros ||
+			actualMicros > reservedMicros ||
+			result.Cost.Currency != reservedCurrency ||
+			result.Cost.PricingVersion != reservedPricing
 		ledgerID := uuid.NewSHA1(jobID, []byte("actual-cost"))
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO video_pipeline.cost_ledger
@@ -1016,9 +1570,215 @@ func (p *Postgres) CompleteProviderJob(
 			result.Usage.InputUnits+result.Usage.OutputUnits, result.Usage.Unit,
 			result.Cost.PricingVersion, result.Cost.Verified,
 		); err != nil {
-			return struct{}{}, fmt.Errorf("insert actual provider cost: %w", err)
+			return completionOutcome{}, fmt.Errorf("insert actual provider cost: %w", err)
 		}
-		if state != "SUCCEEDED" {
+		var storedActual int64
+		var storedCurrency, storedPricing string
+		if err := tx.QueryRow(ctx, `
+			SELECT amount_micros, currency, pricing_rule_version
+			FROM video_pipeline.cost_ledger
+			WHERE id = $1
+			FOR SHARE`,
+			ledgerID,
+		).Scan(&storedActual, &storedCurrency, &storedPricing); err != nil {
+			return completionOutcome{}, fmt.Errorf("read actual provider cost: %w", err)
+		}
+		if storedActual != actualMicros ||
+			storedCurrency != result.Cost.Currency ||
+			storedPricing != result.Cost.PricingVersion {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"Provider completion cost differs from its immutable ledger entry",
+			)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.budget_reservations
+			SET status = 'SETTLED'
+			WHERE id = $1 AND status = 'RESERVED'`,
+			reservationID,
+		); err != nil {
+			return completionOutcome{}, fmt.Errorf("settle Provider budget reservation: %w", err)
+		}
+		if actualMicros >= 0 && actualMicros < reservedMicros {
+			releaseMicros := reservedMicros - actualMicros
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'RELEASE', $4, $5, $6, true)
+				ON CONFLICT (id) DO NOTHING`,
+				uuid.NewSHA1(jobID, []byte("unused-reservation-release")),
+				jobID, reservationID, releaseMicros, reservedCurrency, reservedPricing,
+			); err != nil {
+				return completionOutcome{}, fmt.Errorf(
+					"release unused Provider reservation: %w", err,
+				)
+			}
+		}
+		if budgetExceeded {
+			errorSnapshot, encodeErr := json.Marshal(map[string]any{
+				"code":                   "BUDGET_EXCEEDED",
+				"reservedMicros":         reservedMicros,
+				"reservedCurrency":       reservedCurrency,
+				"reservedPricingVersion": reservedPricing,
+				"providerCost":           result.Cost,
+			})
+			if encodeErr != nil {
+				return completionOutcome{}, fmt.Errorf(
+					"encode budget failure evidence: %w", encodeErr,
+				)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.provider_jobs
+				SET upstream_task_id = $2, upstream_request_id = $3,
+				    state = 'FAILED', updated_at = now(), terminal_at = now(),
+				    error_code = 'BUDGET_EXCEEDED', error_snapshot = $4
+				WHERE id = $1
+				  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+				jobID, result.UpstreamTaskID, result.RequestID, errorSnapshot,
+			); err != nil {
+				return completionOutcome{}, fmt.Errorf(
+					"fail over-budget Provider job: %w", err,
+				)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_attempts
+				SET state = 'FAILED', failure_code = 'BUDGET_EXCEEDED',
+				    heartbeat_at = now(), finished_at = now()
+				WHERE id = $1
+				  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+				attemptID,
+			); err != nil {
+				return completionOutcome{}, fmt.Errorf(
+					"fail over-budget generation attempt: %w", err,
+				)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_runs
+				SET state = 'FAILED', failure_class = 'BUDGET',
+				    failure_code = 'BUDGET_EXCEEDED', finished_at = now()
+				WHERE id = $1
+				  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+				runID,
+			); err != nil {
+				return completionOutcome{}, fmt.Errorf(
+					"fail over-budget generation run: %w", err,
+				)
+			}
+			if err := insertAuditAndOutbox(
+				ctx, tx,
+				uuid.NewSHA1(runID, []byte("provider-budget-failed-audit")),
+				uuid.NewSHA1(runID, []byte("provider-budget-failed-outbox")),
+				controlplane.Actor{ActorID: "temporal-worker", Role: "OPERATOR"},
+				"provider_job.completed", "GENERATION_RUN", runID,
+				nil, nil, "BUDGET_EXCEEDED", step.TraceID,
+				map[string]any{
+					"providerJobId":  jobID.String(),
+					"reservedMicros": reservedMicros,
+					"cost":           result.Cost,
+					"state":          "FAILED",
+				},
+				p.now().UTC(),
+			); err != nil {
+				return completionOutcome{}, err
+			}
+			return completionOutcome{budgetExceeded: true}, nil
+		}
+		artifactID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("artifact:"+result.ArtifactDigest))
+		mediaType := result.MediaType
+		if mediaType == "" {
+			mediaType = "video/mp4"
+		}
+		mediaSpec := map[string]any{
+			"width": result.Width, "height": result.Height,
+			"durationMillis": result.DurationMillis,
+			"modelSnapshot":  result.Model, "usage": result.Usage, "cost": result.Cost,
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.artifacts
+				(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+			VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE')
+			ON CONFLICT (content_hash) DO NOTHING`,
+			artifactID, result.ArtifactDigest, result.ArtifactURI, mediaType, result.ArtifactSize,
+			mediaSpec,
+		); err != nil {
+			return completionOutcome{}, fmt.Errorf("insert provider artifact: %w", err)
+		}
+		if err := tx.QueryRow(ctx,
+			`SELECT id
+			 FROM video_pipeline.artifacts
+			 WHERE content_hash = $1
+			   AND artifact_uri = $2
+			   AND media_type = $3
+			   AND size_bytes = $4
+			   AND media_spec = $5
+			   AND status = 'ACTIVE'
+			 FOR SHARE`,
+			result.ArtifactDigest, result.ArtifactURI, mediaType,
+			result.ArtifactSize, mediaSpec,
+		).Scan(&artifactID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return completionOutcome{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"provider artifact hash is bound to incompatible CAS metadata",
+				)
+			}
+			return completionOutcome{}, fmt.Errorf("resolve ACTIVE provider artifact: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.run_artifacts
+				(generation_run_id, artifact_id, role)
+			VALUES ($1, $2, 'OUTPUT')
+			ON CONFLICT DO NOTHING`,
+			runID, artifactID,
+		); err != nil {
+			return completionOutcome{}, fmt.Errorf("link provider artifact: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.provider_jobs
+			SET upstream_task_id = $2, upstream_request_id = $3, state = 'SUCCEEDED',
+			    progress = 100, updated_at = now(), terminal_at = now(), error_code = NULL,
+			    error_snapshot = NULL
+			WHERE id = $1
+			  AND state NOT IN ('FAILED', 'CANCELLED')`,
+			jobID, result.UpstreamTaskID, result.RequestID,
+		); err != nil {
+			return completionOutcome{}, fmt.Errorf("complete provider job: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.generation_attempts
+			SET state = 'SUCCEEDED', heartbeat_at = now(),
+			    started_at = COALESCE(started_at, now()), finished_at = now()
+			WHERE id = $1
+			  AND state NOT IN ('FAILED', 'CANCELLED')`,
+			attemptID,
+		); err != nil {
+			return completionOutcome{}, fmt.Errorf("complete generation attempt: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.generation_runs
+			SET state = CASE WHEN state = 'PAUSED' THEN 'PAUSED' ELSE 'SUCCEEDED' END,
+			    failure_class = CASE WHEN state = 'PAUSED' THEN failure_class ELSE NULL END,
+			    failure_code = CASE WHEN state = 'PAUSED' THEN failure_code ELSE NULL END,
+			    started_at = COALESCE(started_at, now()), finished_at = now()
+			WHERE id = $1
+			  AND state NOT IN ('FAILED', 'CANCELLED')`,
+			runID,
+		); err != nil {
+			return completionOutcome{}, fmt.Errorf("complete generation run: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.shot_spec_revisions ssr
+			SET lifecycle_state = 'QC_PENDING'
+			FROM video_pipeline.generation_runs gr
+			WHERE gr.id = $1
+			  AND gr.state = 'SUCCEEDED'
+			  AND ssr.id = gr.shot_spec_revision_id`,
+			runID,
+		); err != nil {
+			return completionOutcome{}, fmt.Errorf("advance shot to QC: %w", err)
+		}
+		if runState != "SUCCEEDED" {
 			if err := insertAuditAndOutbox(
 				ctx, tx,
 				uuid.NewSHA1(runID, []byte("provider-completed-audit")),
@@ -1034,12 +1794,22 @@ func (p *Postgres) CompleteProviderJob(
 				},
 				p.now().UTC(),
 			); err != nil {
-				return struct{}{}, err
+				return completionOutcome{}, err
 			}
 		}
-		return struct{}{}, nil
+		return completionOutcome{}, nil
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if outcome.budgetExceeded {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"Provider cost exceeded or drifted from the immutable reservation",
+			"create a new priced plan and budget approval before retrying",
+		)
+	}
+	return nil
 }
 
 func (p *Postgres) RecordAutomaticQC(
@@ -1053,6 +1823,34 @@ func (p *Postgres) RecordAutomaticQC(
 		return errors.New("runId must be a UUID")
 	}
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		var runState, runDigest string
+		var artifactLinked bool
+		if err := tx.QueryRow(ctx, `
+			SELECT gr.state, gr.run_spec_digest,
+			       EXISTS (
+			         SELECT 1
+			         FROM video_pipeline.run_artifacts ra
+			         JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+			         WHERE ra.generation_run_id = gr.id
+			           AND ra.role = 'OUTPUT'
+			           AND a.content_hash = $2
+			           AND a.status = 'ACTIVE'
+			       )
+			FROM video_pipeline.generation_runs gr
+			WHERE gr.id = $1
+			FOR UPDATE OF gr`,
+			runID, input.Provider.ArtifactDigest,
+		).Scan(&runState, &runDigest, &artifactLinked); err != nil {
+			return struct{}{}, fmt.Errorf("lock QC generation run: %w", err)
+		}
+		if runState != "SUCCEEDED" ||
+			runDigest != input.Run.RunSpecDigest ||
+			!artifactLinked {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"QC evidence must bind the succeeded run and its exact ACTIVE Provider artifact",
+			)
+		}
 		reportHash, err := digestValue(map[string]any{
 			"thresholdVersion": "structural-qc-v1",
 			"runSpecDigest":    input.Run.RunSpecDigest,
@@ -1089,7 +1887,9 @@ func (p *Postgres) RecordAutomaticQC(
 			UPDATE video_pipeline.shot_spec_revisions ssr
 			SET lifecycle_state = $2
 			FROM video_pipeline.generation_runs gr
-			WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
+			WHERE gr.id = $1
+			  AND gr.state = 'SUCCEEDED'
+			  AND ssr.id = gr.shot_spec_revision_id`,
 			runID, shotState,
 		); err != nil {
 			return struct{}{}, fmt.Errorf("advance shot QC state: %w", err)
@@ -2862,7 +3662,8 @@ func (p *Postgres) RecordProviderCancellation(
 				return struct{}{}, fmt.Errorf("finish terminal-success cancellation race: %w", err)
 			}
 		case "CANCELLED":
-			if currentState != "SUCCEEDED" {
+			if currentState != "SUCCEEDED" && currentState != "FAILED" &&
+				currentState != "CANCELLED" {
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.provider_jobs pj
 					SET state = 'CANCELLED', terminal_at = now(), updated_at = now(),
@@ -2887,7 +3688,8 @@ func (p *Postgres) RecordProviderCancellation(
 					UPDATE video_pipeline.generation_runs
 					SET state = 'CANCELLED', finished_at = now(),
 					    failure_class = NULL, failure_code = NULL
-					WHERE id = $1 AND state <> 'SUCCEEDED'`,
+					WHERE id = $1
+					  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
 					runID,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("cancel generation run: %w", err)
@@ -2896,10 +3698,17 @@ func (p *Postgres) RecordProviderCancellation(
 					UPDATE video_pipeline.shot_spec_revisions ssr
 					SET lifecycle_state = 'CANCELLED'
 					FROM video_pipeline.generation_runs gr
-					WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
+					WHERE gr.id = $1
+					  AND gr.state = 'CANCELLED'
+					  AND ssr.id = gr.shot_spec_revision_id`,
 					runID,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("cancel shot revision: %w", err)
+				}
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, "provider-cancelled",
+				); err != nil {
+					return struct{}{}, err
 				}
 			}
 			if _, err := tx.Exec(ctx, `
@@ -2918,7 +3727,8 @@ func (p *Postgres) RecordProviderCancellation(
 				return struct{}{}, fmt.Errorf("finish cancellation operations: %w", err)
 			}
 		default:
-			if currentState != "SUCCEEDED" {
+			if currentState != "SUCCEEDED" && currentState != "FAILED" &&
+				currentState != "CANCELLED" {
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.provider_jobs pj
 					SET state = 'UNKNOWN', error_code = 'CANCEL_NOT_CONFIRMED',
@@ -2948,7 +3758,8 @@ func (p *Postgres) RecordProviderCancellation(
 					    END,
 					    failure_class = 'INFRASTRUCTURE',
 					    failure_code = 'CANCEL_NOT_CONFIRMED'
-					WHERE id = $1 AND state <> 'SUCCEEDED'`,
+					WHERE id = $1
+					  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
 					runID, input.ReasonCode,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("mark run cancellation unknown: %w", err)
@@ -3030,6 +3841,13 @@ func (p *Postgres) FinalizeShotRun(
 		).Scan(&currentState); err != nil {
 			return struct{}{}, fmt.Errorf("lock finalizing shot run: %w", err)
 		}
+		if (currentState == "CANCELLED" || currentState == "FAILED") &&
+			input.State != currentState {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a workflow completion cannot reverse an existing terminal run state",
+			)
+		}
 		operationState := "SUCCEEDED"
 		if input.State == "FAILED" {
 			operationState = "FAILED"
@@ -3051,6 +3869,11 @@ func (p *Postgres) FinalizeShotRun(
 					runID, input.FailureCode,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("fail shot attempt: %w", err)
+				}
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, "workflow-failed-before-settlement",
+				); err != nil {
+					return struct{}{}, err
 				}
 			}
 		} else if input.State == "SUCCEEDED" && currentState != "SUCCEEDED" {
@@ -3103,6 +3926,57 @@ func (p *Postgres) FinalizeShotRun(
 		)
 	})
 	return err
+}
+
+func releaseRunBudgetReservation(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	reason string,
+) error {
+	var reservationID, jobID uuid.UUID
+	var amountMicros int64
+	var currency, pricingVersion, status string
+	err := tx.QueryRow(ctx, `
+		SELECT br.id, pj.id, br.amount_micros, br.currency,
+		       br.pricing_rule_version, br.status
+		FROM video_pipeline.budget_reservations br
+		JOIN video_pipeline.provider_jobs pj ON pj.budget_reservation_id = br.id
+		WHERE br.generation_run_id = $1
+		FOR UPDATE OF br, pj`,
+		runID,
+	).Scan(
+		&reservationID, &jobID, &amountMicros, &currency, &pricingVersion, &status,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("lock releasable Provider reservation: %w", err)
+	}
+	if status != "RESERVED" {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE video_pipeline.budget_reservations
+		SET status = 'RELEASED'
+		WHERE id = $1 AND status = 'RESERVED'`,
+		reservationID,
+	); err != nil {
+		return fmt.Errorf("release Provider budget reservation: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO video_pipeline.cost_ledger
+			(id, provider_job_id, budget_reservation_id, entry_type,
+			 amount_micros, currency, pricing_rule_version, verified)
+		VALUES ($1, $2, $3, 'RELEASE', $4, $5, $6, true)
+		ON CONFLICT (id) DO NOTHING`,
+		uuid.NewSHA1(jobID, []byte("release:"+reason)),
+		jobID, reservationID, amountMicros, currency, pricingVersion,
+	); err != nil {
+		return fmt.Errorf("record Provider budget release: %w", err)
+	}
+	return nil
 }
 
 func dialogueCues(

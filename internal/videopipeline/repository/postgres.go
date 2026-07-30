@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/google/uuid"
@@ -101,6 +102,57 @@ func (p *Postgres) Ping(ctx context.Context) error {
 		return errors.New("PostgreSQL pool is not configured")
 	}
 	return p.pool.Ping(ctx)
+}
+
+// ValidateWorkerUpgradeReadiness prevents a v6 worker from replaying an
+// in-flight Temporal execution whose Prompt predates executable lineage.
+// Deployments must drain/cancel those runs and recompile their Prompt before
+// the new worker is allowed to consume the task queue.
+func (p *Postgres) ValidateWorkerUpgradeReadiness(ctx context.Context) error {
+	var incompatible int
+	if err := p.pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.prompt_snapshots ps ON ps.id = gr.prompt_snapshot_id
+		JOIN video_pipeline.effective_context_snapshots ecs
+		  ON ecs.id = ps.effective_context_snapshot_id
+		WHERE gr.state IN (
+		  'DRAFT', 'VALIDATED', 'QUEUED', 'RUNNING', 'UNKNOWN',
+		  'RECONCILING', 'REQUIRES_ACTION', 'CANCEL_REQUESTED', 'PAUSED'
+		)
+		  AND (
+		    ps.compiler_version <> 'control-plane-compiler-v1'
+		    OR ps.output_spec = '{}'::jsonb
+		    OR ps.input_revision_hashes = '{}'::jsonb
+		    OR (
+		      SELECT COUNT(*)
+		      FROM video_pipeline.prompt_snapshot_inputs psi
+		      WHERE psi.prompt_snapshot_id = ps.id
+		    ) <> 2 + cardinality(ecs.context_revision_ids)
+		    OR (
+		      SELECT COUNT(*)
+		      FROM video_pipeline.prompt_snapshot_assets psa
+		      WHERE psa.prompt_snapshot_id = ps.id
+		    ) <> cardinality(ps.asset_version_refs)
+		    OR EXISTS (
+		      SELECT 1
+		      FROM video_pipeline.generation_attempts ga
+		      JOIN video_pipeline.provider_jobs pj
+		        ON pj.generation_attempt_id = ga.id
+		      WHERE ga.generation_run_id = gr.id
+		        AND NOT (pj.request_snapshot ? 'prepared')
+		    )
+		  )`,
+	).Scan(&incompatible); err != nil {
+		return fmt.Errorf("check v6 worker upgrade readiness: %w", err)
+	}
+	if incompatible != 0 {
+		return fmt.Errorf(
+			"v6 worker startup refused: %d active generation run(s) use legacy Prompt or Provider reservation lineage; drain or cancel in-flight Temporal executions and recompile before retrying",
+			incompatible,
+		)
+	}
+	return nil
 }
 
 // BeginWorkflowStep reserves one stable Temporal Activity identity or returns
@@ -670,6 +722,134 @@ func (p *Postgres) CreateGenerationPlan(
 	})
 }
 
+func (p *Postgres) StartContentCompilation(
+	ctx context.Context,
+	sourceRevisionIDRaw string,
+	command controlplane.StartContentCompilationCommand,
+	idempotency controlplane.Idempotency,
+	traceID string,
+) (controlplane.Stored[controlplane.Operation], error) {
+	sourceRevisionID, err := uuid.Parse(sourceRevisionIDRaw)
+	if err != nil {
+		return controlplane.Stored[controlplane.Operation]{},
+			controlplane.NewNotFoundError("source revision", sourceRevisionIDRaw)
+	}
+	operationID := uuid.New()
+	now := p.now().UTC()
+	return withSerializable(ctx, p.pool, func(
+		tx pgx.Tx,
+	) (controlplane.Stored[controlplane.Operation], error) {
+		var replay controlplane.Operation
+		replayed, err := reserveIdempotency(ctx, tx, idempotency, &replay, now)
+		if err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if replayed {
+			return controlplane.Stored[controlplane.Operation]{
+				Value: replay, Replayed: true,
+			}, nil
+		}
+		var seriesID uuid.UUID
+		var sourceHash, sourceStatus string
+		if err := tx.QueryRow(ctx, `
+			SELECT series_id, content_hash, status
+			FROM video_pipeline.source_revisions
+			WHERE id = $1
+			FOR SHARE`,
+			sourceRevisionID,
+		).Scan(&seriesID, &sourceHash, &sourceStatus); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return controlplane.Stored[controlplane.Operation]{},
+					controlplane.NewNotFoundError("source revision", sourceRevisionIDRaw)
+			}
+			return controlplane.Stored[controlplane.Operation]{},
+				fmt.Errorf("read compilation source revision: %w", err)
+		}
+		if sourceStatus != "APPROVED" || sourceHash != command.SourceHash {
+			return controlplane.Stored[controlplane.Operation]{},
+				controlplane.NewPolicyError(
+					controlplane.CodeStaleDependency,
+					"content compilation must bind the exact approved source revision",
+					"approve the current source hash and retry",
+				)
+		}
+		if _, _, err := validateRouteSnapshot(
+			ctx, tx, command.TextRouteSnapshot, now,
+		); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		compilationIDs := make([]string, 0, len(command.Stages))
+		for _, rawStage := range command.Stages {
+			stage := strings.ToUpper(strings.TrimSpace(rawStage))
+			inputHash, err := digestValue(map[string]any{
+				"schemaVersion":     "v1",
+				"sourceRevisionId":  sourceRevisionID.String(),
+				"sourceHash":        sourceHash,
+				"stage":             stage,
+				"textRouteSnapshot": command.TextRouteSnapshot,
+			})
+			if err != nil {
+				return controlplane.Stored[controlplane.Operation]{}, err
+			}
+			compilationID := uuid.NewSHA1(
+				sourceRevisionID,
+				[]byte("content-compilation:"+stage+":"+inputHash),
+			)
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO video_pipeline.content_compilation_runs
+					(id, series_id, source_revision_id, stage, generator_model,
+					 input_hash, state, trace_id, created_by)
+				VALUES ($1, $2, $3, $4, $5, $6, 'VALIDATED', $7, $8)
+				ON CONFLICT (source_revision_id, stage, input_hash) DO NOTHING`,
+				compilationID, seriesID, sourceRevisionID, stage,
+				command.TextRouteSnapshot, inputHash, traceID, command.Actor.ActorID,
+			); err != nil {
+				return controlplane.Stored[controlplane.Operation]{},
+					fmt.Errorf("insert content compilation run: %w", err)
+			}
+			compilationIDs = append(compilationIDs, compilationID.String())
+		}
+		operation := controlplane.Operation{
+			OperationID:   operationID.String(),
+			OperationType: "START_CONTENT_COMPILATION",
+			AggregateType: "SOURCE_REVISION",
+			AggregateID:   sourceRevisionID.String(),
+			State:         "ACCEPTED", TraceID: traceID,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		if err := insertOperation(
+			ctx, tx, operation, command.Actor.ActorID, nil,
+		); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if err := insertAuditAndOutbox(
+			ctx, tx, uuid.NewSHA1(operationID, []byte("audit")),
+			uuid.NewSHA1(operationID, []byte("outbox")),
+			command.Actor,
+			"content_compilation.requested",
+			"CONTENT_COMPILATION",
+			operationID,
+			nil, nil, "", traceID,
+			map[string]any{
+				"sourceRevisionId":  sourceRevisionID.String(),
+				"sourceHash":        sourceHash,
+				"stages":            command.Stages,
+				"compilationRunIds": compilationIDs,
+				"textRouteSnapshot": command.TextRouteSnapshot,
+			},
+			now,
+		); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if err := completeIdempotency(
+			ctx, tx, idempotency, operation.OperationID, operation, 202,
+		); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		return controlplane.Stored[controlplane.Operation]{Value: operation}, nil
+	})
+}
+
 func (p *Postgres) PrepareProduction(
 	ctx context.Context,
 	episodeIDRaw string,
@@ -1125,20 +1305,16 @@ func (p *Postgres) CreateGenerationRun(
 			return controlplane.Stored[controlplane.Operation]{}, fmt.Errorf("read prompt snapshot: %w", err)
 		}
 		profileID, _ := uuid.Parse(command.GenerationProfileRevisionID)
-		runDigest, err := digestValue(struct {
-			ShotSpecID      string
-			PromptID        string
-			PromptHash      string
-			ProfileID       string
-			PlanID          string
-			Route           controlplane.ModelRouteSnapshot
-			CreativeAttempt int
-			Fallback        string
-		}{
-			command.ShotSpecRevisionID, command.PromptSnapshotID, promptHash,
-			command.GenerationProfileRevisionID, command.GenerationPlanID,
-			command.RouteSnapshot, command.CreativeAttempt, command.FallbackReasonCode,
-		})
+		providerRoute := providerRouteSnapshot(command.RouteSnapshot)
+		runDigest, err := generationRunSpecDigest(
+			command.ShotSpecRevisionID,
+			command.PromptSnapshotID,
+			promptHash,
+			command.GenerationProfileRevisionID,
+			command.GenerationPlanID,
+			providerRoute,
+			command.CreativeAttempt,
+		)
 		if err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
@@ -1153,7 +1329,7 @@ func (p *Postgres) CreateGenerationRun(
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, translateWriteError("insert generation run", err)
 		}
-		modelSnapshot, err := json.Marshal(command.RouteSnapshot)
+		modelSnapshot, err := json.Marshal(providerRoute)
 		if err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, fmt.Errorf("encode model snapshot: %w", err)
 		}
@@ -1268,13 +1444,23 @@ func (p *Postgres) GetShotWorkflowRecord(
 	record.Run.FailureClass = valueOrEmpty(failureClass)
 	record.Run.FailureCode = valueOrEmpty(failureCode)
 	record.Run.TemporalWorkflowID = valueOrEmpty(temporalWorkflowID)
-	if err := json.Unmarshal(routeJSON, &record.RouteSnapshot); err != nil {
-		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("decode shot workflow route: %w", err)
+	var attemptRoute providercontract.ModelSnapshot
+	if err := json.Unmarshal(routeJSON, &attemptRoute); err != nil {
+		return controlplane.ShotWorkflowRecord{}, fmt.Errorf(
+			"decode shot workflow Provider route: %w", err,
+		)
 	}
 	plan, err := p.GetGenerationPlan(ctx, planID)
 	if err != nil {
 		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("read shot workflow plan: %w", err)
 	}
+	if attemptRoute != providerRouteSnapshot(plan.Plan.RouteSnapshot) {
+		return controlplane.ShotWorkflowRecord{}, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"shot workflow Provider route differs from its immutable generation plan",
+		)
+	}
+	record.RouteSnapshot = plan.Plan.RouteSnapshot
 	record.BudgetLimit = plan.BudgetLimit
 	return record, nil
 }
@@ -1569,6 +1755,218 @@ func (p *Postgres) CreateApprovalDecision(
 			return controlplane.Stored[controlplane.ApprovalDecision]{}, err
 		}
 		return controlplane.Stored[controlplane.ApprovalDecision]{Value: decision}, nil
+	})
+}
+
+func (p *Postgres) LockPublication(
+	ctx context.Context,
+	runIDRaw string,
+	command controlplane.LockPublicationCommand,
+	idempotency controlplane.Idempotency,
+	traceID string,
+) (controlplane.Stored[controlplane.PublicationLock], error) {
+	runID, err := uuid.Parse(runIDRaw)
+	if err != nil {
+		return controlplane.Stored[controlplane.PublicationLock]{},
+			controlplane.NewNotFoundError("generation run", runIDRaw)
+	}
+	manifestID, err := uuid.Parse(command.ManifestID)
+	if err != nil {
+		return controlplane.Stored[controlplane.PublicationLock]{},
+			controlplane.NewNotFoundError("generation manifest", command.ManifestID)
+	}
+	qcReportID, err := uuid.Parse(command.QCReportID)
+	if err != nil {
+		return controlplane.Stored[controlplane.PublicationLock]{},
+			controlplane.NewNotFoundError("QC report", command.QCReportID)
+	}
+	gate3DecisionID, err := uuid.Parse(command.Gate3DecisionID)
+	if err != nil {
+		return controlplane.Stored[controlplane.PublicationLock]{},
+			controlplane.NewNotFoundError("G3 decision", command.Gate3DecisionID)
+	}
+	now := p.now().UTC()
+	return withSerializable(ctx, p.pool, func(
+		tx pgx.Tx,
+	) (controlplane.Stored[controlplane.PublicationLock], error) {
+		var replay controlplane.PublicationLock
+		replayed, err := reserveIdempotency(ctx, tx, idempotency, &replay, now)
+		if err != nil {
+			return controlplane.Stored[controlplane.PublicationLock]{}, err
+		}
+		if replayed {
+			return controlplane.Stored[controlplane.PublicationLock]{
+				Value: replay, Replayed: true,
+			}, nil
+		}
+		var (
+			seriesID, episodeID            uuid.UUID
+			runState, manifestHash, qcHash string
+			qcState, gate, decision        string
+			manifestGateID                 *uuid.UUID
+			manifestLockedAt               *time.Time
+			gateBindingMatches             bool
+		)
+		if err := tx.QueryRow(ctx, `
+			SELECT ep.series_id, ep.id, gr.state,
+			       gm.manifest_hash, gm.gate_decision_id, gm.locked_at,
+			       qr.report_hash, qr.state, ad.gate, ad.decision,
+			       EXISTS (
+			         SELECT 1
+			         FROM video_pipeline.approval_bindings ab
+			         WHERE ab.decision_id = ad.id
+			           AND ab.object_type = 'MANIFEST'
+			           AND ab.revision_id = gm.id
+			           AND ab.content_hash = gm.manifest_hash
+			       )
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.shot_spec_revisions ssr
+			  ON ssr.id = gr.shot_spec_revision_id
+			JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+			JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+			JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+			JOIN video_pipeline.run_artifacts ra
+			  ON ra.generation_run_id = gr.id AND ra.role = 'MANIFEST'
+			JOIN video_pipeline.generation_manifests gm
+			  ON gm.artifact_id = ra.artifact_id AND gm.id = $2
+			JOIN video_pipeline.artifacts a
+			  ON a.id = gm.artifact_id AND a.status = 'ACTIVE'
+			JOIN video_pipeline.qc_reports qr
+			  ON qr.generation_run_id = gr.id AND qr.id = $3
+			JOIN video_pipeline.approval_decisions ad ON ad.id = $4
+			WHERE gr.id = $1
+			FOR UPDATE OF gr, gm, qr, ad`,
+			runID, manifestID, qcReportID, gate3DecisionID,
+		).Scan(
+			&seriesID, &episodeID, &runState,
+			&manifestHash, &manifestGateID, &manifestLockedAt,
+			&qcHash, &qcState, &gate, &decision, &gateBindingMatches,
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return controlplane.Stored[controlplane.PublicationLock]{},
+					controlplane.NewPolicyError(
+						controlplane.CodeGateRequired,
+						"publication lock inputs do not resolve to one immutable run lineage",
+						"bind the succeeded run, ACTIVE manifest, passing QC, and exact G3 decision",
+					)
+			}
+			return controlplane.Stored[controlplane.PublicationLock]{},
+				fmt.Errorf("lock publication lineage: %w", err)
+		}
+		if runState != "SUCCEEDED" ||
+			manifestHash != command.ManifestHash ||
+			manifestGateID == nil || *manifestGateID != gate3DecisionID ||
+			manifestLockedAt == nil ||
+			qcHash != command.QCReportHash || qcState != "PASSED" ||
+			gate != "G3" || decision != "APPROVED" || !gateBindingMatches {
+			return controlplane.Stored[controlplane.PublicationLock]{},
+				controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"publication lock requires exact succeeded Run/Manifest/QC/G3 bindings",
+					"approve G3 for the current manifest and use the matching passing QC report",
+				)
+		}
+		var decisionSeriesID uuid.UUID
+		var decisionEpisodeID *uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			SELECT series_id, episode_id
+			FROM video_pipeline.approval_decisions
+			WHERE id = $1
+			FOR SHARE`,
+			gate3DecisionID,
+		).Scan(&decisionSeriesID, &decisionEpisodeID); err != nil {
+			return controlplane.Stored[controlplane.PublicationLock]{},
+				fmt.Errorf("read G3 publication scope: %w", err)
+		}
+		if decisionSeriesID != seriesID ||
+			decisionEpisodeID == nil || *decisionEpisodeID != episodeID {
+			return controlplane.Stored[controlplane.PublicationLock]{},
+				controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"G3 publication decision belongs to a different series or episode",
+					"approve the exact current episode manifest",
+				)
+		}
+		lockID := uuid.NewSHA1(runID, []byte(strings.Join([]string{
+			command.ManifestID, command.ManifestHash,
+			command.QCReportID, command.QCReportHash,
+			command.Gate3DecisionID,
+		}, ":")))
+		tag, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.publication_locks
+				(id, generation_run_id, manifest_id, manifest_hash,
+				 qc_report_id, qc_report_hash, gate3_decision_id,
+				 locked_by, locked_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+			ON CONFLICT (generation_run_id) DO NOTHING`,
+			lockID, runID, manifestID, command.ManifestHash,
+			qcReportID, command.QCReportHash, gate3DecisionID,
+			command.Actor.ActorID, now,
+		)
+		if err != nil {
+			return controlplane.Stored[controlplane.PublicationLock]{},
+				fmt.Errorf("insert publication lock: %w", err)
+		}
+		var lock controlplane.PublicationLock
+		var storedLockID, storedRunID, storedManifestID, storedQCID, storedGateID uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			SELECT id, generation_run_id, manifest_id, manifest_hash,
+			       qc_report_id, qc_report_hash, gate3_decision_id, locked_at
+			FROM video_pipeline.publication_locks
+			WHERE generation_run_id = $1
+			FOR SHARE`,
+			runID,
+		).Scan(
+			&storedLockID, &storedRunID,
+			&storedManifestID, &lock.ManifestHash,
+			&storedQCID, &lock.QCReportHash, &storedGateID, &lock.LockedAt,
+		); err != nil {
+			return controlplane.Stored[controlplane.PublicationLock]{},
+				fmt.Errorf("read publication lock: %w", err)
+		}
+		lock.PublicationLockID = storedLockID.String()
+		lock.RunID = storedRunID.String()
+		lock.ManifestID = storedManifestID.String()
+		lock.QCReportID = storedQCID.String()
+		lock.Gate3DecisionID = storedGateID.String()
+		if lock.PublicationLockID != lockID.String() ||
+			lock.ManifestID != command.ManifestID ||
+			lock.ManifestHash != command.ManifestHash ||
+			lock.QCReportID != command.QCReportID ||
+			lock.QCReportHash != command.QCReportHash ||
+			lock.Gate3DecisionID != command.Gate3DecisionID {
+			return controlplane.Stored[controlplane.PublicationLock]{},
+				controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"generation run already has a different immutable publication lock",
+				)
+		}
+		if tag.RowsAffected() == 1 {
+			if err := insertAuditAndOutbox(
+				ctx, tx, uuid.NewSHA1(lockID, []byte("audit")),
+				uuid.NewSHA1(lockID, []byte("outbox")),
+				command.Actor, "publication_lock.created",
+				"PUBLICATION_LOCK", lockID,
+				nil, nil, "", traceID,
+				map[string]any{
+					"runId":           runID.String(),
+					"manifestId":      command.ManifestID,
+					"manifestHash":    command.ManifestHash,
+					"qcReportId":      command.QCReportID,
+					"qcReportHash":    command.QCReportHash,
+					"gate3DecisionId": command.Gate3DecisionID,
+				},
+				now,
+			); err != nil {
+				return controlplane.Stored[controlplane.PublicationLock]{}, err
+			}
+		}
+		if err := completeIdempotency(
+			ctx, tx, idempotency, "", lock, 201,
+		); err != nil {
+			return controlplane.Stored[controlplane.PublicationLock]{}, err
+		}
+		return controlplane.Stored[controlplane.PublicationLock]{Value: lock}, nil
 	})
 }
 
@@ -2097,6 +2495,7 @@ func eventTypeForAction(action string) (string, error) {
 	eventTypes := map[string]string{
 		"series.created":                       "video.series.created.v1",
 		"source_revision.created":              "video.revision.created.v1",
+		"content_compilation.requested":        "video.content-compilation.requested.v1",
 		"generation_plan.created":              "video.generation-plan.created.v1",
 		"episode.production.requested":         "video.production.requested.v1",
 		"generation_run.created":               "video.run.state-changed.v1",
@@ -2112,6 +2511,7 @@ func eventTypeForAction(action string) (string, error) {
 		"manifest.created":                     "video.revision.created.v1",
 		"approval.decided":                     "video.approval.decided.v1",
 		"manifest.locked":                      "video.manifest.locked.v1",
+		"publication_lock.created":             "video.publication-lock.created.v1",
 		"dependency.stale":                     "video.dependency.stale.v1",
 		"workflow_step.completed":              "video.workflow-step.completed.v1",
 		"episode.postproduction.completed":     "video.episode.postproduction-completed.v1",

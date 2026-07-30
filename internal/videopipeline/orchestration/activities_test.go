@@ -56,9 +56,9 @@ func (l *providerPreparationLedgerFixture) PrepareProviderJob(
 	context.Context,
 	WorkflowStep,
 	ExecuteProviderJobInput,
-) error {
+) (PreparedProviderJob, error) {
 	l.prepareCalls++
-	return l.prepareErr
+	return PreparedProviderJob{}, l.prepareErr
 }
 
 type postProductionLedgerFixture struct {

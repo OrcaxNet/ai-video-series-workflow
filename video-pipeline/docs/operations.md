@@ -12,12 +12,32 @@ make video-down
 
 ```text
 PostgreSQL healthy
-  → migration v6 clean
+  → migration v7 clean
 Temporal healthy
 Mock Provider healthy
   → Orchestrator Worker registered
   → Control Plane ready
 ```
+
+### v5 → v6/v7 数据升级
+
+`000006_generation_mainline` 创建 v6 主链路表；`000007_generation_mainline_upgrade`
+专门覆盖已经应用过旧版 `000006` 的数据库。生产发布顺序：
+
+1. 停止旧 worker 消费 task queue，控制面暂停创建新 Run；
+2. 备份 PostgreSQL、Temporal 与 CAS，执行 migration 到 `000007`；
+3. 让已有 ProviderJob 用旧 worker 收敛；无法收敛的 Run 显式取消；
+4. 对仍需执行的镜头重新编译 Prompt，并创建新 Run，不原地改写 v5
+   request snapshot；
+5. 启动新 worker。它会在注册 task queue 前检查所有活跃 Run 的 Prompt 输入/
+   资产谱系与 Provider reservation snapshot；任一 v5 活跃记录会使启动失败；
+6. worker ready 后再开放控制面写流量。
+
+回滚边界：若新 worker 尚未消费，可停止新 binary 并恢复旧 worker，但保留已升级
+schema。若已经产生 `GENERATION_PROFILE` lineage 或一 Manifest 对应多个
+publication lock，不允许执行 migration down 或让 v5 worker接管；应先停止写入、
+保留数据库证据并以前向修复恢复。`000007` down 只用于没有这些数据的可丢弃测试
+环境，并会在不安全时主动失败。
 
 ## 2. 配置
 

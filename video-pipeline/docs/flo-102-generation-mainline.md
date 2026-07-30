@@ -2,8 +2,9 @@
 
 ## 交付边界
 
-本切片实现了可独立测试的后端领域主链路，代码位于
-`internal/videopipeline/production`。它只依赖
+本切片实现了可独立测试的后端领域主链路。纯领域逻辑位于
+`internal/videopipeline/production`，生产执行投影位于
+`controlplane`、`orchestration` 与 `repository`。它们只依赖
 `internal/providercontract` 的统一接口，不依赖 GPU、ComfyUI、模型权重或单一供应商字段。
 
 ```text
@@ -54,10 +55,18 @@
 ### Provider 执行、CAS 与谱系
 
 - `GenerationRunner` 在任何付费调用前校验来源授权、G1、G2、预算预留、
-  路由快照和运行时能力发现。预算预留绑定 run、Prompt content hash、模型
-  路由和估算包络，且金额必须覆盖当前 estimate、不得超过请求上限；
-  `ReservedMicros` 仅表示其他未结预留。Provider 返回的实际费用超过已批准
-  预留时，Run 以 `budget_exceeded` 失败关闭，不能进入成功 Manifest/G3。
+  路由快照和运行时能力发现。生产 repository 对同一
+  `budget_approval_id` 加行锁，将所有 `RESERVED` 与已 `SETTLED` 的实际费用
+  累计后再分配单 Run 上限；并发 Run 不可能各自把整份 plan 额度当成自己的上限。
+- ProviderJob 的不可变 request snapshot 同时冻结 Run digest、完整 Prompt、
+  Profile、route、单 Run reservation、币种和 pricing version。Run A 搭配
+  Prompt/route B 会在 reservation、ProviderJob 和外部 submit 都为零时被拒绝。
+- Provider 完成必须返回可验证的实际金额、币种与 pricing version，且估算和
+  实付都不能超过单 Run reservation。少报、未验证或漂移会持久化
+  `FAILED/BUDGET_EXCEEDED`，不会写 Run Artifact、QC、Manifest 或 G3。
+- 取消和完成都锁住 Run/Attempt/ProviderJob/Reservation；最先提交的
+  `SUCCEEDED`、`FAILED` 或 `CANCELLED` 是单调终态。取消优先时迟到成功只能
+  记为冲突，成功优先时迟到取消不能回退状态。
 - 不确定 submit 使用原 idempotency key 重试；poll 错误不会创建新的创作
   attempt；同 key 不同输入返回 conflict。
 - 401/403、429、5xx、超时、配额、内容安全、地区和模型不可用使用
@@ -71,9 +80,14 @@
 
 ## Temporal、FLO-101 与 FLO-103 接口
 
-Temporal `CompilePrompt` Activity 已支持注入 `PromptSource`，将完整 Prompt、
-ContextRefs、资产与输出规格传给 Provider Job。无数据库注入时只使用明确标记的
-mock-only fallback，以维持无 Key Compose smoke；live 环境不得用该 fallback。
+Temporal `CompilePrompt` Activity 将完整 Prompt、ContextRefs、资产与输出规格
+写入 `prompt_snapshots`、`prompt_snapshot_inputs` 与
+`prompt_snapshot_assets`，付费前再从 PostgreSQL 解析并逐项复核。
+`POST /sources/{sourceRevisionId}/compilations` 会为 STRUCTURE/EPISODES/SCENES/
+SHOTS 创建可对账的编译记录；`POST /runs/{runId}/publication-lock` 只接受精确
+绑定 SUCCEEDED Run、ACTIVE Manifest、通过 QC 与 G3 的输入。无数据库注入时只
+使用明确标记的 mock-only fallback，以维持无 Key Compose smoke；live 环境不得
+用该 fallback。
 
 FLO-101 前端使用以下稳定对象，不接收 provider Secret 或临时 URL：
 
@@ -90,8 +104,9 @@ FLO-103 控制面按 `contracts/openapi.yaml` 实现：
 
 PostgreSQL migration `000006_generation_mainline` 增加内容编译记录、Prompt 输入/
 资产关联、上一 Prompt、输出规格、输入 hash，以及同时绑定 QC/G3 的 publication
-lock。事务写入时应同时写 `revision_dependencies`、`idempotency_records`、
-`audit_events` 和 outbox。
+lock。`000007_generation_mainline_upgrade` 为已经执行过旧版 `000006` 的数据库
+补上 generation-profile lineage 与一 Manifest 多 Run 的约束升级。事务写入同时
+写 `revision_dependencies`、`idempotency_records`、`audit_events` 和 outbox。
 
 ## 测试与证据边界
 
@@ -112,7 +127,9 @@ make video-test
 Manifest 和 G3 lock；另有授权、上下文覆盖、引用冲突、Prompt diff、stale、
 回滚、幂等、恢复和 API 错误分类测试。负向预检同时断言篡改/未持久化
 PromptSnapshot 与低于估算的预算预留都在 Provider `Submit` 调用计数为 0 时
-失败。
+失败。PostgreSQL 集成测试还覆盖共享审批并发累计预留、释放后重试、实付超限、
+Run/Prompt/route 交叉绑定、取消/成功双向竞态、Artifact hash 元数据冲突、v5
+活跃数据升级闸门，以及 publication lock 的精确 QC/G3 谱系。
 
 Fake/fixture 证据仅为 `mock_only`，不能证明真实画质、p95、成功率、模型可用性
 或费用。火山 Key 到位前这些指标保持 `pending_key`。真实运行需要：

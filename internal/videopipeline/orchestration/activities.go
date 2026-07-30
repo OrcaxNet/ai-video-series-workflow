@@ -50,7 +50,7 @@ type ProductionLedger interface {
 	CompilePromptSnapshot(context.Context, WorkflowStep, CompilePromptInput) (PromptSnapshotRef, error)
 	ResolvePromptSnapshot(context.Context, string) (PromptSnapshotRef, error)
 	CreateWorkflowRun(context.Context, WorkflowStep, CreateRunInput) (GenerationRunRef, error)
-	PrepareProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput) error
+	PrepareProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput) (PreparedProviderJob, error)
 	CompleteProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput, ProviderResult) error
 	RecordAutomaticQC(context.Context, WorkflowStep, RunQCInput, QCResult) error
 	OpenShotReview(context.Context, WorkflowStep, CreateReviewInput) error
@@ -256,6 +256,7 @@ func (a *Activities) CreateRun(ctx context.Context, input CreateRunInput) (Gener
 func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (ProviderResult, error) {
 		var step WorkflowStep
+		var prepared PreparedProviderJob
 		if input.PersistProductTruth {
 			if a.Production == nil {
 				return ProviderResult{}, errors.New("production ledger is required")
@@ -285,11 +286,12 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 				)
 			}
 			input.Prompt = exactPrompt
-			if err := a.Production.PrepareProviderJob(ctx, step, input); err != nil {
+			prepared, err = a.Production.PrepareProviderJob(ctx, step, input)
+			if err != nil {
 				return ProviderResult{}, classifyPostProductionError(err)
 			}
 		}
-		result, err := a.executeProviderJob(ctx, input)
+		result, err := a.executeProviderJob(ctx, input, prepared)
 		if err != nil {
 			return ProviderResult{}, err
 		}
@@ -321,7 +323,11 @@ func promptSnapshotCarriesExecutionFields(prompt PromptSnapshotRef) bool {
 		len(prompt.InputRevisionHashes) != 0
 }
 
-func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
+func (a *Activities) executeProviderJob(
+	ctx context.Context,
+	input ExecuteProviderJobInput,
+	prepared PreparedProviderJob,
+) (ProviderResult, error) {
 	if a.HTTPClient == nil {
 		return ProviderResult{}, errors.New("provider HTTP client is required")
 	}
@@ -338,6 +344,40 @@ func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProvid
 	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
 		return ProviderResult{}, errors.New("immutable compiled output specification is required")
 	}
+	budget := prepared.Budget
+	budgetReservation := prepared.BudgetReservation
+	if !input.PersistProductTruth {
+		budget = providercontract.BudgetEnvelope{
+			EstimatedCostMicros: input.BudgetMaximumMicros,
+			MaxCostMicros:       input.BudgetMaximumMicros,
+			MaxAttempts:         2,
+		}
+		var err error
+		budgetReservation, err = providercontract.BindBudgetReservation(
+			providercontract.BudgetReservation{
+				ReservationID:  input.BudgetApprovalID,
+				Currency:       input.BudgetCurrency,
+				AmountMicros:   input.BudgetMaximumMicros,
+				PricingVersion: "workflow-approved-v1",
+				ConfirmedBy:    input.BudgetApprovalID,
+			},
+			providercontract.BudgetBindingInput{
+				RunID:     input.Run.RunID,
+				InputHash: input.Run.RunSpecDigest,
+				Model:     input.Route,
+				Budget:    budget,
+			},
+		)
+		if err != nil {
+			return ProviderResult{}, fmt.Errorf("bind budget approval: %w", err)
+		}
+	}
+	if err := budgetReservation.ValidateFor(providercontract.BudgetBindingInput{
+		RunID: input.Run.RunID, InputHash: input.Run.RunSpecDigest,
+		Model: input.Route, Budget: budget,
+	}); err != nil {
+		return ProviderResult{}, fmt.Errorf("validate prepared budget allocation: %w", err)
+	}
 	generationRequest := providercontract.GenerationRequest{
 		RequestID:        jobID,
 		IdempotencyKey:   jobID,
@@ -348,29 +388,7 @@ func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProvid
 		Assets:           input.Prompt.Assets,
 		Output:           outputSpec,
 		ModelHint:        input.Route.ModelID,
-		Budget: providercontract.BudgetEnvelope{
-			EstimatedCostMicros: input.BudgetMaximumMicros,
-			MaxCostMicros:       input.BudgetMaximumMicros,
-			MaxAttempts:         2,
-		},
-	}
-	budgetReservation, err := providercontract.BindBudgetReservation(
-		providercontract.BudgetReservation{
-			ReservationID:  input.BudgetApprovalID,
-			Currency:       input.BudgetCurrency,
-			AmountMicros:   input.BudgetMaximumMicros,
-			PricingVersion: "workflow-approved-v1",
-			ConfirmedBy:    input.BudgetApprovalID,
-		},
-		providercontract.BudgetBindingInput{
-			RunID:     input.Run.RunID,
-			InputHash: input.Run.RunSpecDigest,
-			Model:     input.Route,
-			Budget:    generationRequest.Budget,
-		},
-	)
-	if err != nil {
-		return ProviderResult{}, fmt.Errorf("bind budget approval: %w", err)
+		Budget:           budget,
 	}
 	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, providercontract.JobRequest{
 		SchemaVersion:     "v1",
@@ -735,6 +753,22 @@ func (a *Activities) CancelProviderJob(
 					return CancelProviderResult{}, errors.New("artifact store is required")
 				}
 				providerResult := providerResultFromResponse(response)
+				completionDispatch := input.Dispatch
+				exactPrompt, err := a.Production.ResolvePromptSnapshot(
+					ctx, input.Dispatch.Prompt.ID,
+				)
+				if err != nil {
+					return CancelProviderResult{}, err
+				}
+				if input.Dispatch.Prompt.ID != exactPrompt.ID ||
+					input.Dispatch.Prompt.Digest != exactPrompt.Digest {
+					return CancelProviderResult{},
+						controlplane.NewConflictError(
+							controlplane.CodeRevisionConflict,
+							"cancellation race Prompt differs from the persisted immutable record",
+						)
+				}
+				completionDispatch.Prompt = exactPrompt
 				exists, err := a.Artifacts.Exists(providerResult.ArtifactDigest)
 				if err != nil {
 					return CancelProviderResult{}, fmt.Errorf("verify raced provider artifact in CAS: %w", err)
@@ -742,7 +776,9 @@ func (a *Activities) CancelProviderJob(
 				if !exists {
 					return CancelProviderResult{}, errors.New("raced provider result was not committed to CAS")
 				}
-				if err := a.Production.CompleteProviderJob(ctx, step, input.Dispatch, providerResult); err != nil {
+				if err := a.Production.CompleteProviderJob(
+					ctx, step, completionDispatch, providerResult,
+				); err != nil {
 					return CancelProviderResult{}, err
 				}
 			}

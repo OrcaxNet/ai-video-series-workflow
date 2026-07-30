@@ -36,6 +36,9 @@ func main() {
 		log.Fatalf("connect to video PostgreSQL: %v", err)
 	}
 	defer store.Close()
+	if err := store.ValidateWorkerUpgradeReadiness(context.Background()); err != nil {
+		log.Fatalf("video PostgreSQL upgrade gate failed: %v", err)
+	}
 	artifacts, err := artifactstore.New(cfg.ArtifactRoot)
 	if err != nil {
 		log.Fatalf("open video artifact store: %v", err)

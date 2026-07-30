@@ -35,7 +35,8 @@ CREATE TABLE prompt_snapshot_inputs (
     prompt_snapshot_id UUID NOT NULL REFERENCES prompt_snapshots(id),
     input_type         TEXT NOT NULL CHECK (input_type IN (
         'SOURCE', 'WORLD', 'CHARACTER', 'RELATIONSHIP', 'LOCATION', 'PROP',
-        'EPISODE', 'SCENE', 'SHOT_SPEC', 'CONTEXT', 'PREVIOUS_PROMPT', 'TAIL_FRAME'
+        'EPISODE', 'SCENE', 'SHOT_SPEC', 'GENERATION_PROFILE', 'CONTEXT',
+        'PREVIOUS_PROMPT', 'TAIL_FRAME'
     )),
     input_revision_id  UUID NOT NULL,
     input_hash         CHAR(64) NOT NULL CHECK (input_hash ~ '^[0-9a-f]{64}$'),
@@ -58,7 +59,7 @@ CREATE TABLE prompt_snapshot_assets (
 CREATE TABLE publication_locks (
     id                 UUID PRIMARY KEY,
     generation_run_id  UUID NOT NULL UNIQUE REFERENCES generation_runs(id),
-    manifest_id        UUID NOT NULL UNIQUE REFERENCES generation_manifests(id),
+    manifest_id        UUID NOT NULL REFERENCES generation_manifests(id),
     manifest_hash      CHAR(64) NOT NULL CHECK (manifest_hash ~ '^[0-9a-f]{64}$'),
     qc_report_id       UUID NOT NULL UNIQUE REFERENCES qc_reports(id),
     qc_report_hash     CHAR(64) NOT NULL CHECK (qc_report_hash ~ '^[0-9a-f]{64}$'),
