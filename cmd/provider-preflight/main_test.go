@@ -15,7 +15,14 @@ func TestScanRepositoryCoversRootHiddenAndUntrackedFiles(t *testing.T) {
 		name    string
 		path    string
 		tracked bool
+		content string
 	}{
+		{
+			name:    "QA root credential probe",
+			path:    "qa-secret-probe.txt",
+			tracked: false,
+			content: strings.Join([]string{"ARK_API_KEY", strings.Repeat("b", 20)}, "="),
+		},
 		{name: "tracked root file", path: "root-fixture.txt", tracked: true},
 		{name: "tracked hidden directory", path: ".github/workflows/fixture.yml", tracked: true},
 		{name: "future untracked file", path: "future/provider/fixture.txt", tracked: false},
@@ -34,7 +41,10 @@ func TestScanRepositoryCoversRootHiddenAndUntrackedFiles(t *testing.T) {
 			if err := os.MkdirAll(filepath.Dir(fixturePath), 0o700); err != nil {
 				t.Fatal(err)
 			}
-			synthetic := strings.Join([]string{"Bearer", strings.Repeat("x", 20)}, " ")
+			synthetic := tt.content
+			if synthetic == "" {
+				synthetic = strings.Join([]string{"Bearer", strings.Repeat("x", 20)}, " ")
+			}
 			if err := os.WriteFile(fixturePath, []byte(synthetic), 0o600); err != nil {
 				t.Fatal(err)
 			}

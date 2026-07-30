@@ -75,6 +75,31 @@ func TestFakeProvider_SuccessAndIdempotency(t *testing.T) {
 	}
 }
 
+func TestFakeProvider_Estimate(t *testing.T) {
+	t.Parallel()
+	provider := NewFakeProvider(FakeSuccess)
+	estimate, err := provider.Estimate(t.Context(), EstimateRequest{
+		Capability: CapabilityVideo,
+		Model: ModelSnapshot{
+			CapabilityAlias: string(CapabilityVideo),
+			Provider:        "fake",
+			ModelID:         "fake-video-v1",
+			RouteVersion:    "route-v1",
+			CapabilityHash:  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+			Verification:    "mock_only",
+		},
+		Candidates: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if estimate.AmountMinimum == nil || estimate.AmountMaximum == nil ||
+		*estimate.AmountMinimum != 200 || *estimate.AmountMaximum != 300 ||
+		estimate.PricingVersion != "mock-pricing-v1" {
+		t.Fatalf("Estimate() = %#v, want bounded mock pricing", estimate)
+	}
+}
+
 func TestFakeProvider_RecoveryUsesOriginalJob(t *testing.T) {
 	t.Parallel()
 	provider := NewFakeProvider(FakeRecovery)

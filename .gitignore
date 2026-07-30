@@ -7,6 +7,7 @@ coverage.out
 
 # Local environment and generated evidence
 .env
+video-pipeline/.env.video
 artifacts/
 provider-preflight-manifest*.json
 

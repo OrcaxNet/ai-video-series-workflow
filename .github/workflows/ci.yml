@@ -10,9 +10,9 @@ permissions:
   contents: read
 
 jobs:
-  provider-contract:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -26,11 +26,11 @@ jobs:
       - name: Scan every repository file for credential literals
         run: go run ./cmd/provider-preflight --mode scan
 
-      - name: Test with race detector
-        run: go test -race ./...
+      - name: Unit, race, contract, vet and secret checks
+        run: make video-test
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Run no-key preflight
-        run: ./scripts/flo110-preflight.sh
+      - name: No-key Compose smoke
+        run: |
+          trap 'make video-down' EXIT
+          make video-up
+          make video-smoke

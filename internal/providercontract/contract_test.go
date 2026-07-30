@@ -85,18 +85,19 @@ func TestGenerationRequest_Validate(t *testing.T) {
 func TestMapHTTPError(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name         string
-		status       int
-		providerCode string
-		wantCode     ErrorCode
-		retryable    bool
+		name           string
+		status         int
+		providerCode   string
+		wantCode       ErrorCode
+		retryable      bool
+		requiresAction bool
 	}{
-		{name: "401", status: 401, wantCode: CodeUnauthenticated},
-		{name: "403", status: 403, wantCode: CodeForbidden},
+		{name: "401", status: 401, wantCode: CodeUnauthenticated, requiresAction: true},
+		{name: "403", status: 403, wantCode: CodeForbidden, requiresAction: true},
 		{name: "429 rate", status: 429, providerCode: "RateLimitExceeded", wantCode: CodeRateLimited, retryable: true},
-		{name: "429 quota", status: 429, providerCode: "QuotaExceeded", wantCode: CodeQuotaExceeded},
-		{name: "content policy", status: 400, providerCode: "InputTextSensitiveContentDetected", wantCode: CodeContentBlocked},
-		{name: "model missing", status: 404, providerCode: "ModelNotFound", wantCode: CodeModelUnavailable},
+		{name: "429 quota", status: 429, providerCode: "QuotaExceeded", wantCode: CodeQuotaExceeded, requiresAction: true},
+		{name: "content policy", status: 400, providerCode: "InputTextSensitiveContentDetected", wantCode: CodeContentBlocked, requiresAction: true},
+		{name: "model missing", status: 404, providerCode: "ModelNotFound", wantCode: CodeModelUnavailable, requiresAction: true},
 		{name: "server", status: 503, providerCode: "InternalError", wantCode: CodeUnavailable, retryable: true},
 	}
 	for _, tt := range tests {
@@ -104,8 +105,11 @@ func TestMapHTTPError(t *testing.T) {
 			t.Parallel()
 			rawSecret := "sensitive upstream body " + "Bearer " + strings.Repeat("x", 20)
 			got := MapHTTPError(tt.status, tt.providerCode, "request-1", rawSecret)
-			if got.Code != tt.wantCode || got.Retryable != tt.retryable {
-				t.Fatalf("MapHTTPError() = %#v, want code=%s retryable=%t", got, tt.wantCode, tt.retryable)
+			if got.Code != tt.wantCode || got.Retryable != tt.retryable || got.RequiresAction != tt.requiresAction {
+				t.Fatalf("MapHTTPError() = %#v, want code=%s retryable=%t requiresAction=%t", got, tt.wantCode, tt.retryable, tt.requiresAction)
+			}
+			if got.RequiresAction && got.SuggestedAction == "" {
+				t.Fatalf("MapHTTPError() = %#v, actionable errors require a safe next step", got)
 			}
 			if strings.Contains(got.Error(), rawSecret) || strings.Contains(got.Error(), strings.Repeat("x", 20)) {
 				t.Fatalf("safe error leaked raw provider body: %q", got.Error())

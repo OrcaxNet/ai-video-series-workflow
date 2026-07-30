@@ -101,6 +101,8 @@ func runMock(ctx context.Context) (report, error) {
 		{name: "timeout", scenario: providercontract.FakeTimeout, want: providercontract.CodeTimeout},
 		{name: "quota exhausted", scenario: providercontract.FakeQuotaExceeded, want: providercontract.CodeQuotaExceeded},
 		{name: "content blocked", scenario: providercontract.FakeContentBlocked, want: providercontract.CodeContentBlocked},
+		{name: "region unavailable", scenario: providercontract.FakeRegionUnavailable, want: providercontract.CodeRegionUnavailable},
+		{name: "model unavailable", scenario: providercontract.FakeModelUnavailable, want: providercontract.CodeModelUnavailable},
 	}
 	for _, scenario := range errorScenarios {
 		_, err := providercontract.NewFakeProvider(scenario.scenario).Submit(ctx, mockRequest())
@@ -267,7 +269,7 @@ func scanRepository(ctx context.Context, path string) (report, error) {
 	result.Checks = append(result.Checks, checkResult{
 		Name:   "repository files",
 		Status: "passed",
-		Detail: fmt.Sprintf("scanned %d tracked and unignored files", count),
+		Detail: fmt.Sprintf("scanned %d tracked plus unignored files", count),
 	})
 	return result, nil
 }
