@@ -87,12 +87,31 @@ export interface ProviderJob {
   progress: number;
   retryCount: number;
   attempt: number;
+  isCurrentAttempt: boolean;
+  supersedesJobId?: string;
+  supersededByJobId?: string;
   traceId: string;
   taskId?: string;
   costMicros?: number;
   costVerified: boolean;
   updatedAt: string;
   failure?: JobFailure;
+}
+
+export interface CreateJobAttemptInput {
+  sourceJob: ProviderJob;
+  nextAttempt: number;
+  generationAttemptId: string;
+  idempotencyKey: string;
+}
+
+export interface CreateJobAttemptResult {
+  providerJobId: string;
+  generationAttemptId: string;
+  state: "QUEUED";
+  traceId: string;
+  createdAt: string;
+  taskId?: string;
 }
 
 export interface AssetRevision {

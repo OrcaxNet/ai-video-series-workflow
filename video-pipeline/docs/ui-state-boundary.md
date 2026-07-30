@@ -32,7 +32,20 @@
 
 派生的 `RETRYING` 和 `CANCEL_REQUESTED` 是面向用户的本地 projection，不改写冻结 ProviderJob enum；来源分别是错误+调度信息与 GenerationRun/Operation 的取消状态。
 
-`SUCCEEDED`、`FAILED`、`CANCELLED` 是不可回退终态。晚到/乱序 callback、重复事件、异常演练以及“完成批次”只能推进非终态 Job；遇到既有终态必须 no-op 并保留原更新时间、错误与费用证据。需要重做时创建新的 Job/creative attempt。
+`SUCCEEDED`、`FAILED`、`CANCELLED` 是不可回退终态。晚到/乱序 callback、重复事件、异常演练以及“完成批次”只能推进非终态 Job；遇到既有终态必须 no-op 并保留原更新时间、错误与费用证据。
+
+终态创作重做遵循下列映射：
+
+| 操作 | 旧 Job | 新 Job / attempt | G3 计算 |
+|---|---|---|---|
+| FAILED / CANCELLED → 创建新 attempt | 保持原 ID、终态、时间、错误/费用并转为历史只读行 | `POST /api/v1/provider-jobs`；新 Job ID，attempt + 1，初始 QUEUED | 新 Job 成为该镜头当前 attempt；未成功前持续阻断 |
+| 429 / 5xx 基础设施 retry | 原 Job ID 上递增 retryCount | 不创建新 attempt | 仍由同一当前 Job 决定 |
+| 当前批次完成 | 历史行 no-op | 只推进各镜头当前的非终态 Job | 所有当前 attempt SUCCEEDED 且 G2 APPROVED 才解锁 |
+
+前端投影用 `isCurrentAttempt` 标识每个镜头参与当前批次判定的唯一行，并用
+`supersedesJobId` / `supersededByJobId` 呈现替代关系。Mock API 对新 attempt 同样执行
+Idempotency-Key 与严格递增校验；切换 live 后复用冻结 OpenAPI 已定义的
+`POST /api/v1/provider-jobs`，不增加专用私有路由。
 
 ## 3. 错误映射
 

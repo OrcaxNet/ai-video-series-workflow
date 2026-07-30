@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ApiProblem, type ApprovalInput, type GateId } from "../domain";
-import { gates } from "../mock-data";
+import { ApiProblem, type ApprovalInput, type CreateJobAttemptInput, type GateId } from "../domain";
+import { gates, jobs } from "../mock-data";
 import { HttpControlPlaneApi, MockControlPlaneApi } from "./control-plane";
 
 const input = (
@@ -15,6 +15,16 @@ const input = (
   decision,
   explanation: "reviewed",
   bindings: gates[gateId].bindings,
+});
+
+const jobAttemptInput = (
+  state: "FAILED" | "CANCELLED" = "FAILED",
+  idempotencyKey = "attempt-key",
+): CreateJobAttemptInput => ({
+  sourceJob: { ...jobs[1], state },
+  nextAttempt: 2,
+  generationAttemptId: "22222222-2222-4222-8222-222222222202",
+  idempotencyKey,
 });
 
 describe("MockControlPlaneApi", () => {
@@ -141,6 +151,42 @@ describe("MockControlPlaneApi", () => {
       decision: "APPROVED",
     });
   });
+
+  it.each(["FAILED", "CANCELLED"] as const)(
+    "creates a distinct current Job for a %s creative redo without mutating the source",
+    async (state) => {
+      const api = new MockControlPlaneApi();
+      const input = jobAttemptInput(state, `new-${state.toLowerCase()}-attempt`);
+      const result = await api.createJobAttempt(input);
+
+      expect(result).toMatchObject({
+        providerJobId: "job-v-032-a2",
+        generationAttemptId: input.generationAttemptId,
+        state: "QUEUED",
+      });
+      expect(result.providerJobId).not.toBe(input.sourceJob.id);
+      expect(input.sourceJob).toMatchObject({
+        id: "job-v-032",
+        state,
+        attempt: 1,
+        isCurrentAttempt: true,
+      });
+    },
+  );
+
+  it("keeps creative-attempt submission idempotent and rejects a changed payload", async () => {
+    const api = new MockControlPlaneApi();
+    const firstInput = jobAttemptInput("FAILED", "same-attempt-key");
+    const first = await api.createJobAttempt(firstInput);
+
+    await expect(api.createJobAttempt(firstInput)).resolves.toEqual(first);
+    await expect(
+      api.createJobAttempt({
+        ...firstInput,
+        nextAttempt: 3,
+      }),
+    ).rejects.toMatchObject({ status: 409, errorCode: "conflict" });
+  });
 });
 
 describe("HttpControlPlaneApi", () => {
@@ -174,5 +220,40 @@ describe("HttpControlPlaneApi", () => {
     expect((conflict as ApiProblem).affectedObjects[0]?.currentRevision).toBe(12);
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/approvals");
+  });
+
+  it("submits a new creative attempt through the frozen provider-jobs route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          providerJobId: "33333333-3333-4333-8333-333333333303",
+          generationAttemptId: "22222222-2222-4222-8222-222222222202",
+          state: "QUEUED",
+          traceId: "trc-live-attempt-2",
+          createdAt: "2026-07-30T06:10:00Z",
+        }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("/api/v1");
+
+    await expect(api.createJobAttempt(jobAttemptInput("FAILED", "live-attempt"))).resolves.toMatchObject({
+      providerJobId: "33333333-3333-4333-8333-333333333303",
+      state: "QUEUED",
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/provider-jobs");
+    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
+    const body = JSON.parse(String(request.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      schemaVersion: "v1",
+      generationAttemptId: "22222222-2222-4222-8222-222222222202",
+      capability: "video.primary",
+    });
+    expect(body.requestSnapshot).toMatchObject({
+      creativeAttempt: 2,
+      supersedesProviderJobId: "job-v-032",
+    });
   });
 });

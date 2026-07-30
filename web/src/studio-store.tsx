@@ -12,6 +12,7 @@ import { createControlPlaneApi, type ControlPlaneApi } from "./api/control-plane
 import {
   ApiProblem,
   type ApprovalResult,
+  type CreateJobAttemptResult,
   type CreateProjectInput,
   type CreateProjectResult,
   type Decision,
@@ -40,6 +41,7 @@ type Action =
   | { type: "CANCEL_JOB"; jobId: string }
   | { type: "CONFIRM_CANCEL_JOB"; jobId: string }
   | { type: "RETRY_JOB"; jobId: string }
+  | { type: "JOB_ATTEMPT_CREATED"; sourceJobId: string; result: CreateJobAttemptResult }
   | { type: "SET_JOBS_VIEW_STATE"; viewState: JobsViewState }
   | { type: "SELECT_PROMPT"; version: number }
   | { type: "SELECT_ASSET"; assetId: string }
@@ -210,7 +212,8 @@ function reducer(state: StudioState, action: Action): StudioState {
         nextGates.G2 = { ...nextGates.G2, state: "PENDING" };
       }
       if (decision === "APPROVED" && gateId === "G2") {
-        const allFinished = state.jobs.every((job) => job.state === "SUCCEEDED");
+        const currentJobs = state.jobs.filter((job) => job.isCurrentAttempt);
+        const allFinished = currentJobs.length > 0 && currentJobs.every((job) => job.state === "SUCCEEDED");
         nextGates.G3 = { ...nextGates.G3, state: allFinished ? "PENDING" : "BLOCKED" };
       }
       if (decision === "RETURNED" && gateId === "G1") {
@@ -318,7 +321,7 @@ function reducer(state: StudioState, action: Action): StudioState {
       );
     case "COMPLETE_MOCK_RUN": {
       const jobs = state.jobs.map((job) =>
-        terminalJobStates.has(job.state)
+        !job.isCurrentAttempt || terminalJobStates.has(job.state)
           ? job
           : {
               ...job,
@@ -328,8 +331,11 @@ function reducer(state: StudioState, action: Action): StudioState {
               updatedAt: nowLabel(),
             },
       );
-      const terminalBlockers = jobs.filter((job) => job.state === "FAILED" || job.state === "CANCELLED");
-      const allSucceeded = jobs.every((job) => job.state === "SUCCEEDED");
+      const currentJobs = jobs.filter((job) => job.isCurrentAttempt);
+      const terminalBlockers = currentJobs.filter(
+        (job) => job.state === "FAILED" || job.state === "CANCELLED",
+      );
+      const allSucceeded = currentJobs.length > 0 && currentJobs.every((job) => job.state === "SUCCEEDED");
       const nextGates = {
         ...state.gates,
         G3: {
@@ -353,7 +359,7 @@ function reducer(state: StudioState, action: Action): StudioState {
               actor: "Provider Mock",
               action: allSucceeded ? "完成排练" : "排练保留终态",
               detail: allSucceeded
-                ? "5 个镜头均生成固定 fixture；证据仍标记 mock_only"
+                ? `${currentJobs.length} 个当前 attempt 均生成固定 fixture；证据仍标记 mock_only`
                 : `${terminalBlockers.length} 个 FAILED/CANCELLED 终态未被覆盖；G3 保持阻断`,
             },
             ...state.activity,
@@ -369,7 +375,17 @@ function reducer(state: StudioState, action: Action): StudioState {
       );
     }
     case "INJECT_SCENARIO": {
-      const current = state.jobs[1];
+      const currentIndex = state.jobs.findIndex(
+        (job) => job.shotId === "shot-032" && job.isCurrentAttempt,
+      );
+      const current = state.jobs[currentIndex];
+      if (!current) {
+        return toast(state, {
+          tone: "error",
+          title: "找不到当前 attempt",
+          description: "重新加载任务投影后再注入异常场景。",
+        });
+      }
       if (terminalJobStates.has(current.state)) {
         return toast(state, {
           tone: "info",
@@ -378,7 +394,7 @@ function reducer(state: StudioState, action: Action): StudioState {
         });
       }
       const jobs = state.jobs.map((job, index) => {
-        if (index !== 1) return job;
+        if (index !== currentIndex) return job;
         if (action.scenario === "duplicate_callback") {
           return job;
         }
@@ -455,7 +471,9 @@ function reducer(state: StudioState, action: Action): StudioState {
     }
     case "CANCEL_JOB": {
       const jobs = state.jobs.map((job) =>
-        job.id === action.jobId && !["SUCCEEDED", "FAILED", "CANCELLED"].includes(job.state)
+        job.id === action.jobId &&
+        job.isCurrentAttempt &&
+        !["SUCCEEDED", "FAILED", "CANCELLED"].includes(job.state)
           ? { ...job, state: "CANCEL_REQUESTED" as const, updatedAt: nowLabel() }
           : job,
       );
@@ -470,7 +488,7 @@ function reducer(state: StudioState, action: Action): StudioState {
     }
     case "CONFIRM_CANCEL_JOB": {
       const jobs = state.jobs.map((job) =>
-        job.id === action.jobId && job.state === "CANCEL_REQUESTED"
+        job.id === action.jobId && job.isCurrentAttempt && job.state === "CANCEL_REQUESTED"
           ? { ...job, state: "CANCELLED" as const, updatedAt: nowLabel() }
           : job,
       );
@@ -485,7 +503,10 @@ function reducer(state: StudioState, action: Action): StudioState {
     }
     case "RETRY_JOB": {
       const jobs = state.jobs.map((job) =>
-        job.id === action.jobId && job.failure?.retryable && job.retryCount < 3
+        job.id === action.jobId &&
+        job.isCurrentAttempt &&
+        job.failure?.retryable &&
+        job.retryCount < 3
           ? {
               ...job,
               state: "RETRYING" as const,
@@ -500,6 +521,78 @@ function reducer(state: StudioState, action: Action): StudioState {
           tone: "info",
           title: "已安排同任务重试",
           description: "沿用原 Job ID 与上游映射，不创建新的创作 attempt。",
+        },
+      );
+    }
+    case "JOB_ATTEMPT_CREATED": {
+      const source = state.jobs.find((job) => job.id === action.sourceJobId);
+      if (
+        !source ||
+        !source.isCurrentAttempt ||
+        (source.state !== "FAILED" && source.state !== "CANCELLED")
+      ) {
+        return toast(
+          { ...state, busy: false },
+          {
+            tone: "warning",
+            title: "任务投影已变化",
+            description: "当前行已不是可重做的终态任务；请刷新后确认最新 attempt。",
+          },
+        );
+      }
+      const nextJob: ProviderJob = {
+        ...source,
+        id: action.result.providerJobId,
+        state: action.result.state,
+        progress: 0,
+        retryCount: 0,
+        attempt: source.attempt + 1,
+        isCurrentAttempt: true,
+        supersedesJobId: source.id,
+        supersededByJobId: undefined,
+        traceId: action.result.traceId,
+        taskId: action.result.taskId,
+        costMicros: source.costMicros,
+        costVerified: false,
+        updatedAt: nowLabel(),
+        failure: undefined,
+      };
+      const jobs = state.jobs.flatMap((job) =>
+        job.id === source.id
+          ? [
+              {
+                ...job,
+                isCurrentAttempt: false,
+                supersededByJobId: nextJob.id,
+              },
+              nextJob,
+            ]
+          : [job],
+      );
+      return toast(
+        {
+          ...state,
+          busy: false,
+          jobs,
+          gates: {
+            ...state.gates,
+            G3: { ...state.gates.G3, state: "BLOCKED" },
+          },
+          activity: [
+            {
+              id: `act-attempt-${action.result.generationAttemptId}`,
+              at: nowLabel(),
+              actor: "本地创作者",
+              action: `创建 ${source.shot} attempt ${nextJob.attempt}`,
+              detail: `${source.id} 保留 ${source.state} · 新 Job ${nextJob.id} 进入 QUEUED`,
+            },
+            ...state.activity,
+          ],
+        },
+        {
+          tone: "success",
+          title: `${source.shot} attempt ${nextJob.attempt} 已创建`,
+          description: `新 Job ${nextJob.id} 已加入当前批次；旧 Job ${source.id} 保持 ${source.state} 终态。`,
         },
       );
     }
@@ -614,6 +707,7 @@ interface StudioActions {
   cancelJob(jobId: string): void;
   confirmCancelJob(jobId: string): void;
   retryJob(jobId: string): void;
+  createJobAttempt(jobId: string): Promise<void>;
   setJobsViewState(viewState: JobsViewState): void;
   selectPrompt(version: number): void;
   selectAsset(assetId: string): void;
@@ -776,6 +870,43 @@ export function StudioProvider({
     [handleProblem, state.gates.G1.etag],
   );
 
+  const createJobAttempt = useCallback(
+    async (jobId: string) => {
+      const sourceJob = state.jobs.find((job) => job.id === jobId);
+      if (
+        !sourceJob ||
+        !sourceJob.isCurrentAttempt ||
+        (sourceJob.state !== "FAILED" && sourceJob.state !== "CANCELLED")
+      ) {
+        handleProblem(
+          new ApiProblem({
+            status: 422,
+            errorCode: "RUN_TERMINAL_REQUIRED",
+            title: "Current terminal job required",
+            detail: "只有当前 FAILED 或 CANCELLED Job 可以创建新的创作 attempt。",
+            retryable: false,
+            traceId: "trc_client_attempt_guard",
+            suggestedAction: "重新加载任务投影后选择当前终态任务。",
+          }),
+        );
+        return;
+      }
+      dispatch({ type: "BUSY", busy: true });
+      try {
+        const result = await apiRef.current.createJobAttempt({
+          sourceJob,
+          nextAttempt: sourceJob.attempt + 1,
+          generationAttemptId: crypto.randomUUID(),
+          idempotencyKey: crypto.randomUUID(),
+        });
+        dispatch({ type: "JOB_ATTEMPT_CREATED", sourceJobId: sourceJob.id, result });
+      } catch (error) {
+        handleProblem(error);
+      }
+    },
+    [handleProblem, state.jobs],
+  );
+
   useEffect(() => {
     let active = true;
     void apiRef.current
@@ -805,13 +936,22 @@ export function StudioProvider({
       cancelJob: (jobId) => dispatch({ type: "CANCEL_JOB", jobId }),
       confirmCancelJob: (jobId) => dispatch({ type: "CONFIRM_CANCEL_JOB", jobId }),
       retryJob: (jobId) => dispatch({ type: "RETRY_JOB", jobId }),
+      createJobAttempt,
       setJobsViewState: (viewState) => dispatch({ type: "SET_JOBS_VIEW_STATE", viewState }),
       selectPrompt: (version) => dispatch({ type: "SELECT_PROMPT", version }),
       selectAsset: (assetId) => dispatch({ type: "SELECT_ASSET", assetId }),
       lockAssetRevision,
       dismissToast: (id) => dispatch({ type: "DISMISS_TOAST", id }),
     }),
-    [createProject, decideGate, lockAssetRevision, regenerateGate, simulateConcurrentUpdate, synchronizeGate],
+    [
+      createJobAttempt,
+      createProject,
+      decideGate,
+      lockAssetRevision,
+      regenerateGate,
+      simulateConcurrentUpdate,
+      synchronizeGate,
+    ],
   );
 
   return <StudioContext.Provider value={{ state, actions }}>{children}</StudioContext.Provider>;

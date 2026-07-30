@@ -53,9 +53,11 @@ VITE_STUDIO_MODE=live npm run dev
   `affectedObjects[].currentRevision` 对账，不调用未定义的 Gate 查询路由。
 - 资产引用切换会创建新的不可变 G1/asset-set snapshot，使 G1 重新待审并阻断
   G2/G3；同一 G2 revision 不能批准 stale 镜头。
-- 基础设施重试沿用同一 Provider Job；创意修改创建新的 attempt。
+- 基础设施重试沿用同一 Provider Job；`FAILED` / `CANCELLED` 的创作重做通过
+  `POST /api/v1/provider-jobs` 创建递增 attempt 和全新 Job ID。旧终态行、时间、错误与
+  费用证据只读保留，并显示新旧替代关系。
 - `SUCCEEDED`、`FAILED`、`CANCELLED` 是单调终态；晚到 callback、异常注入和批次
-  完成均不得覆盖，重做必须创建新的 Job/attempt。
+  完成均不得覆盖；批次完成和 G3 只计算每个镜头标记为当前的 attempt。
 - Prompt“回滚”只切换下一次使用的 revision，不删除历史产物、费用或 Manifest。
 
 ## Secret 与权限边界

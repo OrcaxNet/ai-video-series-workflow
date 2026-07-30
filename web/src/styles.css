@@ -2540,6 +2540,12 @@ code,
   min-width: 125px;
 }
 
+.job-history-row {
+  color: #68716d;
+  background: #f3f4f1;
+  box-shadow: inset 3px 0 #aeb8b2;
+}
+
 .job-table td > strong,
 .job-table td > small {
   display: block;
@@ -2561,6 +2567,29 @@ code,
   margin-top: 7px;
   color: var(--red);
   font-size: 7px;
+}
+
+.attempt-scope {
+  display: inline-flex;
+  margin-top: 7px;
+  padding: 2px 5px;
+  border: 1px solid #aeb8b2;
+  color: #65716b;
+  font-family: var(--mono);
+  font-size: 7px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+}
+
+.attempt-scope.is-current {
+  border-color: #6c9183;
+  color: #31594c;
+  background: #e0ebe5;
+}
+
+.job-table td > .attempt-link {
+  margin-top: 5px;
+  color: #65716b;
 }
 
 .progress-wrap {
@@ -2599,6 +2628,22 @@ code,
   color: var(--green);
   font-size: 8px;
   font-weight: 650;
+}
+
+.table-done.needs-attempt {
+  color: var(--red);
+}
+
+.table-done.history-preserved {
+  color: #65716b;
+}
+
+.attempt-action {
+  width: 100%;
+  padding-top: 5px;
+  border-top: 1px solid var(--line);
+  color: #254e41;
+  font-weight: 750;
 }
 
 .trace-boundary {

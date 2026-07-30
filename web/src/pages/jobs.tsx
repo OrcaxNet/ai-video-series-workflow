@@ -38,7 +38,9 @@ const scenarios: Array<{
 
 export function JobsPage() {
   const { state, actions } = useStudio();
-  const estimated = state.jobs.reduce((sum, job) => sum + (job.costMicros ?? 0), 0) / 1_000_000;
+  const currentJobs = state.jobs.filter((job) => job.isCurrentAttempt);
+  const historicalJobs = state.jobs.length - currentJobs.length;
+  const estimated = currentJobs.reduce((sum, job) => sum + (job.costMicros ?? 0), 0) / 1_000_000;
   const completeEnabled = state.gates.G2.state === "APPROVED";
 
   return (
@@ -47,7 +49,7 @@ export function JobsPage() {
         <div>
           <span className="eyebrow">Provider 操作中心</span>
           <h1>每个远程任务都有凭据</h1>
-          <p>submit、poll、webhook、cancel、retry 和 timeout 都回到同一个 Job ID；浏览器只看脱敏投影。</p>
+          <p>基础设施重试沿用原 Job ID；创作重做生成新 attempt 与新 Job，旧终态始终保留。</p>
         </div>
         <button
           className="button button-primary critical-header-action"
@@ -80,8 +82,8 @@ export function JobsPage() {
       <section className="job-metrics">
         <article>
           <span>当前批次</span>
-          <strong>{state.jobs.length} 个任务</strong>
-          <small>plan hash · 7d3a…e910</small>
+          <strong>{currentJobs.length} 个当前任务</strong>
+          <small>{historicalJobs ? `${historicalJobs} 个历史 attempt 已保留` : "plan hash · 7d3a…e910"}</small>
         </article>
         <article>
           <span>预算预占上界</span>
@@ -218,10 +220,19 @@ export function JobsPage() {
             </thead>
             <tbody>
               {state.jobs.map((job) => (
-                <tr key={job.id}>
+                <tr key={job.id} className={job.isCurrentAttempt ? undefined : "job-history-row"}>
                   <td>
                     <strong>{job.shot}</strong>
                     <small className="mono">{job.id}</small>
+                    <span className={`attempt-scope ${job.isCurrentAttempt ? "is-current" : ""}`}>
+                      {job.isCurrentAttempt ? "当前 attempt" : "历史 attempt"}
+                    </span>
+                    {job.supersedesJobId && (
+                      <small className="attempt-link">替代 {job.supersedesJobId}</small>
+                    )}
+                    {job.supersededByJobId && (
+                      <small className="attempt-link">由 {job.supersededByJobId} 替代</small>
+                    )}
                     {job.failure && (
                       <span className="job-error-inline">
                         <XOctagon size={13} aria-hidden="true" />
@@ -249,24 +260,71 @@ export function JobsPage() {
                   </td>
                   <td>
                     <div className="table-actions">
-                      {job.failure?.retryable && job.retryCount < 3 && (
-                        <button className="text-button" type="button" onClick={() => actions.retryJob(job.id)}>
+                      {job.isCurrentAttempt && job.failure?.retryable && job.retryCount < 3 && (
+                        <button
+                          className="text-button"
+                          type="button"
+                          onClick={() => actions.retryJob(job.id)}
+                          disabled={state.busy}
+                        >
                           重试
                         </button>
                       )}
-                      {!["SUCCEEDED", "FAILED", "CANCELLED", "CANCEL_REQUESTED"].includes(job.state) && (
-                        <button className="text-button muted" type="button" onClick={() => actions.cancelJob(job.id)}>
+                      {job.isCurrentAttempt &&
+                        !["SUCCEEDED", "FAILED", "CANCELLED", "CANCEL_REQUESTED"].includes(job.state) && (
+                        <button
+                          className="text-button muted"
+                          type="button"
+                          onClick={() => actions.cancelJob(job.id)}
+                          disabled={state.busy}
+                        >
                           取消
                         </button>
                       )}
-                      {job.state === "CANCEL_REQUESTED" && (
-                        <button className="text-button" type="button" onClick={() => actions.confirmCancelJob(job.id)}>
+                      {job.isCurrentAttempt && job.state === "CANCEL_REQUESTED" && (
+                        <button
+                          className="text-button"
+                          type="button"
+                          onClick={() => actions.confirmCancelJob(job.id)}
+                          disabled={state.busy}
+                        >
                           确认取消终态
                         </button>
                       )}
-                      {job.state === "CANCELLED" && <span className="table-done">已确认取消</span>}
-                      {job.state === "FAILED" && <span className="table-done">需新建 attempt</span>}
-                      {job.state === "SUCCEEDED" && <span className="table-done">已归档 CAS</span>}
+                      {job.isCurrentAttempt && job.state === "CANCELLED" && (
+                        <>
+                          <span className="table-done">已确认取消</span>
+                          <button
+                            className="text-button attempt-action"
+                            type="button"
+                            aria-label={`为 ${job.shot} 创建新 attempt`}
+                            onClick={() => void actions.createJobAttempt(job.id)}
+                            disabled={state.busy}
+                          >
+                            创建新 attempt
+                          </button>
+                        </>
+                      )}
+                      {job.isCurrentAttempt && job.state === "FAILED" && (
+                        <>
+                          <span className="table-done needs-attempt">需新建 attempt</span>
+                          <button
+                            className="text-button attempt-action"
+                            type="button"
+                            aria-label={`为 ${job.shot} 创建新 attempt`}
+                            onClick={() => void actions.createJobAttempt(job.id)}
+                            disabled={state.busy}
+                          >
+                            创建新 attempt
+                          </button>
+                        </>
+                      )}
+                      {!job.isCurrentAttempt && (
+                        <span className="table-done history-preserved">历史终态已保留</span>
+                      )}
+                      {job.isCurrentAttempt && job.state === "SUCCEEDED" && (
+                        <span className="table-done">已归档 CAS</span>
+                      )}
                     </div>
                   </td>
                 </tr>

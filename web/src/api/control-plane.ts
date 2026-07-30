@@ -2,6 +2,8 @@ import {
   ApiProblem,
   type ApprovalInput,
   type ApprovalResult,
+  type CreateJobAttemptInput,
+  type CreateJobAttemptResult,
   type CreateProjectInput,
   type CreateProjectResult,
   type Gate,
@@ -15,6 +17,7 @@ export interface ControlPlaneApi {
   getProviderStatus(): Promise<ProviderCapability[]>;
   createSeries(input: CreateProjectInput, idempotencyKey: string): Promise<CreateProjectResult>;
   createApproval(input: ApprovalInput): Promise<ApprovalResult>;
+  createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult>;
   regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult>;
   simulateConcurrentUpdate(gateId: GateId): Promise<number>;
 }
@@ -47,9 +50,25 @@ const payloadFingerprint = (input: ApprovalInput) =>
     bindings: input.bindings.map((item) => [item.objectType, item.revisionId, item.contentHash]),
   });
 
+const jobAttemptFingerprint = (input: CreateJobAttemptInput) =>
+  JSON.stringify({
+    sourceJobId: input.sourceJob.id,
+    shotId: input.sourceJob.shotId,
+    nextAttempt: input.nextAttempt,
+    generationAttemptId: input.generationAttemptId,
+    capability: input.sourceJob.capability,
+    model: input.sourceJob.model,
+  });
+
+const sha256 = async (seed: string) => {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(seed));
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+};
+
 export class MockControlPlaneApi implements ControlPlaneApi {
   private gates: Record<GateId, Gate>;
   private idempotency = new Map<string, { fingerprint: string; result: ApprovalResult }>();
+  private jobAttempts = new Map<string, { fingerprint: string; result: CreateJobAttemptResult }>();
   private staleGates = new Set<GateId>();
 
   constructor(seed: Record<GateId, Gate> = fixtureGates) {
@@ -156,6 +175,53 @@ export class MockControlPlaneApi implements ControlPlaneApi {
       expectedRevision: gate.etag,
     };
     this.idempotency.set(input.idempotencyKey, { fingerprint, result });
+    return structuredClone(result);
+  }
+
+  async createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult> {
+    await Promise.resolve();
+    const fingerprint = jobAttemptFingerprint(input);
+    const existing = this.jobAttempts.get(input.idempotencyKey);
+    if (existing) {
+      if (existing.fingerprint !== fingerprint) {
+        throw problem(
+          409,
+          "conflict",
+          "同一 Idempotency-Key 被用于不同的创作 attempt。",
+          "生成新的幂等键后重新提交，不要修改已持久化的 attempt。",
+        );
+      }
+      return structuredClone(existing.result);
+    }
+    if (
+      !input.sourceJob.isCurrentAttempt ||
+      (input.sourceJob.state !== "FAILED" && input.sourceJob.state !== "CANCELLED")
+    ) {
+      throw problem(
+        422,
+        "RUN_TERMINAL_REQUIRED",
+        "只有当前 FAILED 或 CANCELLED Job 可以创建替代 attempt。",
+        "选择当前终态任务，或对可重试故障沿用原 Job ID。",
+      );
+    }
+    if (input.nextAttempt !== input.sourceJob.attempt + 1) {
+      throw problem(
+        409,
+        "REVISION_CONFLICT",
+        "新 attempt 序号必须严格递增。",
+        "刷新任务投影后从最新 attempt 创建替代任务。",
+      );
+    }
+
+    const suffix = input.sourceJob.shotId.replace(/^shot-/, "");
+    const result: CreateJobAttemptResult = {
+      providerJobId: `job-v-${suffix}-a${input.nextAttempt}`,
+      generationAttemptId: input.generationAttemptId,
+      state: "QUEUED",
+      traceId: `trc_attempt_${suffix}_a${input.nextAttempt}`,
+      createdAt: new Date().toISOString(),
+    };
+    this.jobAttempts.set(input.idempotencyKey, { fingerprint, result });
     return structuredClone(result);
   }
 
@@ -286,6 +352,71 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
       throw await this.readProblem(response);
     }
     return (await response.json()) as ApprovalResult;
+  }
+
+  async createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult> {
+    const [inputHash, capabilityHash] = await Promise.all([
+      sha256(`${input.sourceJob.shotId}:${input.nextAttempt}:${input.generationAttemptId}`),
+      sha256(`${input.sourceJob.capability}:${input.sourceJob.model}`),
+    ]);
+    const response = await fetch(`${this.baseUrl}/provider-jobs`, {
+      method: "POST",
+      credentials: "omit",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": input.idempotencyKey,
+      },
+      body: JSON.stringify({
+        schemaVersion: "v1",
+        generationAttemptId: input.generationAttemptId,
+        generationPlanId: "00000000-0000-4000-8000-000000000301",
+        capability: input.sourceJob.capability,
+        inputHash,
+        routeSnapshot: {
+          capabilityAlias: input.sourceJob.capability,
+          providerProfileId: "00000000-0000-4000-8000-000000000401",
+          provider: input.sourceJob.provider,
+          modelId: input.sourceJob.model,
+          routeVersion: "route-v4",
+          capabilityHash,
+        },
+        requestSnapshot: {
+          shotId: input.sourceJob.shotId,
+          creativeAttempt: input.nextAttempt,
+          supersedesProviderJobId: input.sourceJob.id,
+          evidence: input.sourceJob.evidence,
+        },
+        actor: { actorId: "local-creator", role: "CREATOR" },
+      }),
+    });
+    if (!response.ok) {
+      throw await this.readProblem(response);
+    }
+    const job = (await response.json()) as {
+      providerJobId: string;
+      generationAttemptId: string;
+      state: string;
+      traceId: string;
+      createdAt: string;
+      upstreamTaskId?: string;
+    };
+    if (job.state !== "QUEUED") {
+      throw problem(
+        502,
+        "PROJECTION_STATE_UNSUPPORTED",
+        `新 Provider Job 返回了未就绪状态 ${job.state}。`,
+        "重新加载任务投影，确认控制面已完成持久化与提交。",
+      );
+    }
+    return {
+      providerJobId: job.providerJobId,
+      generationAttemptId: job.generationAttemptId,
+      state: "QUEUED",
+      traceId: job.traceId,
+      createdAt: job.createdAt,
+      taskId: job.upstreamTaskId,
+    };
   }
 
   async regenerateGate(): Promise<RegenerationResult> {

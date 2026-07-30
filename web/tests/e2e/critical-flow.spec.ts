@@ -1,4 +1,13 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+
+async function approveG1AndG2(page: Page) {
+  await page.getByRole("button", { name: "内容与资产 G1" }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r7" }).click();
+  await page.getByRole("button", { name: "剧本与分镜 G2" }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r9" }).click();
+}
 
 test("creator completes the three non-bypassable gates in order", async ({ page }) => {
   await page.goto("/");
@@ -166,6 +175,73 @@ test("terminal Provider states survive later callbacks and batch completion", as
   await expect(failedRow.getByText("失败", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "成片审核 G3" }).click();
   await expect(page.getByRole("button", { name: "等待上游" })).toBeDisabled();
+});
+
+test("FAILED creates a new Job attempt, preserves the old terminal row, and unlocks G3 only after success", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await approveG1AndG2(page);
+  await page.getByRole("button", { name: "任务中心" }).click();
+
+  await page.getByRole("button", { name: /失败.*FAILED 终态/ }).click();
+  const oldJob = page.getByRole("row").filter({ has: page.getByText("job-v-032", { exact: true }) });
+  await expect(oldJob.getByText("失败", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "为 S03-02 创建新 attempt" }).click();
+
+  await expect(page.getByText("S03-02 attempt 2 已创建")).toBeVisible();
+  await expect(oldJob.getByText("失败", { exact: true })).toBeVisible();
+  await expect(oldJob.getByText("历史 attempt", { exact: true })).toBeVisible();
+  await expect(oldJob.getByText("历史终态已保留", { exact: true })).toBeVisible();
+  const newJob = page.getByRole("row").filter({ has: page.getByText("job-v-032-a2", { exact: true }) });
+  await expect(newJob.getByText("当前 attempt", { exact: true })).toBeVisible();
+  await expect(newJob.getByText("排队中", { exact: true })).toBeVisible();
+  await expect(newJob.getByText("attempt 2 · retry 0", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "成片审核 G3" }).click();
+  await expect(page.getByRole("button", { name: "等待上游" })).toBeDisabled();
+  await page.getByRole("button", { name: "任务中心" }).click();
+  await page.getByRole("button", { name: "完成 Mock 排练" }).click();
+
+  await expect(oldJob.getByText("失败", { exact: true })).toBeVisible();
+  await expect(newJob.getByText("已完成", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "成片审核 G3" }).click();
+  await expect(page.getByRole("button", { name: "开始审核" })).toBeEnabled();
+});
+
+test("CANCELLED creates a new Job attempt while its old evidence remains immutable", async ({ page }) => {
+  await page.goto("/");
+  await approveG1AndG2(page);
+  await page.getByRole("button", { name: "任务中心" }).click();
+
+  await page.getByRole("button", { name: /取消.*CANCELLED 终态/ }).click();
+  const oldJob = page.getByRole("row").filter({ has: page.getByText("job-v-032", { exact: true }) });
+  await expect(oldJob.getByText("已取消", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "为 S03-02 创建新 attempt" }).click();
+
+  await expect(oldJob.getByText("已取消", { exact: true })).toBeVisible();
+  await expect(oldJob.getByText("历史终态已保留", { exact: true })).toBeVisible();
+  const newJob = page.getByRole("row").filter({ has: page.getByText("job-v-032-a2", { exact: true }) });
+  await expect(newJob.getByText("attempt 2 · retry 0", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "完成 Mock 排练" }).click();
+  await expect(newJob.getByText("已完成", { exact: true })).toBeVisible();
+  await expect(oldJob.getByText("已取消", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: "成片审核 G3" }).click();
+  await expect(page.getByRole("button", { name: "开始审核" })).toBeEnabled();
+});
+
+test("429 infrastructure retry keeps the same Job ID and creative attempt", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "任务中心" }).click();
+  await page.getByRole("button", { name: /429.*限流等待/ }).click();
+
+  const job = page.getByRole("row").filter({ has: page.getByText("job-v-032", { exact: true }) });
+  await job.getByRole("button", { name: "重试" }).click();
+  await expect(job.getByText("job-v-032", { exact: true })).toBeVisible();
+  await expect(job.getByText("attempt 1 · retry 2", { exact: true })).toBeVisible();
+  await expect(page.getByText("job-v-032-a2", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("5 个当前任务", { exact: true })).toBeVisible();
 });
 
 test("project dialog traps focus, closes on Escape, and restores the trigger", async ({ page }) => {
