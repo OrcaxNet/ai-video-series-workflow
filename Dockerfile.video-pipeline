@@ -1,0 +1,24 @@
+# syntax=docker/dockerfile:1.7
+# One reproducible multi-stage build for the isolated video-pipeline binaries.
+FROM golang:1.26-alpine AS dependencies
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+
+FROM dependencies AS build
+ARG TARGET
+COPY . .
+RUN test -n "${TARGET}" \
+ && CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" \
+      -o /out/service "./cmd/${TARGET}"
+
+FROM alpine:3.20 AS runtime
+RUN apk add --no-cache ca-certificates wget \
+ && addgroup -g 10001 -S vpipe \
+ && adduser -u 10001 -S vpipe -G vpipe \
+ && mkdir -p /var/lib/video-pipeline/artifacts \
+ && chown -R vpipe:vpipe /var/lib/video-pipeline
+COPY --from=build --chown=vpipe:vpipe /out/service /usr/local/bin/video-service
+WORKDIR /var/lib/video-pipeline
+USER 10001:10001
+ENTRYPOINT ["/usr/local/bin/video-service"]

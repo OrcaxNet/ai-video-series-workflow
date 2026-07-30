@@ -64,10 +64,19 @@ func main() {
 		result, err = validatePlan(*planPath)
 	case "scan":
 		result, err = scanRepository([]string{
-			"cmd/provider-preflight",
-			"docs/flo-110",
-			"internal/providercontract",
-			"scripts/flo110-preflight.sh",
+			".github",
+			"cmd",
+			"docs",
+			"internal",
+			"scripts",
+			"video-pipeline",
+			".dockerignore",
+			".gitignore",
+			"Dockerfile.video-pipeline",
+			"Makefile",
+			"README.md",
+			"go.mod",
+			"go.sum",
 		})
 	case "live-auth":
 		result, err = runLiveAuth(ctx, *confirmLive)
@@ -106,6 +115,8 @@ func runMock(ctx context.Context) (report, error) {
 		{name: "timeout", scenario: providercontract.FakeTimeout, want: providercontract.CodeTimeout},
 		{name: "quota exhausted", scenario: providercontract.FakeQuotaExceeded, want: providercontract.CodeQuotaExceeded},
 		{name: "content blocked", scenario: providercontract.FakeContentBlocked, want: providercontract.CodeContentBlocked},
+		{name: "region unavailable", scenario: providercontract.FakeRegionUnavailable, want: providercontract.CodeRegionUnavailable},
+		{name: "model unavailable", scenario: providercontract.FakeModelUnavailable, want: providercontract.CodeModelUnavailable},
 	}
 	for _, scenario := range errorScenarios {
 		_, err := providercontract.NewFakeProvider(scenario.scenario).Submit(ctx, mockRequest())

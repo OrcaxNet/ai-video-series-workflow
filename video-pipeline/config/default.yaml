@@ -1,0 +1,162 @@
+schemaVersion: v1
+environment: development
+
+controlPlane:
+  httpAddressEnv: VIDEO_CONTROL_PLANE_HTTP_ADDRESS
+  postgresAddressEnv: VIDEO_POSTGRES_ADDRESS
+  temporalAddressEnv: VIDEO_TEMPORAL_ADDRESS
+  artifactRootEnv: VIDEO_ARTIFACT_ROOT
+  providerAdapterUrlEnv: VIDEO_PROVIDER_ADAPTER_URL
+  dependencyTimeout: 2s
+  shutdownTimeout: 10s
+
+temporal:
+  namespace: default
+  taskQueue: video-production-v1
+  workflowName: video.production.episode.v1
+  infrastructureRetry:
+    initialInterval: 1s
+    backoffCoefficient: 2
+    maximumInterval: 30s
+    maximumAttempts: 3
+    honorRetryAfter: true
+    nonRetryableErrorTypes:
+      - VALIDATION_ERROR
+      - LICENSE_BLOCKED
+      - budget_exceeded
+      - unauthenticated
+      - forbidden
+      - quota_exceeded
+      - content_blocked
+      - region_unavailable
+      - model_unavailable
+  providerJob:
+    saveIntentBeforeSubmit: true
+    unknownMeansReconcile: true
+    reuseUpstreamTaskId: true
+    callbackAndPollingMayCoexist: true
+
+artifactStore:
+  scheme: cas://sha256
+  localLayout: sha256/{digest[0:2]}/{digest}
+  writeMode: immutable-atomic-rename
+  expansionAdapter: s3-compatible
+  rejectTemporarySignedUrlsInHistory: true
+
+providerRouting:
+  defaultMode: dry-run
+  automaticCrossProviderFailover: false
+  localGenerativeInference: disabled
+  credentialPolicy:
+    sources: [explicit-environment, secret-store-reference]
+    scanDeveloperConfig: false
+    persistPlaintext: false
+    exposeToFrontend: false
+  providers:
+    mock:
+      mode: mock
+      enabled: true
+      requiresCredential: false
+      adapterUrlEnv: VIDEO_PROVIDER_ADAPTER_URL
+    volcengine:
+      mode: live
+      priority: 1
+      enabledWhenSecretPresent: true
+      arkApiKeyEnv: ARK_API_KEY
+      speechAppIdEnv: DOUBAO_TTS_APP_ID
+      speechAccessTokenEnv: DOUBAO_TTS_ACCESS_TOKEN
+    claude:
+      mode: live
+      priority: 2
+      capabilities: [text.primary]
+      implementationStatus: planned_not_enabled
+      sdk: github.com/anthropics/anthropic-sdk-go
+      allowOpenAICompatibleShim: false
+      enabledWhenSecretPresent: true
+      baseUrlEnv: ANTHROPIC_BASE_URL
+      apiKeyEnv: ANTHROPIC_API_KEY
+      authTokenEnv: ANTHROPIC_AUTH_TOKEN
+      modelEnv: ANTHROPIC_MODEL
+      scanClaudeCodeConfig: false
+  routes:
+    text.primary:
+      preferredProvider: volcengine
+      explicitFallbackProvider: claude
+      mockModel: fixture-text-v1
+    image.primary:
+      preferredProvider: volcengine
+      mockModel: fixture-image-v1
+    video.primary:
+      preferredProvider: volcengine
+      mockModel: fixture-video-v1
+    speech.primary:
+      preferredProvider: volcengine
+      mockModel: fixture-speech-v1
+  snapshotRules:
+    persist:
+      - capability alias
+      - provider profile ID
+      - actual model or endpoint ID
+      - route version
+      - capability snapshot hash
+      - request ID and upstream task ID
+    neverPersist:
+      - authorization header
+      - API key
+      - credential value
+      - temporary signed URL
+
+generationProfile:
+  stage: M0
+  status: ACTIVE
+  generationExecution: remote-provider-api
+  localCPUProcessing:
+    allowed: true
+    tools: [ffmpeg, ffprobe]
+    operations: [download, checksum, transcode, concatenate, mix, subtitles, package]
+  capabilityValidatedParameters:
+    aspectRatio: "16:9"
+    resolution: 720p
+    episodeTarget: 45-60s
+    shotDuration: 4-6s
+  requiredGates: [G1, G2, Q1, G3]
+  creativeAttemptPolicy:
+    retryInfrastructureWithSameJobId: true
+    promptAssetOrModelChangeCreatesNewAttempt: true
+    automaticProviderSwitch: false
+
+budgetPolicy:
+  requirePlanBeforeSubmit: true
+  requireHumanConfirmation: true
+  reserveEstimateUpperBound: true
+  unknownPriceRequiresConfirmation: true
+  projectLimitRequired: true
+  runLimitRequired: true
+  perShotRetryLimitRequired: true
+  initialVideoConcurrency: 1
+  probeShotBeforeBatch: true
+
+mockProvider:
+  fixedResponseVersion: v1
+  scenarios:
+    - success
+    - slow_success
+    - timeout
+    - unauthorized
+    - forbidden
+    - rate_limited
+    - provider_unavailable
+    - quota_exhausted
+    - budget_exceeded
+    - content_blocked
+    - region_unavailable
+    - model_unavailable
+    - duplicate_callback
+    - cancel_race
+    - recovery
+
+licensePolicy:
+  unknownItemsAllowed: 0
+  voiceCloneWrittenConsentRequired: true
+  aiDisclosureRequired: true
+  provenanceManifestRequired: true

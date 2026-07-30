@@ -1,0 +1,373 @@
+asyncapi: 3.0.0
+info:
+  title: AI Video Series Workflow Production Events
+  version: 1.0.0
+  description: |
+    At-least-once domain events published from the PostgreSQL transactional
+    outbox. Consumers deduplicate by eventId and reject unsupported
+    schemaVersion values. Temporal history is execution truth; these events are
+    query/UI/integration projections and never replace Workflow commands.
+defaultContentType: application/json
+servers:
+  local:
+    host: localhost:9092
+    protocol: kafka
+    description: Optional local event transport; the outbox is authoritative until published.
+channels:
+  productionEvents:
+    address: video.production.events.v1
+    messages:
+      revisionCreated:
+        $ref: "#/components/messages/RevisionCreated"
+      approvalDecided:
+        $ref: "#/components/messages/ApprovalDecided"
+      runStateChanged:
+        $ref: "#/components/messages/RunStateChanged"
+      providerJobStateChanged:
+        $ref: "#/components/messages/ProviderJobStateChanged"
+      costLedgerRecorded:
+        $ref: "#/components/messages/CostLedgerRecorded"
+      artifactCommitted:
+        $ref: "#/components/messages/ArtifactCommitted"
+      qcCompleted:
+        $ref: "#/components/messages/QCCompleted"
+      dependencyStale:
+        $ref: "#/components/messages/DependencyStale"
+      manifestLocked:
+        $ref: "#/components/messages/ManifestLocked"
+operations:
+  publishProductionEvents:
+    action: send
+    channel:
+      $ref: "#/channels/productionEvents"
+    messages:
+      - $ref: "#/channels/productionEvents/messages/revisionCreated"
+      - $ref: "#/channels/productionEvents/messages/approvalDecided"
+      - $ref: "#/channels/productionEvents/messages/runStateChanged"
+      - $ref: "#/channels/productionEvents/messages/providerJobStateChanged"
+      - $ref: "#/channels/productionEvents/messages/costLedgerRecorded"
+      - $ref: "#/channels/productionEvents/messages/artifactCommitted"
+      - $ref: "#/channels/productionEvents/messages/qcCompleted"
+      - $ref: "#/channels/productionEvents/messages/dependencyStale"
+      - $ref: "#/channels/productionEvents/messages/manifestLocked"
+components:
+  messages:
+    RevisionCreated:
+      name: video.revision.created.v1
+      title: Immutable revision created
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.revision.created.v1
+              data:
+                $ref: "#/components/schemas/RevisionData"
+    ApprovalDecided:
+      name: video.approval.decided.v1
+      title: G1/G2/Q1/G3 decision recorded
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.approval.decided.v1
+              data:
+                type: object
+                required: [decisionId, gate, decision, bindings]
+                properties:
+                  decisionId:
+                    type: string
+                    format: uuid
+                  gate:
+                    enum: [G1, G2, Q1, G3]
+                  decision:
+                    enum: [APPROVED, REJECTED, RETURNED]
+                  reasonCode:
+                    type: string
+                  bindings:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RevisionRef"
+    RunStateChanged:
+      name: video.run.state-changed.v1
+      title: Generation run entered a new durable state
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.run.state-changed.v1
+              data:
+                type: object
+                required: [runId, shotSpecRevisionId, state, creativeAttempt]
+                properties:
+                  runId:
+                    type: string
+                    format: uuid
+                  shotSpecRevisionId:
+                    type: string
+                    format: uuid
+                  state:
+                    enum: [DRAFT, VALIDATED, QUEUED, RUNNING, UNKNOWN, RECONCILING, REQUIRES_ACTION, CANCEL_REQUESTED, CANCELLED, SUCCEEDED, FAILED]
+                  creativeAttempt:
+                    type: integer
+                  failureClass:
+                    enum: [INFRASTRUCTURE, TRANSIENT, CREATIVE, INPUT, LICENSE, BUDGET, AUTHENTICATION, PERMISSION, QUOTA, RATE_LIMIT, CONTENT_SAFETY, REGION, MODEL]
+                  failureCode:
+                    type: string
+    ProviderJobStateChanged:
+      name: video.provider-job.state-changed.v1
+      title: Remote provider task entered a new durable state
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.provider-job.state-changed.v1
+              data:
+                type: object
+                required:
+                  [providerJobId, generationAttemptId, capability, state, modelSnapshot, retryCount]
+                properties:
+                  providerJobId:
+                    type: string
+                    format: uuid
+                  generationAttemptId:
+                    type: string
+                    format: uuid
+                  capability:
+                    enum: [text.primary, image.primary, video.primary, speech.primary]
+                  state:
+                    enum: [DRAFT, VALIDATED, QUEUED, RUNNING, SUCCEEDED, FAILED, UNKNOWN, REQUIRES_ACTION, CANCELLED]
+                  upstreamTaskId:
+                    type: string
+                  upstreamRequestId:
+                    type: string
+                  progress:
+                    type: integer
+                    minimum: 0
+                    maximum: 100
+                  retryCount:
+                    type: integer
+                    minimum: 0
+                    maximum: 3
+                  modelSnapshot:
+                    type: object
+                    required: [provider, modelId, routeVersion, capabilityHash]
+                    properties:
+                      provider:
+                        type: string
+                      modelId:
+                        type: string
+                      endpointId:
+                        type: string
+                      routeVersion:
+                        type: string
+                      capabilityHash:
+                        $ref: "#/components/schemas/SHA256"
+                  errorCode:
+                    enum:
+                      [unauthenticated, forbidden, rate_limited, quota_exceeded, budget_exceeded, content_blocked, region_unavailable, model_unavailable, provider_unavailable, invalid_request, timeout]
+                  nextPollAt:
+                    type: string
+                    format: date-time
+    CostLedgerRecorded:
+      name: video.cost-ledger.recorded.v1
+      title: Estimated, reserved, actual, released, or adjusted provider cost
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.cost-ledger.recorded.v1
+              data:
+                type: object
+                required: [providerJobId, entryType, pricingRuleVersion, verified]
+                properties:
+                  providerJobId:
+                    type: string
+                    format: uuid
+                  entryType:
+                    enum: [ESTIMATE, RESERVATION, ACTUAL, RELEASE, ADJUSTMENT]
+                  amountMicros:
+                    type: integer
+                    minimum: 0
+                  currency:
+                    type: string
+                    pattern: '^[A-Z]{3}$'
+                  units:
+                    type: number
+                    minimum: 0
+                  unitName:
+                    type: string
+                  pricingRuleVersion:
+                    type: string
+                  verified:
+                    type: boolean
+    ArtifactCommitted:
+      name: video.artifact.committed.v1
+      title: Immutable output committed to content-addressed storage
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.artifact.committed.v1
+              data:
+                type: object
+                required: [artifactId, contentHash, artifactUri, mediaType, sizeBytes]
+                properties:
+                  artifactId:
+                    type: string
+                    format: uuid
+                  contentHash:
+                    $ref: "#/components/schemas/SHA256"
+                  artifactUri:
+                    type: string
+                  mediaType:
+                    type: string
+                  sizeBytes:
+                    type: integer
+    QCCompleted:
+      name: video.qc.completed.v1
+      title: Automatic quality-control result
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.qc.completed.v1
+              data:
+                type: object
+                required: [qcReportId, runId, state, thresholdVersion, reasonCodes]
+                properties:
+                  qcReportId:
+                    type: string
+                    format: uuid
+                  runId:
+                    type: string
+                    format: uuid
+                  state:
+                    enum: [PASSED, FAILED, NEEDS_REVIEW]
+                  thresholdVersion:
+                    type: string
+                  reasonCodes:
+                    type: array
+                    items:
+                      type: string
+    DependencyStale:
+      name: video.dependency.stale.v1
+      title: Upstream change invalidated downstream consumers
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.dependency.stale.v1
+              data:
+                type: object
+                required: [sourceRevision, impacts]
+                properties:
+                  sourceRevision:
+                    $ref: "#/components/schemas/RevisionRef"
+                  impacts:
+                    type: array
+                    minItems: 1
+                    items:
+                      $ref: "#/components/schemas/RevisionRef"
+    ManifestLocked:
+      name: video.manifest.locked.v1
+      title: Shot or episode lineage manifest locked
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.manifest.locked.v1
+              data:
+                type: object
+                required: [manifestId, scopeType, scopeRevisionId, manifestHash]
+                properties:
+                  manifestId:
+                    type: string
+                    format: uuid
+                  scopeType:
+                    enum: [SHOT, EPISODE]
+                  scopeRevisionId:
+                    type: string
+                    format: uuid
+                  manifestHash:
+                    $ref: "#/components/schemas/SHA256"
+  schemas:
+    EventEnvelope:
+      type: object
+      required:
+        [schemaVersion, eventId, eventType, aggregateType, aggregateId, occurredAt, traceId, data]
+      properties:
+        schemaVersion:
+          const: v1
+        eventId:
+          type: string
+          format: uuid
+        eventType:
+          type: string
+        aggregateType:
+          type: string
+        aggregateId:
+          type: string
+          format: uuid
+        aggregateRevision:
+          type: integer
+          minimum: 1
+        occurredAt:
+          type: string
+          format: date-time
+        traceId:
+          type: string
+        causationId:
+          type: string
+        correlationId:
+          type: string
+        data:
+          type: object
+    RevisionData:
+      type: object
+      required: [objectType, revisionId, revision, contentHash, parentRevisionId]
+      properties:
+        objectType:
+          type: string
+        revisionId:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          minimum: 1
+        contentHash:
+          $ref: "#/components/schemas/SHA256"
+        parentRevisionId:
+          type: [string, "null"]
+          format: uuid
+    RevisionRef:
+      type: object
+      required: [objectType, revisionId, contentHash]
+      properties:
+        objectType:
+          type: string
+        revisionId:
+          type: string
+          format: uuid
+        contentHash:
+          $ref: "#/components/schemas/SHA256"
+    SHA256:
+      type: string
+      pattern: '^[0-9a-f]{64}$'

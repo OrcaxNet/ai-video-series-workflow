@@ -1,0 +1,199 @@
+name: ai-video-series-workflow
+
+services:
+  postgres:
+    image: postgres:16.4-alpine3.20
+    environment:
+      POSTGRES_USER: ${VIDEO_POSTGRES_USER:-video}
+      POSTGRES_PASSWORD: ${VIDEO_POSTGRES_PASSWORD:-video-local-only}
+      POSTGRES_DB: ${VIDEO_POSTGRES_DATABASE:-video_pipeline}
+    volumes:
+      - video-postgres:/var/lib/postgresql/data
+    ports:
+      - "${VIDEO_POSTGRES_PORT:-55432}:5432"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [video-backplane]
+    restart: unless-stopped
+
+  migrate:
+    image: migrate/migrate:v4.17.1
+    command:
+      - -path=/migrations
+      - -database=postgres://${VIDEO_POSTGRES_USER:-video}:${VIDEO_POSTGRES_PASSWORD:-video-local-only}@postgres:5432/${VIDEO_POSTGRES_DATABASE:-video_pipeline}?sslmode=disable
+      - up
+    volumes:
+      - ./db/migrations:/migrations:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [video-backplane]
+    restart: "no"
+
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: ${VIDEO_POSTGRES_USER:-video}
+      POSTGRES_PWD: ${VIDEO_POSTGRES_PASSWORD:-video-local-only}
+      POSTGRES_SEEDS: postgres
+    ports:
+      - "${VIDEO_TEMPORAL_PORT:-7233}:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - tctl --address "$$(hostname -i):7233" cluster health | grep -q SERVING
+      interval: 10s
+      timeout: 5s
+      start_period: 20s
+      retries: 20
+    networks: [video-backplane]
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:2.31.2
+    profiles: [tools]
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:${VIDEO_TEMPORAL_UI_PORT:-8233}
+    ports:
+      - "${VIDEO_TEMPORAL_UI_PORT:-8233}:8080"
+    depends_on:
+      temporal:
+        condition: service_healthy
+    networks: [video-backplane]
+    restart: unless-stopped
+
+  mock-provider:
+    build:
+      context: ..
+      dockerfile: Dockerfile.video-pipeline
+      args:
+        TARGET: video-mock-provider
+    image: ai-video-series-mock-provider:${VIDEO_BUILD_VERSION:-dev}
+    environment:
+      VIDEO_MOCK_PROVIDER_HTTP_ADDRESS: :8090
+      VIDEO_MOCK_PROVIDER_ID: mock-local-v1
+      VIDEO_MOCK_PROVIDER_CAPABILITIES: text.primary,image.primary,video.primary,speech.primary
+      VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+    volumes:
+      - video-artifacts:/var/lib/video-pipeline/artifacts
+    ports:
+      - "${VIDEO_MOCK_PROVIDER_PORT:-8090}:8090"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8090/health/ready
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [video-backplane]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  orchestrator-worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile.video-pipeline
+      args:
+        TARGET: video-orchestrator-worker
+    image: ai-video-series-orchestrator-worker:${VIDEO_BUILD_VERSION:-dev}
+    environment:
+      VIDEO_TEMPORAL_ADDRESS: temporal:7233
+      VIDEO_TEMPORAL_NAMESPACE: default
+      VIDEO_TEMPORAL_TASK_QUEUE: video-production-v1
+      VIDEO_PROVIDER_ADAPTER_URL: http://mock-provider:8090
+    depends_on:
+      temporal:
+        condition: service_healthy
+      mock-provider:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [video-backplane]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  control-plane:
+    build:
+      context: ..
+      dockerfile: Dockerfile.video-pipeline
+      args:
+        TARGET: video-control-plane
+    image: ai-video-series-control-plane:${VIDEO_BUILD_VERSION:-dev}
+    environment:
+      VIDEO_ENVIRONMENT: local
+      VIDEO_BUILD_VERSION: ${VIDEO_BUILD_VERSION:-dev}
+      VIDEO_CONTROL_PLANE_HTTP_ADDRESS: :8080
+      VIDEO_POSTGRES_ADDRESS: postgres:5432
+      VIDEO_TEMPORAL_ADDRESS: temporal:7233
+      VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+      VIDEO_PROVIDER_ADAPTER_URL: http://mock-provider:8090
+      VIDEO_REQUIRE_DEPENDENCIES: "true"
+    volumes:
+      - video-artifacts:/var/lib/video-pipeline/artifacts
+    ports:
+      - "${VIDEO_CONTROL_PLANE_PORT:-18080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+      mock-provider:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8080/health/ready
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [video-backplane]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+networks:
+  video-backplane:
+    name: ai-video-series-backplane
+    driver: bridge
+
+volumes:
+  video-postgres:
+    name: ${VIDEO_POSTGRES_VOLUME:-ai-video-series-postgres}
+  video-artifacts:
+    name: ${VIDEO_ARTIFACT_VOLUME:-ai-video-series-artifacts}

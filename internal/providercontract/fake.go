@@ -18,6 +18,8 @@ const (
 	FakeTimeout           FakeScenario = "timeout"
 	FakeQuotaExceeded     FakeScenario = "quota_exceeded"
 	FakeContentBlocked    FakeScenario = "content_blocked"
+	FakeRegionUnavailable FakeScenario = "region_unavailable"
+	FakeModelUnavailable  FakeScenario = "model_unavailable"
 	FakeDuplicateCallback FakeScenario = "duplicate_callback"
 	FakeCancelRace        FakeScenario = "cancel_race"
 	FakeRecovery          FakeScenario = "recovery"
@@ -71,6 +73,31 @@ func (f *FakeProvider) Discover(context.Context) ([]Capability, error) {
 		NativeFPS:              []int{24},
 		Verification:           "mock_only",
 	}}, nil
+}
+
+func (f *FakeProvider) Estimate(ctx context.Context, request EstimateRequest) (EstimateResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return EstimateResponse{}, MapContextError(err)
+	}
+	if request.Candidates < 1 || !request.Capability.Valid() {
+		return EstimateResponse{}, &Error{Code: CodeInvalidRequest, SafeMessage: "valid capability and positive candidates are required"}
+	}
+	if err := request.Model.Validate(request.Capability); err != nil {
+		return EstimateResponse{}, &Error{Code: CodeInvalidRequest, SafeMessage: err.Error()}
+	}
+	minimum := int64(request.Candidates * 100)
+	maximum := int64(request.Candidates * 150)
+	return EstimateResponse{
+		EstimateID:     fmt.Sprintf("fake-estimate-%s-%d", request.Capability, request.Candidates),
+		UnitsMinimum:   minimum,
+		UnitsMaximum:   maximum,
+		Unit:           "mock-units",
+		AmountMinimum:  &minimum,
+		AmountMaximum:  &maximum,
+		Currency:       "CNY",
+		PricingVersion: "mock-pricing-v1",
+		ValidUntil:     f.now().Add(15 * time.Minute).Format(time.RFC3339),
+	}, nil
 }
 
 func (f *FakeProvider) Submit(ctx context.Context, request GenerationRequest) (Job, error) {
@@ -187,6 +214,14 @@ func (f *FakeProvider) ApplyCallback(callback Callback) (applied bool, job Job, 
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if callback.EventID == "" || callback.JobID == "" ||
+		(callback.Status != StatusQueued &&
+			callback.Status != StatusRunning &&
+			callback.Status != StatusSucceeded &&
+			callback.Status != StatusFailed &&
+			callback.Status != StatusCancelled) {
+		return false, Job{}, &Error{Code: CodeInvalidRequest, SafeMessage: "valid callback event, job, and state are required"}
+	}
 	if _, duplicate := f.callbackEvents[callback.EventID]; duplicate {
 		record, ok := f.records[callback.JobID]
 		if !ok {
@@ -222,6 +257,10 @@ func (f *FakeProvider) scenarioError() error {
 		return &Error{Code: CodeQuotaExceeded, HTTPStatus: 429, SafeMessage: "provider quota is exhausted"}
 	case FakeContentBlocked:
 		return &Error{Code: CodeContentBlocked, HTTPStatus: 400, SafeMessage: "provider content policy blocked the request"}
+	case FakeRegionUnavailable:
+		return &Error{Code: CodeRegionUnavailable, HTTPStatus: 422, SafeMessage: "provider model is unavailable in the configured region"}
+	case FakeModelUnavailable:
+		return &Error{Code: CodeModelUnavailable, HTTPStatus: 422, SafeMessage: "provider model is unavailable"}
 	default:
 		return nil
 	}

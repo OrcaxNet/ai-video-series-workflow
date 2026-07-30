@@ -10,9 +10,9 @@ permissions:
   contents: read
 
 jobs:
-  provider-contract:
+  verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 25
     steps:
       - name: Check out source
         uses: actions/checkout@v6
@@ -23,11 +23,11 @@ jobs:
           go-version-file: go.mod
           cache: false
 
-      - name: Test with race detector
-        run: go test -race ./...
+      - name: Unit, race, contract, vet and secret checks
+        run: make video-test
 
-      - name: Vet
-        run: go vet ./...
-
-      - name: Run no-key preflight
-        run: ./scripts/flo110-preflight.sh
+      - name: No-key Compose smoke
+        run: |
+          trap 'make video-down' EXIT
+          make video-up
+          make video-smoke

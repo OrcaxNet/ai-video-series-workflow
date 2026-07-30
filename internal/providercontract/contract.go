@@ -22,11 +22,13 @@ const (
 type JobStatus string
 
 const (
-	StatusQueued    JobStatus = "queued"
-	StatusRunning   JobStatus = "running"
-	StatusSucceeded JobStatus = "succeeded"
-	StatusFailed    JobStatus = "failed"
-	StatusCancelled JobStatus = "cancelled"
+	StatusQueued         JobStatus = "queued"
+	StatusRunning        JobStatus = "running"
+	StatusSucceeded      JobStatus = "succeeded"
+	StatusFailed         JobStatus = "failed"
+	StatusUnknown        JobStatus = "unknown"
+	StatusRequiresAction JobStatus = "requires_action"
+	StatusCancelled      JobStatus = "cancelled"
 )
 
 func (s JobStatus) Terminal() bool {
@@ -54,6 +56,11 @@ type AssetRef struct {
 	URI              string    `json:"uri,omitempty"`
 	SHA256           string    `json:"sha256"`
 	LicenseReference string    `json:"license_reference"`
+	MediaType        string    `json:"media_type,omitempty"`
+	SizeBytes        int64     `json:"size_bytes,omitempty"`
+	Width            int       `json:"width,omitempty"`
+	Height           int       `json:"height,omitempty"`
+	DurationMillis   int64     `json:"duration_millis,omitempty"`
 }
 
 // ContextRefs pins reusable context snapshots without embedding provider fields
@@ -123,13 +130,16 @@ func (r GenerationRequest) Validate() error {
 }
 
 type Usage struct {
-	InputTokens        int64 `json:"input_tokens,omitempty"`
-	OutputTokens       int64 `json:"output_tokens,omitempty"`
-	VideoTokens        int64 `json:"video_tokens,omitempty"`
-	GeneratedImages    int64 `json:"generated_images,omitempty"`
-	GeneratedChars     int64 `json:"generated_chars,omitempty"`
-	GeneratedMillis    int64 `json:"generated_millis,omitempty"`
-	ProviderCostMicros int64 `json:"provider_cost_micros,omitempty"`
+	InputTokens        int64  `json:"input_tokens,omitempty"`
+	OutputTokens       int64  `json:"output_tokens,omitempty"`
+	VideoTokens        int64  `json:"video_tokens,omitempty"`
+	GeneratedImages    int64  `json:"generated_images,omitempty"`
+	GeneratedChars     int64  `json:"generated_chars,omitempty"`
+	GeneratedMillis    int64  `json:"generated_millis,omitempty"`
+	ProviderCostMicros int64  `json:"provider_cost_micros,omitempty"`
+	InputUnits         int64  `json:"input_units,omitempty"`
+	OutputUnits        int64  `json:"output_units,omitempty"`
+	Unit               string `json:"unit,omitempty"`
 }
 
 type Output struct {
