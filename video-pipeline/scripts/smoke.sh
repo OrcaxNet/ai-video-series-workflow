@@ -39,7 +39,13 @@ postgres_password="${VIDEO_POSTGRES_PASSWORD:-video-local-only}"
 postgres_database="${VIDEO_POSTGRES_DATABASE:-video_pipeline}"
 postgres_port="${VIDEO_POSTGRES_PORT:-55432}"
 VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
-  go test -tags=integration ./internal/videopipeline/repository
+  go test -count=1 -tags=integration ./internal/videopipeline/repository
+VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
+VIDEO_TEST_TEMPORAL_ADDRESS="127.0.0.1:7233" \
+VIDEO_TEST_PROVIDER_URL="${provider_url}" \
+  go test -count=1 -tags=integration \
+    -run TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage \
+    ./internal/videopipeline/repository
 
 temporal_container="${VIDEO_TEMPORAL_CONTAINER:-ai-video-series-workflow-temporal-1}"
 temporal_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${temporal_container}")"

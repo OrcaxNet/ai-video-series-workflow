@@ -5,7 +5,11 @@ package repository
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"sync"
@@ -16,9 +20,16 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/temporalcontrol"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.temporal.io/sdk/activity"
+	temporalclient "go.temporal.io/sdk/client"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/worker"
+	"go.temporal.io/sdk/workflow"
 )
 
 func TestPostgres_CreateSeriesIdempotencyAndAtomicEvidence(t *testing.T) {
@@ -807,6 +818,19 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if temporalAddress := os.Getenv("VIDEO_TEST_TEMPORAL_ADDRESS"); temporalAddress != "" {
+		testHTTPTemporalImmediateCancellation(
+			t,
+			ctx,
+			pool,
+			store,
+			temporalAddress,
+			os.Getenv("VIDEO_TEST_PROVIDER_URL"),
+			shotID.String(),
+			publicCommand,
+		)
+		return
+	}
 	publicOperation, err := store.CreateGenerationRun(
 		ctx, shotID.String(), 1, publicCommand,
 		controlplane.Idempotency{
@@ -974,6 +998,245 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if racedRun.State != "SUCCEEDED" || racedRun.FailureClass != "" || racedRun.FailureCode != "" {
 		t.Fatalf("terminal-success cancellation race = %#v", racedRun)
 	}
+}
+
+func testHTTPTemporalImmediateCancellation(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	store *Postgres,
+	temporalAddress string,
+	providerURL string,
+	shotID string,
+	command controlplane.CreateGenerationRunCommand,
+) {
+	t.Helper()
+	if providerURL == "" {
+		providerURL = "http://127.0.0.1:8090"
+	}
+	temporalClient, err := temporalclient.Dial(temporalclient.Options{
+		HostPort:  temporalAddress,
+		Namespace: "default",
+	})
+	if err != nil {
+		t.Fatalf("connect Temporal integration service: %v", err)
+	}
+	defer temporalClient.Close()
+	taskQueue := "video-http-cancel-" + uuid.NewString()
+	controller, err := temporalcontrol.New(temporalClient, taskQueue, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	newWorker := func(identity string) worker.Worker {
+		temporalWorker := worker.New(temporalClient, taskQueue, worker.Options{Identity: identity})
+		temporalWorker.RegisterWorkflowWithOptions(
+			orchestration.ShotProductionWorkflow,
+			workflow.RegisterOptions{Name: orchestration.ShotWorkflowName},
+		)
+		activities := orchestration.NewProductionActivities(providerURL, store, store, artifacts)
+		temporalWorker.RegisterActivityWithOptions(
+			activities.ExecuteProviderJob,
+			activity.RegisterOptions{Name: orchestration.ActivityExecuteProviderJob},
+		)
+		temporalWorker.RegisterActivityWithOptions(
+			activities.CancelProviderJob,
+			activity.RegisterOptions{Name: orchestration.ActivityCancelProviderJob},
+		)
+		return temporalWorker
+	}
+
+	// Establish a prior worker process, then stop it. HTTP create/cancel below is
+	// accepted by Temporal while no worker is polling; the replacement worker
+	// must replay the already-recorded cancellation without provider submission.
+	previousWorker := newWorker("prior-http-cancel-worker-" + uuid.NewString())
+	if err := previousWorker.Start(); err != nil {
+		t.Fatalf("start prior Temporal worker: %v", err)
+	}
+	previousWorker.Stop()
+
+	api := httptest.NewServer(
+		controlplane.NewWithRuntime(
+			runtimeconfig.ControlPlane{},
+			nil,
+			store,
+			controller,
+			nil,
+		).Handler(),
+	)
+	defer api.Close()
+	createBody, err := json.Marshal(command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createResponse := executeIntegrationRequest(
+		t,
+		http.MethodPost,
+		api.URL+controlplane.APIBase+"/shots/"+shotID+"/runs",
+		createBody,
+		map[string]string{
+			"Idempotency-Key": uuid.NewString(),
+			"If-Match":        `"1"`,
+		},
+	)
+	if createResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("create status=%d body=%s", createResponse.StatusCode, createResponse.Body)
+	}
+	var createOperation controlplane.Operation
+	if err := json.Unmarshal(createResponse.Body, &createOperation); err != nil {
+		t.Fatalf("decode create operation: %v body=%s", err, createResponse.Body)
+	}
+	if createOperation.State != "RUNNING" || createOperation.TemporalWorkflowID == "" {
+		t.Fatalf("create operation = %#v", createOperation)
+	}
+
+	cancelBody := []byte(
+		`{"actor":{"actorId":"operator","role":"OPERATOR"},"reasonCode":"IMMEDIATE_CANCEL"}`,
+	)
+	cancelKey := uuid.NewString()
+	var cancelOperation controlplane.Operation
+	for attempt := 1; attempt <= 2; attempt++ {
+		response := executeIntegrationRequest(
+			t,
+			http.MethodPost,
+			api.URL+controlplane.APIBase+"/runs/"+createOperation.AggregateID+"/cancel",
+			cancelBody,
+			map[string]string{
+				"Idempotency-Key": cancelKey,
+				"If-Match":        `"2"`,
+			},
+		)
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf(
+				"cancel attempt %d status=%d body=%s",
+				attempt,
+				response.StatusCode,
+				response.Body,
+			)
+		}
+		if attempt == 1 {
+			// Discarding the first response models a client-visible response
+			// loss; the same idempotency key must recover the operation.
+			continue
+		}
+		var replayed controlplane.Operation
+		if err := json.Unmarshal(response.Body, &replayed); err != nil {
+			t.Fatalf("decode cancel attempt %d: %v", attempt, err)
+		}
+		cancelOperation = replayed
+	}
+	var cancelOperationCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.operation_requests
+		WHERE aggregate_type = 'GENERATION_RUN'
+		  AND aggregate_id = $1
+		  AND operation_type = 'CANCEL_GENERATION_RUN'`,
+		createOperation.AggregateID,
+	).Scan(&cancelOperationCount); err != nil {
+		t.Fatal(err)
+	}
+	if cancelOperationCount != 1 || cancelOperation.OperationID == "" {
+		t.Fatalf(
+			"duplicate cancellation persisted %d operations; replay=%#v",
+			cancelOperationCount,
+			cancelOperation,
+		)
+	}
+
+	replacementWorker := newWorker("replacement-http-cancel-worker-" + uuid.NewString())
+	if err := replacementWorker.Start(); err != nil {
+		t.Fatalf("start replacement Temporal worker: %v", err)
+	}
+	defer replacementWorker.Stop()
+	workflowRun := temporalClient.GetWorkflow(ctx, createOperation.TemporalWorkflowID, "")
+	if err := workflowRun.Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
+		t.Fatalf("workflow completion error = %v, want Canceled", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		run, err := store.GetGenerationRun(ctx, createOperation.AggregateID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		createState, cancelState := "", ""
+		if err := pool.QueryRow(ctx, `
+			SELECT
+				(SELECT state FROM video_pipeline.operation_requests WHERE id = $1),
+				(SELECT state FROM video_pipeline.operation_requests WHERE id = $2)`,
+			createOperation.OperationID,
+			cancelOperation.OperationID,
+		).Scan(&createState, &cancelState); err != nil {
+			t.Fatal(err)
+		}
+		if run.State == "CANCELLED" &&
+			createState == "CANCELLED" &&
+			cancelState == "SUCCEEDED" {
+			if run.FailureClass != "" || run.FailureCode != "" {
+				t.Fatalf("cancelled run retained failure = %#v", run)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf(
+				"cancellation did not converge: run=%#v create=%s cancel=%s",
+				run,
+				createState,
+				cancelState,
+			)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	var providerJobs int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+		WHERE ga.generation_run_id = $1`,
+		createOperation.AggregateID,
+	).Scan(&providerJobs); err != nil {
+		t.Fatal(err)
+	}
+	if providerJobs != 0 {
+		t.Fatalf("provider jobs after immediate cancellation = %d, want 0", providerJobs)
+	}
+}
+
+type integrationHTTPResponse struct {
+	StatusCode int
+	Body       []byte
+}
+
+func executeIntegrationRequest(
+	t *testing.T,
+	method string,
+	url string,
+	body []byte,
+	headers map[string]string,
+) integrationHTTPResponse {
+	t.Helper()
+	request, err := http.NewRequest(method, url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer response.Body.Close()
+	responseBody, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return integrationHTTPResponse{StatusCode: response.StatusCode, Body: responseBody}
 }
 
 func TestPostgres_CreateSeriesRollsBackIdempotencyOnPolicyFailure(t *testing.T) {
