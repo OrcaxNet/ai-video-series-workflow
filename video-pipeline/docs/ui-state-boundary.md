@@ -14,7 +14,7 @@
 
 后端的 Q1 是逐镜头质量复核，UI 在任务/QC 视图中显示，但不替代三道剧集级闸门。任何角色都不能绕过许可、stale 或预算策略。
 
-审批按钮只在前置完成时可用；这只是即时反馈，控制面仍必须再次执行 RBAC、Gate、freshness、license、budget 和 ETag 校验。409/422 显示稳定 `errorCode`、建议动作与 `traceId`，不回显上游错误体。
+审批按钮只在前置完成时可用；这只是即时反馈，控制面仍必须再次执行 RBAC、Gate、freshness、license、budget 和 ETag 校验。409/422 显示稳定 `errorCode`、建议动作与 `traceId`，不回显上游错误体。`REVISION_CONFLICT` 的对账 revision 只读取冻结 Error schema 的 `affectedObjects[].currentRevision`；前端不得自行发明 Gate 查询路由。
 
 ## 2. Provider 与运行状态
 
@@ -31,6 +31,8 @@
 | REQUIRES_ACTION | 需要处理 | 按 auth/permission/quota/budget/content/region/model 类别处理 |
 
 派生的 `RETRYING` 和 `CANCEL_REQUESTED` 是面向用户的本地 projection，不改写冻结 ProviderJob enum；来源分别是错误+调度信息与 GenerationRun/Operation 的取消状态。
+
+`SUCCEEDED`、`FAILED`、`CANCELLED` 是不可回退终态。晚到/乱序 callback、重复事件、异常演练以及“完成批次”只能推进非终态 Job；遇到既有终态必须 no-op 并保留原更新时间、错误与费用证据。需要重做时创建新的 Job/creative attempt。
 
 ## 3. 错误映射
 
@@ -61,10 +63,11 @@ Mock 任务即使 SUCCEEDED 也保持 `mock_only`，不会升级为真实质量�
 1. 上游内容、资产、上下文和 Prompt 都只新增 revision。
 2. Gate decision 精确绑定 revision ID 和 content hash。
 3. 新 revision 通过 dependency graph 将消费者标为 stale，不覆盖已批准 revision。
-4. Prompt/资产“选择”创建新的业务引用；锁定只对后续新运行生效。
-5. 回滚选择历史 revision，不删除较新 revision、CAS artifact、cost ledger、audit 或 Manifest。
-6. 已提交 ProviderJob 不随应用回滚而撤销；reconciliation 继续使用原 task ID。
-7. G3 锁版后的修改产生新的 episode cut/Manifest revision，旧导出仍可验证。
+4. Prompt/资产“选择”创建新的业务引用；资产引用变化同时创建新的不可变 asset-set/G1 snapshot，更新精确 binding 和 hash，使 G1 重新待审并阻断 G2/G3。
+5. 受资产变化影响的镜头标记 stale；旧 G2 revision 不得再次批准，必须创建新的 G2 revision 吸收 Prompt/镜头影响。
+6. 回滚选择历史 revision，不删除较新 revision、CAS artifact、cost ledger、audit 或 Manifest。
+7. 已提交 ProviderJob 不随应用回滚而撤销；reconciliation 继续使用原 task ID。
+8. G3 锁版后的修改产生新的 episode cut/Manifest revision，旧导出仍可验证。
 
 ## 6. 浏览器安全边界
 

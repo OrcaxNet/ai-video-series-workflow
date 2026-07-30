@@ -345,9 +345,9 @@ export function AssetsPage() {
               <button
                 className="button button-primary"
                 type="button"
-                disabled={candidate.version === selected.version}
+                disabled={state.busy || candidate.version === selected.version}
                 onClick={() => {
-                  actions.lockAssetRevision(selected.id, candidate.version);
+                  void actions.lockAssetRevision(selected.id, candidate.version);
                   closeRevisionDialog();
                 }}
               >

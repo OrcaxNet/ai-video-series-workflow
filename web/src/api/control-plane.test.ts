@@ -1,7 +1,7 @@
-import { describe, expect, it } from "vitest";
-import type { ApprovalInput, GateId } from "../domain";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { ApiProblem, type ApprovalInput, type GateId } from "../domain";
 import { gates } from "../mock-data";
-import { MockControlPlaneApi } from "./control-plane";
+import { HttpControlPlaneApi, MockControlPlaneApi } from "./control-plane";
 
 const input = (
   gateId: GateId,
@@ -94,13 +94,16 @@ describe("MockControlPlaneApi", () => {
     });
   });
 
-  it("lets a stale client synchronize the current ETag and safely resubmit", async () => {
+  it("returns the frozen affectedObjects.currentRevision truth for safe conflict recovery", async () => {
     const api = new MockControlPlaneApi();
     await api.simulateConcurrentUpdate("G1");
 
-    const synchronized = await api.synchronizeGate("G1");
-    expect(synchronized).toMatchObject({ id: "G1", revision: 7, etag: 8 });
-    await expect(api.createApproval(input("G1", synchronized.etag, "fresh-client"))).resolves.toMatchObject({
+    const conflict = await api.createApproval(input("G1", 7, "stale-client")).catch((error: unknown) => error);
+    expect(conflict).toBeInstanceOf(ApiProblem);
+    expect((conflict as ApiProblem).affectedObjects).toEqual([
+      { objectType: "GATE", objectId: "G1", currentRevision: 8 },
+    ]);
+    await expect(api.createApproval(input("G1", 8, "fresh-client"))).resolves.toMatchObject({
       gate: "G1",
       decision: "APPROVED",
       expectedRevision: 9,
@@ -118,5 +121,58 @@ describe("MockControlPlaneApi", () => {
       revisionId: "gate-g1-r8",
       etag: 9,
     });
+  });
+
+  it("requires a new G2 revision after a regenerated G1 snapshot", async () => {
+    const api = new MockControlPlaneApi();
+    await api.createApproval(input("G1", 7, "g1-first"));
+    await api.createApproval(input("G2", 9, "g2-first"));
+    await api.regenerateGate("G1", 8);
+    await api.createApproval(input("G1", 9, "g1-new"));
+
+    await expect(api.createApproval(input("G2", 10, "g2-stale"))).rejects.toMatchObject({
+      status: 422,
+      errorCode: "STALE_DEPENDENCY",
+    });
+
+    await api.regenerateGate("G2", 10);
+    await expect(api.createApproval(input("G2", 11, "g2-new"))).resolves.toMatchObject({
+      gate: "G2",
+      decision: "APPROVED",
+    });
+  });
+});
+
+describe("HttpControlPlaneApi", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("uses the frozen conflict payload and never calls an invented gate read route", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          type: "https://errors.example/revision-conflict",
+          title: "Revision conflict",
+          status: 409,
+          detail: "G1 changed",
+          errorCode: "REVISION_CONFLICT",
+          retryable: false,
+          traceId: "trc-live-conflict",
+          suggestedAction: "Reconcile from affected objects",
+          affectedObjects: [{ objectType: "GATE", objectId: "G1", currentRevision: 12 }],
+        }),
+        { status: 409, headers: { "Content-Type": "application/problem+json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("/api/v1");
+
+    const conflict = await api.createApproval(input("G1", 7, "live-stale")).catch((error: unknown) => error);
+
+    expect(conflict).toBeInstanceOf(ApiProblem);
+    expect((conflict as ApiProblem).affectedObjects[0]?.currentRevision).toBe(12);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/approvals");
   });
 });

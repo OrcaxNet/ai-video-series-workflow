@@ -289,7 +289,7 @@ export const shots: Shot[] = [
     assetIds: ["asset-tideclock"],
     promptRevision: 4,
     contextHash: hash("shot-033-context"),
-    state: "STALE",
+    state: "READY",
   },
   {
     id: "shot-034",

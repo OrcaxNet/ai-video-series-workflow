@@ -49,8 +49,13 @@ VITE_STUDIO_MODE=live npm run dev
 - G1 未批准时 G2 不可审核；G2 与全部镜头未完成时 G3 不可审核。
 - 批准、退回和重生成都绑定精确 revision/hash；重生成只新增 revision。
 - Mock API 使用 `Idempotency-Key` 语义；同键同请求 replay，同键不同请求返回 409。
-- 审核携带 ETag；模拟并发更新后旧客户端得到 `REVISION_CONFLICT`，不会覆盖新版本。
+- 审核携带 ETag；`REVISION_CONFLICT` 通过冻结 Error schema 的
+  `affectedObjects[].currentRevision` 对账，不调用未定义的 Gate 查询路由。
+- 资产引用切换会创建新的不可变 G1/asset-set snapshot，使 G1 重新待审并阻断
+  G2/G3；同一 G2 revision 不能批准 stale 镜头。
 - 基础设施重试沿用同一 Provider Job；创意修改创建新的 attempt。
+- `SUCCEEDED`、`FAILED`、`CANCELLED` 是单调终态；晚到 callback、异常注入和批次
+  完成均不得覆盖，重做必须创建新的 Job/attempt。
 - Prompt“回滚”只切换下一次使用的 revision，不删除历史产物、费用或 Manifest。
 
 ## Secret 与权限边界

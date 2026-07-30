@@ -9,8 +9,14 @@ export function GateCard({ gate, compact = false }: { gate: Gate; compact?: bool
   const [expanded, setExpanded] = useState(false);
   const [explanation, setExplanation] = useState("");
   const noteId = useId();
-  const blocked = gate.state === "BLOCKED";
+  const upstreamBlocked = gate.state === "BLOCKED";
+  const staleDependency =
+    gate.id === "G2" && !upstreamBlocked && state.shots.some((shot) => shot.state === "STALE");
+  const blocked = upstreamBlocked || staleDependency;
   const terminal = gate.state === "APPROVED";
+  const conflictRevision = state.lastProblem?.affectedObjects.find(
+    (object) => object.objectType === "GATE" && object.objectId === gate.id,
+  )?.currentRevision;
 
   const decide = (decision: Decision) => {
     void actions.decideGate(gate.id, decision, explanation.trim());
@@ -53,18 +59,29 @@ export function GateCard({ gate, compact = false }: { gate: Gate; compact?: bool
             <div>
               <strong>本地 ETag 已过期</strong>
               <p>
-                {state.lastProblem.message} <span className="mono">{state.lastProblem.traceId}</span>
+                {state.lastProblem.message}{" "}
+                {conflictRevision
+                  ? `冻结错误契约返回 currentRevision=${conflictRevision}。`
+                  : "响应缺少 currentRevision，请重新加载工作区。"}{" "}
+                <span className="mono">{state.lastProblem.traceId}</span>
               </p>
             </div>
             <button
               className="button button-secondary"
               type="button"
-              onClick={() => void actions.synchronizeGate(gate.id)}
-              disabled={state.busy}
+              onClick={() => actions.synchronizeGate(gate.id)}
+              disabled={state.busy || !conflictRevision}
             >
               <RefreshCw className={state.busy ? "spin-slow" : ""} size={15} aria-hidden="true" />
-              同步最新 revision
+              {conflictRevision ? `同步最新 revision ${conflictRevision}` : "重新加载后同步"}
             </button>
+          </div>
+        )}
+
+        {staleDependency && (
+          <div className="gate-stale-dependency" role="status">
+            <strong>资产引用已变化，此 G2 revision 不可继续批准</strong>
+            <p>先“创建新 revision”吸收 STALE 镜头和 Prompt 影响；旧 G2 审核记录保持只读。</p>
           </div>
         )}
 
@@ -109,7 +126,15 @@ export function GateCard({ gate, compact = false }: { gate: Gate; compact?: bool
             aria-expanded={expanded}
           >
             <MessageSquareText size={15} aria-hidden="true" />
-            {expanded ? "收起审核" : terminal ? "已完成审核" : blocked ? "等待上游" : "开始审核"}
+            {expanded
+              ? "收起审核"
+              : terminal
+                ? "已完成审核"
+                : staleDependency
+                  ? "依赖已变更"
+                  : blocked
+                    ? "等待上游"
+                    : "开始审核"}
             <ChevronDown className={expanded ? "turn-180" : ""} size={14} aria-hidden="true" />
           </button>
           <div className="gate-utility">
@@ -126,7 +151,7 @@ export function GateCard({ gate, compact = false }: { gate: Gate; compact?: bool
               className="text-button"
               type="button"
               onClick={() => actions.regenerateGate(gate.id)}
-              disabled={state.busy || blocked}
+              disabled={state.busy || upstreamBlocked}
             >
               <History size={15} aria-hidden="true" />
               创建新 revision

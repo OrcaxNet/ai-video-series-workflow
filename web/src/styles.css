@@ -1052,6 +1052,25 @@ code,
   flex: none;
 }
 
+.gate-stale-dependency {
+  margin-top: 13px;
+  padding: 11px 12px;
+  border: 1px solid #d4a65f;
+  border-left: 4px solid var(--amber);
+  color: #765a31;
+  background: var(--amber-pale);
+}
+
+.gate-stale-dependency strong {
+  font-size: 10px;
+}
+
+.gate-stale-dependency p {
+  margin: 3px 0 0;
+  font-size: 8px;
+  line-height: 1.5;
+}
+
 .gate-footer {
   display: flex;
   align-items: center;

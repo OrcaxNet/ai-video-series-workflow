@@ -17,7 +17,6 @@ export interface ControlPlaneApi {
   createApproval(input: ApprovalInput): Promise<ApprovalResult>;
   regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult>;
   simulateConcurrentUpdate(gateId: GateId): Promise<number>;
-  synchronizeGate(gateId: GateId): Promise<Gate>;
 }
 
 const problem = (
@@ -26,6 +25,7 @@ const problem = (
   detail: string,
   suggestedAction: string,
   retryable = false,
+  affectedObjects: ApiProblem["affectedObjects"] = [],
 ) =>
   new ApiProblem({
     status,
@@ -35,6 +35,7 @@ const problem = (
     retryable,
     traceId: `trc_mock_${Math.random().toString(16).slice(2, 10)}`,
     suggestedAction,
+    affectedObjects,
   });
 
 const payloadFingerprint = (input: ApprovalInput) =>
@@ -49,6 +50,7 @@ const payloadFingerprint = (input: ApprovalInput) =>
 export class MockControlPlaneApi implements ControlPlaneApi {
   private gates: Record<GateId, Gate>;
   private idempotency = new Map<string, { fingerprint: string; result: ApprovalResult }>();
+  private staleGates = new Set<GateId>();
 
   constructor(seed: Record<GateId, Gate> = fixtureGates) {
     this.gates = structuredClone(seed);
@@ -94,6 +96,8 @@ export class MockControlPlaneApi implements ControlPlaneApi {
         "REVISION_CONFLICT",
         `${input.gateId} 已被其他协作者更新（当前 ETag ${gate.etag}）。`,
         "同步最新 revision，检查差异后重新提交审核。",
+        false,
+        [{ objectType: "GATE", objectId: input.gateId, currentRevision: gate.etag }],
       );
     }
 
@@ -109,6 +113,14 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     if (gate.state === "BLOCKED") {
       throw problem(422, "GATE_REQUIRED", `${input.gateId} 仍被上游条件阻断。`, "检查审核链与任务终态。");
     }
+    if (this.staleGates.has(input.gateId)) {
+      throw problem(
+        422,
+        "STALE_DEPENDENCY",
+        `${input.gateId} 当前 revision 仍绑定旧的上游 snapshot。`,
+        `先创建新的 ${input.gateId} revision，吸收变更后重新审核。`,
+      );
+    }
     if (gate.state === "APPROVED" && input.decision === "APPROVED") {
       throw problem(
         409,
@@ -121,6 +133,7 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     gate.state = input.decision;
     gate.etag += 1;
     gate.explanation = input.explanation;
+    gate.bindings = structuredClone(input.bindings);
     if (input.decision === "APPROVED" && input.gateId === "G1") {
       this.gates.G2.state = "PENDING";
     }
@@ -155,6 +168,8 @@ export class MockControlPlaneApi implements ControlPlaneApi {
         "REVISION_CONFLICT",
         `${gateId} 的版本已变化，不能覆盖当前 revision。`,
         "同步后基于最新 revision 重新生成。",
+        false,
+        [{ objectType: "GATE", objectId: gateId, currentRevision: gate.etag }],
       );
     }
     gate.revision += 1;
@@ -162,10 +177,16 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     gate.revisionId = `gate-${gateId.toLowerCase()}-r${gate.revision}`;
     gate.state = "PENDING";
     if (gateId === "G1") {
+      this.staleGates.add("G2");
+      this.staleGates.add("G3");
       this.gates.G2.state = "BLOCKED";
       this.gates.G3.state = "BLOCKED";
     } else if (gateId === "G2") {
+      this.staleGates.delete("G2");
+      this.staleGates.add("G3");
       this.gates.G3.state = "BLOCKED";
+    } else {
+      this.staleGates.delete("G3");
     }
     return {
       gate: gateId,
@@ -182,10 +203,6 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     return this.gates[gateId].etag;
   }
 
-  async synchronizeGate(gateId: GateId): Promise<Gate> {
-    await Promise.resolve();
-    return structuredClone(this.gates[gateId]);
-  }
 }
 
 interface ProviderStatusResponse {
@@ -282,18 +299,6 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
 
   async simulateConcurrentUpdate(): Promise<number> {
     throw problem(501, "CAPABILITY_UNAVAILABLE", "真实控制面不提供测试注入。", "仅在 Mock 场景中使用此操作。");
-  }
-
-  async synchronizeGate(gateId: GateId): Promise<Gate> {
-    const response = await fetch(`${this.baseUrl}/gates/${gateId}`, {
-      method: "GET",
-      credentials: "omit",
-      headers: { Accept: "application/json" },
-    });
-    if (!response.ok) {
-      throw await this.readProblem(response);
-    }
-    return (await response.json()) as Gate;
   }
 
   private async readProblem(response: Response) {

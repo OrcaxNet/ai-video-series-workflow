@@ -4,6 +4,7 @@ import { useStudio } from "../studio-store";
 
 export function StoryboardPage() {
   const { state } = useStudio();
+  const staleShots = state.shots.filter((shot) => shot.state === "STALE");
 
   return (
     <div className="page">
@@ -127,14 +128,15 @@ export function StoryboardPage() {
         </aside>
       </section>
 
-      <div className="stale-warning" role="status">
-        <TriangleAlert size={18} aria-hidden="true" />
-        <div>
-          <strong>S03-03 使用的道具草稿发生变化</strong>
-          <p>已锁定的潮汐钟 v1 不受影响；只有选择 v2 并创建新 Prompt revision 后才会进入生成。</p>
+      {staleShots.length > 0 && (
+        <div className="stale-warning" role="status">
+          <TriangleAlert size={18} aria-hidden="true" />
+          <div>
+            <strong>{staleShots.map((shot) => shot.code).join("、")} 的资产引用发生变化</strong>
+            <p>旧 G2 revision 与已生成产物保持只读；创建新 G2 revision 后才可重新审核和生成。</p>
+          </div>
         </div>
-        <button className="button button-secondary" type="button">检查差异</button>
-      </div>
+      )}
 
       <section className="gate-section">
         <div className="section-heading">

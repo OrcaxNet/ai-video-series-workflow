@@ -50,7 +50,7 @@ test("provider failures and callback races have explicit, stable feedback", asyn
 
   await page.getByRole("button", { name: /乱序.*禁止回退/ }).click();
   await expect(page.getByText(/旧序列 callback 被忽略/)).toBeVisible();
-  await expect(page.getByText("生成中", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("状态未知", { exact: true }).first()).toBeVisible();
 });
 
 test("asset revisions can be compared, locked, and rolled back without deleting history", async ({ page }) => {
@@ -66,9 +66,11 @@ test("asset revisions can be compared, locked, and rolled back without deleting 
   await expect(dialog.getByText("G1 审核历史、旧 Prompt 和 CAS 产物保持只读可追溯。")).toBeVisible();
   await dialog.getByRole("button", { name: "回滚业务引用至 v2" }).click();
 
-  await expect(page.getByText("季岚 当前引用已设为 v2")).toBeVisible();
+  await expect(page.getByText("季岚 已切换；G1 r8 等待重审")).toBeVisible();
   await expect(page.getByText("asset-jilan-r2").first()).toBeVisible();
   await expect(page.getByText("v4 · DRAFT")).toBeVisible();
+  await expect(page.getByText("revision 8")).toBeVisible();
+  await expect(page.getByText("基础原画 · 14 项 · 季岚 v2")).toBeVisible();
 });
 
 test("quota, budget, failed, and cancelled provider outcomes are reachable", async ({ page }) => {
@@ -86,6 +88,8 @@ test("quota, budget, failed, and cancelled provider outcomes are reachable", asy
   await expect(page.getByText("失败", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("需新建 attempt", { exact: true })).toBeVisible();
 
+  await page.reload();
+  await page.getByRole("button", { name: "任务中心" }).click();
   await page.getByRole("button", { name: /取消.*CANCELLED 终态/ }).click();
   await expect(page.getByText("已取消", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("已确认取消", { exact: true })).toBeVisible();
@@ -100,10 +104,68 @@ test("a 409 conflict exposes synchronization and then accepts a fresh decision",
   await page.getByRole("button", { name: "批准并锁定 r7" }).click();
 
   await expect(page.getByText("本地 ETag 已过期")).toBeVisible();
-  await page.getByRole("button", { name: "同步最新 revision" }).click();
+  await page.getByRole("button", { name: "同步最新 revision 8" }).click();
   await expect(page.getByText("G1 已同步到 ETag 8")).toBeVisible();
   await page.getByRole("button", { name: "批准并锁定 r7" }).click();
   await expect(page.getByText("G1 已批准并锁定")).toBeVisible();
+});
+
+test("asset reference changes create a new G1 snapshot and invalidate the old G2 revision", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "内容与资产 G1" }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r7" }).click();
+  await expect(page.getByText("G1 已批准并锁定")).toBeVisible();
+
+  await page.getByRole("button", { name: "查看影响与回滚" }).click();
+  const dialog = page.getByRole("dialog", { name: /季岚 · 影响分析与回滚/ });
+  await dialog.getByRole("radio", { name: /v2 · APPROVED/ }).click();
+  await dialog.getByRole("button", { name: "回滚业务引用至 v2" }).click();
+  await expect(page.getByText("季岚 已切换；G1 r8 等待重审")).toBeVisible();
+  await expect(page.getByText("等待人工审核", { exact: true })).toBeVisible();
+  await expect(page.getByText("基础原画 · 14 项 · 季岚 v2")).toBeVisible();
+
+  await page.getByRole("button", { name: "剧本与分镜 G2" }).click();
+  await expect(page.getByRole("button", { name: "等待上游" })).toBeDisabled();
+  await expect(page.getByText(/S03-01、S03-02、S03-04 的资产引用发生变化/)).toBeVisible();
+
+  await page.getByRole("button", { name: "内容与资产 G1" }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r8" }).click();
+  await page.getByRole("button", { name: "剧本与分镜 G2" }).click();
+  await expect(page.getByText("资产引用已变化，此 G2 revision 不可继续批准")).toBeVisible();
+  await expect(page.getByRole("button", { name: "依赖已变更" })).toBeDisabled();
+  await page.getByRole("button", { name: "创建新 revision" }).click();
+  await expect(page.getByText("已创建 G2 revision 10")).toBeVisible();
+  await expect(page.getByText("资产引用已变化，此 G2 revision 不可继续批准")).toHaveCount(0);
+});
+
+test("terminal Provider states survive later callbacks and batch completion", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "任务中心" }).click();
+  const cancelledRow = page.getByRole("row").filter({ hasText: "S03-02" });
+  await page.getByRole("button", { name: /取消.*CANCELLED 终态/ }).click();
+  await expect(cancelledRow.getByText("已取消", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: /乱序.*禁止回退/ }).click();
+  await expect(page.getByText("CANCELLED 终态保持不变")).toBeVisible();
+  await expect(cancelledRow.getByText("已取消", { exact: true })).toBeVisible();
+
+  await page.reload();
+  await page.getByRole("button", { name: "内容与资产 G1" }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r7" }).click();
+  await page.getByRole("button", { name: "剧本与分镜 G2" }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r9" }).click();
+  await page.getByRole("button", { name: "任务中心" }).click();
+  const failedRow = page.getByRole("row").filter({ hasText: "S03-02" });
+  await page.getByRole("button", { name: /失败.*FAILED 终态/ }).click();
+  await expect(failedRow.getByText("失败", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "完成 Mock 排练" }).click();
+  await expect(page.getByText("Mock 排练未解锁 G3")).toBeVisible();
+  await expect(failedRow.getByText("失败", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "成片审核 G3" }).click();
+  await expect(page.getByRole("button", { name: "等待上游" })).toBeDisabled();
 });
 
 test("project dialog traps focus, closes on Escape, and restores the trigger", async ({ page }) => {

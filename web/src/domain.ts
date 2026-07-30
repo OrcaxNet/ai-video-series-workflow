@@ -257,6 +257,11 @@ export interface ApiProblemShape {
   retryable: boolean;
   traceId: string;
   suggestedAction: string;
+  affectedObjects?: Array<{
+    objectType: string;
+    objectId: string;
+    currentRevision?: number;
+  }>;
 }
 
 export class ApiProblem extends Error {
@@ -265,6 +270,7 @@ export class ApiProblem extends Error {
   readonly retryable: boolean;
   readonly traceId: string;
   readonly suggestedAction: string;
+  readonly affectedObjects: NonNullable<ApiProblemShape["affectedObjects"]>;
 
   constructor(problem: ApiProblemShape) {
     super(problem.detail);
@@ -274,5 +280,6 @@ export class ApiProblem extends Error {
     this.retryable = problem.retryable;
     this.traceId = problem.traceId;
     this.suggestedAction = problem.suggestedAction;
+    this.affectedObjects = problem.affectedObjects ?? [];
   }
 }

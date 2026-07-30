@@ -34,7 +34,7 @@ type Action =
   | { type: "BUSY"; busy: boolean }
   | { type: "GATE_DECIDED"; result: ApprovalResult; explanation: string }
   | { type: "GATE_REGENERATED"; result: RegenerationResult }
-  | { type: "GATE_SYNCHRONIZED"; gateId: GateId; gate: StudioState["gates"][GateId] }
+  | { type: "GATE_REVISION_RECONCILED"; gateId: GateId; currentRevision: number }
   | { type: "COMPLETE_MOCK_RUN" }
   | { type: "INJECT_SCENARIO"; scenario: FailureScenario }
   | { type: "CANCEL_JOB"; jobId: string }
@@ -43,7 +43,7 @@ type Action =
   | { type: "SET_JOBS_VIEW_STATE"; viewState: JobsViewState }
   | { type: "SELECT_PROMPT"; version: number }
   | { type: "SELECT_ASSET"; assetId: string }
-  | { type: "LOCK_ASSET_REVISION"; assetId: string; version: number }
+  | { type: "ASSET_REVISION_LOCKED"; assetId: string; version: number; result: RegenerationResult }
   | { type: "PROBLEM"; problem?: ApiProblem }
   | { type: "TOAST"; toast: Omit<ToastMessage, "id"> }
   | { type: "DISMISS_TOAST"; id: number };
@@ -121,6 +121,11 @@ const scenarioFailure: Partial<Record<FailureScenario, ProviderJob["failure"]>> 
     suggestedAction: "修正请求参数并创建新的创作 attempt；当前任务保持失败终态。",
   },
 };
+
+const terminalJobStates = new Set<ProviderJob["state"]>(["SUCCEEDED", "FAILED", "CANCELLED"]);
+
+const stableHash = (seed: string) =>
+  Array.from({ length: 64 }, (_, index) => ((seed.charCodeAt(index % seed.length) + index) % 16).toString(16)).join("");
 
 const toast = (state: StudioState, value: Omit<ToastMessage, "id">) => ({
   ...state,
@@ -278,42 +283,61 @@ function reducer(state: StudioState, action: Action): StudioState {
       } else if (action.result.gate === "G2") {
         nextGates.G3 = { ...nextGates.G3, state: "BLOCKED" };
       }
+      const shots =
+        action.result.gate === "G2"
+          ? state.shots.map((shot) => (shot.state === "STALE" ? { ...shot, state: "READY" as const } : shot))
+          : state.shots;
       return toast(
-        { ...state, busy: false, gates: nextGates, lastProblem: undefined },
+        { ...state, busy: false, gates: nextGates, shots, lastProblem: undefined },
         {
           tone: "info",
           title: `已创建 ${action.result.gate} revision ${action.result.revision}`,
-          description: "被批准或退回的旧版本保持只读，新的 revision 等待审核。",
+          description:
+            action.result.gate === "G2"
+              ? "旧版保持只读；新剧本/分镜 snapshot 已吸收资产影响，等待重新审核。"
+              : "被批准或退回的旧版本保持只读，新的 revision 等待审核。",
         },
       );
     }
-    case "GATE_SYNCHRONIZED":
+    case "GATE_REVISION_RECONCILED":
       return toast(
         {
           ...state,
           busy: false,
           lastProblem: undefined,
-          gates: { ...state.gates, [action.gateId]: action.gate },
+          gates: {
+            ...state.gates,
+            [action.gateId]: { ...state.gates[action.gateId], etag: action.currentRevision },
+          },
         },
         {
           tone: "success",
-          title: `${action.gateId} 已同步到 ETag ${action.gate.etag}`,
-          description: "请检查最新 revision 与绑定差异，再重新提交审核或创建新版本。",
+          title: `${action.gateId} 已同步到 ETag ${action.currentRevision}`,
+          description: "revision 来自冻结 Error.affectedObjects 契约；请检查绑定后重新提交。",
         },
       );
     case "COMPLETE_MOCK_RUN": {
-      const jobs = state.jobs.map((job) => ({
-        ...job,
-        state: "SUCCEEDED" as const,
-        progress: 100,
-        failure: undefined,
-        updatedAt: nowLabel(),
-      }));
+      const jobs = state.jobs.map((job) =>
+        terminalJobStates.has(job.state)
+          ? job
+          : {
+              ...job,
+              state: "SUCCEEDED" as const,
+              progress: 100,
+              failure: undefined,
+              updatedAt: nowLabel(),
+            },
+      );
+      const terminalBlockers = jobs.filter((job) => job.state === "FAILED" || job.state === "CANCELLED");
+      const allSucceeded = jobs.every((job) => job.state === "SUCCEEDED");
       const nextGates = {
         ...state.gates,
         G3: {
           ...state.gates.G3,
-          state: state.gates.G2.state === "APPROVED" ? ("PENDING" as const) : ("BLOCKED" as const),
+          state:
+            state.gates.G2.state === "APPROVED" && allSucceeded
+              ? ("PENDING" as const)
+              : ("BLOCKED" as const),
         },
       };
       return toast(
@@ -327,28 +351,39 @@ function reducer(state: StudioState, action: Action): StudioState {
               id: `act-run-${Date.now()}`,
               at: nowLabel(),
               actor: "Provider Mock",
-              action: "完成排练",
-              detail: "5 个镜头均生成固定 fixture；证据仍标记 mock_only",
+              action: allSucceeded ? "完成排练" : "排练保留终态",
+              detail: allSucceeded
+                ? "5 个镜头均生成固定 fixture；证据仍标记 mock_only"
+                : `${terminalBlockers.length} 个 FAILED/CANCELLED 终态未被覆盖；G3 保持阻断`,
             },
             ...state.activity,
           ],
         },
         {
-          tone: "success",
-          title: "Mock 排练已完成",
-          description: "这只验证编排与界面，不代表真实质量、时延、成功率或费用。",
+          tone: allSucceeded ? "success" : "warning",
+          title: allSucceeded ? "Mock 排练已完成" : "Mock 排练未解锁 G3",
+          description: allSucceeded
+            ? "这只验证编排与界面，不代表真实质量、时延、成功率或费用。"
+            : `${terminalBlockers.map((job) => `${job.shot} ${job.state}`).join("、")} 已保持终态；如需重做，必须创建新的 Job/attempt。`,
         },
       );
     }
     case "INJECT_SCENARIO": {
       const current = state.jobs[1];
+      if (terminalJobStates.has(current.state)) {
+        return toast(state, {
+          tone: "info",
+          title: `${current.state} 终态保持不变`,
+          description: `${action.scenario} 事件已忽略；终态不可回退，如需重做必须创建新的 Job/attempt。`,
+        });
+      }
       const jobs = state.jobs.map((job, index) => {
         if (index !== 1) return job;
         if (action.scenario === "duplicate_callback") {
-          return { ...job, state: current.state, updatedAt: nowLabel() };
+          return job;
         }
         if (action.scenario === "out_of_order_callback") {
-          return { ...job, state: "RUNNING" as const, progress: Math.max(job.progress, 64), updatedAt: nowLabel() };
+          return job;
         }
         if (action.scenario === "cancel_race") {
           return {
@@ -474,7 +509,7 @@ function reducer(state: StudioState, action: Action): StudioState {
       return { ...state, jobsViewState: action.viewState };
     case "SELECT_ASSET":
       return { ...state, selectedAssetId: action.assetId };
-    case "LOCK_ASSET_REVISION": {
+    case "ASSET_REVISION_LOCKED": {
       const asset = state.assets.find((item) => item.id === action.assetId);
       const revision = asset?.revisions.find((item) => item.version === action.version);
       if (!asset || !revision) return state;
@@ -490,30 +525,74 @@ function reducer(state: StudioState, action: Action): StudioState {
           : item,
       );
       const shots = state.shots.map((shot) =>
-        shot.assetIds.includes(action.assetId) && shot.state !== "SUCCEEDED"
-          ? { ...shot, state: "STALE" as const }
-          : shot,
+        shot.assetIds.includes(action.assetId) ? { ...shot, state: "STALE" as const } : shot,
       );
+      const gate = state.gates.G1;
+      const assetSetRevisionId = `asset-set-g1-r${action.result.revision}-${revision.revisionId}`;
+      const bindings = gate.bindings.map((binding) =>
+        binding.objectType === "ASSET_SET"
+          ? {
+              ...binding,
+              revisionId: assetSetRevisionId,
+              contentHash: stableHash(assetSetRevisionId),
+              label: `基础原画 · 14 项 · ${asset.name} v${revision.version}`,
+            }
+          : binding,
+      );
+      const history = [
+        ...gate.history.map((record) =>
+          record.revision === gate.revision && record.state === "CURRENT"
+            ? { ...record, state: "SUPERSEDED" as const }
+            : record,
+        ),
+        {
+          revision: action.result.revision,
+          revisionId: action.result.revisionId,
+          state: "CURRENT" as const,
+          author: "本地导演",
+          createdAt: nowLabel(),
+          note: `${asset.name} 当前引用切换为 ${revision.revisionId}；重建不可变资产集合`,
+        },
+      ];
       return toast(
         {
           ...state,
+          busy: false,
+          lastProblem: undefined,
           assets,
           shots,
+          gates: {
+            ...state.gates,
+            G1: {
+              ...gate,
+              revision: action.result.revision,
+              revisionId: action.result.revisionId,
+              etag: action.result.etag,
+              state: "PENDING",
+              bindings,
+              history,
+              decidedAt: undefined,
+              decidedBy: undefined,
+              explanation: undefined,
+            },
+            G2: { ...state.gates.G2, state: "BLOCKED" },
+            G3: { ...state.gates.G3, state: "BLOCKED" },
+          },
           activity: [
             {
               id: `act-asset-${action.assetId}-${revision.version}-${Date.now()}`,
               at: nowLabel(),
               actor: "本地导演",
-              action: revision.version < asset.version ? "回滚资产引用" : "切换资产引用",
-              detail: `${asset.name} → ${revision.revisionId} · ${affectedShots.length} 个镜头待重验 · 历史 revision 保留`,
+              action: revision.version < asset.version ? "回滚资产并创建 G1 snapshot" : "切换资产并创建 G1 snapshot",
+              detail: `${asset.name} → ${revision.revisionId} · ${action.result.revisionId} · ${affectedShots.length} 个镜头待重验`,
             },
             ...state.activity,
           ],
         },
         {
           tone: revision.version < asset.version ? "warning" : "success",
-          title: `${asset.name} 当前引用已设为 v${revision.version}`,
-          description: `${affectedShots.length} 个下游镜头已标记待重验；版本链与已批准历史均未覆盖。`,
+          title: `${asset.name} 已切换；G1 r${action.result.revision} 等待重审`,
+          description: `${affectedShots.length} 个镜头已标记 STALE，G2/G3 已阻断；旧 G1 与资产 revision 均保留。`,
         },
       );
     }
@@ -529,7 +608,7 @@ interface StudioActions {
   decideGate(gateId: GateId, decision: Decision, explanation: string): Promise<void>;
   regenerateGate(gateId: GateId): Promise<void>;
   simulateConcurrentUpdate(gateId: GateId): Promise<void>;
-  synchronizeGate(gateId: GateId): Promise<void>;
+  synchronizeGate(gateId: GateId): void;
   completeMockRun(): void;
   injectScenario(scenario: FailureScenario): void;
   cancelJob(jobId: string): void;
@@ -538,7 +617,7 @@ interface StudioActions {
   setJobsViewState(viewState: JobsViewState): void;
   selectPrompt(version: number): void;
   selectAsset(assetId: string): void;
-  lockAssetRevision(assetId: string, version: number): void;
+  lockAssetRevision(assetId: string, version: number): Promise<void>;
   dismissToast(id: number): void;
 }
 
@@ -579,6 +658,23 @@ export function StudioProvider({
 
   const decideGate = useCallback(
     async (gateId: GateId, decision: Decision, explanation: string) => {
+      if (gateId === "G2" && state.shots.some((shot) => shot.state === "STALE")) {
+        handleProblem(
+          new ApiProblem({
+            status: 422,
+            errorCode: "STALE_DEPENDENCY",
+            title: "Stale asset dependency",
+            detail: "资产集合已变化，不能批准同一 G2 revision。",
+            retryable: false,
+            traceId: "trc_client_stale_g2",
+            suggestedAction: "先创建新的 G2 revision，吸收待重验镜头与 Prompt 影响。",
+            affectedObjects: state.shots
+              .filter((shot) => shot.state === "STALE")
+              .map((shot) => ({ objectType: "SHOT", objectId: shot.id })),
+          }),
+        );
+        return;
+      }
       dispatch({ type: "BUSY", busy: true });
       try {
         const gate = state.gates[gateId];
@@ -595,7 +691,7 @@ export function StudioProvider({
         handleProblem(error);
       }
     },
-    [handleProblem, state.gates],
+    [handleProblem, state.gates, state.shots],
   );
 
   const createProject = useCallback(
@@ -644,16 +740,40 @@ export function StudioProvider({
   );
 
   const synchronizeGate = useCallback(
-    async (gateId: GateId) => {
+    (gateId: GateId) => {
+      const currentRevision = state.lastProblem?.affectedObjects.find(
+        (object) => object.objectType === "GATE" && object.objectId === gateId,
+      )?.currentRevision;
+      if (!currentRevision) {
+        handleProblem(
+          new ApiProblem({
+            status: 409,
+            errorCode: "REVISION_CONFLICT",
+            title: "Conflict response is incomplete",
+            detail: `${gateId} 冲突响应未包含 affectedObjects.currentRevision。`,
+            retryable: false,
+            traceId: state.lastProblem?.traceId ?? "missing-trace",
+            suggestedAction: "重新加载工作区投影后再检查差异。",
+          }),
+        );
+        return;
+      }
+      dispatch({ type: "GATE_REVISION_RECONCILED", gateId, currentRevision });
+    },
+    [handleProblem, state.lastProblem],
+  );
+
+  const lockAssetRevision = useCallback(
+    async (assetId: string, version: number) => {
       dispatch({ type: "BUSY", busy: true });
       try {
-        const gate = await apiRef.current.synchronizeGate(gateId);
-        dispatch({ type: "GATE_SYNCHRONIZED", gateId, gate });
+        const result = await apiRef.current.regenerateGate("G1", state.gates.G1.etag);
+        dispatch({ type: "ASSET_REVISION_LOCKED", assetId, version, result });
       } catch (error) {
         handleProblem(error);
       }
     },
-    [handleProblem],
+    [handleProblem, state.gates.G1.etag],
   );
 
   useEffect(() => {
@@ -688,10 +808,10 @@ export function StudioProvider({
       setJobsViewState: (viewState) => dispatch({ type: "SET_JOBS_VIEW_STATE", viewState }),
       selectPrompt: (version) => dispatch({ type: "SELECT_PROMPT", version }),
       selectAsset: (assetId) => dispatch({ type: "SELECT_ASSET", assetId }),
-      lockAssetRevision: (assetId, version) => dispatch({ type: "LOCK_ASSET_REVISION", assetId, version }),
+      lockAssetRevision,
       dismissToast: (id) => dispatch({ type: "DISMISS_TOAST", id }),
     }),
-    [createProject, decideGate, regenerateGate, simulateConcurrentUpdate, synchronizeGate],
+    [createProject, decideGate, lockAssetRevision, regenerateGate, simulateConcurrentUpdate, synchronizeGate],
   );
 
   return <StudioContext.Provider value={{ state, actions }}>{children}</StudioContext.Provider>;
