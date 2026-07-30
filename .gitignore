@@ -1,0 +1,17 @@
+# Go
+/bin/
+*.exe
+*.test
+*.out
+coverage.out
+
+# Local environment and generated evidence
+.env
+artifacts/
+provider-preflight-manifest*.json
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
+*.swp

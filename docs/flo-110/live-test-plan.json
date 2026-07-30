@@ -1,0 +1,342 @@
+{
+  "schema_version": "1",
+  "status": "pending_key",
+  "provider": "volcengine_ark",
+  "verified_at": "2026-07-30",
+  "soft_budget_micros": 560000000,
+  "hard_budget_micros": 700000000,
+  "categories": [
+    {
+      "name": "character_dialogue",
+      "shots": [
+        {
+          "id": "character-dialogue-01",
+          "prompt": "固定女主参考图。中景，女主在书房窗边平静说话，嘴型自然，镜头缓慢推进，保持面部、服装和发型一致。",
+          "prompt_snapshot_id": "prompt-character-dialogue-01-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-lead-front@rev-pending-rights-check",
+            "asset-scene-study@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "character-dialogue-02",
+          "prompt": "固定男主参考图。近景，男主在同一书房回应，表情从疑惑转为坚定，机位稳定，保持五官、服装和色彩一致。",
+          "prompt_snapshot_id": "prompt-character-dialogue-02-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-support-front@rev-pending-rights-check",
+            "asset-scene-study@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "character-dialogue-03",
+          "prompt": "双人过肩镜头，两位固定角色在书桌两侧短暂交谈，动作克制，不新增人物，保持角色比例和服装连续。",
+          "prompt_snapshot_id": "prompt-character-dialogue-03-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-lead-front@rev-pending-rights-check",
+            "asset-character-support-front@rev-pending-rights-check",
+            "asset-scene-study@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "character-dialogue-04",
+          "prompt": "固定女主侧面参考图。特写，女主停顿后轻轻点头，眼神方向连续，背景虚化，保持角色身份特征稳定。",
+          "prompt_snapshot_id": "prompt-character-dialogue-04-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-lead-side@rev-pending-rights-check",
+            "asset-scene-study@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "character-dialogue-05",
+          "prompt": "固定男主三分之二侧面参考图。男主低声说完一句话后望向窗外，呼吸和眨眼自然，保持人物与光线连续。",
+          "prompt_snapshot_id": "prompt-character-dialogue-05-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-support-side@rev-pending-rights-check",
+            "asset-scene-study@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        }
+      ]
+    },
+    {
+      "name": "action_continuity",
+      "shots": [
+        {
+          "id": "action-continuity-01",
+          "prompt": "固定女主全身参考图。女主从书房门口快步走向书桌，运动方向由左到右，镜头平稳跟随，肢体结构自然。",
+          "prompt_snapshot_id": "prompt-action-continuity-01-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-lead-full@rev-pending-rights-check",
+            "asset-scene-study@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "action-continuity-02",
+          "prompt": "承接上一镜头尾帧，女主伸手拿起桌上的铜钥匙，手部动作清楚，钥匙形状和位置不突变，镜头轻微下摇。",
+          "prompt_snapshot_id": "prompt-action-continuity-02-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-lead-full@rev-pending-rights-check",
+            "asset-prop-brass-key@rev-pending-rights-check",
+            "asset-previous-last-frame@rev-runtime-required"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "action-continuity-03",
+          "prompt": "承接上一镜头尾帧，女主转身把铜钥匙递给男主，角色站位不交换，道具始终只有一把，动作自然连续。",
+          "prompt_snapshot_id": "prompt-action-continuity-03-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-lead-full@rev-pending-rights-check",
+            "asset-character-support-full@rev-pending-rights-check",
+            "asset-prop-brass-key@rev-pending-rights-check",
+            "asset-previous-last-frame@rev-runtime-required"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "action-continuity-04",
+          "prompt": "固定双人全身参考图。男主接过铜钥匙并走向门口，女主留在书桌旁，运动轨迹明确，人物和道具不闪烁。",
+          "prompt_snapshot_id": "prompt-action-continuity-04-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-pair-full@rev-pending-rights-check",
+            "asset-prop-brass-key@rev-pending-rights-check",
+            "asset-scene-study@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "action-continuity-05",
+          "prompt": "承接上一镜头尾帧，男主用铜钥匙打开木门，门向走廊方向开启，摄影机跟随穿过门框，空间关系保持连续。",
+          "prompt_snapshot_id": "prompt-action-continuity-05-v1",
+          "reference_asset_revision_ids": [
+            "asset-character-support-full@rev-pending-rights-check",
+            "asset-prop-brass-key@rev-pending-rights-check",
+            "asset-scene-study-door@rev-pending-rights-check",
+            "asset-previous-last-frame@rev-runtime-required"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        }
+      ]
+    },
+    {
+      "name": "scene_prop_continuity",
+      "shots": [
+        {
+          "id": "scene-prop-continuity-01",
+          "prompt": "固定书房场景参考图。广角建立镜头，书桌、木门、窗户和壁灯位置固定，铜钥匙放在书桌右侧，不出现人物。",
+          "prompt_snapshot_id": "prompt-scene-prop-continuity-01-v1",
+          "reference_asset_revision_ids": [
+            "asset-scene-study@rev-pending-rights-check",
+            "asset-prop-brass-key@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "scene-prop-continuity-02",
+          "prompt": "固定书房场景参考图。镜头从窗户缓慢横移到书桌，家具布局和壁灯数量不变，最终聚焦唯一一把铜钥匙。",
+          "prompt_snapshot_id": "prompt-scene-prop-continuity-02-v1",
+          "reference_asset_revision_ids": [
+            "asset-scene-study@rev-pending-rights-check",
+            "asset-prop-brass-key@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "scene-prop-continuity-03",
+          "prompt": "铜钥匙特写，固定道具参考图，表面有月牙刻纹，形状、材质和颜色不变，背景保持同一书房桌面纹理。",
+          "prompt_snapshot_id": "prompt-scene-prop-continuity-03-v1",
+          "reference_asset_revision_ids": [
+            "asset-prop-brass-key@rev-pending-rights-check",
+            "asset-scene-study-tabletop@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "scene-prop-continuity-04",
+          "prompt": "固定走廊场景参考图。摄影机从门外回看书房，门框、窗户和书桌的相对位置可辨，不新增道具或改变空间结构。",
+          "prompt_snapshot_id": "prompt-scene-prop-continuity-04-v1",
+          "reference_asset_revision_ids": [
+            "asset-scene-corridor@rev-pending-rights-check",
+            "asset-scene-study-door@rev-pending-rights-check"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        },
+        {
+          "id": "scene-prop-continuity-05",
+          "prompt": "承接书房到走廊的空间关系，镜头沿走廊向前移动，墙面材质、壁灯间距和门的位置连续，保持写实电影光效。",
+          "prompt_snapshot_id": "prompt-scene-prop-continuity-05-v1",
+          "reference_asset_revision_ids": [
+            "asset-scene-corridor@rev-pending-rights-check",
+            "asset-previous-last-frame@rev-runtime-required"
+          ],
+          "output": {
+            "width": 1280,
+            "height": 720,
+            "aspect_ratio": "16:9",
+            "fps": 24,
+            "duration_millis": 5000,
+            "format": "mp4"
+          },
+          "max_attempts": 2,
+          "max_video_tokens": 500000,
+          "max_cost_micros": 46000000
+        }
+      ]
+    }
+  ],
+  "required_metrics": [
+    "cold_latency_ms",
+    "hot_latency_ms",
+    "success_rate",
+    "retry_count",
+    "quality_scores",
+    "usage_tokens",
+    "cost_micros",
+    "manifest_hashes"
+  ]
+}
