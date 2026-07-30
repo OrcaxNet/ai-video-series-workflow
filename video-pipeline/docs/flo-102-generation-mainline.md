@@ -88,7 +88,7 @@ FLO-103 控制面按 `contracts/openapi.yaml` 实现：
 - `POST /shots/{shotId}/runs`
 - `POST /runs/{runId}/publication-lock`
 
-PostgreSQL migration `000002_generation_mainline` 增加内容编译记录、Prompt 输入/
+PostgreSQL migration `000006_generation_mainline` 增加内容编译记录、Prompt 输入/
 资产关联、上一 Prompt、输出规格、输入 hash，以及同时绑定 QC/G3 的 publication
 lock。事务写入时应同时写 `revision_dependencies`、`idempotency_records`、
 `audit_events` 和 outbox。

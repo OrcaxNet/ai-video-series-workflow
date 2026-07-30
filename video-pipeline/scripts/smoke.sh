@@ -29,10 +29,26 @@ printf '%s' "${completed}" | grep -Eq '"uri":"cas://sha256/[0-9a-f]{64}"'
 postgres_container="${VIDEO_POSTGRES_CONTAINER:-ai-video-series-workflow-postgres-1}"
 migration_version="$(docker exec "${postgres_container}" psql -U video -d video_pipeline -Atc 'SELECT version FROM public.schema_migrations;')"
 migration_dirty="$(docker exec "${postgres_container}" psql -U video -d video_pipeline -Atc 'SELECT dirty FROM public.schema_migrations;')"
-test "${migration_version}" = "2"
+test "${migration_version}" = "6"
 test "${migration_dirty}" = "f"
 table_count="$(docker exec "${postgres_container}" psql -U video -d video_pipeline -Atc "SELECT count(*) FROM information_schema.tables WHERE table_schema='video_pipeline';")"
 test "${table_count}" -ge 46
+
+postgres_user="${VIDEO_POSTGRES_USER:-video}"
+postgres_password="${VIDEO_POSTGRES_PASSWORD:-video-local-only}"
+postgres_database="${VIDEO_POSTGRES_DATABASE:-video_pipeline}"
+postgres_port="${VIDEO_POSTGRES_PORT:-55432}"
+VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
+  go test -count=1 -tags=integration ./internal/videopipeline/repository
+VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
+VIDEO_TEST_TEMPORAL_ADDRESS="127.0.0.1:7233" \
+VIDEO_TEST_PROVIDER_URL="${provider_url}" \
+VIDEO_TEST_PROVIDER_CONTAINER="${VIDEO_MOCK_PROVIDER_CONTAINER:-ai-video-series-workflow-mock-provider-1}" \
+VIDEO_TEST_WORKER_CONTAINER="${VIDEO_WORKER_CONTAINER:-ai-video-series-workflow-orchestrator-worker-1}" \
+VIDEO_TEST_COMPOSE_TASK_QUEUE="video-production-v1" \
+  go test -count=1 -tags=integration \
+    -run TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage \
+    ./internal/videopipeline/repository
 
 temporal_container="${VIDEO_TEMPORAL_CONTAINER:-ai-video-series-workflow-temporal-1}"
 temporal_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${temporal_container}")"

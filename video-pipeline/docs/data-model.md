@@ -118,12 +118,12 @@ erDiagram
 | 表 | 角色 |
 |---|---|
 | `generation_profiles` | 本地 CPU 媒体规则、能力 alias、QC/预算/许可策略，不含硬件类或本地模型 |
-| `generation_runs` | 一次镜头创作输入；含 workflow、run digest、dry_run、budget approval |
+| `generation_runs` | 一次镜头创作输入；含 workflow、run digest、dry_run、budget approval；冻结 Generation Plan ID 写入不可变 `generation_run.created` audit |
 | `generation_attempts` | 输入 hash、model snapshot、参数 diff；provider retry 不新建创作 attempt |
 | `artifacts` | CAS hash/URI/MIME/size/media spec/状态 |
 | `run_artifacts` | INPUT/OUTPUT/TAIL_FRAME/PROXY/AUDIO/SUBTITLE/MANIFEST |
 | `qc_reports` | 技术/连续性/内容/音画结构指标 |
-| `review_tasks` | SHOT(Q1)、G1/G2/G3、LICENSE、BUDGET |
+| `review_tasks` | SHOT(Q1)、G1/G2/G3、LICENSE、BUDGET；预算审批精确绑定 Generation Plan、VIDEO/SPEECH scope、额度与币种 |
 | `approval_decisions` / `approval_bindings` | actor/reason + 精确 revision/hash |
 | `generation_manifests` | Shot/Episode 全谱系和锁定 hash |
 
@@ -203,8 +203,9 @@ cost ledger → provider job → generation attempt → run → shot → scene �
 ## 8. 删除、归档与保留
 
 - revision 与成本 ledger 不物理覆盖；
+- migration v2 的 trigger 拒绝 revision/snapshot、Approval、Audit 的 payload 更新或物理删除；只允许明确列出的状态推进；
 - 被 Manifest/Gate/其他 revision 引用的 artifact 不删除；
 - 上游临时 URL 不保存；
-- 无引用下载/取消产物先标 `ORPHAN_CANDIDATE`，保留期后 GC；
+- 无引用下载/取消产物先标 `ORPHAN_CANDIDATE` 并设置 `orphaned_at/retention_until`；保留期前或仍有 FK 引用时数据库拒绝删除；
 - Secret 生命周期独立于项目数据库备份；
 - idempotency、callback receipts、audit/outbox 设置合规保留与分区策略。

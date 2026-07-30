@@ -17,8 +17,16 @@ channels:
   productionEvents:
     address: video.production.events.v1
     messages:
+      seriesCreated:
+        $ref: "#/components/messages/SeriesCreated"
       revisionCreated:
         $ref: "#/components/messages/RevisionCreated"
+      generationPlanCreated:
+        $ref: "#/components/messages/GenerationPlanCreated"
+      productionRequested:
+        $ref: "#/components/messages/ProductionRequested"
+      workflowStepCompleted:
+        $ref: "#/components/messages/WorkflowStepCompleted"
       approvalDecided:
         $ref: "#/components/messages/ApprovalDecided"
       runStateChanged:
@@ -29,6 +37,8 @@ channels:
         $ref: "#/components/messages/CostLedgerRecorded"
       artifactCommitted:
         $ref: "#/components/messages/ArtifactCommitted"
+      postProductionCompleted:
+        $ref: "#/components/messages/PostProductionCompleted"
       qcCompleted:
         $ref: "#/components/messages/QCCompleted"
       dependencyStale:
@@ -41,17 +51,95 @@ operations:
     channel:
       $ref: "#/channels/productionEvents"
     messages:
+      - $ref: "#/channels/productionEvents/messages/seriesCreated"
       - $ref: "#/channels/productionEvents/messages/revisionCreated"
+      - $ref: "#/channels/productionEvents/messages/generationPlanCreated"
+      - $ref: "#/channels/productionEvents/messages/productionRequested"
+      - $ref: "#/channels/productionEvents/messages/workflowStepCompleted"
       - $ref: "#/channels/productionEvents/messages/approvalDecided"
       - $ref: "#/channels/productionEvents/messages/runStateChanged"
       - $ref: "#/channels/productionEvents/messages/providerJobStateChanged"
       - $ref: "#/channels/productionEvents/messages/costLedgerRecorded"
       - $ref: "#/channels/productionEvents/messages/artifactCommitted"
+      - $ref: "#/channels/productionEvents/messages/postProductionCompleted"
       - $ref: "#/channels/productionEvents/messages/qcCompleted"
       - $ref: "#/channels/productionEvents/messages/dependencyStale"
       - $ref: "#/channels/productionEvents/messages/manifestLocked"
 components:
   messages:
+    SeriesCreated:
+      name: video.series.created.v1
+      title: Series aggregate created
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.series.created.v1
+    GenerationPlanCreated:
+      name: video.generation-plan.created.v1
+      title: Immutable generation plan and budget decision created
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.generation-plan.created.v1
+    ProductionRequested:
+      name: video.production.requested.v1
+      title: G2-bound episode production requested
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.production.requested.v1
+    WorkflowStepCompleted:
+      name: video.workflow-step.completed.v1
+      title: Durable Temporal Activity result committed
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.workflow-step.completed.v1
+    PostProductionCompleted:
+      name: video.episode.postproduction-completed.v1
+      title: Deterministic final cut, SRT, dialogue track, Manifest, and Service BOM committed
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.episode.postproduction-completed.v1
+              data:
+                type: object
+                required:
+                  [runIds, evidence, finalVideoHash, subtitleHash, dialogueHash, manifestHash, serviceBomHash]
+                properties:
+                  runIds:
+                    type: array
+                    minItems: 1
+                    items:
+                      type: string
+                      format: uuid
+                  evidence:
+                    enum: [mock_only, live_provider_call]
+                  finalVideoHash:
+                    $ref: "#/components/schemas/SHA256"
+                  subtitleHash:
+                    $ref: "#/components/schemas/SHA256"
+                  dialogueHash:
+                    $ref: "#/components/schemas/SHA256"
+                  manifestHash:
+                    $ref: "#/components/schemas/SHA256"
+                  serviceBomHash:
+                    $ref: "#/components/schemas/SHA256"
     RevisionCreated:
       name: video.revision.created.v1
       title: Immutable revision created

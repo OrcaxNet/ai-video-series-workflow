@@ -12,7 +12,7 @@ make video-down
 
 ```text
 PostgreSQL healthy
-  → migration v1 clean
+  → migration v6 clean
 Temporal healthy
 Mock Provider healthy
   → Orchestrator Worker registered
@@ -25,7 +25,12 @@ Mock Provider healthy
 |---|---|---|
 | `VIDEO_CONTROL_PLANE_HTTP_ADDRESS` | `:8080` | Control Plane listen |
 | `VIDEO_POSTGRES_ADDRESS` | `postgres:5432` | 仅 host:port；凭证由独立 DSN/Secret 提供 |
+| `VIDEO_POSTGRES_DSN` | 未设置 | 可选的完整 DSN；生产从 Secret 注入且禁止记录 |
 | `VIDEO_TEMPORAL_ADDRESS` | `temporal:7233` | Temporal |
+| `VIDEO_TEMPORAL_NAMESPACE` | `default` | Workflow namespace |
+| `VIDEO_TEMPORAL_TASK_QUEUE` | `video-production-v1` | 控制面与 worker 共享 queue |
+| `VIDEO_AUTH_HMAC_SECRET` | 本地未设置 | 生产必填、至少 32 bytes；只从 Secret manager 注入 |
+| `VIDEO_AUTH_AUDIENCE` | `video-control-plane` | JWT `aud` 精确值 |
 | `VIDEO_PROVIDER_ADAPTER_URL` | `http://mock-provider:8090` | Provider-neutral adapter |
 | `VIDEO_ARTIFACT_ROOT` | `/var/lib/video-pipeline/artifacts` | 本地 CAS |
 | `ARK_API_KEY` | 未设置 | 火山方舟；只显式注入 |
@@ -41,6 +46,8 @@ Mock Provider healthy
 - 将 Secret 写入 `.env.video.example`、数据库、日志、trace、error、fixture、Manifest；
 - 通过 UI 返回 Secret；
 - 将 signed download URL 写入 outbox/history。
+
+生产业务 API 要求 HS256 Bearer JWT，并校验 `sub`、RBAC `role`、`aud`、`exp`；mutation body 的 `actor` 必须与签名 claims 完全一致，不能由调用方自报身份。`local/development/test` 且未配置认证 Secret 时才允许无 token 的开发模式；`VIDEO_ENVIRONMENT=production` 缺少 Secret 会启动失败。健康、系统信息和脱敏 Provider 状态保持公开。
 
 `.env.video` 已被 `.gitignore` 忽略，且只能用于非生产本地值。生产使用 Secret manager/容器 secret injection。
 
@@ -62,10 +69,10 @@ Mock Provider healthy
 三个 Go service 镜像：
 
 - multi-stage、`CGO_ENABLED=0`、`-trimpath`；
-- Alpine runtime，仅 ca-certs/wget；
+- Alpine runtime；基础服务仅 ca-certs/wget，Orchestrator 额外安装 FFmpeg 与 Noto CJK 字体；
 - non-root `10001:10001`；
 - read-only root FS；
-- `/tmp` tmpfs；
+- `/tmp` tmpfs；Orchestrator 为 45～60 秒后期处理单独限制为 1 GiB；
 - `no-new-privileges`；
 - drop all Linux capabilities；
 - CAS volume 只挂到需要的服务。
@@ -120,7 +127,9 @@ Metrics：
 - estimate/reservation/actual/release、unverified cost；
 - per provider/model/capability success/429/5xx；
 - CAS bytes/disk headroom、Temporal backlog、outbox lag；
+- Activity journal incomplete age、input-hash conflict；
 - QC pass、Q1/Gate cycle time、3-shot episode completion。
+- post-production/TTS cue latency、FFmpeg duration、output bytes、manual timing required 与 G3 manifest binding。
 
 Alerts：
 
@@ -148,9 +157,10 @@ Alerts：
 2. 查 `UNKNOWN/QUEUED/RUNNING` ProviderJob；
 3. 对已有 CAS hash 先核验；
 4. 用已保存 upstream task ID poll；
-5. 禁止批量 create replacement jobs；
-6. reconcile callback receipts/cost；
-7. 校验 manifests 和 revision dependencies。
+5. 对 incomplete Activity journal 使用同一 JobID reconcile；
+6. 禁止批量 create replacement jobs；
+7. reconcile callback receipts/cost；
+8. 校验 manifests 和 revision dependencies。
 
 RPO/RTO 需在部署环境 SLO 中冻结；M0 只保证流程可演练。
 
@@ -160,7 +170,7 @@ Key 到位后不改领域/Workflow：
 
 1. 通过 Secret manager 注入 `ARK_API_KEY`；语音凭证独立注入；
 2. 配置 allowlisted Ark/Speech base URL 与区域；
-3. connection-test 只返回 fingerprint/masked identity；
+3. Provider Adapter 增量的 connection-test 只允许返回 fingerprint/masked identity；控制面当前不公开占位路由；
 4. discover 实际 text/image/video/speech model/endpoint；
 5. 保存 capability snapshot（ratio/duration/resolution/reference/callback/concurrency）；
 6. 配置 pricing version、quota、QPM/TPM；
@@ -184,6 +194,10 @@ Key 到位后不改领域/Workflow：
 | Artifact | 临时 URL 过期后 CAS 可访问并 checksum 一致 |
 | Secret | 响应/日志/trace/PG backup/Manifest/export 0 命中 |
 | E2E | 1 集 ≥3 镜，TTS+SRT+VTT+CPU MP4+Manifest |
+
+FLO-104 的成片运行、证据分层和三次真实 Key 执行单见
+`docs/flo-104-postproduction.md`。真实 CER、字幕边界、音画起点、
+p50/p95、成功率与费用在 Key 到位前必须保持 `pending_key`。
 
 ## 9. 已知风险
 

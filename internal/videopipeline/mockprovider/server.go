@@ -205,7 +205,7 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	record, ok := s.jobs[r.PathValue("jobID")]
 	if !ok {
-		writeProviderError(w, http.StatusNotFound, newError(providercontract.CodeInvalidRequest, "job not found", false, false))
+		writeProviderError(w, http.StatusNotFound, newError(providercontract.CodeNotFound, "job not found", false, false))
 		return
 	}
 	if !providercontract.Terminal(record.Response.State) && record.Response.State != providercontract.StatusUnknown {
@@ -230,7 +230,7 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.Unlock()
 	record, ok := s.jobs[r.PathValue("jobID")]
 	if !ok {
-		writeProviderError(w, http.StatusNotFound, newError(providercontract.CodeInvalidRequest, "job not found", false, false))
+		writeProviderError(w, http.StatusNotFound, newError(providercontract.CodeNotFound, "job not found", false, false))
 		return
 	}
 	if record.Request.Simulation == "cancel_race" {

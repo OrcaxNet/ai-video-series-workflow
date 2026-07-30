@@ -3,9 +3,14 @@
 package main
 
 import (
+	"context"
 	"log"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
@@ -26,13 +31,46 @@ func main() {
 		log.Fatalf("connect to Temporal: %v", err)
 	}
 	defer temporalClient.Close()
+	store, err := repository.Open(context.Background(), cfg.PostgresDSN, repository.PoolConfig{})
+	if err != nil {
+		log.Fatalf("connect to video PostgreSQL: %v", err)
+	}
+	defer store.Close()
+	artifacts, err := artifactstore.New(cfg.ArtifactRoot)
+	if err != nil {
+		log.Fatalf("open video artifact store: %v", err)
+	}
 
 	temporalWorker := worker.New(temporalClient, cfg.TaskQueue, worker.Options{})
 	temporalWorker.RegisterWorkflowWithOptions(
 		orchestration.EpisodeProductionWorkflow,
 		workflow.RegisterOptions{Name: orchestration.WorkflowName},
 	)
-	activities := orchestration.NewActivities(cfg.ProviderAdapterURL)
+	temporalWorker.RegisterWorkflowWithOptions(
+		orchestration.ShotProductionWorkflow,
+		workflow.RegisterOptions{Name: orchestration.ShotWorkflowName},
+	)
+	temporalWorker.RegisterWorkflowWithOptions(
+		orchestration.ShotReconciliationWorkflow,
+		workflow.RegisterOptions{Name: orchestration.ShotReconciliationWorkflowName},
+	)
+	activities := orchestration.NewProductionActivities(cfg.ProviderAdapterURL, store, store, artifacts)
+	speech, err := postproduction.NewHTTPSpeechProvider(
+		cfg.ProviderAdapterURL,
+		mockprovider.DefaultHTTPClient(),
+	)
+	if err != nil {
+		log.Fatalf("configure speech provider adapter: %v", err)
+	}
+	media, err := postproduction.NewFFmpegProcessor(artifacts)
+	if err != nil {
+		log.Fatalf("configure FFmpeg post-production: %v", err)
+	}
+	postProduction, err := postproduction.NewService(speech, media, artifacts)
+	if err != nil {
+		log.Fatalf("configure episode post-production: %v", err)
+	}
+	activities.ConfigurePostProduction(postProduction, store)
 	temporalWorker.RegisterActivityWithOptions(activities.ValidateBatch, activity.RegisterOptions{Name: orchestration.ActivityValidateBatch})
 	temporalWorker.RegisterActivityWithOptions(activities.CompilePrompt, activity.RegisterOptions{Name: orchestration.ActivityCompilePrompt})
 	temporalWorker.RegisterActivityWithOptions(activities.CreateRun, activity.RegisterOptions{Name: orchestration.ActivityCreateRun})
@@ -40,7 +78,10 @@ func main() {
 	temporalWorker.RegisterActivityWithOptions(activities.RunAutomaticQC, activity.RegisterOptions{Name: orchestration.ActivityRunAutomaticQC})
 	temporalWorker.RegisterActivityWithOptions(activities.CreateShotReview, activity.RegisterOptions{Name: orchestration.ActivityCreateShotReview})
 	temporalWorker.RegisterActivityWithOptions(activities.EscalateShot, activity.RegisterOptions{Name: orchestration.ActivityEscalateShot})
+	temporalWorker.RegisterActivityWithOptions(activities.FinalizeEpisode, activity.RegisterOptions{Name: orchestration.ActivityFinalizeEpisode})
 	temporalWorker.RegisterActivityWithOptions(activities.CreateGate3, activity.RegisterOptions{Name: orchestration.ActivityCreateGate3})
+	temporalWorker.RegisterActivityWithOptions(activities.CancelProviderJob, activity.RegisterOptions{Name: orchestration.ActivityCancelProviderJob})
+	temporalWorker.RegisterActivityWithOptions(activities.FinalizeShotRun, activity.RegisterOptions{Name: orchestration.ActivityFinalizeShotRun})
 
 	log.Printf("video Temporal worker listening (namespace=%s task_queue=%s)", cfg.Namespace, cfg.TaskQueue)
 	if err := temporalWorker.Run(worker.InterruptCh()); err != nil {
