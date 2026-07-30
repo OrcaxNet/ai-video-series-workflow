@@ -59,9 +59,12 @@ export type JobErrorCode =
   | "rate_limited"
   | "quota_exceeded"
   | "budget_exceeded"
+  | "invalid_request"
   | "content_blocked"
   | "provider_unavailable"
   | "timeout";
+
+export type JobsViewState = "READY" | "LOADING" | "EMPTY" | "UNRECOVERABLE";
 
 export interface JobFailure {
   errorCode: JobErrorCode;
@@ -192,6 +195,7 @@ export interface StudioState {
   capabilities: ProviderCapability[];
   gates: Record<GateId, Gate>;
   jobs: ProviderJob[];
+  jobsViewState: JobsViewState;
   assets: Asset[];
   shots: Shot[];
   contextLayers: ContextLayer[];

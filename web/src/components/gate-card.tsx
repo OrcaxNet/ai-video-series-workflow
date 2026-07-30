@@ -48,6 +48,26 @@ export function GateCard({ gate, compact = false }: { gate: Gate; compact?: bool
           </div>
         )}
 
+        {state.lastProblem?.errorCode === "REVISION_CONFLICT" && (
+          <div className="gate-conflict-recovery" role="alert">
+            <div>
+              <strong>本地 ETag 已过期</strong>
+              <p>
+                {state.lastProblem.message} <span className="mono">{state.lastProblem.traceId}</span>
+              </p>
+            </div>
+            <button
+              className="button button-secondary"
+              type="button"
+              onClick={() => void actions.synchronizeGate(gate.id)}
+              disabled={state.busy}
+            >
+              <RefreshCw className={state.busy ? "spin-slow" : ""} size={15} aria-hidden="true" />
+              同步最新 revision
+            </button>
+          </div>
+        )}
+
         {expanded && (
           <div className="review-box">
             <label htmlFor={noteId}>审核意见</label>

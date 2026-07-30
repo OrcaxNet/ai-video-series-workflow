@@ -53,6 +53,111 @@ test("provider failures and callback races have explicit, stable feedback", asyn
   await expect(page.getByText("生成中", { exact: true }).first()).toBeVisible();
 });
 
+test("asset revisions can be compared, locked, and rolled back without deleting history", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "内容与资产 G1" }).click();
+  await page.getByRole("button", { name: "查看影响与回滚" }).click();
+
+  const dialog = page.getByRole("dialog", { name: /季岚 · 影响分析与回滚/ });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("radio", { name: /v2 · APPROVED/ }).click();
+  await expect(dialog.locator("ins").filter({ hasText: "asset-jilan-r2" })).toBeVisible();
+  await expect(dialog.getByText(/下游影响 · 3 个镜头/)).toBeVisible();
+  await expect(dialog.getByText("G1 审核历史、旧 Prompt 和 CAS 产物保持只读可追溯。")).toBeVisible();
+  await dialog.getByRole("button", { name: "回滚业务引用至 v2" }).click();
+
+  await expect(page.getByText("季岚 当前引用已设为 v2")).toBeVisible();
+  await expect(page.getByText("asset-jilan-r2").first()).toBeVisible();
+  await expect(page.getByText("v4 · DRAFT")).toBeVisible();
+});
+
+test("quota, budget, failed, and cancelled provider outcomes are reachable", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "任务中心" }).click();
+
+  await page.getByRole("button", { name: /配额.*阻断并换路由/ }).click();
+  await expect(page.getByText(/配额不足/).first()).toBeVisible();
+  await expect(page.getByText("需要处理", { exact: true }).first()).toBeVisible();
+
+  await page.getByRole("button", { name: /预算.*等待负责人批准/ }).click();
+  await expect(page.getByText(/超出预算/).first()).toBeVisible();
+
+  await page.getByRole("button", { name: /失败.*FAILED 终态/ }).click();
+  await expect(page.getByText("失败", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("需新建 attempt", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /取消.*CANCELLED 终态/ }).click();
+  await expect(page.getByText("已取消", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("已确认取消", { exact: true })).toBeVisible();
+});
+
+test("a 409 conflict exposes synchronization and then accepts a fresh decision", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "内容与资产 G1" }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByLabel("审核意见").fill("确认冲突恢复路径");
+  await page.getByRole("button", { name: "并发测试" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r7" }).click();
+
+  await expect(page.getByText("本地 ETag 已过期")).toBeVisible();
+  await page.getByRole("button", { name: "同步最新 revision" }).click();
+  await expect(page.getByText("G1 已同步到 ETag 8")).toBeVisible();
+  await page.getByRole("button", { name: "批准并锁定 r7" }).click();
+  await expect(page.getByText("G1 已批准并锁定")).toBeVisible();
+});
+
+test("project dialog traps focus, closes on Escape, and restores the trigger", async ({ page }) => {
+  await page.goto("/");
+  const trigger = page.getByRole("button", { name: "切换或新建项目" });
+  await trigger.click();
+
+  await expect(page.getByLabel("项目名称")).toBeFocused();
+  const submit = page.getByRole("button", { name: "创建并生成结构草稿" });
+  await submit.focus();
+  await page.keyboard.press("Tab");
+  await expect(page.getByRole("button", { name: "关闭新建项目" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(trigger).toBeFocused();
+});
+
+test("job projection has loading, empty, and explicit unrecoverable states", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "任务中心" }).click();
+
+  await page.getByRole("button", { name: "加载中" }).click();
+  await expect(page.getByLabel("正在加载 Provider jobs")).toHaveAttribute("aria-busy", "true");
+  await page.getByRole("button", { name: "空列表" }).click();
+  await expect(page.getByText("还没有 Provider 任务")).toBeVisible();
+  await page.getByRole("button", { name: "不可恢复" }).click();
+  await expect(page.getByRole("alert")).toContainText("ARTIFACT_STORE_UNAVAILABLE");
+  await expect(page.getByRole("alert")).toContainText("retryable=false");
+  await page.getByRole("button", { name: "重新加载投影" }).click();
+  await expect(page.getByRole("table")).toBeVisible();
+});
+
+test("390px mobile flow keeps the critical Mock action reachable through G3", async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "资产", exact: true }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r7" }).click();
+  await page.getByRole("button", { name: "分镜", exact: true }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r9" }).click();
+  await page.getByRole("button", { name: "任务", exact: true }).click();
+
+  const complete = page.getByRole("button", { name: "完成 Mock 排练" });
+  await expect(complete).toBeVisible();
+  await expect(complete).toBeEnabled();
+  await complete.click();
+  await page.getByRole("button", { name: "成片", exact: true }).click();
+  await page.getByRole("button", { name: "开始审核" }).click();
+  await page.getByRole("button", { name: "批准并锁定 r2" }).click();
+  await expect(page.getByText("G3 已批准并锁定")).toBeVisible();
+});
+
 test("prompt rollback changes only the selected reference", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "版本与谱系" }).click();

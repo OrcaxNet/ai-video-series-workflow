@@ -1,4 +1,19 @@
-import { Archive, Box, CheckCircle2, Fingerprint, Image, Link2, Palette, ShieldCheck, Users } from "lucide-react";
+import {
+  Archive,
+  ArrowRight,
+  Box,
+  CheckCircle2,
+  Fingerprint,
+  GitCompareArrows,
+  Image,
+  Link2,
+  Palette,
+  RotateCcw,
+  ShieldCheck,
+  Users,
+  X,
+} from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { GateCard } from "../components/gate-card";
 import { useStudio } from "../studio-store";
 
@@ -10,7 +25,56 @@ const kindLabel = {
 
 export function AssetsPage() {
   const { state, actions } = useStudio();
+  const [revisionDialogOpen, setRevisionDialogOpen] = useState(false);
+  const [selectedRevisionVersion, setSelectedRevisionVersion] = useState<number>();
+  const revisionTriggerRef = useRef<HTMLButtonElement>(null);
+  const revisionDialogRef = useRef<HTMLElement>(null);
   const selected = state.assets.find((asset) => asset.id === state.selectedAssetId) ?? state.assets[0];
+  const candidate =
+    selected.revisions.find((revision) => revision.version === selectedRevisionVersion) ??
+    selected.revisions.find((revision) => revision.version === selected.version) ??
+    selected.revisions[0];
+  const impactedShots = state.shots.filter((shot) => shot.assetIds.includes(selected.id));
+
+  const closeRevisionDialog = () => setRevisionDialogOpen(false);
+
+  useEffect(() => {
+    if (!revisionDialogOpen) return;
+    const dialog = revisionDialogRef.current;
+    if (!dialog) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    dialog.querySelector<HTMLElement>("button")?.focus();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRevisionDialog();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    dialog.addEventListener("keydown", handleKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      revisionTriggerRef.current?.focus();
+    };
+  }, [revisionDialogOpen]);
 
   return (
     <div className="page">
@@ -151,7 +215,15 @@ export function AssetsPage() {
                 </div>
               ))}
           </div>
-          <button className="button button-secondary full-width" type="button">
+          <button
+            ref={revisionTriggerRef}
+            className="button button-secondary full-width"
+            type="button"
+            onClick={() => {
+              setSelectedRevisionVersion(selected.version);
+              setRevisionDialogOpen(true);
+            }}
+          >
             <Archive size={15} aria-hidden="true" />
             查看影响与回滚
           </button>
@@ -176,6 +248,118 @@ export function AssetsPage() {
         </div>
         <GateCard gate={state.gates.G1} />
       </section>
+
+      {revisionDialogOpen && candidate && (
+        <div className="dialog-backdrop" role="presentation">
+          <section
+            ref={revisionDialogRef}
+            className="asset-revision-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="asset-revision-title"
+            aria-describedby="asset-revision-description"
+            tabIndex={-1}
+          >
+            <header className="asset-revision-header">
+              <div>
+                <span className="eyebrow">不可变版本链 · {kindLabel[selected.kind]}</span>
+                <h2 id="asset-revision-title">{selected.name} · 影响分析与回滚</h2>
+                <p id="asset-revision-description">
+                  这里只切换业务引用，不删除、不覆盖历史 revision。已批准的 G1 记录仍指向原内容哈希。
+                </p>
+              </div>
+              <button className="icon-button" type="button" onClick={closeRevisionDialog} aria-label="关闭版本影响分析">
+                <X size={17} />
+              </button>
+            </header>
+
+            <div className="asset-revision-layout">
+              <div className="revision-picker" role="radiogroup" aria-label="选择资产 revision">
+                <span className="eyebrow">选择目标版本</span>
+                {selected.revisions
+                  .slice()
+                  .reverse()
+                  .map((revision) => (
+                    <button
+                      type="button"
+                      role="radio"
+                      aria-checked={candidate.version === revision.version}
+                      className={candidate.version === revision.version ? "selected" : ""}
+                      key={revision.revisionId}
+                      onClick={() => setSelectedRevisionVersion(revision.version)}
+                    >
+                      <span className={`revision-dot state-${revision.state.toLowerCase()}`} />
+                      <span>
+                        <strong>v{revision.version} · {revision.state}</strong>
+                        <small>{revision.note}</small>
+                        <em className="mono">{revision.revisionId}</em>
+                      </span>
+                      {revision.version === selected.version && <i>当前</i>}
+                    </button>
+                  ))}
+              </div>
+
+              <div className="revision-analysis">
+                <div className="revision-compare-heading">
+                  <GitCompareArrows size={18} aria-hidden="true" />
+                  <div>
+                    <span className="eyebrow">精确差异</span>
+                    <strong>v{selected.version} <ArrowRight size={14} aria-hidden="true" /> v{candidate.version}</strong>
+                  </div>
+                </div>
+                <dl className="revision-diff">
+                  <div>
+                    <dt>引用 ID</dt>
+                    <dd><del>{selected.revisionId}</del><ins>{candidate.revisionId}</ins></dd>
+                  </div>
+                  <div>
+                    <dt>版本状态</dt>
+                    <dd><del>{selected.state}</del><ins>{candidate.state}</ins></dd>
+                  </div>
+                  <div>
+                    <dt>内容说明</dt>
+                    <dd><span>当前引用 v{selected.version}</span><ins>{candidate.note}</ins></dd>
+                  </div>
+                </dl>
+
+                <div className="revision-impact">
+                  <span className="eyebrow">下游影响 · {impactedShots.length} 个镜头</span>
+                  <ul>
+                    {impactedShots.map((shot) => (
+                      <li key={shot.id}>
+                        <span>
+                          <strong>{shot.code} · {shot.title}</strong>
+                          <small>{shot.id} · Prompt r{shot.promptRevision}</small>
+                        </span>
+                        <em>{shot.state === "SUCCEEDED" ? "历史成片保持不变" : "切换后标记 STALE"}</em>
+                      </li>
+                    ))}
+                  </ul>
+                  <p><ShieldCheck size={14} aria-hidden="true" /> G1 审核历史、旧 Prompt 和 CAS 产物保持只读可追溯。</p>
+                </div>
+              </div>
+            </div>
+
+            <footer className="asset-revision-actions">
+              <button className="button button-secondary" type="button" onClick={closeRevisionDialog}>取消</button>
+              <button
+                className="button button-primary"
+                type="button"
+                disabled={candidate.version === selected.version}
+                onClick={() => {
+                  actions.lockAssetRevision(selected.id, candidate.version);
+                  closeRevisionDialog();
+                }}
+              >
+                <RotateCcw size={15} aria-hidden="true" />
+                {candidate.version < selected.version
+                  ? `回滚业务引用至 v${candidate.version}`
+                  : `设为当前引用 v${candidate.version}`}
+              </button>
+            </footer>
+          </section>
+        </div>
+      )}
     </div>
   );
 }

@@ -17,6 +17,7 @@ export interface ControlPlaneApi {
   createApproval(input: ApprovalInput): Promise<ApprovalResult>;
   regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult>;
   simulateConcurrentUpdate(gateId: GateId): Promise<number>;
+  synchronizeGate(gateId: GateId): Promise<Gate>;
 }
 
 const problem = (
@@ -180,6 +181,11 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     this.gates[gateId].etag += 1;
     return this.gates[gateId].etag;
   }
+
+  async synchronizeGate(gateId: GateId): Promise<Gate> {
+    await Promise.resolve();
+    return structuredClone(this.gates[gateId]);
+  }
 }
 
 interface ProviderStatusResponse {
@@ -276,6 +282,18 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
 
   async simulateConcurrentUpdate(): Promise<number> {
     throw problem(501, "CAPABILITY_UNAVAILABLE", "真实控制面不提供测试注入。", "仅在 Mock 场景中使用此操作。");
+  }
+
+  async synchronizeGate(gateId: GateId): Promise<Gate> {
+    const response = await fetch(`${this.baseUrl}/gates/${gateId}`, {
+      method: "GET",
+      credentials: "omit",
+      headers: { Accept: "application/json" },
+    });
+    if (!response.ok) {
+      throw await this.readProblem(response);
+    }
+    return (await response.json()) as Gate;
   }
 
   private async readProblem(response: Response) {

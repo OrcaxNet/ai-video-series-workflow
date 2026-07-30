@@ -17,7 +17,14 @@ import {
   ShieldCheck,
   X,
 } from "lucide-react";
-import { type ComponentType, useState } from "react";
+import {
+  type ComponentType,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import type { CreateProjectInput, ViewId } from "./domain";
 import { useStudio } from "./studio-store";
 import { AssetsPage } from "./pages/assets";
@@ -54,6 +61,8 @@ const pages: Record<ViewId, ComponentType> = {
 export function App() {
   const { state, actions } = useStudio();
   const [projectDialogOpen, setProjectDialogOpen] = useState(false);
+  const projectSwitcherRef = useRef<HTMLButtonElement>(null);
+  const closeProjectDialog = useCallback(() => setProjectDialogOpen(false), []);
   const CurrentPage = pages[state.view];
 
   return (
@@ -74,6 +83,7 @@ export function App() {
           <span>AI 剧集创作操作台</span>
         </div>
         <button
+          ref={projectSwitcherRef}
           className="project-switcher"
           type="button"
           aria-label="切换或新建项目"
@@ -186,13 +196,23 @@ export function App() {
           </div>
         ))}
       </div>
-      {projectDialogOpen && <ProjectDialog onClose={() => setProjectDialogOpen(false)} />}
+      {projectDialogOpen && (
+        <ProjectDialog onClose={closeProjectDialog} returnFocusRef={projectSwitcherRef} />
+      )}
     </div>
   );
 }
 
-function ProjectDialog({ onClose }: { onClose(): void }) {
+function ProjectDialog({
+  onClose,
+  returnFocusRef,
+}: {
+  onClose(): void;
+  returnFocusRef: RefObject<HTMLButtonElement | null>;
+}) {
   const { state, actions } = useStudio();
+  const dialogRef = useRef<HTMLElement>(null);
+  const firstInputRef = useRef<HTMLInputElement>(null);
   const [draft, setDraft] = useState<CreateProjectInput>({
     title: "潮汐失语者",
     sourceText: "台风登陆前，观测员在一座停止报时的灯塔里收到来自三年前的求救信号。",
@@ -205,9 +225,59 @@ function ProjectDialog({ onClose }: { onClose(): void }) {
   const update = <Key extends keyof CreateProjectInput>(key: Key, value: CreateProjectInput[Key]) =>
     setDraft((current) => ({ ...current, [key]: value }));
 
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    firstInputRef.current?.focus();
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((element) => !element.hasAttribute("hidden"));
+      if (focusable.length === 0) {
+        event.preventDefault();
+        dialog.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    dialog.addEventListener("keydown", handleKeyDown);
+    return () => {
+      dialog.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      returnFocusRef.current?.focus();
+    };
+  }, [onClose, returnFocusRef]);
+
   return (
     <div className="dialog-backdrop" role="presentation">
-      <section className="project-dialog" role="dialog" aria-modal="true" aria-labelledby="create-project-title">
+      <section
+        ref={dialogRef}
+        className="project-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="create-project-title"
+        tabIndex={-1}
+      >
         <div className="dialog-header">
           <div>
             <span className="eyebrow">新建制作项目</span>
@@ -228,6 +298,7 @@ function ProjectDialog({ onClose }: { onClose(): void }) {
             <label className="field field-wide">
               <span>项目名称</span>
               <input
+                ref={firstInputRef}
                 required
                 value={draft.title}
                 onChange={(event) => update("title", event.target.value)}

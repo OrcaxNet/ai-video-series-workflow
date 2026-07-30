@@ -94,6 +94,19 @@ describe("MockControlPlaneApi", () => {
     });
   });
 
+  it("lets a stale client synchronize the current ETag and safely resubmit", async () => {
+    const api = new MockControlPlaneApi();
+    await api.simulateConcurrentUpdate("G1");
+
+    const synchronized = await api.synchronizeGate("G1");
+    expect(synchronized).toMatchObject({ id: "G1", revision: 7, etag: 8 });
+    await expect(api.createApproval(input("G1", synchronized.etag, "fresh-client"))).resolves.toMatchObject({
+      gate: "G1",
+      decision: "APPROVED",
+      expectedRevision: 9,
+    });
+  });
+
   it("creates a new revision for regeneration instead of mutating the reviewed one", async () => {
     const api = new MockControlPlaneApi();
     await api.createApproval(input("G1", 7, "g1-return", "RETURNED"));

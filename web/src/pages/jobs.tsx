@@ -1,5 +1,6 @@
 import {
   Ban,
+  Boxes,
   CircleDollarSign,
   CloudOff,
   FlaskConical,
@@ -12,7 +13,7 @@ import {
   Webhook,
   XOctagon,
 } from "lucide-react";
-import { EvidenceBadge, JobBadge, ProgressBar } from "../components/ui";
+import { EmptyPanel, EvidenceBadge, JobBadge, ProgressBar } from "../components/ui";
 import { jobErrorLabel, type FailureScenario, useStudio } from "../studio-store";
 
 const scenarios: Array<{
@@ -24,8 +25,12 @@ const scenarios: Array<{
   { id: "unauthorized", label: "401", detail: "凭据未配置", icon: KeyRound },
   { id: "forbidden", label: "403", detail: "模型无权限", icon: Ban },
   { id: "rate_limited", label: "429", detail: "限流等待", icon: Gauge },
+  { id: "quota_exceeded", label: "配额", detail: "阻断并换路由", icon: Gauge },
+  { id: "budget_exceeded", label: "预算", detail: "等待负责人批准", icon: CircleDollarSign },
   { id: "provider_unavailable", label: "5xx", detail: "同任务重试", icon: Unplug },
   { id: "timeout", label: "超时", detail: "进入 UNKNOWN", icon: TimerReset },
+  { id: "terminal_failure", label: "失败", detail: "FAILED 终态", icon: XOctagon },
+  { id: "cancelled", label: "取消", detail: "CANCELLED 终态", icon: Ban },
   { id: "duplicate_callback", label: "重复", detail: "回调去重", icon: Webhook },
   { id: "out_of_order_callback", label: "乱序", detail: "禁止回退", icon: RotateCcw },
   { id: "cancel_race", label: "竞态", detail: "终态优先", icon: ShieldAlert },
@@ -37,7 +42,7 @@ export function JobsPage() {
   const completeEnabled = state.gates.G2.state === "APPROVED";
 
   return (
-    <div className="page">
+    <div className="page page-jobs">
       <header className="page-header">
         <div>
           <span className="eyebrow">Provider 操作中心</span>
@@ -45,7 +50,7 @@ export function JobsPage() {
           <p>submit、poll、webhook、cancel、retry 和 timeout 都回到同一个 Job ID；浏览器只看脱敏投影。</p>
         </div>
         <button
-          className="button button-primary"
+          className="button button-primary critical-header-action"
           type="button"
           onClick={() => actions.completeMockRun()}
           disabled={!completeEnabled}
@@ -133,7 +138,73 @@ export function JobsPage() {
             )}
           </div>
         </div>
-        <div className="job-table-wrap">
+        <div className="projection-state-lab" aria-label="任务列表投影状态">
+          <span>投影演练</span>
+          {([
+            ["READY", "正常"],
+            ["LOADING", "加载中"],
+            ["EMPTY", "空列表"],
+            ["UNRECOVERABLE", "不可恢复"],
+          ] as const).map(([viewState, label]) => (
+            <button
+              type="button"
+              key={viewState}
+              aria-pressed={state.jobsViewState === viewState}
+              onClick={() => actions.setJobsViewState(viewState)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {state.jobsViewState === "LOADING" && (
+          <div className="jobs-loading" aria-busy="true" aria-label="正在加载 Provider jobs">
+            {[0, 1, 2].map((row) => (
+              <div key={row}>
+                <span />
+                <span />
+                <span />
+                <span />
+              </div>
+            ))}
+            <p>正在读取脱敏任务投影…</p>
+          </div>
+        )}
+
+        {state.jobsViewState === "EMPTY" && (
+          <EmptyPanel
+            title="还没有 Provider 任务"
+            description="批准 G2 并提交生成计划后，任务会以同一个 Job ID 贯穿 submit、poll 与 callback。"
+            action={
+              <button className="button button-secondary" type="button" onClick={() => actions.navigate("storyboard")}>
+                <Boxes size={15} aria-hidden="true" />
+                前往 G2 生成计划
+              </button>
+            }
+          />
+        )}
+
+        {state.jobsViewState === "UNRECOVERABLE" && (
+          <div className="jobs-unrecoverable" role="alert">
+            <CloudOff size={24} aria-hidden="true" />
+            <div>
+              <span className="eyebrow">投影读取失败 · 不可自动恢复</span>
+              <h3>ARTIFACT_STORE_UNAVAILABLE</h3>
+              <p>任务源记录仍在控制面，但当前投影不可用。不要重复提交 Provider 任务。</p>
+              <small className="mono">trace trc_projection_7f92a1 · retryable=false</small>
+            </div>
+            <button
+              className="button button-secondary"
+              type="button"
+              onClick={() => actions.setJobsViewState("READY")}
+            >
+              <RotateCcw size={15} aria-hidden="true" />
+              重新加载投影
+            </button>
+          </div>
+        )}
+
+        {state.jobsViewState === "READY" && <div className="job-table-wrap">
           <table className="job-table">
             <thead>
               <tr>
@@ -188,6 +259,13 @@ export function JobsPage() {
                           取消
                         </button>
                       )}
+                      {job.state === "CANCEL_REQUESTED" && (
+                        <button className="text-button" type="button" onClick={() => actions.confirmCancelJob(job.id)}>
+                          确认取消终态
+                        </button>
+                      )}
+                      {job.state === "CANCELLED" && <span className="table-done">已确认取消</span>}
+                      {job.state === "FAILED" && <span className="table-done">需新建 attempt</span>}
                       {job.state === "SUCCEEDED" && <span className="table-done">已归档 CAS</span>}
                     </div>
                   </td>
@@ -195,7 +273,7 @@ export function JobsPage() {
               ))}
             </tbody>
           </table>
-        </div>
+        </div>}
       </section>
 
       <section className="trace-boundary">

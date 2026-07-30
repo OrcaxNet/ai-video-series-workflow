@@ -543,6 +543,7 @@ export const createInitialState = (): StudioState => ({
   capabilities,
   gates: structuredClone(gates),
   jobs: structuredClone(jobs),
+  jobsViewState: "READY",
   assets: structuredClone(assets),
   shots: structuredClone(shots),
   contextLayers: structuredClone(contextLayers),
