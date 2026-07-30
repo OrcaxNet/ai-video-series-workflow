@@ -117,13 +117,15 @@ Consent。`mock_only` 可省略 `voiceRef` 并使用明确标注的合成 tone�
 - VIDEO/TTS 的 `budget_exceeded` 同样在 `ExecuteProviderJob` /
   `FinalizeEpisode` Activity 边界保持同码、不可重试。
 - 提交事务还会重新检查每个 Run 仍为成功且 QC 通过，避免准备后状态漂移。
-- G3 只在当前后期 Manifest 已关联到所有贡献 Run，且完整后期集合中的
+- G3 只在冻结 payload 的全部 `providerExecutions.artifacts` 仍以相同
+  artifact ID、content hash、URI、kind、role 关联到原 Run 且为 ACTIVE，
+  并且当前后期 Manifest 已关联到所有贡献 Run、完整后期集合中的
   final video、SRT、对白、后期 Manifest、Service BOM 及任何额外后期引用都
   保持 `status=ACTIVE`、`postProductionManifestHash` 完全一致并链接到每个
-  精确 Run 后创建。Commit 会把 payload 的 `providerExecutions.artifacts`
-  与事务内产品真值逐项比较；同 Run 的旧后期/字幕 revision 不会进入新的
-  Generation Manifest，Build 后任一引用失活也不会留下 Manifest、G3 或新
-  run link。
+  精确 Run 后创建。Commit 在同一 SERIALIZABLE 事务首次写入前逐项锁定并
+  比较上述完整冻结集合；同 Run 的旧后期/字幕 revision 不会进入新的
+  Generation Manifest，Build 后任一原始 Provider output、无后期 hash 的
+  额外引用或后期引用失活，也不会留下 Manifest、G3 或新 run link。
   缺失 G1/G2、许可、预算、路由、成功镜头、QC 或 Manifest 均 fail closed。
 - Artifact hash 冲突只允许复用 `ACTIVE` CAS 记录；`ORPHAN_CANDIDATE`、
   `ARCHIVED`、`DISABLED` 不会被隐式恢复或重新链接。Manifest 读取和 G3
@@ -240,6 +242,7 @@ workflow Run 会写入该字段；历史 workflow Run 若缺少 `generationPlanI
 Migration 5 down 仅移除新增预算绑定列与索引，不删除 review task；但旧
 二进制只检查任意 APPROVED BUDGET ID，会重新打开弱预算边界，因此禁止在
 付费提交开启时回滚应用。仅回滚本轮应用代码不会改变 migration 5，但会移除
-实际 submit 与完整后期引用的二次复查，同样必须先关闭付费提交和 G3 创建。
+实际 submit、完整冻结 payload artifact 与后期引用的二次复查，同样必须先
+关闭付费提交和 G3 创建。
 其余已知风险是 FFmpeg/libass 版本差异、真实 TTS 时间戳与费用能力未知，
 以及当前真实 Key 缺失；这些都必须通过固定镜像 digest 和第 6 节实测关闭。

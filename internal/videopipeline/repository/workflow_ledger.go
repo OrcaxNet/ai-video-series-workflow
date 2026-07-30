@@ -1323,7 +1323,15 @@ func (p *Postgres) BuildEpisodeManifest(
 			    WHERE ga.generation_run_id = gr.id
 			  ), '[]'::jsonb),
 			  'artifacts', COALESCE((
-			    SELECT jsonb_agg(to_jsonb(a) || jsonb_build_object('role', ra.role) ORDER BY ra.role, a.id)
+			    SELECT jsonb_agg(
+			      to_jsonb(a) || jsonb_build_object(
+			        'role', ra.role,
+			        'media_spec', a.media_spec || jsonb_build_object(
+			          'kind', COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video')
+			        )
+			      )
+			      ORDER BY ra.role, a.id
+			    )
 			    FROM video_pipeline.run_artifacts ra
 			    JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
 			    WHERE ra.generation_run_id = gr.id
@@ -1546,8 +1554,14 @@ func (p *Postgres) CommitEpisodeManifest(
 	if err != nil {
 		return errors.New("manifest run IDs must be UUIDs")
 	}
-	payloadPostProductionReferences, err := postProductionReferencesFromPayload(
+	payloadArtifactReferences, err := artifactReferencesFromPayload(
 		binding, runIDs,
+	)
+	if err != nil {
+		return err
+	}
+	payloadPostProductionReferences, err := postProductionReferencesFromPayload(
+		payloadArtifactReferences, binding.PostProductionManifestHash, runIDs,
 	)
 	if err != nil {
 		return err
@@ -1560,6 +1574,11 @@ func (p *Postgres) CommitEpisodeManifest(
 			runIDs,
 			input.GenerationPlanID,
 			input.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		if err := requireActiveManifestArtifacts(
+			ctx, tx, payloadArtifactReferences,
 		); err != nil {
 			return struct{}{}, err
 		}
@@ -1703,6 +1722,22 @@ type generationManifestCommitBinding struct {
 	Outputs []string `json:"outputs"`
 }
 
+type manifestArtifactReference struct {
+	RunID                      uuid.UUID
+	ArtifactID                 uuid.UUID
+	ContentHash                string
+	ArtifactURI                string
+	Kind                       string
+	Role                       string
+	PostProductionManifestHash string
+}
+
+type manifestArtifactReferenceKey struct {
+	RunID      uuid.UUID
+	ArtifactID uuid.UUID
+	Role       string
+}
+
 type postProductionArtifactReference struct {
 	RunID       uuid.UUID
 	ArtifactID  uuid.UUID
@@ -1717,19 +1752,17 @@ type activePostProductionArtifacts struct {
 	References    []postProductionArtifactReference
 }
 
-func postProductionReferencesFromPayload(
+func artifactReferencesFromPayload(
 	binding generationManifestCommitBinding,
 	runIDs []uuid.UUID,
-) ([]postProductionArtifactReference, error) {
-	if binding.PostProductionManifestHash == "" {
-		return nil, nil
-	}
+) ([]manifestArtifactReference, error) {
 	expectedRuns := make(map[uuid.UUID]struct{}, len(runIDs))
 	for _, runID := range runIDs {
 		expectedRuns[runID] = struct{}{}
 	}
 	seenRuns := make(map[uuid.UUID]struct{}, len(runIDs))
-	references := make([]postProductionArtifactReference, 0, len(runIDs)*5)
+	seenReferences := make(map[manifestArtifactReferenceKey]struct{})
+	references := make([]manifestArtifactReference, 0, len(runIDs)*6)
 	for _, execution := range binding.ProviderExecutions {
 		runID, err := uuid.Parse(execution.RunID)
 		if err != nil {
@@ -1755,26 +1788,51 @@ func postProductionReferencesFromPayload(
 		}
 		seenRuns[runID] = struct{}{}
 		for _, artifact := range execution.Artifacts {
-			if artifact.MediaSpec.PostProductionManifestHash !=
-				binding.PostProductionManifestHash {
-				continue
-			}
 			artifactID, err := uuid.Parse(artifact.ID)
 			if err != nil {
 				return nil, controlplane.NewPolicyError(
 					controlplane.CodeGateRequired,
-					"generation manifest contains an invalid post-production artifact",
+					"generation manifest contains an invalid artifact identity",
 					"rebuild the manifest from current persisted artifact identities",
 				)
 			}
-			references = append(references, postProductionArtifactReference{
-				RunID:       runID,
-				ArtifactID:  artifactID,
-				ContentHash: artifact.ContentHash,
-				ArtifactURI: artifact.ArtifactURI,
-				Kind:        artifact.MediaSpec.Kind,
-				Role:        artifact.Role,
-			})
+			kind := artifact.MediaSpec.Kind
+			if kind == "" {
+				// Provider artifacts created before kind was explicitly frozen in
+				// the manifest use the repository's canonical default.
+				kind = "shot_video"
+			}
+			reference := manifestArtifactReference{
+				RunID:                      runID,
+				ArtifactID:                 artifactID,
+				ContentHash:                artifact.ContentHash,
+				ArtifactURI:                artifact.ArtifactURI,
+				Kind:                       kind,
+				Role:                       artifact.Role,
+				PostProductionManifestHash: artifact.MediaSpec.PostProductionManifestHash,
+			}
+			if reference.ContentHash == "" ||
+				reference.ArtifactURI == "" ||
+				reference.Kind == "" ||
+				reference.Role == "" {
+				return nil, controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"generation manifest contains an incomplete artifact reference",
+					"rebuild the manifest from complete persisted artifact identities",
+				)
+			}
+			key := manifestArtifactReferenceKey{
+				RunID: runID, ArtifactID: artifactID, Role: reference.Role,
+			}
+			if _, duplicate := seenReferences[key]; duplicate {
+				return nil, controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"generation manifest contains a duplicate artifact reference",
+					"rebuild the manifest from one frozen reference per persisted run link",
+				)
+			}
+			seenReferences[key] = struct{}{}
+			references = append(references, reference)
 		}
 	}
 	if len(seenRuns) != len(expectedRuns) {
@@ -1784,12 +1842,145 @@ func postProductionReferencesFromPayload(
 			"rebuild the manifest from every exact persisted run",
 		)
 	}
+	return references, nil
+}
+
+func postProductionReferencesFromPayload(
+	artifacts []manifestArtifactReference,
+	manifestHash string,
+	runIDs []uuid.UUID,
+) ([]postProductionArtifactReference, error) {
+	references := make([]postProductionArtifactReference, 0, len(runIDs)*5)
+	for _, artifact := range artifacts {
+		if artifact.PostProductionManifestHash == "" {
+			continue
+		}
+		if manifestHash == "" ||
+			artifact.PostProductionManifestHash != manifestHash {
+			return nil, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest contains an artifact from a different post-production revision",
+				"rebuild the manifest from the exact current post-production manifest hash",
+			)
+		}
+		references = append(references, postProductionArtifactReference{
+			RunID:       artifact.RunID,
+			ArtifactID:  artifact.ArtifactID,
+			ContentHash: artifact.ContentHash,
+			ArtifactURI: artifact.ArtifactURI,
+			Kind:        artifact.Kind,
+			Role:        artifact.Role,
+		})
+	}
+	if manifestHash == "" {
+		return nil, nil
+	}
 	if _, err := validatePostProductionArtifactReferences(
-		references, runIDs, binding.PostProductionManifestHash,
+		references, runIDs, manifestHash,
 	); err != nil {
 		return nil, err
 	}
 	return references, nil
+}
+
+func requireActiveManifestArtifacts(
+	ctx context.Context,
+	tx pgx.Tx,
+	references []manifestArtifactReference,
+) error {
+	if len(references) == 0 {
+		return nil
+	}
+	runIDs := make([]uuid.UUID, 0, len(references))
+	artifactIDs := make([]uuid.UUID, 0, len(references))
+	roles := make([]string, 0, len(references))
+	for _, reference := range references {
+		runIDs = append(runIDs, reference.RunID)
+		artifactIDs = append(artifactIDs, reference.ArtifactID)
+		roles = append(roles, reference.Role)
+	}
+	rows, err := tx.Query(ctx, `
+		WITH requested AS (
+		  SELECT *
+		  FROM unnest($1::uuid[], $2::uuid[], $3::text[])
+		    WITH ORDINALITY AS requested(run_id, artifact_id, role, ordinal)
+		)
+		SELECT requested.ordinal,
+		       ra.generation_run_id,
+		       a.id,
+		       a.content_hash,
+		       a.artifact_uri,
+		       COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video'),
+		       ra.role,
+		       a.status
+		FROM requested
+		JOIN video_pipeline.run_artifacts ra
+		  ON ra.generation_run_id = requested.run_id
+		 AND ra.artifact_id = requested.artifact_id
+		 AND ra.role = requested.role
+		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+		ORDER BY requested.ordinal
+		FOR SHARE OF ra, a`,
+		runIDs, artifactIDs, roles,
+	)
+	if err != nil {
+		return fmt.Errorf("verify frozen manifest artifacts: %w", err)
+	}
+	verified := 0
+	for rows.Next() {
+		var (
+			ordinal int64
+			actual  manifestArtifactReference
+			status  string
+		)
+		if err := rows.Scan(
+			&ordinal,
+			&actual.RunID,
+			&actual.ArtifactID,
+			&actual.ContentHash,
+			&actual.ArtifactURI,
+			&actual.Kind,
+			&actual.Role,
+			&status,
+		); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan frozen manifest artifact: %w", err)
+		}
+		index := int(ordinal - 1)
+		if index < 0 || index >= len(references) {
+			rows.Close()
+			return fmt.Errorf("verify frozen manifest artifact: invalid reference ordinal %d", ordinal)
+		}
+		expected := references[index]
+		if status != "ACTIVE" ||
+			actual.RunID != expected.RunID ||
+			actual.ArtifactID != expected.ArtifactID ||
+			actual.ContentHash != expected.ContentHash ||
+			actual.ArtifactURI != expected.ArtifactURI ||
+			actual.Kind != expected.Kind ||
+			actual.Role != expected.Role {
+			rows.Close()
+			return controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest artifact no longer matches its ACTIVE persisted run link",
+				"rebuild the manifest from the complete current artifact set",
+			)
+		}
+		verified++
+	}
+	iterationErr := rows.Err()
+	rows.Close()
+	if iterationErr != nil {
+		return fmt.Errorf("iterate frozen manifest artifacts: %w", iterationErr)
+	}
+	if verified != len(references) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"generation manifest artifact run link no longer exists",
+			"rebuild the manifest from the complete current artifact set",
+		)
+	}
+	return nil
 }
 
 func requireActivePostProductionArtifacts(

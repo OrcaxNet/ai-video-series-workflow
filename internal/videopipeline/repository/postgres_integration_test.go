@@ -1495,6 +1495,25 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			($1, $4, 'SUBTITLE')`,
 		run.RunID, oldPostManifestID, oldFinalVideoID, oldSubtitleID,
 	)
+	extraHashlessArtifactID := uuid.New()
+	extraHashlessArtifactHash := fixtureDigest("hashless provider auxiliary")
+	extraHashlessArtifactURI := "cas://sha256/" + extraHashlessArtifactHash
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES ($1, $2, $3, 'application/octet-stream', 1,
+		        '{"kind":"provider_auxiliary"}', 'ACTIVE')`,
+		extraHashlessArtifactID,
+		extraHashlessArtifactHash,
+		extraHashlessArtifactURI,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.run_artifacts
+			(generation_run_id, artifact_id, role)
+		VALUES ($1, $2, 'PROXY')`,
+		run.RunID,
+		extraHashlessArtifactID,
+	)
 
 	step.ActivityID, step.ActivityType = "manifest", orchestration.ActivityCreateGate3
 	gate3Input := orchestration.CreateGate3Input{
@@ -1524,7 +1543,11 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		Outputs                    []string `json:"outputs"`
 		ProviderExecutions         []struct {
 			Artifacts []struct {
-				MediaSpec struct {
+				ID          string `json:"id"`
+				ContentHash string `json:"content_hash"`
+				ArtifactURI string `json:"artifact_uri"`
+				Role        string `json:"role"`
+				MediaSpec   struct {
 					Kind                       string `json:"kind"`
 					PostProductionManifestHash string `json:"postProductionManifestHash"`
 				} `json:"media_spec"`
@@ -1566,6 +1589,40 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		bytes.Contains(manifestPayload, []byte(oldFinalVideoURI)) ||
 		bytes.Contains(manifestPayload, []byte(oldSubtitleURI)) {
 		t.Fatal("G3 manifest leaked an old post-production revision")
+	}
+	frozenHashlessArtifacts := map[string]struct {
+		id, uri, kind, role string
+	}{
+		providerResult.ArtifactDigest: {
+			id: uuid.NewSHA1(
+				uuid.NameSpaceOID,
+				[]byte("artifact:"+providerResult.ArtifactDigest),
+			).String(),
+			uri: providerResult.ArtifactURI, kind: "shot_video", role: "OUTPUT",
+		},
+		extraHashlessArtifactHash: {
+			id:  extraHashlessArtifactID.String(),
+			uri: extraHashlessArtifactURI, kind: "provider_auxiliary", role: "PROXY",
+		},
+	}
+	for _, execution := range builtManifest.ProviderExecutions {
+		for _, artifact := range execution.Artifacts {
+			expected, ok := frozenHashlessArtifacts[artifact.ContentHash]
+			if !ok {
+				continue
+			}
+			if artifact.ID != expected.id ||
+				artifact.ArtifactURI != expected.uri ||
+				artifact.Role != expected.role ||
+				artifact.MediaSpec.Kind != expected.kind ||
+				artifact.MediaSpec.PostProductionManifestHash != "" {
+				t.Fatalf("G3 frozen hashless artifact = %#v, want %#v", artifact, expected)
+			}
+			delete(frozenHashlessArtifacts, artifact.ContentHash)
+		}
+	}
+	if len(frozenHashlessArtifacts) != 0 {
+		t.Fatalf("G3 omitted frozen hashless artifacts = %#v", frozenHashlessArtifacts)
 	}
 	manifestArtifact, err := cas.Put(ctx, bytes.NewReader(manifestPayload))
 	if err != nil {
@@ -1660,6 +1717,81 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			)
 		}
 	}
+	for _, inactiveStatus := range []string{
+		"ORPHAN_CANDIDATE",
+		"ARCHIVED",
+		"DISABLED",
+	} {
+		inactiveStatus := inactiveStatus
+		t.Run(
+			"G3 commit rejects raw provider output "+inactiveStatus,
+			func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.artifacts
+					SET status = $2,
+					    orphaned_at = CASE
+					      WHEN $2::text = 'ORPHAN_CANDIDATE' THEN now()
+					      ELSE orphaned_at
+					    END,
+					    retention_until = CASE
+					      WHEN $2::text = 'ORPHAN_CANDIDATE' THEN now() + interval '1 hour'
+					      ELSE retention_until
+					    END
+					WHERE content_hash = $1`,
+					providerResult.ArtifactDigest,
+					inactiveStatus,
+				)
+				err := store.CommitEpisodeManifest(
+					ctx,
+					step,
+					gate3Input,
+					manifestPayload,
+					manifestArtifact,
+				)
+				assertPolicyCode(
+					t,
+					"G3 raw provider output "+inactiveStatus,
+					err,
+					controlplane.CodeGateRequired,
+				)
+				assertNoG3CommitSideEffects(t, "raw provider output "+inactiveStatus)
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.artifacts
+					SET status = 'ACTIVE'
+					WHERE content_hash = $1`,
+					providerResult.ArtifactDigest,
+				)
+			},
+		)
+	}
+	t.Run("G3 commit rejects inactive hashless payload artifact", func(t *testing.T) {
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.artifacts
+			SET status = 'DISABLED'
+			WHERE id = $1`,
+			extraHashlessArtifactID,
+		)
+		err := store.CommitEpisodeManifest(
+			ctx,
+			step,
+			gate3Input,
+			manifestPayload,
+			manifestArtifact,
+		)
+		assertPolicyCode(
+			t,
+			"G3 inactive hashless payload artifact",
+			err,
+			controlplane.CodeGateRequired,
+		)
+		assertNoG3CommitSideEffects(t, "inactive hashless payload artifact")
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.artifacts
+			SET status = 'ACTIVE'
+			WHERE id = $1`,
+			extraHashlessArtifactID,
+		)
+	})
 	disabledManifestPayload := append(append([]byte(nil), manifestPayload...), '\n')
 	disabledManifestArtifact, err := cas.Put(ctx, bytes.NewReader(disabledManifestPayload))
 	if err != nil {
