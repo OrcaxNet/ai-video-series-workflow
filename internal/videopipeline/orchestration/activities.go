@@ -462,7 +462,13 @@ func (a *Activities) CancelProviderJob(
 		jobID := "provider-job-" + input.Dispatch.Run.RunID
 		response, cancelErr := mockprovider.Cancel(ctx, a.HTTPClient, a.ProviderAdapterURL, jobID)
 		result := CancelProviderResult{State: "UNKNOWN", ErrorCode: "CANCEL_NOT_CONFIRMED"}
-		if cancelErr == nil {
+		if providercontract.ErrorCodeOf(cancelErr) == providercontract.CodeNotFound {
+			// The provider's stable task registry is authoritative: a recovered
+			// provider reporting that the idempotent JobID does not exist proves
+			// there is no upstream task left to cancel.
+			result.State = "CANCELLED"
+			result.ErrorCode = ""
+		} else if cancelErr == nil {
 			result.UpstreamTaskID = response.UpstreamTaskID
 			switch response.State {
 			case providercontract.StatusSucceeded:
@@ -497,6 +503,12 @@ func (a *Activities) CancelProviderJob(
 			if err := a.Production.RecordProviderCancellation(ctx, step, input, result); err != nil {
 				return CancelProviderResult{}, err
 			}
+		}
+		if result.State == "UNKNOWN" {
+			return CancelProviderResult{}, temporal.NewApplicationError(
+				"provider cancellation is not yet confirmed",
+				"CANCEL_NOT_CONFIRMED",
+			)
 		}
 		return result, nil
 	})

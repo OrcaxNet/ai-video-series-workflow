@@ -733,7 +733,7 @@ components:
           minLength: 1
         role:
           type: string
-          enum: [CREATOR, DIRECTOR, ARTIST, PRODUCER, REVIEWER, OPERATOR, ADMIN]
+          enum: [CREATOR, DIRECTOR, ARTIST, PRODUCER, REVIEWER, SAFETY_REVIEWER, OPERATOR, ADMIN]
     CreateSeriesRequest:
       type: object
       additionalProperties: false

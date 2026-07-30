@@ -17,6 +17,7 @@ type shotHandlerStore struct {
 	createRun      func(context.Context, string, int, CreateGenerationRunCommand, Idempotency, string) (Stored[Operation], error)
 	requestPause   func(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
 	requestCancel  func(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
+	requestResume  func(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
 	operation      Operation
 	cancelRequests int
 	startedCalls   int
@@ -61,8 +62,23 @@ func (s *shotHandlerStore) RequestRunCancellation(
 	return s.requestCancel(ctx, runID, expected, actor, reason, idempotency, traceID)
 }
 
-func (s *shotHandlerStore) MarkOperationStarted(context.Context, string, string, string) error {
+func (s *shotHandlerStore) RequestRunResume(
+	ctx context.Context,
+	runID string,
+	expected int,
+	actor Actor,
+	mode string,
+	idempotency Idempotency,
+	traceID string,
+) (Stored[Operation], error) {
+	return s.requestResume(ctx, runID, expected, actor, mode, idempotency, traceID)
+}
+
+func (s *shotHandlerStore) MarkOperationStarted(_ context.Context, _ string, workflowID, runID string) error {
 	s.startedCalls++
+	s.operation.State = "RUNNING"
+	s.operation.TemporalWorkflowID = workflowID
+	s.operation.TemporalRunID = runID
 	return nil
 }
 
@@ -81,6 +97,7 @@ type shotWorkflowFixture struct {
 	startCalls  int
 	pauseCalls  int
 	cancelCalls int
+	resumeCalls int
 }
 
 func (f *shotWorkflowFixture) StartShot(_ context.Context, operation Operation) (WorkflowStart, error) {
@@ -96,6 +113,22 @@ func (f *shotWorkflowFixture) Pause(context.Context, string, string, string) err
 func (f *shotWorkflowFixture) Cancel(context.Context, string, string) error {
 	f.cancelCalls++
 	return nil
+}
+
+func (f *shotWorkflowFixture) Resume(
+	_ context.Context,
+	_ string,
+	_ string,
+	recoveryMode string,
+) (WorkflowStart, error) {
+	f.resumeCalls++
+	if recoveryMode == "RESUME_PAUSED" {
+		return WorkflowStart{WorkflowID: "shot-generation-original"}, nil
+	}
+	return WorkflowStart{
+		WorkflowID: "shot-recovery-operation-1",
+		RunID:      "recovery-temporal-run-1",
+	}, nil
 }
 
 func TestServerCreateGenerationRunStartsStableTemporalWorkflow(t *testing.T) {
@@ -299,6 +332,108 @@ func TestServerPauseRunPersistsSignalsAndClosesOperation(t *testing.T) {
 		!strings.Contains(recorder.Body.String(), `"state":"SUCCEEDED"`) {
 		t.Fatalf("pauseCalls=%d succeededCalls=%d response=%s",
 			workflows.pauseCalls, store.succeededCalls, recorder.Body.String())
+	}
+}
+
+func TestServerReconcileStartsDurableWorkflowAndKeepsOperationRunning(t *testing.T) {
+	t.Parallel()
+	runID := uuid.NewString()
+	operationID := uuid.NewString()
+	now := time.Now().UTC()
+	store := &shotHandlerStore{
+		operation: Operation{
+			OperationID: operationID, OperationType: "RESUME_GENERATION_RUN",
+			AggregateType: "GENERATION_RUN", AggregateID: runID, State: "ACCEPTED",
+			TemporalWorkflowID: "shot-generation-original", TraceID: "trace-recovery",
+			CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	store.requestResume = func(
+		context.Context, string, int, Actor, string, Idempotency, string,
+	) (Stored[Operation], error) {
+		return Stored[Operation]{Value: store.operation}, nil
+	}
+	workflows := &shotWorkflowFixture{}
+	server := NewWithRuntime(runtimeconfig.ControlPlane{}, nil, store, workflows, nil)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		APIBase+"/runs/"+runID+"/resume",
+		strings.NewReader(
+			`{"actor":{"actorId":"operator-1","role":"OPERATOR"},"recoveryMode":"RECONCILE_HISTORY"}`,
+		),
+	)
+	request.Header.Set("Idempotency-Key", uuid.NewString())
+	request.Header.Set("If-Match", `"1"`)
+	recorder := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("status = %d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if workflows.resumeCalls != 1 || store.startedCalls != 1 ||
+		store.succeededCalls != 0 {
+		t.Fatalf(
+			"resume=%d started=%d succeeded=%d",
+			workflows.resumeCalls,
+			store.startedCalls,
+			store.succeededCalls,
+		)
+	}
+	if !strings.Contains(recorder.Body.String(), `"state":"RUNNING"`) ||
+		!strings.Contains(recorder.Body.String(), `"temporalWorkflowId":"shot-recovery-operation-1"`) {
+		t.Fatalf("response = %s", recorder.Body.String())
+	}
+}
+
+func TestServerReconcileResponseLossReplaysTerminalOperationWithoutRestart(t *testing.T) {
+	t.Parallel()
+	runID := uuid.NewString()
+	operationID := uuid.NewString()
+	now := time.Now().UTC()
+	store := &shotHandlerStore{
+		operation: Operation{
+			OperationID: operationID, OperationType: "RESUME_GENERATION_RUN",
+			AggregateType: "GENERATION_RUN", AggregateID: runID, State: "SUCCEEDED",
+			TemporalWorkflowID: "shot-recovery-operation-1",
+			TemporalRunID:      "recovery-temporal-run-1",
+			TraceID:            "trace-recovery", CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	store.requestResume = func(
+		context.Context, string, int, Actor, string, Idempotency, string,
+	) (Stored[Operation], error) {
+		stale := store.operation
+		stale.State = "ACCEPTED"
+		stale.TemporalWorkflowID = "shot-generation-original"
+		stale.TemporalRunID = ""
+		return Stored[Operation]{Value: stale, Replayed: true}, nil
+	}
+	workflows := &shotWorkflowFixture{}
+	server := NewWithRuntime(runtimeconfig.ControlPlane{}, nil, store, workflows, nil)
+	request := httptest.NewRequest(
+		http.MethodPost,
+		APIBase+"/runs/"+runID+"/resume",
+		strings.NewReader(
+			`{"actor":{"actorId":"operator-1","role":"OPERATOR"},"recoveryMode":"RECONCILE_HISTORY"}`,
+		),
+	)
+	request.Header.Set("Idempotency-Key", uuid.NewString())
+	request.Header.Set("If-Match", `"1"`)
+	recorder := httptest.NewRecorder()
+
+	server.Handler().ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusAccepted ||
+		!strings.Contains(recorder.Body.String(), `"state":"SUCCEEDED"`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if workflows.resumeCalls != 0 || store.startedCalls != 0 {
+		t.Fatalf(
+			"terminal replay restarted recovery: resume=%d started=%d",
+			workflows.resumeCalls,
+			store.startedCalls,
+		)
 	}
 }
 

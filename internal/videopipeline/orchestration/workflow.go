@@ -340,13 +340,17 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	}, nil
 }
 
-func waitForResume(ctx workflow.Context, status *WorkflowStatus, controls workflow.ReceiveChannel) {
+func waitForResume(ctx workflow.Context, status *WorkflowStatus, controls workflow.ReceiveChannel) bool {
 	var command WorkflowControl
+	pauseObserved := status.Paused
 	for controls.ReceiveAsync(&command) {
 		applyControl(status, command)
+		if command.Action == "PAUSE" {
+			pauseObserved = true
+		}
 	}
 	if !status.Paused {
-		return
+		return pauseObserved
 	}
 	previous := status.State
 	status.State = "PAUSED"
@@ -359,10 +363,11 @@ func waitForResume(ctx workflow.Context, status *WorkflowStatus, controls workfl
 		selector.AddReceive(ctx.Done(), func(workflow.ReceiveChannel, bool) {})
 		selector.Select(ctx)
 		if ctx.Err() != nil {
-			return
+			return true
 		}
 	}
 	status.State = previous
+	return true
 }
 
 func applyControl(status *WorkflowStatus, command WorkflowControl) {

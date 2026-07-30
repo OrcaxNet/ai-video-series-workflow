@@ -65,6 +65,7 @@ func TestOpenAPIContainsRunnableControlPlaneOperationsAndErrors(t *testing.T) {
 		"model_unavailable",
 		"timeout",
 		"ExecutionPolicy:",
+		"SAFETY_REVIEWER",
 	} {
 		if !contains(text, required) {
 			t.Errorf("openapi.yaml missing %q", required)
@@ -81,6 +82,48 @@ func TestOpenAPIContainsRunnableControlPlaneOperationsAndErrors(t *testing.T) {
 			t.Errorf("openapi.yaml contains superseded assumption %q", forbidden)
 		}
 	}
+}
+
+func TestOpenAPIActorRoleMatchesSafetyApprovalRuntime(t *testing.T) {
+	t.Parallel()
+	content, err := os.ReadFile("openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := yaml.Unmarshal(content, &document); err != nil {
+		t.Fatal(err)
+	}
+	components, ok := document["components"].(map[string]any)
+	if !ok {
+		t.Fatal("OpenAPI components missing")
+	}
+	schemas, ok := components["schemas"].(map[string]any)
+	if !ok {
+		t.Fatal("OpenAPI component schemas missing")
+	}
+	actor, ok := schemas["Actor"].(map[string]any)
+	if !ok {
+		t.Fatal("OpenAPI Actor schema missing")
+	}
+	properties, ok := actor["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("OpenAPI Actor properties missing")
+	}
+	role, ok := properties["role"].(map[string]any)
+	if !ok {
+		t.Fatal("OpenAPI Actor.role schema missing")
+	}
+	enum, ok := role["enum"].([]any)
+	if !ok {
+		t.Fatalf("OpenAPI Actor.role enum = %#v", role["enum"])
+	}
+	for _, value := range enum {
+		if value == "SAFETY_REVIEWER" {
+			return
+		}
+	}
+	t.Fatalf("OpenAPI Actor.role enum does not authorize SAFETY_REVIEWER: %#v", enum)
 }
 
 func TestAsyncAPIContainsProviderAndCostEvents(t *testing.T) {

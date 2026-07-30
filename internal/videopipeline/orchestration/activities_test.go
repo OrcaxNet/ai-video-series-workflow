@@ -246,3 +246,74 @@ func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t 
 		)
 	}
 }
+
+func TestActivities_CancelProviderJobKeepsUnknownRetryable(t *testing.T) {
+	t.Parallel()
+	ledger := &cancellationLedgerFixture{prepared: true}
+	activities := NewProductionActivities(
+		"http://127.0.0.1:1",
+		nil,
+		ledger,
+		nil,
+	)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	_, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "reconcile-operation",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-provider-offline"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY",
+		TraceID:    "provider-offline",
+	})
+	if err == nil {
+		t.Fatal("ExecuteActivity() error = nil, want retryable cancellation uncertainty")
+	}
+	if len(ledger.recorded) != 1 ||
+		ledger.recorded[0].State != "UNKNOWN" ||
+		ledger.recorded[0].ErrorCode != "CANCEL_NOT_CONFIRMED" {
+		t.Fatalf("recorded cancellation = %#v", ledger.recorded)
+	}
+}
+
+func TestActivities_CancelProviderJobTreatsAuthoritativeAbsenceAsCancelled(t *testing.T) {
+	t.Parallel()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": providercontract.Error{
+				Code:        providercontract.CodeNotFound,
+				SafeMessage: "provider job was not found",
+			},
+		})
+	}))
+	defer provider.Close()
+	ledger := &cancellationLedgerFixture{prepared: true}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	encoded, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "reconcile-operation",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-provider-absent"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY",
+		TraceID:    "provider-restored",
+	})
+	if err != nil {
+		t.Fatalf("ExecuteActivity() error = %v", err)
+	}
+	var result CancelProviderResult
+	if err := encoded.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "CANCELLED" || len(ledger.recorded) != 1 ||
+		ledger.recorded[0].State != "CANCELLED" {
+		t.Fatalf("result=%#v recorded=%#v", result, ledger.recorded)
+	}
+}

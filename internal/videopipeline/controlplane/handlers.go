@@ -443,10 +443,20 @@ func (s *Server) resumeGenerationRun(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, traceID, err)
 		return
 	}
+	if stored.Replayed {
+		if current, getErr := s.store.GetOperation(r.Context(), stored.Value.OperationID); getErr == nil {
+			stored.Value = current
+		}
+	}
+	if stored.Value.State != "ACCEPTED" && stored.Value.State != "RUNNING" {
+		writeOperation(w, http.StatusAccepted, stored.Value)
+		return
+	}
 	if s.workflows != nil && stored.Value.TemporalWorkflowID != "" {
-		if err := s.workflows.Resume(
+		started, err := s.workflows.Resume(
 			r.Context(), stored.Value.TemporalWorkflowID, stored.Value.OperationID, command.RecoveryMode,
-		); err != nil {
+		)
+		if err != nil {
 			writeProblem(w, traceID, &DomainError{
 				Code: CodeTemporal, Status: http.StatusServiceUnavailable, Retryable: true,
 				Detail:          "recovery was persisted but Temporal has not acknowledged it",
@@ -455,9 +465,26 @@ func (s *Server) resumeGenerationRun(w http.ResponseWriter, r *http.Request) {
 			})
 			return
 		}
-		_ = s.store.MarkOperationSucceeded(r.Context(), stored.Value.OperationID)
-		if current, getErr := s.store.GetOperation(r.Context(), stored.Value.OperationID); getErr == nil {
+		var markErr error
+		if command.RecoveryMode == "RESUME_PAUSED" {
+			markErr = s.store.MarkOperationSucceeded(r.Context(), stored.Value.OperationID)
+		} else {
+			markErr = s.store.MarkOperationStarted(
+				r.Context(), stored.Value.OperationID, started.WorkflowID, started.RunID,
+			)
+		}
+		current, getErr := s.store.GetOperation(r.Context(), stored.Value.OperationID)
+		if getErr == nil {
 			stored.Value = current
+		}
+		if markErr != nil && (getErr != nil || stored.Value.State == "ACCEPTED") {
+			writeProblem(w, traceID, &DomainError{
+				Code: CodeDependency, Status: http.StatusServiceUnavailable, Retryable: true,
+				Detail:          "Temporal acknowledged recovery but the operation projection is not yet durable",
+				SuggestedAction: "retry with the same idempotency key",
+				Cause:           markErr,
+			})
+			return
 		}
 	}
 	writeOperation(w, http.StatusAccepted, stored.Value)

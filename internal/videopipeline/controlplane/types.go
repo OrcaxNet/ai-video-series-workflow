@@ -272,7 +272,7 @@ type WorkflowController interface {
 	StartShot(context.Context, Operation) (WorkflowStart, error)
 	Pause(context.Context, string, string, string) error
 	Cancel(context.Context, string, string) error
-	Resume(context.Context, string, string, string) error
+	Resume(context.Context, string, string, string) (WorkflowStart, error)
 	RecordApproval(context.Context, ApprovalDecision) error
 }
 

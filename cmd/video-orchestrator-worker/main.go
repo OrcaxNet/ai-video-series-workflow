@@ -48,6 +48,10 @@ func main() {
 		orchestration.ShotProductionWorkflow,
 		workflow.RegisterOptions{Name: orchestration.ShotWorkflowName},
 	)
+	temporalWorker.RegisterWorkflowWithOptions(
+		orchestration.ShotReconciliationWorkflow,
+		workflow.RegisterOptions{Name: orchestration.ShotReconciliationWorkflowName},
+	)
 	activities := orchestration.NewProductionActivities(cfg.ProviderAdapterURL, store, store, artifacts)
 	temporalWorker.RegisterActivityWithOptions(activities.ValidateBatch, activity.RegisterOptions{Name: orchestration.ActivityValidateBatch})
 	temporalWorker.RegisterActivityWithOptions(activities.CompilePrompt, activity.RegisterOptions{Name: orchestration.ActivityCompilePrompt})

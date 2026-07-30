@@ -1775,7 +1775,8 @@ func (p *Postgres) MarkOperationStarted(ctx context.Context, operationIDRaw, wor
 			}
 			return struct{}{}, fmt.Errorf("mark operation running: %w", err)
 		}
-		if aggregateType == "GENERATION_RUN" && operationType == "CREATE_GENERATION_RUN" {
+		if aggregateType == "GENERATION_RUN" &&
+			(operationType == "CREATE_GENERATION_RUN" || operationType == "RESUME_GENERATION_RUN") {
 			if _, err := tx.Exec(ctx, `
 				UPDATE video_pipeline.generation_runs
 				SET state = CASE WHEN state = 'VALIDATED' THEN 'QUEUED' ELSE state END,

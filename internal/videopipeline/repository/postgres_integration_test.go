@@ -13,12 +13,14 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/temporalcontrol"
@@ -231,7 +233,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if dsn == "" {
 		t.Skip("VIDEO_TEST_POSTGRES_DSN is not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -580,6 +582,21 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	publicCommand := controlplane.CreateGenerationRunCommand{
+		SchemaVersion: "v1", ShotSpecRevisionID: shotRevisionID.String(),
+		PromptSnapshotID: prompt.ID, GenerationProfileRevisionID: profileID.String(),
+		GenerationPlanID: plan.Value.GenerationPlanID, RouteSnapshot: route,
+		BudgetApprovalID: budgetID.String(), ExecutionPolicy: executionPolicy,
+		CreativeAttempt: 2,
+		Actor:           controlplane.Actor{ActorID: "operator", Role: "OPERATOR"},
+	}
+	var temporalPauseShotID string
+	var temporalPauseCommand controlplane.CreateGenerationRunCommand
+	if os.Getenv("VIDEO_TEST_TEMPORAL_ADDRESS") != "" {
+		temporalPauseShotID, temporalPauseCommand = cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+	}
 	model := providercontract.ModelSnapshot{
 		CapabilityAlias: "video.primary", Provider: "MOCK", ModelID: "fixture-video-v1",
 		RouteVersion: "route-v1", CapabilityHash: capabilityHash, Verification: "integration",
@@ -806,20 +823,12 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		t.Fatalf("G3 review state = %q, want APPROVED", g3State)
 	}
 
-	publicCommand := controlplane.CreateGenerationRunCommand{
-		SchemaVersion: "v1", ShotSpecRevisionID: shotRevisionID.String(),
-		PromptSnapshotID: prompt.ID, GenerationProfileRevisionID: profileID.String(),
-		GenerationPlanID: plan.Value.GenerationPlanID, RouteSnapshot: route,
-		BudgetApprovalID: budgetID.String(), ExecutionPolicy: executionPolicy,
-		CreativeAttempt: 2,
-		Actor:           controlplane.Actor{ActorID: "operator", Role: "OPERATOR"},
-	}
 	publicDigest, err := digestValue(publicCommand)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if temporalAddress := os.Getenv("VIDEO_TEST_TEMPORAL_ADDRESS"); temporalAddress != "" {
-		testHTTPTemporalImmediateCancellation(
+		testHTTPTemporalRecoveryAndPause(
 			t,
 			ctx,
 			pool,
@@ -828,6 +837,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			os.Getenv("VIDEO_TEST_PROVIDER_URL"),
 			shotID.String(),
 			publicCommand,
+			temporalPauseShotID,
+			temporalPauseCommand,
 		)
 		return
 	}
@@ -1000,20 +1011,19 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 }
 
-func testHTTPTemporalImmediateCancellation(
+func testHTTPTemporalRecoveryAndPause(
 	t *testing.T,
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	store *Postgres,
 	temporalAddress string,
-	providerURL string,
+	_ string,
 	shotID string,
 	command controlplane.CreateGenerationRunCommand,
+	pauseShotID string,
+	pauseCommand controlplane.CreateGenerationRunCommand,
 ) {
 	t.Helper()
-	if providerURL == "" {
-		providerURL = "http://127.0.0.1:8090"
-	}
 	temporalClient, err := temporalclient.Dial(temporalclient.Options{
 		HostPort:  temporalAddress,
 		Namespace: "default",
@@ -1027,17 +1037,60 @@ func testHTTPTemporalImmediateCancellation(
 	if err != nil {
 		t.Fatal(err)
 	}
-	artifacts, err := artifactstore.New(t.TempDir())
+	artifactRoot := t.TempDir()
+	artifacts, err := artifactstore.New(artifactRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
+	provider := mockprovider.New(runtimeconfig.MockProvider{
+		ProviderID:   "integration-recoverable-provider",
+		Capabilities: []string{"video.primary"},
+	}, artifacts)
+	var providerUp atomic.Bool
+	providerUp.Store(true)
+	var holdFirstPoll atomic.Bool
+	holdFirstPoll.Store(true)
+	firstPollStarted := make(chan struct{})
+	releaseFirstPoll := make(chan struct{})
+	var firstPollOnce sync.Once
+	providerServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !providerUp.Load() {
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("provider response writer does not support connection interruption")
+				return
+			}
+			connection, _, hijackErr := hijacker.Hijack()
+			if hijackErr == nil {
+				_ = connection.Close()
+			}
+			return
+		}
+		if r.Method == http.MethodGet &&
+			strings.HasPrefix(r.URL.Path, "/v1/jobs/") &&
+			holdFirstPoll.Load() {
+			firstPollOnce.Do(func() { close(firstPollStarted) })
+			select {
+			case <-releaseFirstPoll:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		provider.Handler().ServeHTTP(w, r)
+	}))
+	defer providerServer.Close()
+
 	newWorker := func(identity string) worker.Worker {
 		temporalWorker := worker.New(temporalClient, taskQueue, worker.Options{Identity: identity})
 		temporalWorker.RegisterWorkflowWithOptions(
 			orchestration.ShotProductionWorkflow,
 			workflow.RegisterOptions{Name: orchestration.ShotWorkflowName},
 		)
-		activities := orchestration.NewProductionActivities(providerURL, store, store, artifacts)
+		temporalWorker.RegisterWorkflowWithOptions(
+			orchestration.ShotReconciliationWorkflow,
+			workflow.RegisterOptions{Name: orchestration.ShotReconciliationWorkflowName},
+		)
+		activities := orchestration.NewProductionActivities(providerServer.URL, store, store, artifacts)
 		temporalWorker.RegisterActivityWithOptions(
 			activities.ExecuteProviderJob,
 			activity.RegisterOptions{Name: orchestration.ActivityExecuteProviderJob},
@@ -1046,17 +1099,24 @@ func testHTTPTemporalImmediateCancellation(
 			activities.CancelProviderJob,
 			activity.RegisterOptions{Name: orchestration.ActivityCancelProviderJob},
 		)
+		temporalWorker.RegisterActivityWithOptions(
+			activities.RunAutomaticQC,
+			activity.RegisterOptions{Name: orchestration.ActivityRunAutomaticQC},
+		)
+		temporalWorker.RegisterActivityWithOptions(
+			activities.CreateShotReview,
+			activity.RegisterOptions{Name: orchestration.ActivityCreateShotReview},
+		)
+		temporalWorker.RegisterActivityWithOptions(
+			activities.EscalateShot,
+			activity.RegisterOptions{Name: orchestration.ActivityEscalateShot},
+		)
+		temporalWorker.RegisterActivityWithOptions(
+			activities.FinalizeShotRun,
+			activity.RegisterOptions{Name: orchestration.ActivityFinalizeShotRun},
+		)
 		return temporalWorker
 	}
-
-	// Establish a prior worker process, then stop it. HTTP create/cancel below is
-	// accepted by Temporal while no worker is polling; the replacement worker
-	// must replay the already-recorded cancellation without provider submission.
-	previousWorker := newWorker("prior-http-cancel-worker-" + uuid.NewString())
-	if err := previousWorker.Start(); err != nil {
-		t.Fatalf("start prior Temporal worker: %v", err)
-	}
-	previousWorker.Stop()
 
 	api := httptest.NewServer(
 		controlplane.NewWithRuntime(
@@ -1068,33 +1128,172 @@ func testHTTPTemporalImmediateCancellation(
 		).Handler(),
 	)
 	defer api.Close()
-	createBody, err := json.Marshal(command)
-	if err != nil {
-		t.Fatal(err)
+	createRun := func(targetShotID string, createCommand controlplane.CreateGenerationRunCommand) controlplane.Operation {
+		t.Helper()
+		body, marshalErr := json.Marshal(createCommand)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		response := executeIntegrationRequest(
+			t,
+			http.MethodPost,
+			api.URL+controlplane.APIBase+"/shots/"+targetShotID+"/runs",
+			body,
+			map[string]string{
+				"Idempotency-Key": uuid.NewString(),
+				"If-Match":        `"1"`,
+			},
+		)
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf("create status=%d body=%s", response.StatusCode, response.Body)
+		}
+		var operation controlplane.Operation
+		if unmarshalErr := json.Unmarshal(response.Body, &operation); unmarshalErr != nil {
+			t.Fatalf("decode create operation: %v body=%s", unmarshalErr, response.Body)
+		}
+		if operation.State != "RUNNING" || operation.TemporalWorkflowID == "" {
+			t.Fatalf("create operation = %#v", operation)
+		}
+		return operation
 	}
-	createResponse := executeIntegrationRequest(
+
+	firstWorker := newWorker("pause-and-outage-worker-" + uuid.NewString())
+	if err := firstWorker.Start(); err != nil {
+		t.Fatalf("start initial Temporal worker: %v", err)
+	}
+	firstWorkerStopped := false
+	defer func() {
+		if !firstWorkerStopped {
+			firstWorker.Stop()
+		}
+	}()
+
+	// Real HTTP + Temporal pause/resume: hold the provider's terminal poll,
+	// persist and deliver PAUSE, then resume the same stable provider JobID.
+	pauseCreate := createRun(pauseShotID, pauseCommand)
+	select {
+	case <-firstPollStarted:
+	case <-ctx.Done():
+		t.Fatalf("provider poll was not reached before pause: %v", ctx.Err())
+	}
+	pauseResponse := executeIntegrationRequest(
 		t,
 		http.MethodPost,
-		api.URL+controlplane.APIBase+"/shots/"+shotID+"/runs",
-		createBody,
+		api.URL+controlplane.APIBase+"/runs/"+pauseCreate.AggregateID+"/pause",
+		[]byte(`{"actor":{"actorId":"operator","role":"OPERATOR"},"reasonCode":"QA_PAUSE"}`),
 		map[string]string{
 			"Idempotency-Key": uuid.NewString(),
 			"If-Match":        `"1"`,
 		},
 	)
-	if createResponse.StatusCode != http.StatusAccepted {
-		t.Fatalf("create status=%d body=%s", createResponse.StatusCode, createResponse.Body)
+	if pauseResponse.StatusCode != http.StatusAccepted {
+		t.Fatalf("pause status=%d body=%s", pauseResponse.StatusCode, pauseResponse.Body)
 	}
-	var createOperation controlplane.Operation
-	if err := json.Unmarshal(createResponse.Body, &createOperation); err != nil {
-		t.Fatalf("decode create operation: %v body=%s", err, createResponse.Body)
+	pauseDeadline := time.Now().Add(10 * time.Second)
+	for {
+		var workflowStatus orchestration.WorkflowStatus
+		value, queryErr := temporalClient.QueryWorkflow(
+			ctx, pauseCreate.TemporalWorkflowID, "", orchestration.StatusQuery,
+		)
+		if queryErr == nil {
+			queryErr = value.Get(&workflowStatus)
+		}
+		if queryErr == nil && workflowStatus.Paused {
+			break
+		}
+		if time.Now().After(pauseDeadline) {
+			t.Fatalf("Temporal did not observe PAUSE: status=%#v error=%v", workflowStatus, queryErr)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
-	if createOperation.State != "RUNNING" || createOperation.TemporalWorkflowID == "" {
-		t.Fatalf("create operation = %#v", createOperation)
+	holdFirstPoll.Store(false)
+	close(releaseFirstPoll)
+	resumeBody := []byte(
+		`{"actor":{"actorId":"operator","role":"OPERATOR"},"recoveryMode":"RESUME_PAUSED"}`,
+	)
+	resumeKey := uuid.NewString()
+	for attempt := 1; attempt <= 2; attempt++ {
+		response := executeIntegrationRequest(
+			t,
+			http.MethodPost,
+			api.URL+controlplane.APIBase+"/runs/"+pauseCreate.AggregateID+"/resume",
+			resumeBody,
+			map[string]string{
+				"Idempotency-Key": resumeKey,
+				"If-Match":        `"1"`,
+			},
+		)
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf("resume attempt %d status=%d body=%s", attempt, response.StatusCode, response.Body)
+		}
+	}
+	q1Deadline := time.Now().Add(15 * time.Second)
+	for {
+		var runState string
+		var providerJobs, passedQC, openQ1, resumeOperations int
+		if err := pool.QueryRow(ctx, `
+			SELECT
+			  (SELECT state FROM video_pipeline.generation_runs WHERE id = $1),
+			  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+			   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+			   WHERE ga.generation_run_id = $1),
+			  (SELECT COUNT(*) FROM video_pipeline.qc_reports
+			   WHERE generation_run_id = $1 AND state = 'PASSED'),
+			  (SELECT COUNT(*) FROM video_pipeline.review_tasks
+			   WHERE generation_run_id = $1 AND review_type = 'Q1' AND state = 'OPEN'),
+			  (SELECT COUNT(*) FROM video_pipeline.operation_requests
+			   WHERE aggregate_id = $1 AND operation_type = 'RESUME_GENERATION_RUN')`,
+			pauseCreate.AggregateID,
+		).Scan(&runState, &providerJobs, &passedQC, &openQ1, &resumeOperations); err != nil {
+			t.Fatal(err)
+		}
+		if runState == "SUCCEEDED" && providerJobs == 1 && passedQC == 1 &&
+			openQ1 == 1 && resumeOperations == 1 {
+			break
+		}
+		if time.Now().After(q1Deadline) {
+			t.Fatalf(
+				"pause/resume did not converge: run=%s providerJobs=%d qc=%d q1=%d resumeOps=%d",
+				runState, providerJobs, passedQC, openQ1, resumeOperations,
+			)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if err := temporalClient.CancelWorkflow(ctx, pauseCreate.TemporalWorkflowID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := temporalClient.GetWorkflow(ctx, pauseCreate.TemporalWorkflowID, "").Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
+		t.Fatalf("pause workflow cleanup error = %v, want Canceled", err)
 	}
 
+	// Real network interruption after ProviderJob preparation. Cancellation
+	// closes the original Workflow with UNKNOWN; a replacement worker and a
+	// stable reconciliation Workflow settle provider/run/all operations once
+	// the provider is restored.
+	providerUp.Store(false)
+	createOperation := createRun(shotID, command)
+	providerJobDeadline := time.Now().Add(10 * time.Second)
+	for {
+		var count int
+		if err := pool.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM video_pipeline.provider_jobs pj
+			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+			WHERE ga.generation_run_id = $1`,
+			createOperation.AggregateID,
+		).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count == 1 {
+			break
+		}
+		if time.Now().After(providerJobDeadline) {
+			t.Fatal("provider job was not durably prepared before network cancellation")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	cancelBody := []byte(
-		`{"actor":{"actorId":"operator","role":"OPERATOR"},"reasonCode":"IMMEDIATE_CANCEL"}`,
+		`{"actor":{"actorId":"operator","role":"OPERATOR"},"reasonCode":"NETWORK_CANCEL"}`,
 	)
 	cancelKey := uuid.NewString()
 	var cancelOperation controlplane.Operation
@@ -1110,44 +1309,15 @@ func testHTTPTemporalImmediateCancellation(
 			},
 		)
 		if response.StatusCode != http.StatusAccepted {
-			t.Fatalf(
-				"cancel attempt %d status=%d body=%s",
-				attempt,
-				response.StatusCode,
-				response.Body,
-			)
+			t.Fatalf("cancel attempt %d status=%d body=%s", attempt, response.StatusCode, response.Body)
 		}
-		if attempt == 1 {
-			// Discarding the first response models a client-visible response
-			// loss; the same idempotency key must recover the operation.
-			continue
-		}
-		var replayed controlplane.Operation
-		if err := json.Unmarshal(response.Body, &replayed); err != nil {
+		if err := json.Unmarshal(response.Body, &cancelOperation); err != nil {
 			t.Fatalf("decode cancel attempt %d: %v", attempt, err)
 		}
-		cancelOperation = replayed
 	}
-	var cancelOperationCount int
-	if err := pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM video_pipeline.operation_requests
-		WHERE aggregate_type = 'GENERATION_RUN'
-		  AND aggregate_id = $1
-		  AND operation_type = 'CANCEL_GENERATION_RUN'`,
-		createOperation.AggregateID,
-	).Scan(&cancelOperationCount); err != nil {
-		t.Fatal(err)
-	}
-	if cancelOperationCount != 1 || cancelOperation.OperationID == "" {
-		t.Fatalf(
-			"duplicate cancellation persisted %d operations; replay=%#v",
-			cancelOperationCount,
-			cancelOperation,
-		)
-	}
-
-	replacementWorker := newWorker("replacement-http-cancel-worker-" + uuid.NewString())
+	firstWorker.Stop()
+	firstWorkerStopped = true
+	replacementWorker := newWorker("reconciliation-worker-" + uuid.NewString())
 	if err := replacementWorker.Start(); err != nil {
 		t.Fatalf("start replacement Temporal worker: %v", err)
 	}
@@ -1156,54 +1326,315 @@ func testHTTPTemporalImmediateCancellation(
 	if err := workflowRun.Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
 		t.Fatalf("workflow completion error = %v, want Canceled", err)
 	}
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		run, err := store.GetGenerationRun(ctx, createOperation.AggregateID)
-		if err != nil {
-			t.Fatal(err)
+	unknownRun, err := store.GetGenerationRun(ctx, createOperation.AggregateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknownRun.State != "UNKNOWN" ||
+		unknownRun.FailureCode != "CANCEL_NOT_CONFIRMED" {
+		t.Fatalf("network cancellation run = %#v", unknownRun)
+	}
+	providerUp.Store(true)
+	reconcileBody := []byte(
+		`{"actor":{"actorId":"operator","role":"OPERATOR"},"recoveryMode":"RECONCILE_HISTORY"}`,
+	)
+	reconcileKey := uuid.NewString()
+	var reconcileOperation controlplane.Operation
+	for attempt := 1; attempt <= 2; attempt++ {
+		response := executeIntegrationRequest(
+			t,
+			http.MethodPost,
+			api.URL+controlplane.APIBase+"/runs/"+createOperation.AggregateID+"/resume",
+			reconcileBody,
+			map[string]string{
+				"Idempotency-Key": reconcileKey,
+				"If-Match":        `"2"`,
+			},
+		)
+		if response.StatusCode != http.StatusAccepted {
+			t.Fatalf("reconcile attempt %d status=%d body=%s", attempt, response.StatusCode, response.Body)
 		}
-		createState, cancelState := "", ""
+		if err := json.Unmarshal(response.Body, &reconcileOperation); err != nil {
+			t.Fatalf("decode reconcile attempt %d: %v", attempt, err)
+		}
+	}
+	recoveryDeadline := time.Now().Add(15 * time.Second)
+	for {
+		run, getErr := store.GetGenerationRun(ctx, createOperation.AggregateID)
+		if getErr != nil {
+			t.Fatal(getErr)
+		}
+		createState, cancelState, recoveryState, providerState := "", "", "", ""
 		if err := pool.QueryRow(ctx, `
 			SELECT
-				(SELECT state FROM video_pipeline.operation_requests WHERE id = $1),
-				(SELECT state FROM video_pipeline.operation_requests WHERE id = $2)`,
+			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $1),
+			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $2),
+			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $3),
+			  (SELECT pj.state FROM video_pipeline.provider_jobs pj
+			   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+			   WHERE ga.generation_run_id = $4)`,
 			createOperation.OperationID,
 			cancelOperation.OperationID,
-		).Scan(&createState, &cancelState); err != nil {
+			reconcileOperation.OperationID,
+			createOperation.AggregateID,
+		).Scan(&createState, &cancelState, &recoveryState, &providerState); err != nil {
 			t.Fatal(err)
 		}
 		if run.State == "CANCELLED" &&
 			createState == "CANCELLED" &&
-			cancelState == "SUCCEEDED" {
+			cancelState == "SUCCEEDED" &&
+			recoveryState == "SUCCEEDED" &&
+			providerState == "CANCELLED" {
 			if run.FailureClass != "" || run.FailureCode != "" {
-				t.Fatalf("cancelled run retained failure = %#v", run)
+				t.Fatalf("reconciled run retained failure = %#v", run)
 			}
 			break
 		}
-		if time.Now().After(deadline) {
+		if time.Now().After(recoveryDeadline) {
 			t.Fatalf(
-				"cancellation did not converge: run=%#v create=%s cancel=%s",
-				run,
-				createState,
-				cancelState,
+				"recovery did not converge: run=%#v create=%s cancel=%s recovery=%s provider=%s",
+				run, createState, cancelState, recoveryState, providerState,
 			)
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	var providerJobs int
+	var providerJobs, recoveryOperations int
 	if err := pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM video_pipeline.provider_jobs pj
-		JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
-		WHERE ga.generation_run_id = $1`,
+		SELECT
+		  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+		   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.operation_requests
+		   WHERE aggregate_id = $1 AND operation_type = 'RESUME_GENERATION_RUN')`,
 		createOperation.AggregateID,
-	).Scan(&providerJobs); err != nil {
+	).Scan(&providerJobs, &recoveryOperations); err != nil {
 		t.Fatal(err)
 	}
-	if providerJobs != 0 {
-		t.Fatalf("provider jobs after immediate cancellation = %d, want 0", providerJobs)
+	if providerJobs != 1 || recoveryOperations != 1 {
+		t.Fatalf(
+			"recovery duplicated durable facts: providerJobs=%d recoveryOperations=%d",
+			providerJobs, recoveryOperations,
+		)
 	}
+}
+
+func cloneIntegrationShotCommand(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	store *Postgres,
+	sourceShotID string,
+	source controlplane.CreateGenerationRunCommand,
+) (string, controlplane.CreateGenerationRunCommand) {
+	t.Helper()
+	newShotID := uuid.New()
+	newShotRevisionID := uuid.New()
+	newContextID := uuid.New()
+	newPromptID := uuid.New()
+	newShotHash := strings.Repeat(
+		strings.ReplaceAll(uuid.NewString(), "-", ""),
+		2,
+	)
+	newContextHash := strings.Repeat(
+		strings.ReplaceAll(uuid.NewString(), "-", ""),
+		2,
+	)
+	newPromptInputHash := strings.Repeat(
+		strings.ReplaceAll(uuid.NewString(), "-", ""),
+		2,
+	)
+	newPromptHash := strings.Repeat(
+		strings.ReplaceAll(uuid.NewString(), "-", ""),
+		2,
+	)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.shots (id, scene_id, ordinal)
+		SELECT $2, source.scene_id,
+		       (SELECT MAX(ordinal) + 1 FROM video_pipeline.shots WHERE scene_id = source.scene_id)
+		FROM video_pipeline.shots source
+		WHERE source.id = $1`,
+		sourceShotID, newShotID,
+	); err != nil {
+		t.Fatalf("clone integration shot: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.shot_spec_revisions
+		  (id, shot_id, storyboard_revision_id, revision, parent_revision_id,
+		   lifecycle_state, freshness, duration_ms, aspect_profile, fps, width, height,
+		   cast_count, primary_action_count, narrative, asset_version_refs,
+		   context_revision_ids, effective_context_hash, continuity, cinematography,
+		   generation_profile_id, gate2_decision_id, content_hash, created_by)
+		SELECT $2, $3, storyboard_revision_id, 1, NULL,
+		       'READY', 'FRESH', duration_ms, aspect_profile, fps, width, height,
+		       cast_count, primary_action_count, narrative, asset_version_refs,
+		       context_revision_ids, $4, continuity, cinematography,
+		       generation_profile_id, gate2_decision_id, $4, 'integration-clone'
+		FROM video_pipeline.shot_spec_revisions
+		WHERE id = $1`,
+		source.ShotSpecRevisionID, newShotRevisionID, newShotID, newShotHash,
+	); err != nil {
+		t.Fatalf("clone integration shot revision: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.effective_context_snapshots
+		  (id, shot_spec_revision_id, schema_version, resolver_version,
+		   context_revision_ids, normalized_payload, content_hash)
+		SELECT $2, $3, ecs.schema_version, ecs.resolver_version,
+		       ecs.context_revision_ids, ecs.normalized_payload, $4
+		FROM video_pipeline.prompt_snapshots ps
+		JOIN video_pipeline.effective_context_snapshots ecs
+		  ON ecs.id = ps.effective_context_snapshot_id
+		WHERE ps.id = $1`,
+		source.PromptSnapshotID, newContextID, newShotRevisionID, newContextHash,
+	); err != nil {
+		t.Fatalf("clone integration effective context: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.prompt_snapshots
+		  (id, shot_spec_revision_id, schema_version, compiler_version,
+		   prompt_template_ref, effective_context_snapshot_id, asset_version_refs,
+		   predecessor_summary, tail_frame_hash, positive_prompt, negative_prompt,
+		   model_payload, evidence_ids, normalized_input_hash, content_hash)
+		SELECT $2, $3, schema_version, compiler_version,
+		       prompt_template_ref, $4, asset_version_refs,
+		       predecessor_summary, tail_frame_hash, positive_prompt, negative_prompt,
+		       model_payload, evidence_ids, $5, $6
+		FROM video_pipeline.prompt_snapshots
+		WHERE id = $1`,
+		source.PromptSnapshotID, newPromptID, newShotRevisionID, newContextID,
+		newPromptInputHash, newPromptHash,
+	); err != nil {
+		t.Fatalf("clone integration prompt: %v", err)
+	}
+
+	planRecord, err := store.GetGenerationPlan(ctx, source.GenerationPlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var episodeID, episodeHash string
+	if err := pool.QueryRow(ctx, `
+		SELECT episode_id, content_hash
+		FROM video_pipeline.episode_revisions
+		WHERE id = $1`,
+		planRecord.EpisodeRevisionID,
+	).Scan(&episodeID, &episodeHash); err != nil {
+		t.Fatal(err)
+	}
+	bindings := []controlplane.ApprovalBinding{
+		{
+			ObjectType:  "EPISODE_REVISION",
+			RevisionID:  planRecord.EpisodeRevisionID,
+			ContentHash: episodeHash,
+		},
+		{
+			ObjectType:  "SHOT_SPEC_REVISION",
+			RevisionID:  newShotRevisionID.String(),
+			ContentHash: newShotHash,
+		},
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT revision_id, content_hash
+		FROM video_pipeline.approval_bindings
+		WHERE decision_id = $1 AND object_type = 'ARTIFACT'
+		ORDER BY revision_id`,
+		source.ExecutionPolicy.ContentSafetyDecisionID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var evidenceHash string
+	for rows.Next() {
+		var artifactID, artifactHash string
+		if err := rows.Scan(&artifactID, &artifactHash); err != nil {
+			rows.Close()
+			t.Fatal(err)
+		}
+		if evidenceHash == "" {
+			evidenceHash = artifactHash
+		}
+		bindings = append(bindings, controlplane.ApprovalBinding{
+			ObjectType: "ARTIFACT", RevisionID: artifactID, ContentHash: artifactHash,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		t.Fatal(err)
+	}
+	rows.Close()
+	validUntil := time.Now().UTC().Add(time.Hour)
+	safetyCommand := controlplane.CreateApprovalDecisionCommand{
+		SchemaVersion: "v1",
+		SeriesID:      planRecord.SeriesID,
+		EpisodeID:     episodeID,
+		Gate:          "SAFETY",
+		Decision:      "APPROVED",
+		ReasonCode:    "CONTENT_SAFETY_APPROVED",
+		PolicyVersion: source.ExecutionPolicy.ContentSafetyPolicyVersion,
+		EvidenceHash:  evidenceHash,
+		ValidUntil:    &validUntil,
+		Bindings:      bindings,
+		Actor: controlplane.Actor{
+			ActorID: "integration-safety-reviewer",
+			Role:    "SAFETY_REVIEWER",
+		},
+	}
+	safetyDigest, err := digestValue(safetyCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	safety, err := store.CreateApprovalDecision(
+		ctx,
+		safetyCommand,
+		controlplane.Idempotency{
+			Scope:       "integration-clone-safety:" + newShotID.String(),
+			Key:         uuid.NewString(),
+			RequestHash: safetyDigest,
+		},
+		"integration-clone-safety",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	executionPolicy := source.ExecutionPolicy
+	executionPolicy.ContentSafetyDecisionID = safety.Value.DecisionID
+	planCommand := controlplane.CreateGenerationPlanCommand{
+		SchemaVersion:       "v1",
+		SeriesID:            planRecord.SeriesID,
+		EpisodeRevisionID:   planRecord.EpisodeRevisionID,
+		ShotSpecRevisionIDs: []string{newShotRevisionID.String()},
+		CandidatesPerShot:   1,
+		RouteSnapshot:       source.RouteSnapshot,
+		BudgetLimit:         planRecord.BudgetLimit,
+		ExecutionPolicy:     executionPolicy,
+		Actor: controlplane.Actor{
+			ActorID: "integration-producer",
+			Role:    "PRODUCER",
+		},
+	}
+	planDigest, err := digestValue(planCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := store.CreateGenerationPlan(
+		ctx,
+		planCommand,
+		controlplane.Idempotency{
+			Scope:       "integration-clone-plan:" + newShotID.String(),
+			Key:         uuid.NewString(),
+			RequestHash: planDigest,
+		},
+		"integration-clone-plan",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cloned := source
+	cloned.ShotSpecRevisionID = newShotRevisionID.String()
+	cloned.PromptSnapshotID = newPromptID.String()
+	cloned.GenerationPlanID = plan.Value.GenerationPlanID
+	cloned.ExecutionPolicy = executionPolicy
+	cloned.CreativeAttempt = 1
+	return newShotID.String(), cloned
 }
 
 type integrationHTTPResponse struct {

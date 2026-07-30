@@ -11,9 +11,11 @@ import (
 )
 
 const (
-	ShotWorkflowName          = "video.production.shot.v1"
-	ActivityCancelProviderJob = "video.activity.cancel-provider-job.v1"
-	ActivityFinalizeShotRun   = "video.activity.finalize-shot-run.v1"
+	ShotWorkflowName               = "video.production.shot.v1"
+	ShotReconciliationWorkflowName = "video.production.shot-reconciliation.v1"
+	ActivityCancelProviderJob      = "video.activity.cancel-provider-job.v1"
+	ActivityFinalizeShotRun        = "video.activity.finalize-shot-run.v1"
+	pauseCompletionRaceVersion     = "shot-provider-pause-completion-race-v1"
 )
 
 // ShotProductionInput is reconstructed from PostgreSQL after the public
@@ -62,6 +64,54 @@ type FinalizeShotRunInput struct {
 	FailureClass string `json:"failureClass,omitempty"`
 	FailureCode  string `json:"failureCode,omitempty"`
 	TraceID      string `json:"traceId"`
+}
+
+// ShotReconciliationInput starts a durable coordinator after the original shot
+// Workflow has closed with ambiguous provider cancellation state. The stable
+// provider JobID is reconstructed from Dispatch.Run; no paid task is created.
+type ShotReconciliationInput struct {
+	OperationID string                  `json:"operationId"`
+	Dispatch    ExecuteProviderJobInput `json:"dispatch"`
+	TraceID     string                  `json:"traceId"`
+}
+
+// ShotReconciliationWorkflow retries the idempotent provider cancellation
+// boundary until the provider can authoritatively report terminal success,
+// cancellation, or absence. PostgreSQL projection and operation convergence
+// are committed by CancelProviderJob before this Workflow closes.
+func ShotReconciliationWorkflow(
+	ctx workflow.Context,
+	input ShotReconciliationInput,
+) (CancelProviderResult, error) {
+	if input.OperationID == "" || input.Dispatch.Run.RunID == "" ||
+		input.Dispatch.Run.RunSpecDigest == "" || input.TraceID == "" {
+		err := errors.New("shot reconciliation immutable dispatch fields are required")
+		return CancelProviderResult{}, temporal.NewNonRetryableApplicationError(
+			err.Error(), "VALIDATION_ERROR", err,
+		)
+	}
+	options := workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+		HeartbeatTimeout:    20 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Second,
+			BackoffCoefficient: 2,
+			MaximumInterval:    30 * time.Second,
+			MaximumAttempts:    0,
+		},
+	}
+	var result CancelProviderResult
+	err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, options),
+		ActivityCancelProviderJob,
+		CancelProviderJobInput{
+			OperationID: input.OperationID,
+			Dispatch:    input.Dispatch,
+			ReasonCode:  "RECONCILE_HISTORY",
+			TraceID:     input.TraceID,
+		},
+	).Get(ctx, &result)
+	return result, err
 }
 
 // ShotProductionWorkflow executes the exact run already persisted by the
@@ -257,6 +307,9 @@ func executeProviderWithControls(
 	options workflow.ActivityOptions,
 	input ExecuteProviderJobInput,
 ) (ProviderResult, error) {
+	raceVersion := workflow.GetVersion(
+		ctx, pauseCompletionRaceVersion, workflow.DefaultVersion, 1,
+	)
 	for {
 		waitForResume(ctx, status, controls)
 		activityCtx, cancelActivity := workflow.WithCancel(workflow.WithActivityOptions(ctx, options))
@@ -283,8 +336,23 @@ func executeProviderWithControls(
 			selector.Select(ctx)
 		}
 		cancelActivity()
-		if pausedCancellation && temporal.IsCanceledError(activityErr) {
-			waitForResume(ctx, status, controls)
+		if raceVersion == workflow.DefaultVersion {
+			if pausedCancellation && temporal.IsCanceledError(activityErr) {
+				waitForResume(ctx, status, controls)
+				continue
+			}
+			return result, activityErr
+		}
+		// A PAUSE signal and Activity completion can be recorded in the same
+		// Workflow task. Drain controls after the Future wins as well as while
+		// it is pending. If pause was observed, replay the same idempotent
+		// provider job after RESUME so CompleteProviderJob can advance the
+		// PostgreSQL run from PAUSED to SUCCEEDED before QC/Q1.
+		pauseObserved := pausedCancellation
+		if waitForResume(ctx, status, controls) {
+			pauseObserved = true
+		}
+		if pauseObserved && (activityErr == nil || temporal.IsCanceledError(activityErr)) {
 			continue
 		}
 		return result, activityErr

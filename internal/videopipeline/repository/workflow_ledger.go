@@ -1095,6 +1095,7 @@ func (p *Postgres) RecordProviderCancellation(
 				SET state = CASE
 					WHEN operation_type = 'CANCEL_GENERATION_RUN' THEN 'SUCCEEDED'
 					WHEN operation_type = 'CREATE_GENERATION_RUN' THEN 'SUCCEEDED'
+					WHEN operation_type = 'RESUME_GENERATION_RUN' THEN 'SUCCEEDED'
 					ELSE state
 				END,
 				updated_at = now()
@@ -1150,6 +1151,7 @@ func (p *Postgres) RecordProviderCancellation(
 				SET state = CASE
 					WHEN operation_type = 'CANCEL_GENERATION_RUN' THEN 'SUCCEEDED'
 					WHEN operation_type = 'CREATE_GENERATION_RUN' THEN 'CANCELLED'
+					WHEN operation_type = 'RESUME_GENERATION_RUN' THEN 'SUCCEEDED'
 					ELSE 'CANCELLED'
 				END,
 				updated_at = now()
@@ -1184,10 +1186,14 @@ func (p *Postgres) RecordProviderCancellation(
 				}
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.generation_runs
-					SET state = 'UNKNOWN', failure_class = 'INFRASTRUCTURE',
+					SET state = CASE
+					      WHEN $2 = 'RECONCILE_HISTORY' THEN 'RECONCILING'
+					      ELSE 'UNKNOWN'
+					    END,
+					    failure_class = 'INFRASTRUCTURE',
 					    failure_code = 'CANCEL_NOT_CONFIRMED'
 					WHERE id = $1 AND state <> 'SUCCEEDED'`,
-					runID,
+					runID, input.ReasonCode,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("mark run cancellation unknown: %w", err)
 				}
@@ -1202,6 +1208,13 @@ func (p *Postgres) RecordProviderCancellation(
 					return struct{}{}, fmt.Errorf("mark cancellation reconciliation active: %w", err)
 				}
 			}
+		}
+		if result.State == "UNKNOWN" &&
+			(input.ReasonCode == "RECONCILE_HISTORY" || currentState == "UNKNOWN") {
+			// Provider outages can produce many Activity retries. Preserve the
+			// durable UNKNOWN/RECONCILING projection without duplicating
+			// audit/outbox facts until a terminal result is observed.
+			return struct{}{}, nil
 		}
 		return struct{}{}, insertAuditAndOutbox(
 			ctx, tx,

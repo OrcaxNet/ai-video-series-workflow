@@ -92,6 +92,7 @@ func (c *Controller) StartShot(
 	if record.BudgetLimit.AmountMicros <= 0 || record.BudgetLimit.Currency == "" {
 		return controlplane.WorkflowStart{}, errors.New("shot generation plan has no positive approved budget limit")
 	}
+	input := shotProductionInput(operation.OperationID, record)
 	workflowID := operation.TemporalWorkflowID
 	if workflowID == "" {
 		workflowID = "shot-generation-" + operation.AggregateID
@@ -102,8 +103,19 @@ func (c *Controller) StartShot(
 		WorkflowIDConflictPolicy:                 enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
 		WorkflowIDReusePolicy:                    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
 		WorkflowExecutionErrorWhenAlreadyStarted: false,
-	}, orchestration.ShotWorkflowName, orchestration.ShotProductionInput{
-		OperationID:        operation.OperationID,
+	}, orchestration.ShotWorkflowName, input)
+	if err != nil {
+		return controlplane.WorkflowStart{}, fmt.Errorf("start shot workflow: %w", err)
+	}
+	return controlplane.WorkflowStart{WorkflowID: run.GetID(), RunID: run.GetRunID()}, nil
+}
+
+func shotProductionInput(
+	operationID string,
+	record controlplane.ShotWorkflowRecord,
+) orchestration.ShotProductionInput {
+	return orchestration.ShotProductionInput{
+		OperationID:        operationID,
 		ShotSpecRevisionID: record.Run.ShotSpecRevisionID,
 		Run: orchestration.GenerationRunRef{
 			RunID: record.Run.RunID, RunSpecDigest: record.Run.RunSpecDigest,
@@ -128,11 +140,7 @@ func (c *Controller) StartShot(
 		TraceID:             record.Run.TraceID,
 		RequireShotApproval: true,
 		PersistProductTruth: true,
-	})
-	if err != nil {
-		return controlplane.WorkflowStart{}, fmt.Errorf("start shot workflow: %w", err)
 	}
-	return controlplane.WorkflowStart{WorkflowID: run.GetID(), RunID: run.GetRunID()}, nil
 }
 
 func (c *Controller) Pause(ctx context.Context, workflowID, operationID, reasonCode string) error {
@@ -151,16 +159,74 @@ func (c *Controller) Cancel(ctx context.Context, workflowID, _ string) error {
 	return c.client.CancelWorkflow(ctx, workflowID, "")
 }
 
-func (c *Controller) Resume(ctx context.Context, workflowID, operationID, recoveryMode string) error {
+func (c *Controller) Resume(
+	ctx context.Context,
+	workflowID, operationID, recoveryMode string,
+) (controlplane.WorkflowStart, error) {
 	if workflowID == "" || operationID == "" {
-		return errors.New("workflow ID and operation ID are required")
+		return controlplane.WorkflowStart{}, errors.New("workflow ID and operation ID are required")
 	}
-	return c.client.SignalWorkflow(ctx, workflowID, "", orchestration.ControlSignal, orchestration.WorkflowControl{
-		CommandID:  operationID,
-		Action:     "RESUME",
-		ActorID:    "control-plane",
-		ReasonCode: recoveryMode,
-	})
+	if recoveryMode == "RESUME_PAUSED" {
+		err := c.client.SignalWorkflow(
+			ctx, workflowID, "", orchestration.ControlSignal, orchestration.WorkflowControl{
+				CommandID:  operationID,
+				Action:     "RESUME",
+				ActorID:    "control-plane",
+				ReasonCode: recoveryMode,
+			},
+		)
+		return controlplane.WorkflowStart{WorkflowID: workflowID}, err
+	}
+	if recoveryMode != "RECONCILE_HISTORY" && recoveryMode != "RETRY_INFRASTRUCTURE" {
+		return controlplane.WorkflowStart{}, fmt.Errorf("unsupported recovery mode %q", recoveryMode)
+	}
+	operation, err := c.store.GetOperation(ctx, operationID)
+	if err != nil {
+		return controlplane.WorkflowStart{}, fmt.Errorf("load recovery operation: %w", err)
+	}
+	record, err := c.store.GetShotWorkflowRecord(ctx, operation.AggregateID)
+	if err != nil {
+		return controlplane.WorkflowStart{}, fmt.Errorf("load shot recovery projection: %w", err)
+	}
+	input := shotProductionInput(operationID, record)
+	recoveryWorkflowID := "shot-recovery-" + operationID
+	options := client.StartWorkflowOptions{
+		ID:                                       recoveryWorkflowID,
+		TaskQueue:                                c.taskQueue,
+		WorkflowIDConflictPolicy:                 enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		WorkflowIDReusePolicy:                    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		WorkflowExecutionErrorWhenAlreadyStarted: false,
+	}
+	var run client.WorkflowRun
+	if recoveryMode == "RECONCILE_HISTORY" &&
+		record.Run.FailureCode == "CANCEL_NOT_CONFIRMED" {
+		run, err = c.client.ExecuteWorkflow(
+			ctx,
+			options,
+			orchestration.ShotReconciliationWorkflowName,
+			orchestration.ShotReconciliationInput{
+				OperationID: operationID,
+				Dispatch: orchestration.ExecuteProviderJobInput{
+					Run: input.Run, Prompt: input.Prompt, Route: input.Route,
+					BudgetApprovalID:    input.BudgetApprovalID,
+					BudgetMaximumMicros: input.BudgetMaximumMicros,
+					BudgetCurrency:      input.BudgetCurrency,
+					ProviderProfileID:   input.ProviderProfileID,
+					TraceID:             input.TraceID,
+					PersistProductTruth: input.PersistProductTruth,
+				},
+				TraceID: input.TraceID,
+			},
+		)
+	} else {
+		run, err = c.client.ExecuteWorkflow(
+			ctx, options, orchestration.ShotWorkflowName, input,
+		)
+	}
+	if err != nil {
+		return controlplane.WorkflowStart{}, fmt.Errorf("start shot recovery workflow: %w", err)
+	}
+	return controlplane.WorkflowStart{WorkflowID: run.GetID(), RunID: run.GetRunID()}, nil
 }
 
 func (c *Controller) RecordApproval(ctx context.Context, decision controlplane.ApprovalDecision) error {

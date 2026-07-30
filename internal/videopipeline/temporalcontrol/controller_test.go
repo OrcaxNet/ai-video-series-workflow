@@ -64,11 +64,16 @@ func (f workflowRunFixture) GetRunID() string { return f.runID }
 
 type storeFixture struct {
 	controlplane.Store
-	shot controlplane.ShotWorkflowRecord
+	shot      controlplane.ShotWorkflowRecord
+	operation controlplane.Operation
 }
 
 func (f *storeFixture) GetShotWorkflowRecord(context.Context, string) (controlplane.ShotWorkflowRecord, error) {
 	return f.shot, nil
+}
+
+func (f *storeFixture) GetOperation(context.Context, string) (controlplane.Operation, error) {
+	return f.operation, nil
 }
 
 func TestControllerStartShotUsesStablePersistedWorkflowAndDispatch(t *testing.T) {
@@ -132,7 +137,7 @@ func TestControllerSignalsPauseResumeAndCancel(t *testing.T) {
 	if err := controller.Pause(t.Context(), "workflow-1", "pause-operation-1", "operator"); err != nil {
 		t.Fatal(err)
 	}
-	if err := controller.Resume(t.Context(), "workflow-1", "resume-operation-1", "RESUME_PAUSED"); err != nil {
+	if _, err := controller.Resume(t.Context(), "workflow-1", "resume-operation-1", "RESUME_PAUSED"); err != nil {
 		t.Fatal(err)
 	}
 	if err := controller.Cancel(t.Context(), "workflow-1", "operator"); err != nil {
@@ -146,5 +151,63 @@ func TestControllerSignalsPauseResumeAndCancel(t *testing.T) {
 	if pause.Action != "PAUSE" || pause.CommandID != "pause-operation-1" ||
 		resume.Action != "RESUME" || resume.CommandID != "resume-operation-1" {
 		t.Fatalf("pause=%#v resume=%#v", pause, resume)
+	}
+}
+
+func TestControllerStartsStableReconciliationAfterOriginalWorkflowClosed(t *testing.T) {
+	t.Parallel()
+	temporalClient := &clientFixture{}
+	store := &storeFixture{
+		operation: controlplane.Operation{
+			OperationID: "recovery-operation-1",
+			AggregateID: "run-1",
+		},
+		shot: controlplane.ShotWorkflowRecord{
+			Run: controlplane.GenerationRun{
+				RunID: "run-1", ShotSpecRevisionID: "shot-revision-1",
+				RunSpecDigest: "digest-1", CreativeAttempt: 2,
+				FailureCode: "CANCEL_NOT_CONFIRMED", TraceID: "trace-1",
+			},
+			PromptSnapshotID: "prompt-1", PromptHash: "prompt-digest-1",
+			RouteSnapshot: controlplane.ModelRouteSnapshot{
+				CapabilityAlias: "video.primary", ProviderProfileID: "provider-profile-1",
+				Provider: "MOCK", ModelID: "fixture-video-v1", RouteVersion: "route-v1",
+				CapabilityHash: "capability-hash-1",
+			},
+			BudgetApprovalID: "budget-approval-1",
+			BudgetLimit:      controlplane.BudgetLimit{AmountMicros: 1000, Currency: "CNY"},
+		},
+	}
+	controller, err := New(temporalClient, "queue-1", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, err := controller.Resume(
+		t.Context(), "closed-shot-workflow", "recovery-operation-1", "RECONCILE_HISTORY",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if started.WorkflowID != "shot-recovery-recovery-operation-1" ||
+		started.RunID != "temporal-run-1" {
+		t.Fatalf("started = %#v", started)
+	}
+	if len(temporalClient.signals) != 0 || len(temporalClient.executions) != 1 {
+		t.Fatalf(
+			"recovery signalled closed workflow: signals=%#v executions=%#v",
+			temporalClient.signals,
+			temporalClient.executions,
+		)
+	}
+	call := temporalClient.executions[0]
+	if call.workflow != orchestration.ShotReconciliationWorkflowName ||
+		call.options.ID != "shot-recovery-recovery-operation-1" {
+		t.Fatalf("recovery execution = %#v", call)
+	}
+	input, ok := call.input.(orchestration.ShotReconciliationInput)
+	if !ok || input.OperationID != "recovery-operation-1" ||
+		input.Dispatch.Run.RunID != "run-1" ||
+		!input.Dispatch.PersistProductTruth {
+		t.Fatalf("recovery input = %#v", call.input)
 	}
 }

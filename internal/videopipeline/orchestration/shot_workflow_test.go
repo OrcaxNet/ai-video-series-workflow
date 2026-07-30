@@ -7,7 +7,9 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/stretchr/testify/mock"
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 )
 
@@ -78,6 +80,104 @@ func TestShotProductionWorkflowCancellationRunsProviderCompensation(t *testing.T
 	if cancelCalls != 1 {
 		t.Fatalf("cancel compensation calls = %d, want 1", cancelCalls)
 	}
+}
+
+func TestShotProductionWorkflowPauseWinningProviderCompletionReplaysBeforeQC(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	var finalized FinalizeShotRunInput
+	registerShotActivities(env, &finalized, nil)
+	digest := strings.Repeat("a", 64)
+	providerResult := ProviderResult{
+		UpstreamTaskID: "task-1", RequestID: "request-1",
+		ArtifactDigest: digest, ArtifactURI: "cas://sha256/" + digest,
+		Usage: providercontract.Usage{GeneratedMillis: 5000},
+		Cost: providercontract.Cost{
+			EstimatedMicros: 100, Currency: "CNY", PricingVersion: "test",
+		},
+	}
+	env.OnActivity(
+		ActivityExecuteProviderJob,
+		mock.Anything,
+		mock.Anything,
+	).After(time.Second).Return(providerResult, nil).Twice()
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(ControlSignal, WorkflowControl{
+			CommandID: "pause-race", Action: "PAUSE", ActorID: "operator-1",
+		})
+	}, time.Second)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(ControlSignal, WorkflowControl{
+			CommandID: "resume-race", Action: "RESUME", ActorID: "operator-1",
+		})
+	}, 2*time.Second)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(ShotDecisionSignal, ShotDecision{
+			DecisionID: "q1-race", ShotSpecRevisionID: "shot-revision-1",
+			RunID: "run-1", Approved: true, ActorID: "reviewer-1",
+		})
+	}, 4*time.Second)
+
+	env.ExecuteWorkflow(ShotProductionWorkflow, shotWorkflowTestInput())
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v", err)
+	}
+	if finalized.State != "SUCCEEDED" {
+		t.Fatalf("finalized = %#v", finalized)
+	}
+	env.AssertExpectations(t)
+}
+
+func TestShotReconciliationWorkflowRetriesUntilProviderTruthConverges(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	cancelActivity := func(context.Context, CancelProviderJobInput) (CancelProviderResult, error) {
+		return CancelProviderResult{}, nil
+	}
+	env.RegisterActivityWithOptions(
+		cancelActivity,
+		activity.RegisterOptions{Name: ActivityCancelProviderJob},
+	)
+	first := env.OnActivity(
+		ActivityCancelProviderJob,
+		mock.Anything,
+		mock.Anything,
+	).Return(
+		CancelProviderResult{},
+		temporal.NewApplicationError("provider unavailable", "CANCEL_NOT_CONFIRMED"),
+	).Once()
+	env.OnActivity(
+		ActivityCancelProviderJob,
+		mock.Anything,
+		mock.Anything,
+	).Return(
+		CancelProviderResult{State: "CANCELLED"},
+		nil,
+	).Once().NotBefore(first)
+
+	env.ExecuteWorkflow(ShotReconciliationWorkflow, ShotReconciliationInput{
+		OperationID: "recovery-operation-1",
+		Dispatch: ExecuteProviderJobInput{
+			Run: GenerationRunRef{
+				RunID: "run-1", RunSpecDigest: strings.Repeat("b", 64),
+			},
+			PersistProductTruth: true,
+		},
+		TraceID: "trace-1",
+	})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v", err)
+	}
+	var result CancelProviderResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "CANCELLED" {
+		t.Fatalf("result = %#v", result)
+	}
+	env.AssertExpectations(t)
 }
 
 func registerShotActivities(
