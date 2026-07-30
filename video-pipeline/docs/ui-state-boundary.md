@@ -47,6 +47,19 @@
 Idempotency-Key 与严格递增校验；切换 live 后复用冻结 OpenAPI 已定义的
 `POST /api/v1/provider-jobs`，不增加专用私有路由。
 
+### 2.1 新 attempt 创作意图幂等
+
+- 意图键为 `project + sourceJobId + nextAttempt`。前端在第一次异步操作前同步写入
+  in-flight set，因此同一事件循环内的重复激活只会进入一次 API。
+- `generationAttemptId` 和 `Idempotency-Key` 由意图键稳定派生并缓存在内存 command
+  ledger；请求已受理但响应丢失时，再次操作会复用同一请求身份，由控制面返回原 Job。
+- 请求快照携带非敏感 `creativeIntentKey = sourceJobId:nextAttempt`，用于审计与唯一性
+  对账；不包含 Secret。该字段位于 OpenAPI 允许扩展的 `requestSnapshot`，无需契约迁移。
+- Mock 服务端维护每个 shot 的 current Job、每个 Job 的 attempt，以及唯一
+  `(sourceJobId, nextAttempt)`。同键同 payload replay 原结果；不同键重放已落库意图返回
+  `ATTEMPT_ALREADY_EXISTS`；历史 source 返回 `ATTEMPT_SOURCE_SUPERSEDED`。客户端传入的
+  `isCurrentAttempt` 不作为服务端真相。
+
 ## 3. 错误映射
 
 | HTTP/错误 | UI 行为 |

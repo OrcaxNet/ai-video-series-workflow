@@ -129,6 +129,20 @@ const terminalJobStates = new Set<ProviderJob["state"]>(["SUCCEEDED", "FAILED", 
 const stableHash = (seed: string) =>
   Array.from({ length: 64 }, (_, index) => ((seed.charCodeAt(index % seed.length) + index) % 16).toString(16)).join("");
 
+interface JobAttemptIntent {
+  generationAttemptId: string;
+  idempotencyKey: string;
+}
+
+const deterministicUuid = async (seed: string) => {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(seed)));
+  const bytes = digest.slice(0, 16);
+  bytes[6] = ((bytes[6] ?? 0) & 0x0f) | 0x80;
+  bytes[8] = ((bytes[8] ?? 0) & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+};
+
 const toast = (state: StudioState, value: Omit<ToastMessage, "id">) => ({
   ...state,
   toasts: [...state.toasts.slice(-2), { ...value, id: Date.now() + state.toasts.length }],
@@ -573,6 +587,7 @@ function reducer(state: StudioState, action: Action): StudioState {
         {
           ...state,
           busy: false,
+          lastProblem: undefined,
           jobs,
           gates: {
             ...state.gates,
@@ -724,6 +739,8 @@ export function StudioProvider({
 }: PropsWithChildren<{ api?: ControlPlaneApi; initialState?: StudioState }>) {
   const [state, dispatch] = useReducer(reducer, initialState ?? createInitialState());
   const apiRef = useRef(api ?? createControlPlaneApi());
+  const jobAttemptIntentsRef = useRef(new Map<string, JobAttemptIntent>());
+  const inFlightJobAttemptKeysRef = useRef(new Set<string>());
 
   const handleProblem = useCallback((error: unknown) => {
     const value =
@@ -891,20 +908,45 @@ export function StudioProvider({
         );
         return;
       }
+      const nextAttempt = sourceJob.attempt + 1;
+      const intentKey = `${state.project.id}:${sourceJob.id}:${nextAttempt}`;
+      if (inFlightJobAttemptKeysRef.current.has(intentKey)) {
+        dispatch({
+          type: "TOAST",
+          toast: {
+            tone: "info",
+            title: `${sourceJob.shot} attempt ${nextAttempt} 正在创建`,
+            description: "相同创作意图已在提交，本次重复激活不会发送第二个 Provider Job 请求。",
+          },
+        });
+        return;
+      }
+      inFlightJobAttemptKeysRef.current.add(intentKey);
       dispatch({ type: "BUSY", busy: true });
       try {
+        let intent = jobAttemptIntentsRef.current.get(intentKey);
+        if (!intent) {
+          const [generationAttemptId, idempotencyKey] = await Promise.all([
+            deterministicUuid(`generation-attempt:${intentKey}`),
+            deterministicUuid(`provider-job-command:${intentKey}`),
+          ]);
+          intent = { generationAttemptId, idempotencyKey };
+          jobAttemptIntentsRef.current.set(intentKey, intent);
+        }
         const result = await apiRef.current.createJobAttempt({
           sourceJob,
-          nextAttempt: sourceJob.attempt + 1,
-          generationAttemptId: crypto.randomUUID(),
-          idempotencyKey: crypto.randomUUID(),
+          nextAttempt,
+          generationAttemptId: intent.generationAttemptId,
+          idempotencyKey: intent.idempotencyKey,
         });
         dispatch({ type: "JOB_ATTEMPT_CREATED", sourceJobId: sourceJob.id, result });
       } catch (error) {
         handleProblem(error);
+      } finally {
+        inFlightJobAttemptKeysRef.current.delete(intentKey);
       }
     },
-    [handleProblem, state.jobs],
+    [handleProblem, state.jobs, state.project.id],
   );
 
   useEffect(() => {

@@ -56,6 +56,10 @@ VITE_STUDIO_MODE=live npm run dev
 - 基础设施重试沿用同一 Provider Job；`FAILED` / `CANCELLED` 的创作重做通过
   `POST /api/v1/provider-jobs` 创建递增 attempt 和全新 Job ID。旧终态行、时间、错误与
   费用证据只读保留，并显示新旧替代关系。
+- 新 attempt 以 `project + sourceJobId + nextAttempt` 作为稳定创作意图：同步 in-flight
+  guard 阻止同一渲染周期重复提交，响应丢失后的重试复用确定性的
+  `generationAttemptId` / `Idempotency-Key`。Mock 另以服务端 current Job 和
+  `(sourceJobId, nextAttempt)` 唯一约束拒绝陈旧 source 重放。
 - `SUCCEEDED`、`FAILED`、`CANCELLED` 是单调终态；晚到 callback、异常注入和批次
   完成均不得覆盖；批次完成和 G3 只计算每个镜头标记为当前的 attempt。
 - Prompt“回滚”只切换下一次使用的 revision，不删除历史产物、费用或 Manifest。

@@ -244,6 +244,28 @@ test("429 infrastructure retry keeps the same Job ID and creative attempt", asyn
   await expect(page.getByText("5 个当前任务", { exact: true })).toBeVisible();
 });
 
+test("sequential creative intents advance attempt 1 to 2 to 3 without reviving history", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "任务中心" }).click();
+
+  await page.getByRole("button", { name: /失败.*FAILED 终态/ }).click();
+  await page.getByRole("button", { name: "为 S03-02 创建新 attempt" }).click();
+  await page.getByRole("button", { name: /失败.*FAILED 终态/ }).click();
+  await page.getByRole("button", { name: "为 S03-02 创建新 attempt" }).click();
+
+  const attempt1 = page.getByRole("row").filter({ has: page.getByText("job-v-032", { exact: true }) });
+  const attempt2 = page.getByRole("row").filter({ has: page.getByText("job-v-032-a2", { exact: true }) });
+  const attempt3 = page.getByRole("row").filter({ has: page.getByText("job-v-032-a3", { exact: true }) });
+  await expect(attempt1.getByText("失败", { exact: true })).toBeVisible();
+  await expect(attempt1.getByText("历史 attempt", { exact: true })).toBeVisible();
+  await expect(attempt2.getByText("失败", { exact: true })).toBeVisible();
+  await expect(attempt2.getByText("历史 attempt", { exact: true })).toBeVisible();
+  await expect(attempt3.getByText("排队中", { exact: true })).toBeVisible();
+  await expect(attempt3.getByText("attempt 3 · retry 0", { exact: true })).toBeVisible();
+  await expect(attempt3.getByText("当前 attempt", { exact: true })).toBeVisible();
+  await expect(page.getByText("5 个当前任务", { exact: true })).toBeVisible();
+});
+
 test("project dialog traps focus, closes on Escape, and restores the trigger", async ({ page }) => {
   await page.goto("/");
   const trigger = page.getByRole("button", { name: "切换或新建项目" });

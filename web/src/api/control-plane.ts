@@ -11,7 +11,11 @@ import {
   type ProviderCapability,
   type RegenerationResult,
 } from "../domain";
-import { capabilities as fixtureCapabilities, gates as fixtureGates } from "../mock-data";
+import {
+  capabilities as fixtureCapabilities,
+  gates as fixtureGates,
+  jobs as fixtureJobs,
+} from "../mock-data";
 
 export interface ControlPlaneApi {
   getProviderStatus(): Promise<ProviderCapability[]>;
@@ -69,10 +73,21 @@ export class MockControlPlaneApi implements ControlPlaneApi {
   private gates: Record<GateId, Gate>;
   private idempotency = new Map<string, { fingerprint: string; result: ApprovalResult }>();
   private jobAttempts = new Map<string, { fingerprint: string; result: CreateJobAttemptResult }>();
+  private jobAttemptIntents = new Map<
+    string,
+    { idempotencyKey: string; generationAttemptId: string; result: CreateJobAttemptResult }
+  >();
+  private currentJobByShot = new Map<string, string>();
+  private attemptByJobId = new Map<string, number>();
+  private generationAttemptOwners = new Map<string, string>();
   private staleGates = new Set<GateId>();
 
   constructor(seed: Record<GateId, Gate> = fixtureGates) {
     this.gates = structuredClone(seed);
+    fixtureJobs.forEach((job) => {
+      if (job.isCurrentAttempt) this.currentJobByShot.set(job.shotId, job.id);
+      this.attemptByJobId.set(job.id, job.attempt);
+    });
   }
 
   async getProviderStatus() {
@@ -193,10 +208,26 @@ export class MockControlPlaneApi implements ControlPlaneApi {
       }
       return structuredClone(existing.result);
     }
-    if (
-      !input.sourceJob.isCurrentAttempt ||
-      (input.sourceJob.state !== "FAILED" && input.sourceJob.state !== "CANCELLED")
-    ) {
+    const intentKey = `${input.sourceJob.id}:${input.nextAttempt}`;
+    const existingIntent = this.jobAttemptIntents.get(intentKey);
+    if (existingIntent) {
+      throw problem(
+        409,
+        "ATTEMPT_ALREADY_EXISTS",
+        `${intentKey} 已绑定 ${existingIntent.result.providerJobId}，不能用新命令重复提交。`,
+        "复用原 Idempotency-Key 获取已持久化的 Job；不要创建第二个外部任务。",
+      );
+    }
+    const currentJobId = this.currentJobByShot.get(input.sourceJob.shotId);
+    if (currentJobId !== input.sourceJob.id) {
+      throw problem(
+        409,
+        "ATTEMPT_SOURCE_SUPERSEDED",
+        `${input.sourceJob.id} 已不是 ${input.sourceJob.shot} 的当前 Job。`,
+        `刷新任务投影并使用当前 Job ${currentJobId ?? "unknown"}；不得从历史 source 重放。`,
+      );
+    }
+    if (input.sourceJob.state !== "FAILED" && input.sourceJob.state !== "CANCELLED") {
       throw problem(
         422,
         "RUN_TERMINAL_REQUIRED",
@@ -204,12 +235,22 @@ export class MockControlPlaneApi implements ControlPlaneApi {
         "选择当前终态任务，或对可重试故障沿用原 Job ID。",
       );
     }
-    if (input.nextAttempt !== input.sourceJob.attempt + 1) {
+    const currentAttempt = this.attemptByJobId.get(input.sourceJob.id);
+    if (currentAttempt === undefined || input.nextAttempt !== currentAttempt + 1) {
       throw problem(
         409,
         "REVISION_CONFLICT",
         "新 attempt 序号必须严格递增。",
         "刷新任务投影后从最新 attempt 创建替代任务。",
+      );
+    }
+    const generationAttemptOwner = this.generationAttemptOwners.get(input.generationAttemptId);
+    if (generationAttemptOwner && generationAttemptOwner !== intentKey) {
+      throw problem(
+        409,
+        "GENERATION_ATTEMPT_CONFLICT",
+        `${input.generationAttemptId} 已绑定其他创作意图。`,
+        "为不同创作意图使用不同 generationAttemptId。",
       );
     }
 
@@ -222,6 +263,14 @@ export class MockControlPlaneApi implements ControlPlaneApi {
       createdAt: new Date().toISOString(),
     };
     this.jobAttempts.set(input.idempotencyKey, { fingerprint, result });
+    this.jobAttemptIntents.set(intentKey, {
+      idempotencyKey: input.idempotencyKey,
+      generationAttemptId: input.generationAttemptId,
+      result,
+    });
+    this.currentJobByShot.set(input.sourceJob.shotId, result.providerJobId);
+    this.attemptByJobId.set(result.providerJobId, input.nextAttempt);
+    this.generationAttemptOwners.set(input.generationAttemptId, intentKey);
     return structuredClone(result);
   }
 
@@ -384,6 +433,7 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
         requestSnapshot: {
           shotId: input.sourceJob.shotId,
           creativeAttempt: input.nextAttempt,
+          creativeIntentKey: `${input.sourceJob.id}:${input.nextAttempt}`,
           supersedesProviderJobId: input.sourceJob.id,
           evidence: input.sourceJob.evidence,
         },

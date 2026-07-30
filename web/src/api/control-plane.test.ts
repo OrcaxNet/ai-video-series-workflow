@@ -187,6 +187,68 @@ describe("MockControlPlaneApi", () => {
       }),
     ).rejects.toMatchObject({ status: 409, errorCode: "conflict" });
   });
+
+  it("rejects a different-key replay of an already persisted source attempt", async () => {
+    const api = new MockControlPlaneApi();
+    const firstInput = jobAttemptInput("FAILED", "original-attempt-key");
+    const first = await api.createJobAttempt(firstInput);
+
+    await expect(
+      api.createJobAttempt({
+        ...firstInput,
+        idempotencyKey: "different-attempt-key",
+        generationAttemptId: "44444444-4444-4444-8444-444444444404",
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      errorCode: "ATTEMPT_ALREADY_EXISTS",
+    });
+    await expect(api.createJobAttempt(firstInput)).resolves.toEqual(first);
+  });
+
+  it("advances server-side current attempt truth from attempt 2 to attempt 3", async () => {
+    const api = new MockControlPlaneApi();
+    const firstInput = jobAttemptInput("FAILED", "attempt-2-key");
+    const attempt2 = await api.createJobAttempt(firstInput);
+    const attempt3 = await api.createJobAttempt({
+      sourceJob: {
+        ...firstInput.sourceJob,
+        id: attempt2.providerJobId,
+        state: "FAILED",
+        attempt: 2,
+        isCurrentAttempt: true,
+      },
+      nextAttempt: 3,
+      generationAttemptId: "55555555-5555-4555-8555-555555555505",
+      idempotencyKey: "attempt-3-key",
+    });
+
+    expect(attempt3).toMatchObject({
+      providerJobId: "job-v-032-a3",
+      generationAttemptId: "55555555-5555-4555-8555-555555555505",
+    });
+    await expect(
+      api.createJobAttempt({
+        ...firstInput,
+        idempotencyKey: "stale-source-key",
+        generationAttemptId: "66666666-6666-4666-8666-666666666606",
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      errorCode: "ATTEMPT_ALREADY_EXISTS",
+    });
+    await expect(
+      api.createJobAttempt({
+        ...firstInput,
+        nextAttempt: 3,
+        idempotencyKey: "superseded-source-key",
+        generationAttemptId: "77777777-7777-4777-8777-777777777707",
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      errorCode: "ATTEMPT_SOURCE_SUPERSEDED",
+    });
+  });
 });
 
 describe("HttpControlPlaneApi", () => {
@@ -253,7 +315,9 @@ describe("HttpControlPlaneApi", () => {
     });
     expect(body.requestSnapshot).toMatchObject({
       creativeAttempt: 2,
+      creativeIntentKey: "job-v-032:2",
       supersedesProviderJobId: "job-v-032",
     });
+    expect((request.headers as Record<string, string>)["Idempotency-Key"]).toBe("live-attempt");
   });
 });
