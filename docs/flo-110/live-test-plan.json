@@ -52,7 +52,6 @@
     "provider.request_id",
     "provider.job_id",
     "attempt.number",
-    "attempt.temperature",
     "attempt.started_at",
     "attempt.completed_at",
     "attempt.latency_millis",

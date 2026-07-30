@@ -59,10 +59,9 @@
     "attempt": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["number", "temperature", "started_at", "completed_at", "latency_millis"],
+      "required": ["number", "started_at", "completed_at", "latency_millis"],
       "properties": {
         "number": {"type": "integer", "minimum": 1},
-        "temperature": {"enum": ["cold", "hot"]},
         "started_at": {"type": "string", "format": "date-time"},
         "completed_at": {"type": "string", "format": "date-time"},
         "latency_millis": {"type": "integer", "minimum": 1}

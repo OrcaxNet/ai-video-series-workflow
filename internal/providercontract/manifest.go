@@ -39,7 +39,6 @@ type ProviderEvidence struct {
 
 type AttemptEvidence struct {
 	Number        int       `json:"number"`
-	Temperature   string    `json:"temperature"`
 	StartedAt     time.Time `json:"started_at"`
 	CompletedAt   time.Time `json:"completed_at"`
 	LatencyMillis int64     `json:"latency_millis"`
@@ -77,7 +76,6 @@ type ManifestBuildInput struct {
 	Request     GenerationRequest
 	Job         Job
 	Attempt     int
-	Temperature string
 	StartedAt   time.Time
 	CompletedAt time.Time
 }
@@ -106,7 +104,6 @@ func NewGenerationManifest(input ManifestBuildInput) (GenerationManifest, error)
 		},
 		Attempt: AttemptEvidence{
 			Number:        input.Attempt,
-			Temperature:   input.Temperature,
 			StartedAt:     input.StartedAt.UTC(),
 			CompletedAt:   input.CompletedAt.UTC(),
 			LatencyMillis: input.CompletedAt.Sub(input.StartedAt).Milliseconds(),
@@ -154,8 +151,6 @@ func (m GenerationManifest) Validate() error {
 		return errors.New("complete provider provenance is required")
 	case m.Attempt.Number < 1:
 		return errors.New("attempt number must be positive")
-	case m.Attempt.Temperature != "cold" && m.Attempt.Temperature != "hot":
-		return errors.New("attempt temperature must be cold or hot")
 	case m.Attempt.StartedAt.IsZero() || !m.Attempt.CompletedAt.After(m.Attempt.StartedAt):
 		return errors.New("attempt timestamps are invalid")
 	case m.Attempt.LatencyMillis != m.Attempt.CompletedAt.Sub(m.Attempt.StartedAt).Milliseconds():
@@ -209,14 +204,10 @@ func toAssetEvidence(asset AssetRef) AssetEvidence {
 // WriteGenerationManifest creates one immutable file with restrictive
 // permissions and returns the SHA-256 of the exact bytes written.
 func WriteGenerationManifest(path string, manifest GenerationManifest) (string, error) {
-	if err := manifest.Validate(); err != nil {
+	data, err := marshalGenerationManifest(manifest)
+	if err != nil {
 		return "", err
 	}
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return "", fmt.Errorf("encode generation manifest: %w", err)
-	}
-	data = append(data, '\n')
 	cleanPath := filepath.Clean(path)
 	if _, err := os.Lstat(cleanPath); err == nil {
 		return "", &Error{Code: CodeConflict, SafeMessage: "generation manifest already exists"}
@@ -263,4 +254,15 @@ func WriteGenerationManifest(path string, manifest GenerationManifest) (string, 
 	}
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:]), nil
+}
+
+func marshalGenerationManifest(manifest GenerationManifest) ([]byte, error) {
+	if err := manifest.Validate(); err != nil {
+		return nil, err
+	}
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode generation manifest: %w", err)
+	}
+	return append(data, '\n'), nil
 }

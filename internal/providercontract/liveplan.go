@@ -113,7 +113,7 @@ func (p LiveTestPlan) Validate() error {
 		"context": false, "input_assets": false, "requested_output": false,
 		"provider.name": false, "provider.model": false, "provider.region": false,
 		"provider.request_id": false, "provider.job_id": false,
-		"attempt.number": false, "attempt.temperature": false,
+		"attempt.number":     false,
 		"attempt.started_at": false, "attempt.completed_at": false,
 		"attempt.latency_millis": false, "status": false, "actual_output": false,
 		"output_assets": false, "usage": false, "budget": false,

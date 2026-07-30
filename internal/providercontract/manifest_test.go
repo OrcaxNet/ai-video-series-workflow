@@ -52,7 +52,6 @@ func TestGenerationManifestWritesImmutableSanitizedEvidence(t *testing.T) {
 		Request:     request,
 		Job:         job,
 		Attempt:     1,
-		Temperature: "cold",
 		StartedAt:   started,
 		CompletedAt: started.Add(30 * time.Second),
 	})
@@ -116,5 +115,8 @@ func TestCommittedGenerationManifestSchema(t *testing.T) {
 	}
 	if strings.Contains(string(data), `"uri"`) {
 		t.Fatal("manifest schema must not persist runtime URIs")
+	}
+	if strings.Contains(string(data), `"temperature"`) {
+		t.Fatal("manifest schema must not persist caller-supplied temperature")
 	}
 }
