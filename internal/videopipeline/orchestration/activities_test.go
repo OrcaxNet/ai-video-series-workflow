@@ -10,7 +10,10 @@ import (
 	"testing"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
+	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 )
 
@@ -32,7 +35,10 @@ type cancellationLedgerFixture struct {
 
 type postProductionLedgerFixture struct {
 	request        postproduction.Request
+	prepareErr     error
 	authorizeErr   error
+	authorizeErrAt int
+	commitErr      error
 	prepareCalls   int
 	authorizeCalls int
 	commitCalls    int
@@ -44,7 +50,7 @@ func (l *postProductionLedgerFixture) PrepareEpisodePostProduction(
 	FinalizeEpisodeInput,
 ) (postproduction.Request, error) {
 	l.prepareCalls++
-	return l.request, nil
+	return l.request, l.prepareErr
 }
 
 func (l *postProductionLedgerFixture) AuthorizeEpisodePostProduction(
@@ -53,6 +59,9 @@ func (l *postProductionLedgerFixture) AuthorizeEpisodePostProduction(
 	FinalizeEpisodeInput,
 ) error {
 	l.authorizeCalls++
+	if l.authorizeErrAt > 0 && l.authorizeCalls != l.authorizeErrAt {
+		return nil
+	}
 	return l.authorizeErr
 }
 
@@ -63,21 +72,61 @@ func (l *postProductionLedgerFixture) CommitEpisodePostProduction(
 	postproduction.Result,
 ) error {
 	l.commitCalls++
-	return nil
+	return l.commitErr
 }
 
 type postProductionExecutorFixture struct {
-	result postproduction.Result
-	err    error
-	calls  int
+	result                  postproduction.Result
+	err                     error
+	invokePaidAuthorization bool
+	calls                   int
 }
 
 func (e *postProductionExecutorFixture) Finalize(
-	context.Context,
-	postproduction.Request,
+	ctx context.Context,
+	request postproduction.Request,
 ) (postproduction.Result, error) {
 	e.calls++
+	if e.invokePaidAuthorization {
+		if request.AuthorizePaidSubmit == nil {
+			return postproduction.Result{}, errors.New("paid submission authorizer is missing")
+		}
+		if err := request.AuthorizePaidSubmit(ctx, postproduction.Cue{ID: "cue"}); err != nil {
+			return postproduction.Result{}, err
+		}
+	}
 	return e.result, e.err
+}
+
+type gate3LedgerFixture struct {
+	ProductionLedger
+	buildErr    error
+	commitErr   error
+	buildCalls  int
+	commitCalls int
+}
+
+func (l *gate3LedgerFixture) BuildEpisodeManifest(
+	context.Context,
+	WorkflowStep,
+	CreateGate3Input,
+) ([]byte, error) {
+	l.buildCalls++
+	if l.buildErr != nil {
+		return nil, l.buildErr
+	}
+	return []byte(`{"schemaVersion":"v1"}`), nil
+}
+
+func (l *gate3LedgerFixture) CommitEpisodeManifest(
+	context.Context,
+	WorkflowStep,
+	CreateGate3Input,
+	[]byte,
+	artifactstore.Artifact,
+) error {
+	l.commitCalls++
+	return l.commitErr
 }
 
 func (l *cancellationLedgerFixture) ProviderJobPrepared(context.Context, string) (bool, error) {
@@ -470,6 +519,126 @@ func TestActivities_FinalizeEpisodeBlocksBeforeExecutorWhenRightsChangeAfterPrep
 	}
 }
 
+func TestActivities_FinalizeEpisodePreservesRightsErrorContract(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		boundary string
+		code     controlplane.ErrorCode
+	}{
+		{name: "prepare consent", boundary: "prepare", code: controlplane.CodeConsentRequired},
+		{name: "prepare license", boundary: "prepare", code: controlplane.CodeLicenseBlocked},
+		{name: "authorize consent", boundary: "authorize", code: controlplane.CodeConsentRequired},
+		{name: "authorize license", boundary: "authorize", code: controlplane.CodeLicenseBlocked},
+		{name: "paid submit consent", boundary: "paid_submit", code: controlplane.CodeConsentRequired},
+		{name: "paid submit license", boundary: "paid_submit", code: controlplane.CodeLicenseBlocked},
+		{name: "commit consent", boundary: "commit", code: controlplane.CodeConsentRequired},
+		{name: "commit license", boundary: "commit", code: controlplane.CodeLicenseBlocked},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			policyErr := controlplane.NewPolicyError(
+				test.code,
+				"fixture rights failure",
+				"renew rights",
+			)
+			ledger := &postProductionLedgerFixture{}
+			executor := &postProductionExecutorFixture{}
+			switch test.boundary {
+			case "prepare":
+				ledger.prepareErr = policyErr
+			case "authorize":
+				ledger.authorizeErr = policyErr
+				ledger.authorizeErrAt = 1
+			case "paid_submit":
+				ledger.authorizeErr = policyErr
+				ledger.authorizeErrAt = 2
+				executor.invokePaidAuthorization = true
+			case "commit":
+				ledger.commitErr = policyErr
+			default:
+				t.Fatalf("unknown boundary %q", test.boundary)
+			}
+			activities := NewActivities("http://provider.invalid")
+			activities.ConfigurePostProduction(executor, ledger)
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestActivityEnvironment()
+			env.RegisterActivity(activities.FinalizeEpisode)
+			_, err := env.ExecuteActivity(
+				activities.FinalizeEpisode,
+				testFinalizeEpisodeInput("trace-"+test.name),
+			)
+			assertNonRetryableApplicationError(t, err, string(test.code))
+		})
+	}
+}
+
+func TestActivities_CreateGate3PreservesRightsErrorContract(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		boundary string
+		code     controlplane.ErrorCode
+	}{
+		{name: "build consent", boundary: "build", code: controlplane.CodeConsentRequired},
+		{name: "build license", boundary: "build", code: controlplane.CodeLicenseBlocked},
+		{name: "commit consent", boundary: "commit", code: controlplane.CodeConsentRequired},
+		{name: "commit license", boundary: "commit", code: controlplane.CodeLicenseBlocked},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			policyErr := controlplane.NewPolicyError(
+				test.code,
+				"fixture rights failure",
+				"renew rights",
+			)
+			ledger := &gate3LedgerFixture{}
+			switch test.boundary {
+			case "build":
+				ledger.buildErr = policyErr
+			case "commit":
+				ledger.commitErr = policyErr
+			default:
+				t.Fatalf("unknown boundary %q", test.boundary)
+			}
+			store, err := artifactstore.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			activities := NewProductionActivities(
+				"http://provider.invalid",
+				nil,
+				ledger,
+				store,
+			)
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestActivityEnvironment()
+			env.RegisterActivity(activities.CreateGate3)
+			_, err = env.ExecuteActivity(activities.CreateGate3, CreateGate3Input{
+				EpisodeRevisionID:   "episode-revision-1",
+				RunIDs:              []string{"run-1"},
+				TraceID:             "trace-" + test.name,
+				PersistProductTruth: true,
+			})
+			assertNonRetryableApplicationError(t, err, string(test.code))
+			if ledger.buildCalls != 1 {
+				t.Fatalf("build calls = %d, want 1", ledger.buildCalls)
+			}
+			wantCommitCalls := 0
+			if test.boundary == "commit" {
+				wantCommitCalls = 1
+			}
+			if ledger.commitCalls != wantCommitCalls {
+				t.Fatalf("commit calls = %d, want %d", ledger.commitCalls, wantCommitCalls)
+			}
+		})
+	}
+}
+
 func TestActivities_FinalizeEpisodeKeepsPendingKeyNonRetryableAndUncommitted(t *testing.T) {
 	t.Parallel()
 	ledger := &postProductionLedgerFixture{}
@@ -493,11 +662,43 @@ func TestActivities_FinalizeEpisodeKeepsPendingKeyNonRetryableAndUncommitted(t *
 	if err == nil {
 		t.Fatal("ExecuteActivity() error = nil, want pending_key failure")
 	}
+	assertNonRetryableApplicationError(t, err, "PENDING_KEY")
 	if executor.calls != 1 || ledger.prepareCalls != 1 ||
 		ledger.authorizeCalls != 1 || ledger.commitCalls != 0 {
 		t.Fatalf(
 			"side effects = executor:%d prepare:%d authorize:%d commit:%d",
 			executor.calls, ledger.prepareCalls, ledger.authorizeCalls, ledger.commitCalls,
 		)
+	}
+}
+
+func testFinalizeEpisodeInput(traceID string) FinalizeEpisodeInput {
+	return FinalizeEpisodeInput{
+		EpisodeRevisionID: "episode-revision-1",
+		RunIDs:            []string{"run-1"},
+		Config: PostProductionConfig{
+			Enabled: true, Evidence: postproduction.EvidenceMockOnly,
+			SpeechRoute: testSpeechRoute(), SpeechProviderProfileID: "speech-profile",
+			SpeechBudgetApprovalID: "speech-budget", SpeechBudgetMaximumMicros: 100,
+			SpeechBudgetCurrency: "CNY", SubtitleLanguage: "zh-CN",
+		},
+		TraceID: traceID,
+	}
+}
+
+func assertNonRetryableApplicationError(t *testing.T, err error, errorType string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("error = nil, want %s", errorType)
+	}
+	var applicationErr *temporal.ApplicationError
+	if !errors.As(err, &applicationErr) {
+		t.Fatalf("error = %T %v, want Temporal ApplicationError", err, err)
+	}
+	if applicationErr.Type() != errorType {
+		t.Fatalf("ApplicationError.Type() = %q, want %q", applicationErr.Type(), errorType)
+	}
+	if !applicationErr.NonRetryable() {
+		t.Fatal("ApplicationError.NonRetryable() = false, want true")
 	}
 }

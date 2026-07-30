@@ -14,6 +14,7 @@ import (
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"go.temporal.io/sdk/activity"
@@ -453,16 +454,18 @@ func (a *Activities) FinalizeEpisode(
 		}
 		request, err := a.PostProductionData.PrepareEpisodePostProduction(ctx, step, input)
 		if err != nil {
-			return postproduction.Result{}, err
+			return postproduction.Result{}, classifyPostProductionError(err)
 		}
 		// Prepare resolves immutable inputs; this second transactional check is
 		// intentionally adjacent to the paid provider boundary so a rights
 		// revocation after Prepare fails closed before speech submission.
 		if err := a.PostProductionData.AuthorizeEpisodePostProduction(ctx, step, input); err != nil {
-			return postproduction.Result{}, err
+			return postproduction.Result{}, classifyPostProductionError(err)
 		}
 		request.AuthorizePaidSubmit = func(submitCtx context.Context, _ postproduction.Cue) error {
-			return a.PostProductionData.AuthorizeEpisodePostProduction(submitCtx, step, input)
+			return classifyPostProductionError(
+				a.PostProductionData.AuthorizeEpisodePostProduction(submitCtx, step, input),
+			)
 		}
 		result, err := finalizePostProductionWithHeartbeat(
 			ctx, a.PostProduction, request, input.EpisodeRevisionID,
@@ -473,10 +476,10 @@ func (a *Activities) FinalizeEpisode(
 			)
 		}
 		if err != nil {
-			return postproduction.Result{}, classifyProviderError(err)
+			return postproduction.Result{}, classifyPostProductionError(err)
 		}
 		if err := a.PostProductionData.CommitEpisodePostProduction(ctx, step, input, result); err != nil {
-			return postproduction.Result{}, err
+			return postproduction.Result{}, classifyPostProductionError(err)
 		}
 		return result, nil
 	})
@@ -537,14 +540,14 @@ func (a *Activities) CreateGate3(ctx context.Context, input CreateGate3Input) er
 			}
 			manifest, err := a.Production.BuildEpisodeManifest(ctx, step, input)
 			if err != nil {
-				return struct{}{}, err
+				return struct{}{}, classifyPostProductionError(err)
 			}
 			artifact, err := a.Artifacts.Put(ctx, bytes.NewReader(manifest))
 			if err != nil {
 				return struct{}{}, fmt.Errorf("commit generation manifest to CAS: %w", err)
 			}
 			if err := a.Production.CommitEpisodeManifest(ctx, step, input, manifest, artifact); err != nil {
-				return struct{}{}, err
+				return struct{}{}, classifyPostProductionError(err)
 			}
 		}
 		return struct{}{}, nil
@@ -759,6 +762,28 @@ func classifyProviderError(err error) error {
 		string(providerErr.Code),
 		err,
 	)
+}
+
+func classifyPostProductionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var applicationErr *temporal.ApplicationError
+	if errors.As(err, &applicationErr) {
+		return applicationErr
+	}
+	var domainErr *controlplane.DomainError
+	if errors.As(err, &domainErr) {
+		switch domainErr.Code {
+		case controlplane.CodeConsentRequired, controlplane.CodeLicenseBlocked:
+			return temporal.NewNonRetryableApplicationError(
+				domainErr.Error(),
+				string(domainErr.Code),
+				err,
+			)
+		}
+	}
+	return classifyProviderError(err)
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {

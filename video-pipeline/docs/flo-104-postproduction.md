@@ -96,6 +96,10 @@ Consent。`mock_only` 可省略 `voiceRef` 并使用明确标注的合成 tone�
   G3 则在构建 Manifest 前和持久化 Manifest/创建 Review 的同一事务中重复上述
   当前授权检查。Prepare 后发生的撤销或过期因此不能留下可发布数据库产物或
   打开 G3。
+- 上述仓储门禁返回的 `CONSENT_REQUIRED` / `LICENSE_BLOCKED` 会在
+  `FinalizeEpisode` 与 `CreateGate3` 的 Temporal Activity 边界被转换为同名、
+  不可重试的 ApplicationError；合同错误码不会退化为 Go 类型名
+  `DomainError`，工作流也不会对真实撤权或过期执行无意义重试。
 - 提交事务还会重新检查每个 Run 仍为成功且 QC 通过，避免准备后状态漂移。
 - G3 只在后期 Manifest 已关联到所有贡献 Run 后创建。缺失 G1/G2、许可、预算、路由、成功镜头、QC 或 Manifest 均 fail closed。
 - `evidence=pending_key` 在语音 Provider 边界之前返回不可重试的
