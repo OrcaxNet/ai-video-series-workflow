@@ -95,6 +95,8 @@ Temporal Activity retry 策略：initial 1s、coefficient 2、max 30s、max 3。
 
 每个 Activity 还以稳定的 `workflowId + activityId` 在 PostgreSQL 预留 journal：只保存输入 SHA-256；成功结果、审计与版本化 outbox 在一个 serializable transaction 中提交。重试先读取已提交结果；若 submit 后进程崩溃但 journal 尚未完成，则使用相同 provider JobID 对账，禁止创建第二个付费任务。相同 ActivityID 出现不同输入 hash 会以冲突终止，避免代码或历史漂移被静默覆盖。
 
+生产 worker 同时将每一步投影到规范化产品表：Prompt 编译冻结四级上下文，Run 校验 G2 计划、冻结路由和预算，ProviderJob 在网络调用前落库，完成后记录 CAS 产物的实际媒体规格、用量和成本。Q1/G3 的 review task 与决策同步闭环；G3 前生成无凭据的 Episode Manifest，并以内容哈希写入 CAS 后锁定。
+
 ## 5. UNKNOWN reconciliation
 
 发生以下任一情况必须进入 `UNKNOWN`：

@@ -1,6 +1,7 @@
 package orchestration
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
@@ -35,6 +37,22 @@ type WorkflowStepJournal interface {
 	CompleteWorkflowStep(context.Context, WorkflowStep, string, json.RawMessage) error
 }
 
+// ProductionLedger projects durable workflow progress into the normalized
+// PostgreSQL product model. Temporal history remains the execution source of
+// truth; these methods make every prompt, run, provider job, QC result, review,
+// and manifest independently queryable and approvable.
+type ProductionLedger interface {
+	CompilePromptSnapshot(context.Context, WorkflowStep, CompilePromptInput) (PromptSnapshotRef, error)
+	CreateWorkflowRun(context.Context, WorkflowStep, CreateRunInput) (GenerationRunRef, error)
+	PrepareProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput) error
+	CompleteProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput, ProviderResult) error
+	RecordAutomaticQC(context.Context, WorkflowStep, RunQCInput, QCResult) error
+	OpenShotReview(context.Context, WorkflowStep, CreateReviewInput) error
+	RecordShotIntervention(context.Context, WorkflowStep, EscalateShotInput) error
+	BuildEpisodeManifest(context.Context, WorkflowStep, CreateGate3Input) ([]byte, error)
+	CommitEpisodeManifest(context.Context, WorkflowStep, CreateGate3Input, []byte, artifactstore.Artifact) error
+}
+
 // Activities executes side effects at the Temporal Activity boundary. Temporal
 // persists orchestration history; Journal persists an independently queryable
 // input digest, result, audit record, and outbox event. Credentials never enter
@@ -43,6 +61,8 @@ type Activities struct {
 	ProviderAdapterURL string
 	HTTPClient         *http.Client
 	Journal            WorkflowStepJournal
+	Production         ProductionLedger
+	Artifacts          *artifactstore.Store
 }
 
 // NewActivities creates bounded Activity clients.
@@ -58,6 +78,20 @@ func NewActivitiesWithJournal(providerAdapterURL string, journal WorkflowStepJou
 	return activities
 }
 
+// NewProductionActivities enables the normalized product projection and CAS
+// manifest writer used by the runnable worker.
+func NewProductionActivities(
+	providerAdapterURL string,
+	journal WorkflowStepJournal,
+	production ProductionLedger,
+	artifacts *artifactstore.Store,
+) *Activities {
+	activities := NewActivitiesWithJournal(providerAdapterURL, journal)
+	activities.Production = production
+	activities.Artifacts = artifacts
+	return activities
+}
+
 // ValidateBatch rejects unversioned or unapproved production inputs.
 func (a *Activities) ValidateBatch(ctx context.Context, input EpisodeProductionInput) error {
 	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
@@ -66,10 +100,21 @@ func (a *Activities) ValidateBatch(ctx context.Context, input EpisodeProductionI
 	return err
 }
 
-// CompilePrompt returns an immutable deterministic placeholder snapshot. The
-// production compiler persists the full effective-context and evidence chain.
+// CompilePrompt persists the full effective-context and evidence chain in
+// production. The deterministic fallback is retained for isolated workflow
+// replay tests that intentionally run without the product repository.
 func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput) (PromptSnapshotRef, error) {
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (PromptSnapshotRef, error) {
+		if input.PersistProductTruth {
+			if a.Production == nil {
+				return PromptSnapshotRef{}, errors.New("production ledger is required")
+			}
+			step, err := currentWorkflowStep(ctx, input.TraceID)
+			if err != nil {
+				return PromptSnapshotRef{}, err
+			}
+			return a.Production.CompilePromptSnapshot(ctx, step, input)
+		}
 		if input.ShotSpecRevisionID == "" || input.GenerationProfileRef == "" {
 			return PromptSnapshotRef{}, errors.New("shotSpecRevisionId and generationProfileRef are required")
 		}
@@ -79,10 +124,20 @@ func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput
 	})
 }
 
-// CreateRun creates deterministic IDs for the runnable skeleton. A production
-// repository makes this an idempotent PostgreSQL transaction with an outbox row.
+// CreateRun makes production runs idempotent PostgreSQL transactions with an
+// outbox row. Isolated workflow tests use a deterministic in-memory identity.
 func (a *Activities) CreateRun(ctx context.Context, input CreateRunInput) (GenerationRunRef, error) {
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (GenerationRunRef, error) {
+		if input.PersistProductTruth {
+			if a.Production == nil {
+				return GenerationRunRef{}, errors.New("production ledger is required")
+			}
+			step, err := currentWorkflowStep(ctx, input.TraceID)
+			if err != nil {
+				return GenerationRunRef{}, err
+			}
+			return a.Production.CreateWorkflowRun(ctx, step, input)
+		}
 		if input.CreativeAttempt < 1 || input.CreativeAttempt > 2 {
 			return GenerationRunRef{}, errors.New("creativeAttempt must be 1 or 2")
 		}
@@ -115,7 +170,40 @@ func (a *Activities) CreateRun(ctx context.Context, input CreateRunInput) (Gener
 // paid attempt. UNKNOWN is polled; it is not treated as a failed generation.
 func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (ProviderResult, error) {
-		return a.executeProviderJob(ctx, input)
+		var step WorkflowStep
+		if input.PersistProductTruth {
+			if a.Production == nil {
+				return ProviderResult{}, errors.New("production ledger is required")
+			}
+			var err error
+			step, err = currentWorkflowStep(ctx, input.TraceID)
+			if err != nil {
+				return ProviderResult{}, err
+			}
+			if err := a.Production.PrepareProviderJob(ctx, step, input); err != nil {
+				return ProviderResult{}, err
+			}
+		}
+		result, err := a.executeProviderJob(ctx, input)
+		if err != nil {
+			return ProviderResult{}, err
+		}
+		if input.PersistProductTruth {
+			if a.Artifacts == nil {
+				return ProviderResult{}, errors.New("artifact store is required")
+			}
+			exists, err := a.Artifacts.Exists(result.ArtifactDigest)
+			if err != nil {
+				return ProviderResult{}, fmt.Errorf("verify provider artifact in CAS: %w", err)
+			}
+			if !exists {
+				return ProviderResult{}, errors.New("provider result was not committed to CAS")
+			}
+			if err := a.Production.CompleteProviderJob(ctx, step, input, result); err != nil {
+				return ProviderResult{}, err
+			}
+		}
+		return result, nil
 	})
 }
 
@@ -218,21 +306,48 @@ func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProvid
 		RequestID:      result.RequestID,
 		ArtifactDigest: output.SHA256,
 		ArtifactURI:    output.URI,
+		MediaType:      output.MediaType,
+		ArtifactSize:   output.SizeBytes,
+		Width:          output.Width,
+		Height:         output.Height,
+		DurationMillis: output.DurationMillis,
 		Model:          result.Model,
 		Usage:          result.Usage,
 		Cost:           result.Cost,
 	}, nil
 }
 
-// RunAutomaticQC is deliberately conservative in the skeleton: a committed,
-// correctly addressed mock artifact passes structural QC only.
+// RunAutomaticQC is deliberately conservative: a committed, correctly
+// addressed artifact passes the current structural QC fixture.
 func (a *Activities) RunAutomaticQC(ctx context.Context, input RunQCInput) (QCResult, error) {
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (QCResult, error) {
 		if input.Provider.ArtifactDigest == "" || input.Provider.ArtifactURI == "" {
-			return QCResult{Passed: false, FailureCode: "QC_MEDIA_MISSING"}, nil
+			result := QCResult{Passed: false, FailureCode: "QC_MEDIA_MISSING"}
+			if err := a.recordQC(ctx, input, result); err != nil {
+				return QCResult{}, err
+			}
+			return result, nil
 		}
-		return QCResult{Passed: true}, nil
+		result := QCResult{Passed: true}
+		if err := a.recordQC(ctx, input, result); err != nil {
+			return QCResult{}, err
+		}
+		return result, nil
 	})
+}
+
+func (a *Activities) recordQC(ctx context.Context, input RunQCInput, result QCResult) error {
+	if !input.PersistProductTruth {
+		return nil
+	}
+	if a.Production == nil {
+		return errors.New("production ledger is required")
+	}
+	step, err := currentWorkflowStep(ctx, input.TraceID)
+	if err != nil {
+		return err
+	}
+	return a.Production.RecordAutomaticQC(ctx, step, input, result)
 }
 
 // CreateShotReview is a typed boundary for the control-plane ReviewTask write.
@@ -240,6 +355,18 @@ func (a *Activities) CreateShotReview(ctx context.Context, input CreateReviewInp
 	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
 		if input.ShotSpecRevisionID == "" || input.RunID == "" || input.ArtifactDigest == "" {
 			return struct{}{}, errors.New("shot review requires shotSpecRevisionId, runId, and artifactDigest")
+		}
+		if input.PersistProductTruth {
+			if a.Production == nil {
+				return struct{}{}, errors.New("production ledger is required")
+			}
+			step, err := currentWorkflowStep(ctx, input.TraceID)
+			if err != nil {
+				return struct{}{}, err
+			}
+			if err := a.Production.OpenShotReview(ctx, step, input); err != nil {
+				return struct{}{}, err
+			}
 		}
 		return struct{}{}, nil
 	})
@@ -252,6 +379,18 @@ func (a *Activities) EscalateShot(ctx context.Context, input EscalateShotInput) 
 		if input.ShotSpecRevisionID == "" {
 			return struct{}{}, errors.New("shotSpecRevisionId is required")
 		}
+		if input.PersistProductTruth {
+			if a.Production == nil {
+				return struct{}{}, errors.New("production ledger is required")
+			}
+			step, err := currentWorkflowStep(ctx, input.TraceID)
+			if err != nil {
+				return struct{}{}, err
+			}
+			if err := a.Production.RecordShotIntervention(ctx, step, input); err != nil {
+				return struct{}{}, err
+			}
+		}
 		return struct{}{}, nil
 	})
 	return err
@@ -263,6 +402,26 @@ func (a *Activities) CreateGate3(ctx context.Context, input CreateGate3Input) er
 	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
 		if input.EpisodeRevisionID == "" || len(input.RunIDs) == 0 {
 			return struct{}{}, errors.New("G3 review requires episodeRevisionId and runIds")
+		}
+		if input.PersistProductTruth {
+			if a.Production == nil || a.Artifacts == nil {
+				return struct{}{}, errors.New("production ledger and artifact store are required")
+			}
+			step, err := currentWorkflowStep(ctx, input.TraceID)
+			if err != nil {
+				return struct{}{}, err
+			}
+			manifest, err := a.Production.BuildEpisodeManifest(ctx, step, input)
+			if err != nil {
+				return struct{}{}, err
+			}
+			artifact, err := a.Artifacts.Put(ctx, bytes.NewReader(manifest))
+			if err != nil {
+				return struct{}{}, fmt.Errorf("commit generation manifest to CAS: %w", err)
+			}
+			if err := a.Production.CommitEpisodeManifest(ctx, step, input, manifest, artifact); err != nil {
+				return struct{}{}, err
+			}
 		}
 		return struct{}{}, nil
 	})
@@ -319,6 +478,20 @@ func journalActivity[T any](
 		return zero, fmt.Errorf("complete Activity journal: %w", err)
 	}
 	return result, nil
+}
+
+func currentWorkflowStep(ctx context.Context, traceID string) (WorkflowStep, error) {
+	info := activity.GetInfo(ctx)
+	step := WorkflowStep{
+		WorkflowID:   info.WorkflowExecution.ID,
+		ActivityID:   info.ActivityID,
+		ActivityType: info.ActivityType.Name,
+		TraceID:      traceID,
+	}
+	if step.WorkflowID == "" || step.ActivityID == "" || step.ActivityType == "" || step.TraceID == "" {
+		return WorkflowStep{}, errors.New("Temporal Activity identity is required for product persistence")
+	}
+	return step, nil
 }
 
 func classifyProviderError(err error) error {

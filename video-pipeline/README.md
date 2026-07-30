@@ -11,6 +11,7 @@
 - 无密钥状态发现、确定性估算/任务、幂等 replay、polling、取消竞态与回调去重；
 - Episode Workflow：G2 精确绑定、逐镜头远程任务、结构 QC、Q1/G3 人工复核、pause/resume/cancel；
 - Activity journal：稳定 workflow/activity ID、输入/输出 hash、可重放结果、审计与 outbox；
+- 产品投影：Activity 将 Prompt/Run/ProviderJob/QC/Q1/G3 写入规范化表，产物和 Manifest 进入本地 CAS；
 - OpenAPI、AsyncAPI、数据模型、状态机、ADR、FR-P0-01～24 追踪；
 - 无 GPU/无模型 Key 的 Compose、smoke 与 CI。
 
@@ -66,7 +67,8 @@ go vet ./...
 4. PostgreSQL migration v2 clean、42 张控制面表、不可变 trigger 与 CAS retention guard 存在；
 5. 并发相同幂等键只提交一份 Series/audit/outbox，不同请求冲突，策略失败整体回滚；
 6. Activity journal 结果可重放且输入漂移被拒绝；
-7. Temporal Workflow 提交 Provider job、通过结构 QC、进入 `WAITING_G3` 后重启 worker，并在持久 G3 signal 后恢复为 `LOCKED`。
+7. 工作流投影可从 Prompt 一直查询到冻结路由、实际媒体规格、成本、审核与锁定 Manifest；
+8. Temporal Workflow 提交 Provider job、通过结构 QC、进入 `WAITING_G3` 后重启 worker，并在持久 G3 signal 后恢复为 `LOCKED`。
 
 ## 目录
 

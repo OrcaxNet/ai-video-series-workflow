@@ -6,6 +6,7 @@ import (
 	"context"
 	"log"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
@@ -33,13 +34,17 @@ func main() {
 		log.Fatalf("connect to video PostgreSQL: %v", err)
 	}
 	defer store.Close()
+	artifacts, err := artifactstore.New(cfg.ArtifactRoot)
+	if err != nil {
+		log.Fatalf("open video artifact store: %v", err)
+	}
 
 	temporalWorker := worker.New(temporalClient, cfg.TaskQueue, worker.Options{})
 	temporalWorker.RegisterWorkflowWithOptions(
 		orchestration.EpisodeProductionWorkflow,
 		workflow.RegisterOptions{Name: orchestration.WorkflowName},
 	)
-	activities := orchestration.NewActivitiesWithJournal(cfg.ProviderAdapterURL, store)
+	activities := orchestration.NewProductionActivities(cfg.ProviderAdapterURL, store, store, artifacts)
 	temporalWorker.RegisterActivityWithOptions(activities.ValidateBatch, activity.RegisterOptions{Name: orchestration.ActivityValidateBatch})
 	temporalWorker.RegisterActivityWithOptions(activities.CompilePrompt, activity.RegisterOptions{Name: orchestration.ActivityCompilePrompt})
 	temporalWorker.RegisterActivityWithOptions(activities.CreateRun, activity.RegisterOptions{Name: orchestration.ActivityCreateRun})

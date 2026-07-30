@@ -57,6 +57,8 @@ func (c *Controller) StartEpisode(
 		ShotSpecRevisionIDs:  command.ShotSpecRevisionIDs,
 		GenerationProfileRef: command.GenerationProfileRevisionID,
 		Gate2DecisionID:      command.Gate2DecisionID,
+		GenerationPlanID:     command.GenerationPlanID,
+		ProviderProfileID:    command.RouteSnapshot.ProviderProfileID,
 		ProviderRoute: providercontract.ModelSnapshot{
 			CapabilityAlias: command.RouteSnapshot.CapabilityAlias,
 			Provider:        command.RouteSnapshot.Provider,
@@ -71,6 +73,7 @@ func (c *Controller) StartEpisode(
 		BudgetCurrency:      record.BudgetLimit.Currency,
 		TraceID:             operation.TraceID,
 		RequireShotApproval: true,
+		PersistProductTruth: true,
 	})
 	if err != nil {
 		return controlplane.WorkflowStart{}, fmt.Errorf("start episode workflow: %w", err)

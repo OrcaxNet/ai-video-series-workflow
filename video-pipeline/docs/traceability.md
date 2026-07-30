@@ -19,8 +19,8 @@ FLO-108 将 FLO-96 的 24 条 P0 制片需求与 FLO-124 的纯模型 API 约束
 | 06 剧本/拆集 | text Provider Adapter | operation + revision | episode_script_revisions | Mock/Dry-run；REAL-KEY 结构和事实质量 |
 | 07 分镜/ShotSpec | Storyboard/Capability validator | revision + capabilities | storyboard/shot_spec | CONTRACT；按当前 snapshot 校验时长/比例，不硬截断 |
 | 08 G2 剧本门/批次 | Approval + Workflow | production-batches | G2 binding/operation | RUNNABLE Workflow 强制 G2 |
-| 09 四层上下文 | Context resolver | Workflow input | context/effective snapshot | CONTRACT golden merge；同输入 hash 稳定 |
-| 10 Prompt 编译 | Prompt compiler | Activity | prompt_snapshots | RUNNABLE placeholder；CONTRACT 保存层来源/尾帧/结构请求 |
+| 09 四层上下文 | Context resolver | Workflow input | context/effective snapshot | RUNNABLE 精确四层解析、来源记录与稳定 hash |
+| 10 Prompt 编译 | Prompt compiler | Activity | prompt_snapshots | RUNNABLE 不可变 Prompt/effective-context snapshot 与依赖证据 |
 | 11 Plan/预算/幂等 | Plan/Run services | generation-plans/provider-jobs | idempotency/budget/run | RUNNABLE Mock replay；0 重复 external task |
 | 12 远程生成执行 | Provider Adapter | submit/poll/callback/cancel | provider profile/cap/job/callback | RUNNABLE Mock 全故障；REAL-KEY 火山 |
 | 13 自动 QC | QC Activity | qc event | qc_reports | RUNNABLE 结构 QC；REAL-KEY 媒体/一致性/安全 |
@@ -30,9 +30,9 @@ FLO-108 将 FLO-96 的 24 条 P0 制片需求与 FLO-124 的纯模型 API 约束
 | 17 TTS/授权 | speech Adapter/Policy | provider job/artifact | voice asset/consent | CONTRACT+Mock；REAL-KEY voice/timestamps |
 | 18 字幕/口型 | Subtitle/CPU media | operation/revision/artifact | subtitle/audio/QC | CONTRACT；REAL-KEY timestamp；口型可选 |
 | 19 拼接/导出 | CPU Media Worker | delivery operation | MP4/SRT/VTT/audio/manifest | 无 GPU；后续 FFmpeg fixture E2E |
-| 20 Q1/G3 锁版 | Review/Policy/Manifest | approvals + G3 signal | review/decision/manifest | RUNNABLE G3 `LOCKED`；Q1 CONTRACT |
+| 20 Q1/G3 锁版 | Review/Policy/Manifest | approvals + G3 signal | review/decision/manifest | RUNNABLE Q1/G3 review task、精确绑定与 `LOCKED` |
 | 21 immutable/stale | Revision graph | impacts API/event | dependencies/freshness | CONTRACT；新 asset v3 不改 v2 引用 |
-| 22 谱系/Manifest | Manifest builder | manifest GET/event | generation_manifests | CONTRACT；provider/model/request/task/usage/cost/hash 挂载 |
+| 22 谱系/Manifest | Manifest builder | manifest GET/event | generation_manifests | RUNNABLE provider/model/request/task/usage/cost/实际媒体规格/hash 挂载 |
 | 23 权限/审计/Secret | Auth/RBAC/Redaction | all mutations | audit/provider profile | CONTRACT；Secret scan 0；禁止扫 Claude Code |
 | 24 观测/成本熔断 | OTel/Budget/Cost | provider/cost events | budget/cost/outbox | CONTRACT；plan confirmation、unknown price、probe shot |
 

@@ -3,6 +3,7 @@
 package repository
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/google/uuid"
@@ -212,6 +215,368 @@ func TestPostgres_WorkflowStepJournalReplaysAtomicResult(t *testing.T) {
 	}
 }
 
+func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
+	dsn := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("VIDEO_TEST_POSTGRES_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	store := NewForPool(pool)
+
+	profileID, profileGroupID := uuid.New(), uuid.New()
+	seriesID, episodeID, episodeRevisionID := uuid.New(), uuid.New(), uuid.New()
+	sceneID, shotID := uuid.New(), uuid.New()
+	scriptID, storyboardID, shotRevisionID := uuid.New(), uuid.New(), uuid.New()
+	gate2ID, budgetID := uuid.New(), uuid.New()
+	providerProfileID, capabilityID := uuid.New(), uuid.New()
+	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
+	episodeHash := strings.Repeat("1", 64)
+	shotHash := strings.Repeat("2", 64)
+	effectiveHash := strings.Repeat("3", 64)
+	profileHash := strings.Repeat("4", 64)
+	capabilityHash := strings.Repeat("5", 64)
+
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.generation_profiles
+			(id, profile_id, revision, schema_version, status, stage, aspect_profile,
+			 episode_target_ms, shot_min_ms, shot_max_ms, capability_routes,
+			 media_processing, render_defaults, qc_thresholds, retry_policy,
+			 budget_policy, license_policy, content_hash, created_by)
+		VALUES ($1, $2, 1, 'v1', 'ACTIVE', 'M0', '16:9_720P24',
+		        60000, 4000, 6000, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb,
+		        '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, $3, 'integration')`,
+		profileID, profileGroupID, profileHash,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.series
+			(id, title, status, default_profile_id, rights_declaration, created_by)
+		VALUES ($1, 'workflow projection fixture', 'ACTIVE', $2, '{}'::jsonb, 'integration')`,
+		seriesID, profileID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.episodes (id, series_id, ordinal, title)
+		VALUES ($1, $2, 1, 'episode')`,
+		episodeID, seriesID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.episode_revisions
+			(id, episode_id, revision, status, target_duration_ms, content_hash, created_by)
+		VALUES ($1, $2, 1, 'G2_APPROVED', 5000, $3, 'integration')`,
+		episodeRevisionID, episodeID, episodeHash,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.scenes (id, episode_id, ordinal)
+		VALUES ($1, $2, 1)`,
+		sceneID, episodeID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.shots (id, scene_id, ordinal)
+		VALUES ($1, $2, 1)`,
+		shotID, sceneID,
+	)
+	contextScopes := []struct {
+		scope string
+		id    uuid.UUID
+	}{
+		{"SERIES", seriesID},
+		{"EPISODE", episodeID},
+		{"SCENE", sceneID},
+		{"SHOT", shotID},
+	}
+	for index, scoped := range contextScopes {
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.context_revisions
+				(id, series_id, scope_type, scope_id, revision, status, schema_version,
+				 resolver_version, payload, content_hash, created_by)
+			VALUES ($1, $2, $3, $4, 1, 'APPROVED', 'v1',
+			        'integration-resolver', $5, $6, 'integration')`,
+			contextIDs[index], seriesID, scoped.scope, scoped.id,
+			map[string]any{"scope": scoped.scope}, strings.Repeat(string(rune('6'+index)), 64),
+		)
+	}
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.approval_decisions
+			(id, series_id, episode_id, gate, decision, reason_code,
+			 actor_id, actor_role, trace_id)
+		VALUES ($1, $2, $3, 'G2', 'APPROVED', 'integration',
+		        'director', 'DIRECTOR', 'workflow-projection')`,
+		gate2ID, seriesID, episodeID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.episode_script_revisions
+			(id, episode_id, revision, status, schema_version, payload, content_hash, created_by)
+		VALUES ($1, $2, 1, 'APPROVED', 'v1', '{}'::jsonb, $3, 'integration')`,
+		scriptID, episodeID, strings.Repeat("a", 64),
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.storyboard_revisions
+			(id, episode_id, script_revision_id, revision, status, content_hash, created_by)
+		VALUES ($1, $2, $3, 1, 'APPROVED', $4, 'integration')`,
+		storyboardID, episodeID, scriptID, strings.Repeat("b", 64),
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.shot_spec_revisions
+			(id, shot_id, storyboard_revision_id, revision, lifecycle_state, freshness,
+			 duration_ms, aspect_profile, fps, width, height, cast_count,
+			 primary_action_count, narrative, asset_version_refs, context_revision_ids,
+			 effective_context_hash, continuity, cinematography, generation_profile_id,
+			 gate2_decision_id, content_hash, created_by)
+		VALUES ($1, $2, $3, 1, 'READY', 'FRESH',
+		        5000, '16:9_720P24', 24, 1280, 720, 1,
+		        1, '{"action":"walk"}', '{}', $4,
+		        $5, '{}'::jsonb, '{}'::jsonb, $6, $7, $8, 'integration')`,
+		shotRevisionID, shotID, storyboardID, contextIDs,
+		effectiveHash, profileID, gate2ID, shotHash,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.approval_bindings
+			(decision_id, object_type, revision_id, content_hash)
+		VALUES
+			($1, 'EPISODE_REVISION', $2, $3),
+			($1, 'SHOT_SPEC_REVISION', $4, $5)`,
+		gate2ID, episodeRevisionID, episodeHash, shotRevisionID, shotHash,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.review_tasks
+			(id, series_id, episode_id, review_type, state, assigned_role, decided_at)
+		VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER', now())`,
+		budgetID, seriesID, episodeID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.provider_profiles
+			(id, provider, display_name, base_url_ref, enabled, mode, health, config_hash)
+		VALUES ($1, 'MOCK', $2, 'runtime://mock', true, 'MOCK', 'READY', $3)`,
+		providerProfileID, "integration mock "+providerProfileID.String(), strings.Repeat("c", 64),
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.provider_capability_snapshots
+			(id, provider_profile_id, capability_alias, model_id, route_version,
+			 supported_inputs, limits, pricing_rule_version, capability_hash,
+			 status, effective_at)
+		VALUES ($1, $2, 'video.primary', 'fixture-video-v1', 'route-v1',
+		        ARRAY['text'], '{"unitPriceMicros":10}', 'pricing-v1', $3,
+		        'ACTIVE', now())`,
+		capabilityID, providerProfileID, capabilityHash,
+	)
+
+	route := controlplane.ModelRouteSnapshot{
+		CapabilityAlias: "video.primary", ProviderProfileID: providerProfileID.String(),
+		Provider: "MOCK", ModelID: "fixture-video-v1", RouteVersion: "route-v1",
+		CapabilityHash: capabilityHash,
+	}
+	planCommand := controlplane.CreateGenerationPlanCommand{
+		SchemaVersion: "v1", SeriesID: seriesID.String(),
+		EpisodeRevisionID:   episodeRevisionID.String(),
+		ShotSpecRevisionIDs: []string{shotRevisionID.String()},
+		CandidatesPerShot:   1, RouteSnapshot: route,
+		BudgetLimit: controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
+		Actor:       controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
+	}
+	planDigest, err := digestValue(planCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := store.CreateGenerationPlan(ctx, planCommand, controlplane.Idempotency{
+		Scope: "workflow-projection-plan:" + seriesID.String(),
+		Key:   uuid.NewString(), RequestHash: planDigest,
+	}, "workflow-projection")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	step := orchestration.WorkflowStep{
+		WorkflowID: "workflow-" + uuid.NewString(),
+		ActivityID: "compile", ActivityType: orchestration.ActivityCompilePrompt,
+		TraceID: "workflow-projection",
+	}
+	prompt, err := store.CompilePromptSnapshot(ctx, step, orchestration.CompilePromptInput{
+		ShotSpecRevisionID:   shotRevisionID.String(),
+		GenerationProfileRef: profileID.String(),
+		PersistProductTruth:  true,
+		TraceID:              step.TraceID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := providercontract.ModelSnapshot{
+		CapabilityAlias: "video.primary", Provider: "MOCK", ModelID: "fixture-video-v1",
+		RouteVersion: "route-v1", CapabilityHash: capabilityHash, Verification: "integration",
+	}
+	step.ActivityID, step.ActivityType = "create-run", orchestration.ActivityCreateRun
+	run, err := store.CreateWorkflowRun(ctx, step, orchestration.CreateRunInput{
+		ShotSpecRevisionID: shotRevisionID.String(), PromptSnapshot: prompt,
+		GenerationProfileRef: profileID.String(), Route: model,
+		GenerationPlanID: plan.Value.GenerationPlanID, BudgetApprovalID: budgetID.String(),
+		ProviderProfileID: providerProfileID.String(),
+		CreativeAttempt:   1, TraceID: step.TraceID, PersistProductTruth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dispatch := orchestration.ExecuteProviderJobInput{
+		Run: run, Prompt: prompt, Route: model,
+		BudgetApprovalID: budgetID.String(), BudgetMaximumMicros: 1_000,
+		BudgetCurrency: "CNY", ProviderProfileID: providerProfileID.String(),
+		TraceID: step.TraceID, PersistProductTruth: true,
+	}
+	step.ActivityID, step.ActivityType = "provider", orchestration.ActivityExecuteProviderJob
+	if err := store.PrepareProviderJob(ctx, step, dispatch); err != nil {
+		t.Fatal(err)
+	}
+	cas, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	videoArtifact, err := cas.Put(ctx, bytes.NewReader([]byte("integration video bytes")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actualCost := int64(750)
+	providerResult := orchestration.ProviderResult{
+		UpstreamTaskID: "task-1", RequestID: "request-1",
+		ArtifactDigest: videoArtifact.Digest, ArtifactURI: videoArtifact.URI,
+		MediaType: "video/mp4", ArtifactSize: videoArtifact.Size,
+		Width: 1280, Height: 720, DurationMillis: 5_000,
+		Model: model,
+		Usage: providercontract.Usage{InputUnits: 10, OutputUnits: 20, Unit: "mock-units"},
+		Cost: providercontract.Cost{
+			EstimatedMicros: 800, ActualMicros: &actualCost, Currency: "CNY",
+			PricingVersion: "pricing-v1", Verified: true,
+		},
+	}
+	if err := store.CompleteProviderJob(ctx, step, dispatch, providerResult); err != nil {
+		t.Fatal(err)
+	}
+	step.ActivityID, step.ActivityType = "qc", orchestration.ActivityRunAutomaticQC
+	qcInput := orchestration.RunQCInput{
+		Run: run, Provider: providerResult, TraceID: step.TraceID, PersistProductTruth: true,
+	}
+	if err := store.RecordAutomaticQC(ctx, step, qcInput, orchestration.QCResult{Passed: true}); err != nil {
+		t.Fatal(err)
+	}
+	step.ActivityID, step.ActivityType = "review", orchestration.ActivityCreateShotReview
+	if err := store.OpenShotReview(ctx, step, orchestration.CreateReviewInput{
+		ShotSpecRevisionID: shotRevisionID.String(), RunID: run.RunID,
+		ArtifactDigest: videoArtifact.Digest, TraceID: step.TraceID, PersistProductTruth: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	q1Command := controlplane.CreateApprovalDecisionCommand{
+		SchemaVersion: "v1", SeriesID: seriesID.String(), EpisodeID: episodeID.String(),
+		Gate: "Q1", Decision: "APPROVED", ReasonCode: "integration",
+		Bindings: []controlplane.ApprovalBinding{
+			{ObjectType: "SHOT_SPEC_REVISION", RevisionID: shotRevisionID.String(), ContentHash: shotHash},
+			{ObjectType: "GENERATION_RUN", RevisionID: run.RunID, ContentHash: run.RunSpecDigest},
+		},
+		Actor: controlplane.Actor{ActorID: "reviewer", Role: "REVIEWER"},
+	}
+	q1Digest, err := digestValue(q1Command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateApprovalDecision(ctx, q1Command, controlplane.Idempotency{
+		Scope: "workflow-projection-q1:" + run.RunID,
+		Key:   uuid.NewString(), RequestHash: q1Digest,
+	}, step.TraceID); err != nil {
+		t.Fatal(err)
+	}
+	var q1State string
+	if err := pool.QueryRow(ctx, `
+		SELECT state
+		FROM video_pipeline.review_tasks
+		WHERE generation_run_id = $1 AND review_type = 'Q1'`,
+		run.RunID,
+	).Scan(&q1State); err != nil {
+		t.Fatal(err)
+	}
+	if q1State != "APPROVED" {
+		t.Fatalf("Q1 review state = %q, want APPROVED", q1State)
+	}
+	var storedSize int64
+	var storedWidth, storedHeight int
+	if err := pool.QueryRow(ctx, `
+		SELECT size_bytes,
+		       (media_spec->>'width')::int,
+		       (media_spec->>'height')::int
+		FROM video_pipeline.artifacts
+		WHERE content_hash = $1`,
+		videoArtifact.Digest,
+	).Scan(&storedSize, &storedWidth, &storedHeight); err != nil {
+		t.Fatal(err)
+	}
+	if storedSize != videoArtifact.Size || storedWidth != 1280 || storedHeight != 720 {
+		t.Fatalf("stored artifact spec = size:%d %dx%d", storedSize, storedWidth, storedHeight)
+	}
+
+	step.ActivityID, step.ActivityType = "manifest", orchestration.ActivityCreateGate3
+	gate3Input := orchestration.CreateGate3Input{
+		EpisodeRevisionID: episodeRevisionID.String(), RunIDs: []string{run.RunID},
+		TraceID: step.TraceID, PersistProductTruth: true,
+	}
+	manifestPayload, err := store.BuildEpisodeManifest(ctx, step, gate3Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestArtifact, err := cas.Put(ctx, bytes.NewReader(manifestPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CommitEpisodeManifest(ctx, step, gate3Input, manifestPayload, manifestArtifact); err != nil {
+		t.Fatal(err)
+	}
+	manifest, err := store.GetManifest(ctx, "EPISODE", episodeRevisionID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(manifest.ProviderExecutions) != 1 || len(manifest.Outputs) != 1 || manifest.LockedAt != nil {
+		t.Fatalf("unlocked manifest projection = %#v", manifest)
+	}
+	g3Command := controlplane.CreateApprovalDecisionCommand{
+		SchemaVersion: "v1", SeriesID: seriesID.String(), EpisodeID: episodeID.String(),
+		Gate: "G3", Decision: "APPROVED", ReasonCode: "integration",
+		Bindings: []controlplane.ApprovalBinding{
+			{ObjectType: "EPISODE_REVISION", RevisionID: episodeRevisionID.String(), ContentHash: episodeHash},
+			{ObjectType: "MANIFEST", RevisionID: manifest.ManifestID, ContentHash: manifest.ManifestHash},
+		},
+		Actor: controlplane.Actor{ActorID: "director", Role: "DIRECTOR"},
+	}
+	g3Digest, err := digestValue(g3Command)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CreateApprovalDecision(ctx, g3Command, controlplane.Idempotency{
+		Scope: "workflow-projection-g3:" + episodeID.String(),
+		Key:   uuid.NewString(), RequestHash: g3Digest,
+	}, step.TraceID); err != nil {
+		t.Fatal(err)
+	}
+	locked, err := store.GetManifest(ctx, "EPISODE", episodeRevisionID.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if locked.LockedAt == nil {
+		t.Fatal("G3 manifest remained unlocked")
+	}
+	var g3State string
+	if err := pool.QueryRow(ctx, `
+		SELECT state
+		FROM video_pipeline.review_tasks
+		WHERE episode_id = $1 AND review_type = 'G3'`,
+		episodeID,
+	).Scan(&g3State); err != nil {
+		t.Fatal(err)
+	}
+	if g3State != "APPROVED" {
+		t.Fatalf("G3 review state = %q, want APPROVED", g3State)
+	}
+}
+
 func TestPostgres_CreateSeriesRollsBackIdempotencyOnPolicyFailure(t *testing.T) {
 	dsn := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
 	if dsn == "" {
@@ -398,5 +763,18 @@ func expectGuardFailure(t *testing.T, ctx context.Context, tx pgx.Tx, query stri
 	}
 	if _, err := tx.Exec(ctx, `ROLLBACK TO SAVEPOINT immutable_guard`); err != nil {
 		t.Fatalf("rollback guard savepoint: %v", err)
+	}
+}
+
+func mustExec(
+	t *testing.T,
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	query string,
+	arguments ...any,
+) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, query, arguments...); err != nil {
+		t.Fatal(err)
 	}
 }

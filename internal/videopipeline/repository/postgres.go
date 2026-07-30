@@ -1840,6 +1840,10 @@ func eventTypeForAction(action string) (string, error) {
 		"generation_run.created":            "video.run.state-changed.v1",
 		"generation_run.cancel_requested":   "video.run.state-changed.v1",
 		"generation_run.recovery_requested": "video.run.state-changed.v1",
+		"prompt_snapshot.created":           "video.revision.created.v1",
+		"provider_job.completed":            "video.provider-job.state-changed.v1",
+		"qc_report.created":                 "video.qc.completed.v1",
+		"manifest.created":                  "video.revision.created.v1",
 		"approval.decided":                  "video.approval.decided.v1",
 		"manifest.locked":                   "video.manifest.locked.v1",
 		"dependency.stale":                  "video.dependency.stale.v1",
@@ -2446,6 +2450,35 @@ func applyApprovedGate(
 	now time.Time,
 ) error {
 	if command.Decision != "APPROVED" {
+		reviewState := "REJECTED"
+		if command.Decision == "CANCELLED" {
+			reviewState = "CANCELLED"
+		}
+		for _, binding := range command.Bindings {
+			if command.Gate != "Q1" || binding.ObjectType != "GENERATION_RUN" {
+				continue
+			}
+			runID, _ := uuid.Parse(binding.RevisionID)
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.review_tasks
+				SET state = $2, reason_codes = ARRAY[$3], decided_at = $4
+				WHERE generation_run_id = $1 AND review_type = 'Q1' AND state = 'OPEN'`,
+				runID, reviewState, command.ReasonCode, now,
+			); err != nil {
+				return fmt.Errorf("close Q1 review: %w", err)
+			}
+		}
+		if command.Gate == "G3" && command.EpisodeID != "" {
+			episodeID, _ := uuid.Parse(command.EpisodeID)
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.review_tasks
+				SET state = $2, reason_codes = ARRAY[$3], decided_at = $4
+				WHERE episode_id = $1 AND review_type = 'G3' AND state = 'OPEN'`,
+				episodeID, reviewState, command.ReasonCode, now,
+			); err != nil {
+				return fmt.Errorf("close G3 review: %w", err)
+			}
+		}
 		return nil
 	}
 	for _, binding := range command.Bindings {
@@ -2469,6 +2502,17 @@ func applyApprovedGate(
 					revisionID,
 				); err != nil {
 					return fmt.Errorf("approve shot revision: %w", err)
+				}
+			}
+		case "GENERATION_RUN":
+			if command.Gate == "Q1" {
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.review_tasks
+					SET state = 'APPROVED', reason_codes = ARRAY[$2], decided_at = $3
+					WHERE generation_run_id = $1 AND review_type = 'Q1' AND state = 'OPEN'`,
+					revisionID, command.ReasonCode, now,
+				); err != nil {
+					return fmt.Errorf("approve Q1 review: %w", err)
 				}
 			}
 		case "MANIFEST":
@@ -2506,6 +2550,17 @@ func applyApprovedGate(
 			); err != nil {
 				return err
 			}
+		}
+	}
+	if command.Gate == "G3" && command.EpisodeID != "" {
+		episodeID, _ := uuid.Parse(command.EpisodeID)
+		if _, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.review_tasks
+			SET state = 'APPROVED', reason_codes = ARRAY[$2], decided_at = $3
+			WHERE episode_id = $1 AND review_type = 'G3' AND state = 'OPEN'`,
+			episodeID, command.ReasonCode, now,
+		); err != nil {
+			return fmt.Errorf("approve G3 review: %w", err)
 		}
 	}
 	return nil

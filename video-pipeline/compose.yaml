@@ -127,6 +127,8 @@ services:
       VIDEO_POSTGRES_PASSWORD: ${VIDEO_POSTGRES_PASSWORD:-video-local-only}
       VIDEO_POSTGRES_DATABASE: ${VIDEO_POSTGRES_DATABASE:-video_pipeline}
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+    volumes:
+      - video-artifacts:/var/lib/video-pipeline/artifacts
     depends_on:
       temporal:
         condition: service_healthy
@@ -199,7 +201,7 @@ services:
 
 networks:
   video-backplane:
-    name: ai-video-series-backplane
+    name: ${VIDEO_NETWORK_NAME:-ai-video-series-backplane}
     driver: bridge
 
 volumes:

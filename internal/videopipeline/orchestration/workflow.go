@@ -39,12 +39,15 @@ type EpisodeProductionInput struct {
 	ShotSpecRevisionIDs  []string                       `json:"shotSpecRevisionIds"`
 	GenerationProfileRef string                         `json:"generationProfileRef"`
 	Gate2DecisionID      string                         `json:"gate2DecisionId"`
+	GenerationPlanID     string                         `json:"generationPlanId,omitempty"`
+	ProviderProfileID    string                         `json:"providerProfileId,omitempty"`
 	ProviderRoute        providercontract.ModelSnapshot `json:"providerRoute"`
 	BudgetApprovalID     string                         `json:"budgetApprovalId"`
 	BudgetMaximumMicros  int64                          `json:"budgetMaximumMicros"`
 	BudgetCurrency       string                         `json:"budgetCurrency"`
 	TraceID              string                         `json:"traceId"`
 	RequireShotApproval  bool                           `json:"requireShotApproval,omitempty"`
+	PersistProductTruth  bool                           `json:"persistProductTruth,omitempty"`
 }
 
 // EpisodeProductionResult is the durable terminal or intervention state.
@@ -121,6 +124,11 @@ type ProviderResult struct {
 	RequestID      string                         `json:"requestId"`
 	ArtifactDigest string                         `json:"artifactDigest"`
 	ArtifactURI    string                         `json:"artifactUri"`
+	MediaType      string                         `json:"mediaType,omitempty"`
+	ArtifactSize   int64                          `json:"artifactSizeBytes,omitempty"`
+	Width          int                            `json:"width,omitempty"`
+	Height         int                            `json:"height,omitempty"`
+	DurationMillis int64                          `json:"durationMillis,omitempty"`
 	Model          providercontract.ModelSnapshot `json:"modelSnapshot"`
 	Usage          providercontract.Usage         `json:"usage"`
 	Cost           providercontract.Cost          `json:"cost"`
@@ -184,6 +192,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			ShotSpecRevisionID:   shotID,
 			GenerationProfileRef: input.GenerationProfileRef,
 			TraceID:              input.TraceID,
+			PersistProductTruth:  input.PersistProductTruth,
 		}
 		if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCompilePrompt, compileInput).Get(ctx, &prompt); err != nil {
 			return EpisodeProductionResult{}, err
@@ -201,8 +210,12 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 				PromptSnapshot:       prompt,
 				GenerationProfileRef: input.GenerationProfileRef,
 				Route:                input.ProviderRoute,
+				GenerationPlanID:     input.GenerationPlanID,
+				BudgetApprovalID:     input.BudgetApprovalID,
+				ProviderProfileID:    input.ProviderProfileID,
 				CreativeAttempt:      creativeAttempt,
 				TraceID:              input.TraceID,
+				PersistProductTruth:  input.PersistProductTruth,
 			}
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateRun, createInput).Get(ctx, &run); err != nil {
 				return EpisodeProductionResult{}, err
@@ -222,7 +235,9 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 				BudgetApprovalID:    input.BudgetApprovalID,
 				BudgetMaximumMicros: input.BudgetMaximumMicros,
 				BudgetCurrency:      input.BudgetCurrency,
+				ProviderProfileID:   input.ProviderProfileID,
 				TraceID:             input.TraceID,
+				PersistProductTruth: input.PersistProductTruth,
 			}
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, providerOptions), ActivityExecuteProviderJob, dispatchInput).Get(ctx, &generated); err != nil {
 				return EpisodeProductionResult{}, err
@@ -234,17 +249,18 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			status.Shots[shotID] = shotStatus
 			var qc QCResult
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityRunAutomaticQC, RunQCInput{
-				Run: run, Provider: generated, TraceID: input.TraceID,
+				Run: run, Provider: generated, TraceID: input.TraceID, PersistProductTruth: input.PersistProductTruth,
 			}).Get(ctx, &qc); err != nil {
 				return EpisodeProductionResult{}, err
 			}
 			waitForResume(ctx, &status, controlChannel)
 			if qc.Passed {
 				if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateShotReview, CreateReviewInput{
-					ShotSpecRevisionID: shotID,
-					RunID:              run.RunID,
-					ArtifactDigest:     generated.ArtifactDigest,
-					TraceID:            input.TraceID,
+					ShotSpecRevisionID:  shotID,
+					RunID:               run.RunID,
+					ArtifactDigest:      generated.ArtifactDigest,
+					TraceID:             input.TraceID,
+					PersistProductTruth: input.PersistProductTruth,
 				}).Get(ctx, nil); err != nil {
 					return EpisodeProductionResult{}, err
 				}
@@ -272,9 +288,10 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 
 		if !accepted {
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityEscalateShot, EscalateShotInput{
-				ShotSpecRevisionID: shotID,
-				FailureCode:        status.Shots[shotID].FailureCode,
-				TraceID:            input.TraceID,
+				ShotSpecRevisionID:  shotID,
+				FailureCode:         status.Shots[shotID].FailureCode,
+				TraceID:             input.TraceID,
+				PersistProductTruth: input.PersistProductTruth,
 			}).Get(ctx, nil); err != nil {
 				return EpisodeProductionResult{}, err
 			}
@@ -290,9 +307,10 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 
 	status.State = "WAITING_G3"
 	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateGate3, CreateGate3Input{
-		EpisodeRevisionID: input.EpisodeRevisionID,
-		RunIDs:            lockedRunIDs,
-		TraceID:           input.TraceID,
+		EpisodeRevisionID:   input.EpisodeRevisionID,
+		RunIDs:              lockedRunIDs,
+		TraceID:             input.TraceID,
+		PersistProductTruth: input.PersistProductTruth,
 	}).Get(ctx, nil); err != nil {
 		return EpisodeProductionResult{}, err
 	}
@@ -417,6 +435,7 @@ type CompilePromptInput struct {
 	ShotSpecRevisionID   string `json:"shotSpecRevisionId"`
 	GenerationProfileRef string `json:"generationProfileRef"`
 	TraceID              string `json:"traceId"`
+	PersistProductTruth  bool   `json:"persistProductTruth,omitempty"`
 }
 
 type CreateRunInput struct {
@@ -424,8 +443,12 @@ type CreateRunInput struct {
 	PromptSnapshot       PromptSnapshotRef              `json:"promptSnapshot"`
 	GenerationProfileRef string                         `json:"generationProfileRef"`
 	Route                providercontract.ModelSnapshot `json:"route"`
+	GenerationPlanID     string                         `json:"generationPlanId,omitempty"`
+	BudgetApprovalID     string                         `json:"budgetApprovalId,omitempty"`
+	ProviderProfileID    string                         `json:"providerProfileId,omitempty"`
 	CreativeAttempt      int                            `json:"creativeAttempt"`
 	TraceID              string                         `json:"traceId"`
+	PersistProductTruth  bool                           `json:"persistProductTruth,omitempty"`
 }
 
 type ExecuteProviderJobInput struct {
@@ -435,32 +458,38 @@ type ExecuteProviderJobInput struct {
 	BudgetApprovalID    string                         `json:"budgetApprovalId"`
 	BudgetMaximumMicros int64                          `json:"budgetMaximumMicros"`
 	BudgetCurrency      string                         `json:"budgetCurrency"`
+	ProviderProfileID   string                         `json:"providerProfileId,omitempty"`
 	TraceID             string                         `json:"traceId"`
+	PersistProductTruth bool                           `json:"persistProductTruth,omitempty"`
 }
 
 type RunQCInput struct {
-	Run      GenerationRunRef `json:"run"`
-	Provider ProviderResult   `json:"provider"`
-	TraceID  string           `json:"traceId"`
+	Run                 GenerationRunRef `json:"run"`
+	Provider            ProviderResult   `json:"provider"`
+	TraceID             string           `json:"traceId"`
+	PersistProductTruth bool             `json:"persistProductTruth,omitempty"`
 }
 
 type CreateReviewInput struct {
-	ShotSpecRevisionID string `json:"shotSpecRevisionId"`
-	RunID              string `json:"runId"`
-	ArtifactDigest     string `json:"artifactDigest"`
-	TraceID            string `json:"traceId"`
+	ShotSpecRevisionID  string `json:"shotSpecRevisionId"`
+	RunID               string `json:"runId"`
+	ArtifactDigest      string `json:"artifactDigest"`
+	TraceID             string `json:"traceId"`
+	PersistProductTruth bool   `json:"persistProductTruth,omitempty"`
 }
 
 type EscalateShotInput struct {
-	ShotSpecRevisionID string `json:"shotSpecRevisionId"`
-	FailureCode        string `json:"failureCode"`
-	TraceID            string `json:"traceId"`
+	ShotSpecRevisionID  string `json:"shotSpecRevisionId"`
+	FailureCode         string `json:"failureCode"`
+	TraceID             string `json:"traceId"`
+	PersistProductTruth bool   `json:"persistProductTruth,omitempty"`
 }
 
 type CreateGate3Input struct {
-	EpisodeRevisionID string   `json:"episodeRevisionId"`
-	RunIDs            []string `json:"runIds"`
-	TraceID           string   `json:"traceId"`
+	EpisodeRevisionID   string   `json:"episodeRevisionId"`
+	RunIDs              []string `json:"runIds"`
+	TraceID             string   `json:"traceId"`
+	PersistProductTruth bool     `json:"persistProductTruth,omitempty"`
 }
 
 func validateWorkflowInput(input EpisodeProductionInput) error {
@@ -469,6 +498,10 @@ func validateWorkflowInput(input EpisodeProductionInput) error {
 	}
 	if input.SeriesID == "" || input.EpisodeRevisionID == "" || input.GenerationProfileRef == "" || input.Gate2DecisionID == "" {
 		return errors.New("seriesId, episodeRevisionId, generationProfileRef, and gate2DecisionId are required")
+	}
+	if input.PersistProductTruth &&
+		(input.GenerationPlanID == "" || input.ProviderProfileID == "") {
+		return errors.New("generationPlanId and providerProfileId are required for product persistence")
 	}
 	if err := input.ProviderRoute.Validate(providercontract.CapabilityVideo); err != nil {
 		return errors.New("a frozen video.primary providerRoute is required")
