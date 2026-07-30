@@ -3,6 +3,7 @@
 package postproduction
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -184,6 +185,10 @@ type Request struct {
 	Output              OutputPolicy     `json:"output"`
 	Gates               []GateBinding    `json:"gates"`
 	TraceID             string           `json:"traceId"`
+	// AuthorizePaidSubmit is an activity-local callback and is deliberately
+	// excluded from durable request/manifest JSON. The worker invokes it
+	// immediately before every provider submission.
+	AuthorizePaidSubmit func(context.Context, Cue) error `json:"-"`
 }
 
 func (r Request) Validate() error {

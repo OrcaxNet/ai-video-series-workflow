@@ -64,6 +64,11 @@ type PostProductionLedger interface {
 		WorkflowStep,
 		FinalizeEpisodeInput,
 	) (postproduction.Request, error)
+	AuthorizeEpisodePostProduction(
+		context.Context,
+		WorkflowStep,
+		FinalizeEpisodeInput,
+	) error
 	CommitEpisodePostProduction(
 		context.Context,
 		WorkflowStep,
@@ -449,6 +454,15 @@ func (a *Activities) FinalizeEpisode(
 		request, err := a.PostProductionData.PrepareEpisodePostProduction(ctx, step, input)
 		if err != nil {
 			return postproduction.Result{}, err
+		}
+		// Prepare resolves immutable inputs; this second transactional check is
+		// intentionally adjacent to the paid provider boundary so a rights
+		// revocation after Prepare fails closed before speech submission.
+		if err := a.PostProductionData.AuthorizeEpisodePostProduction(ctx, step, input); err != nil {
+			return postproduction.Result{}, err
+		}
+		request.AuthorizePaidSubmit = func(submitCtx context.Context, _ postproduction.Cue) error {
+			return a.PostProductionData.AuthorizeEpisodePostProduction(submitCtx, step, input)
 		}
 		result, err := finalizePostProductionWithHeartbeat(
 			ctx, a.PostProduction, request, input.EpisodeRevisionID,

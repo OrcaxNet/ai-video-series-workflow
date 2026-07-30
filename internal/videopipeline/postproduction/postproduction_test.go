@@ -190,6 +190,39 @@ func TestServiceBlocksPendingKeyBeforePaidSubmission(t *testing.T) {
 	}
 }
 
+func TestServiceReauthorizesBeforeEveryPaidSpeechSubmission(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	speech := &fakeSpeech{store: store}
+	service, err := NewService(speech, &fakeMedia{store: store}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := mustRequest(t, EvidenceMockOnly)
+	revoked := errors.New("consent revoked after prior cue")
+	authorizeCalls := 0
+	request.AuthorizePaidSubmit = func(_ context.Context, _ Cue) error {
+		authorizeCalls++
+		if authorizeCalls == 2 {
+			return revoked
+		}
+		return nil
+	}
+	_, err = service.Finalize(context.Background(), request)
+	if !errors.Is(err, revoked) {
+		t.Fatalf("Finalize() error = %v, want revoked authorization", err)
+	}
+	if authorizeCalls != 2 || speech.calls != 1 {
+		t.Fatalf(
+			"paid boundary calls = authorize:%d speech:%d, want authorize:2 speech:1",
+			authorizeCalls, speech.calls,
+		)
+	}
+}
+
 func TestServiceRejectsProviderEvidenceDrift(t *testing.T) {
 	t.Parallel()
 	store, err := artifactstore.New(t.TempDir())

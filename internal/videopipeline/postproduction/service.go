@@ -65,6 +65,13 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 			if int64(index) < remainder {
 				cueBudget++
 			}
+			if request.AuthorizePaidSubmit != nil {
+				if err := request.AuthorizePaidSubmit(ctx, cue); err != nil {
+					return Result{}, fmt.Errorf(
+						"authorize paid speech submission for cue %q: %w", cue.ID, err,
+					)
+				}
+			}
 			attempt, synthErr := s.Speech.Synthesize(ctx, SpeechRequest{
 				EpisodeRevisionID: request.EpisodeRevisionID,
 				SubtitleRevision:  request.Subtitle,

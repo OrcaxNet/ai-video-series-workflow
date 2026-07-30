@@ -211,6 +211,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			NonRetryableErrorTypes: []string{
 				"VALIDATION_ERROR",
 				"LICENSE_BLOCKED",
+				"CONSENT_REQUIRED",
 				string(providercontract.CodeBudgetExceeded),
 				string(providercontract.CodeUnauthenticated),
 				string(providercontract.CodeForbidden),
@@ -360,6 +361,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			FinalizeEpisodeInput{
 				EpisodeRevisionID:   input.EpisodeRevisionID,
 				RunIDs:              lockedRunIDs,
+				GenerationPlanID:    input.GenerationPlanID,
 				Config:              *input.PostProduction,
 				TraceID:             input.TraceID,
 				PersistProductTruth: input.PersistProductTruth,
@@ -380,9 +382,16 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateGate3, CreateGate3Input{
 		EpisodeRevisionID:          input.EpisodeRevisionID,
 		RunIDs:                     lockedRunIDs,
+		GenerationPlanID:           input.GenerationPlanID,
 		PostProductionManifestHash: postProductionManifestHash,
-		TraceID:                    input.TraceID,
-		PersistProductTruth:        input.PersistProductTruth,
+		BackgroundAudioAssetVersionID: func() string {
+			if input.PostProduction == nil {
+				return ""
+			}
+			return input.PostProduction.BackgroundAudioAssetVersionID
+		}(),
+		TraceID:             input.TraceID,
+		PersistProductTruth: input.PersistProductTruth,
 	}).Get(ctx, nil); err != nil {
 		return EpisodeProductionResult{}, err
 	}
@@ -573,16 +582,19 @@ type EscalateShotInput struct {
 }
 
 type CreateGate3Input struct {
-	EpisodeRevisionID          string   `json:"episodeRevisionId"`
-	RunIDs                     []string `json:"runIds"`
-	PostProductionManifestHash string   `json:"postProductionManifestHash,omitempty"`
-	TraceID                    string   `json:"traceId"`
-	PersistProductTruth        bool     `json:"persistProductTruth,omitempty"`
+	EpisodeRevisionID             string   `json:"episodeRevisionId"`
+	RunIDs                        []string `json:"runIds"`
+	GenerationPlanID              string   `json:"generationPlanId,omitempty"`
+	PostProductionManifestHash    string   `json:"postProductionManifestHash,omitempty"`
+	BackgroundAudioAssetVersionID string   `json:"backgroundAudioAssetVersionId,omitempty"`
+	TraceID                       string   `json:"traceId"`
+	PersistProductTruth           bool     `json:"persistProductTruth,omitempty"`
 }
 
 type FinalizeEpisodeInput struct {
 	EpisodeRevisionID   string               `json:"episodeRevisionId"`
 	RunIDs              []string             `json:"runIds"`
+	GenerationPlanID    string               `json:"generationPlanId,omitempty"`
 	Config              PostProductionConfig `json:"config"`
 	TraceID             string               `json:"traceId"`
 	PersistProductTruth bool                 `json:"persistProductTruth,omitempty"`

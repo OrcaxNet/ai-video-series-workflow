@@ -87,7 +87,16 @@ Consent。`mock_only` 可省略 `voiceRef` 并使用明确标注的合成 tone�
 - 语音 JobID 由 episode revision、subtitle hash 和 cue ID 确定，相同输入重放使用相同 idempotency key。
 - Provider submit/poll/cancel 复用统一 Job 契约；超时或 Worker 取消会尝试补偿 cancel。
 - Temporal Activity journal 只在 CAS 产物和 PostgreSQL 谱系事务提交后标记完成。Activity 重放读取已提交结果，不重复生成最终资产。
-- 提交事务重新检查每个 Run 仍为成功且 QC 通过，避免准备后状态漂移。
+- Prepare 之后、每条 TTS 付费提交之前，Worker 都以不可变 Generation Plan
+  的 `ExecutionPolicy` 在 `SERIALIZABLE` 事务中锁定并复查所有贡献镜头
+  AssetVersion、VOICE/AUDIO、可选背景 MUSIC/AUDIO、LicenseSnapshot 和
+  Consent。地区、产品形态、系列归属、审批状态、撤销和过期任一不兼容时返回
+  `LICENSE_BLOCKED` 或 `CONSENT_REQUIRED`，不会调用 Provider。
+- 后期 Commit 在写入最终视频、SRT、对白、后期 Manifest、Service BOM 之前，
+  G3 则在构建 Manifest 前和持久化 Manifest/创建 Review 的同一事务中重复上述
+  当前授权检查。Prepare 后发生的撤销或过期因此不能留下可发布数据库产物或
+  打开 G3。
+- 提交事务还会重新检查每个 Run 仍为成功且 QC 通过，避免准备后状态漂移。
 - G3 只在后期 Manifest 已关联到所有贡献 Run 后创建。缺失 G1/G2、许可、预算、路由、成功镜头、QC 或 Manifest 均 fail closed。
 - `evidence=pending_key` 在语音 Provider 边界之前返回不可重试的
   `PENDING_KEY`，不会伪造样片、质量或费用。
@@ -150,6 +159,17 @@ make video-postproduction-integration-test
 
 宿主 FFmpeg 若不含可选 libass，集成测试仍验证外挂 SRT；生产镜像包含
 libass 依赖并执行烧录路径。命令计划的烧录分支由单元测试固定。
+
+验证 Prepare 后 License/Consent 撤销或过期在付费提交、后期 Commit 与
+G3 边界均回滚：
+
+```bash
+VIDEO_TEST_POSTGRES_DSN='postgres://…' make video-integration-test
+```
+
+回归会断言失败路径没有新增后期 artifact/run link、generation manifest
+或 G3 review；它只使用本地 PostgreSQL fixture，证据等级仍是 `mock_only`，
+不会改变真实 Provider 的 `pending_key` 状态。
 
 ## 6. 真实 Key 到位后的执行单
 

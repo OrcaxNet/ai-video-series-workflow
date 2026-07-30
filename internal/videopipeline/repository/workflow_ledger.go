@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
@@ -966,6 +967,38 @@ func (p *Postgres) PrepareEpisodePostProduction(
 	return request, nil
 }
 
+// AuthorizeEpisodePostProduction is the paid-submit authorization boundary.
+// It locks and rechecks every exact contributing asset, license, and consent
+// under the immutable plan policy in one SERIALIZABLE transaction.
+func (p *Postgres) AuthorizeEpisodePostProduction(
+	ctx context.Context,
+	_ orchestration.WorkflowStep,
+	input orchestration.FinalizeEpisodeInput,
+) error {
+	episodeRevisionID, err := uuid.Parse(input.EpisodeRevisionID)
+	if err != nil {
+		return errors.New("episodeRevisionId must be a UUID")
+	}
+	runIDs, err := parseUUIDs(input.RunIDs)
+	if err != nil {
+		return errors.New("post-production run IDs must be UUIDs")
+	}
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.Config.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	return err
+}
+
 // CommitEpisodePostProduction records only CAS identities and provider-safe
 // evidence. It rechecks the episode/run gate inside one SERIALIZABLE
 // transaction and links final video, SRT, dialogue, Manifest, and Service BOM
@@ -996,6 +1029,16 @@ func (p *Postgres) CommitEpisodePostProduction(
 		return err
 	}
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.Config.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
 		var eligibleRuns int
 		if err := tx.QueryRow(ctx, `
 			SELECT COUNT(*)
@@ -1131,6 +1174,24 @@ func (p *Postgres) BuildEpisodeManifest(
 	runIDs, err := parseUUIDs(input.RunIDs)
 	if err != nil {
 		return nil, errors.New("manifest run IDs must be UUIDs")
+	}
+	// Reject invalid current rights before any generation manifest bytes are
+	// written to CAS. CommitEpisodeManifest repeats this inside its write
+	// transaction to close the build/commit race.
+	if _, err := withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	}); err != nil {
+		return nil, err
 	}
 	if input.PostProductionManifestHash != "" {
 		var linkedRuns int
@@ -1383,6 +1444,16 @@ func (p *Postgres) CommitEpisodeManifest(
 		return errors.New("manifest run IDs must be UUIDs")
 	}
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
 		var seriesID, episodeID uuid.UUID
 		if err := tx.QueryRow(ctx, `
 			SELECT ep.series_id, ep.id
@@ -1469,6 +1540,217 @@ func (p *Postgres) CommitEpisodeManifest(
 		return struct{}{}, nil
 	})
 	return err
+}
+
+func (p *Postgres) requireCurrentEpisodeAssetRights(
+	ctx context.Context,
+	tx pgx.Tx,
+	episodeRevisionID uuid.UUID,
+	runIDs []uuid.UUID,
+	generationPlanID string,
+	backgroundAudioAssetVersionID string,
+) error {
+	plan, err := readPlan(ctx, tx, generationPlanID)
+	if err != nil {
+		return err
+	}
+	if plan.EpisodeRevisionID != episodeRevisionID.String() {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"post-production rights policy is not bound to the exact episode revision",
+			"restart from the immutable generation plan for this episode revision",
+		)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT gr.id, ssr.id, ssr.asset_version_refs, ep.series_id
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id = gr.shot_spec_revision_id
+		JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+		JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+		JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+		JOIN video_pipeline.episode_revisions er
+		  ON er.id = $2 AND er.episode_id = ep.id
+		WHERE gr.id = ANY($1::uuid[])
+		ORDER BY gr.id
+		FOR SHARE OF gr, ssr, er`,
+		runIDs, episodeRevisionID,
+	)
+	if err != nil {
+		return fmt.Errorf("lock post-production asset lineage: %w", err)
+	}
+	defer rows.Close()
+
+	assetSet := make(map[uuid.UUID]struct{})
+	seenRuns := make(map[uuid.UUID]struct{}, len(runIDs))
+	var seriesID uuid.UUID
+	for rows.Next() {
+		var runID, shotRevisionID, currentSeriesID uuid.UUID
+		var assetIDs []uuid.UUID
+		if err := rows.Scan(&runID, &shotRevisionID, &assetIDs, &currentSeriesID); err != nil {
+			return fmt.Errorf("scan post-production asset lineage: %w", err)
+		}
+		if seriesID == uuid.Nil {
+			seriesID = currentSeriesID
+		} else if seriesID != currentSeriesID {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"post-production runs span more than one series",
+				"use exact runs from one approved episode",
+			)
+		}
+		if plan.SeriesID != currentSeriesID.String() ||
+			!containsString(plan.ShotSpecRevisionIDs, shotRevisionID.String()) {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"post-production run lineage is outside the immutable rights plan",
+				"restart with the exact approved plan and shot revisions",
+			)
+		}
+		seenRuns[runID] = struct{}{}
+		for _, assetID := range assetIDs {
+			assetSet[assetID] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate post-production asset lineage: %w", err)
+	}
+	if len(seenRuns) != len(runIDs) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"one or more post-production runs have no current episode asset lineage",
+			"restart with exact successful runs from the approved episode",
+		)
+	}
+
+	var backgroundID uuid.UUID
+	if backgroundAudioAssetVersionID != "" {
+		backgroundID, err = uuid.Parse(backgroundAudioAssetVersionID)
+		if err != nil {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"background audio asset version identifier is invalid",
+				"select an immutable licensed MUSIC/AUDIO asset version",
+			)
+		}
+		assetSet[backgroundID] = struct{}{}
+	}
+	if len(assetSet) == 0 {
+		return nil
+	}
+	assetIDs := make([]uuid.UUID, 0, len(assetSet))
+	for assetID := range assetSet {
+		assetIDs = append(assetIDs, assetID)
+	}
+	sort.Slice(assetIDs, func(i, j int) bool {
+		return strings.Compare(assetIDs[i].String(), assetIDs[j].String()) < 0
+	})
+
+	if err := lockPostProductionRights(ctx, tx, assetIDs); err != nil {
+		return err
+	}
+	var seriesAssetCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.asset_versions av
+		JOIN video_pipeline.assets source_asset ON source_asset.id = av.asset_id
+		WHERE av.id = ANY($1::uuid[])
+		  AND source_asset.series_id = $2`,
+		assetIDs, seriesID,
+	).Scan(&seriesAssetCount); err != nil {
+		return fmt.Errorf("validate post-production asset series: %w", err)
+	}
+	if seriesAssetCount != len(assetIDs) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"one or more post-production assets are missing or outside the approved series",
+			"replace the asset with an approved revision from this series",
+		)
+	}
+	if backgroundID != uuid.Nil {
+		var compatible bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+			  SELECT 1
+			  FROM video_pipeline.asset_versions av
+			  JOIN video_pipeline.assets source_asset ON source_asset.id = av.asset_id
+			  WHERE av.id = $1
+			    AND source_asset.series_id = $2
+			    AND source_asset.asset_type IN ('MUSIC', 'AUDIO')
+			)`,
+			backgroundID, seriesID,
+		).Scan(&compatible); err != nil {
+			return fmt.Errorf("validate background audio type: %w", err)
+		}
+		if !compatible {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"background audio is not a compatible MUSIC/AUDIO asset",
+				"select an approved licensed MUSIC/AUDIO revision from this series",
+			)
+		}
+	}
+	return requireAssetLicenses(ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy)
+}
+
+func lockPostProductionRights(
+	ctx context.Context,
+	tx pgx.Tx,
+	assetIDs []uuid.UUID,
+) error {
+	lockQueries := []struct {
+		name  string
+		query string
+	}{
+		{
+			name: "asset versions",
+			query: `
+				SELECT av.id
+				FROM video_pipeline.asset_versions av
+				WHERE av.id = ANY($1::uuid[])
+				ORDER BY av.id
+				FOR SHARE OF av`,
+		},
+		{
+			name: "license snapshots",
+			query: `
+				SELECT ls.id
+				FROM video_pipeline.asset_versions av
+				JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
+				WHERE av.id = ANY($1::uuid[])
+				ORDER BY ls.id
+				FOR SHARE OF ls`,
+		},
+		{
+			name: "consent assets",
+			query: `
+				SELECT ca.id
+				FROM video_pipeline.asset_versions av
+				JOIN video_pipeline.consent_assets ca ON ca.id = av.consent_asset_id
+				WHERE av.id = ANY($1::uuid[])
+				ORDER BY ca.id
+				FOR SHARE OF ca`,
+		},
+	}
+	for _, lock := range lockQueries {
+		rows, err := tx.Query(ctx, lock.query, assetIDs)
+		if err != nil {
+			return fmt.Errorf("lock post-production %s: %w", lock.name, err)
+		}
+		for rows.Next() {
+			var ignored uuid.UUID
+			if err := rows.Scan(&ignored); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan locked post-production %s: %w", lock.name, err)
+			}
+		}
+		iterationErr := rows.Err()
+		rows.Close()
+		if iterationErr != nil {
+			return fmt.Errorf("iterate locked post-production %s: %w", lock.name, iterationErr)
+		}
+	}
+	return nil
 }
 
 func (p *Postgres) RecordProviderCancellation(

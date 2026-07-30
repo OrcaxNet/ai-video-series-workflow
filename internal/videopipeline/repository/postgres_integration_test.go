@@ -276,6 +276,9 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	gate1ID, gate2ID, budgetID := uuid.New(), uuid.New(), uuid.New()
 	providerProfileID, capabilityID := uuid.New(), uuid.New()
 	safetyEvidenceArtifactID := uuid.New()
+	voiceLicenseID, musicLicenseID, consentID := uuid.New(), uuid.New(), uuid.New()
+	voiceAssetID, voiceAssetVersionID := uuid.New(), uuid.New()
+	musicAssetID, musicAssetVersionID := uuid.New(), uuid.New()
 	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 	episodeHash := strings.Repeat("1", 64)
 	shotHash := strings.Repeat("2", 64)
@@ -308,6 +311,49 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		INSERT INTO video_pipeline.episodes (id, series_id, ordinal, title)
 		VALUES ($1, $2, 1, 'episode')`,
 		episodeID, seriesID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.license_snapshots
+			(id, subject_type, subject_ref, license_id, license_hash,
+			 policy_status, territories, commercial_use, expires_at, source_uri)
+		VALUES
+			($1, 'VOICE', $2, 'voice-license', $3, 'ALLOWED', ARRAY['CN'], true,
+			 now() + interval '1 hour', 'license://integration/voice'),
+			($4, 'MUSIC', $5, 'music-license', $6, 'ALLOWED', ARRAY['CN'], true,
+			 now() + interval '1 hour', 'license://integration/music')`,
+		voiceLicenseID, voiceAssetVersionID.String(), strings.Repeat("d", 64),
+		musicLicenseID, musicAssetVersionID.String(), strings.Repeat("e", 64),
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.consent_assets
+			(id, subject_ref, consent_type, content_hash, artifact_uri,
+			 territories, expires_at, status)
+		VALUES ($1, $2, 'VOICE_CLONE', $3, $4, ARRAY['CN'],
+		        now() + interval '1 hour', 'ACTIVE')`,
+		consentID, voiceAssetVersionID.String(), strings.Repeat("9", 64),
+		"cas://sha256/"+strings.Repeat("9", 64),
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.assets
+			(id, series_id, asset_type, scope_type, scope_id)
+		VALUES
+			($1, $2, 'VOICE', 'SERIES', $2),
+			($3, $2, 'MUSIC', 'SERIES', $2)`,
+		voiceAssetID, seriesID, musicAssetID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.asset_versions
+			(id, asset_id, revision, status, content_hash, artifact_uri, media_type,
+			 source_ref, license_snapshot_id, consent_asset_id, created_by)
+		VALUES
+			($1, $2, 1, 'APPROVED', $3, $4, 'audio/wav',
+			 'integration-voice', $5, $6, 'integration'),
+			($7, $8, 1, 'APPROVED', $9, $10, 'audio/wav',
+			 'integration-music', $11, NULL, 'integration')`,
+		voiceAssetVersionID, voiceAssetID, strings.Repeat("f", 64),
+		"cas://sha256/"+strings.Repeat("f", 64), voiceLicenseID, consentID,
+		musicAssetVersionID, musicAssetID, strings.Repeat("7", 64),
+		"cas://sha256/"+strings.Repeat("7", 64), musicLicenseID,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.episode_revisions
@@ -382,10 +428,10 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 gate2_decision_id, content_hash, created_by)
 		VALUES ($1, $2, $3, 1, 'READY', 'FRESH',
 		        5000, '16:9_720P24', 24, 1280, 720, 1,
-		        1, '{"action":"walk","dialogue":[{"id":"line-1","speaker":"A","text":"Hello fixture","startMillis":500,"endMillis":2000}]}', '{}', $4,
+		        1, '{"action":"walk","dialogue":[{"id":"line-1","speaker":"A","text":"Hello fixture","startMillis":500,"endMillis":2000}]}', ARRAY[$9::uuid], $4,
 		        $5, '{}'::jsonb, '{}'::jsonb, $6, $7, $8, 'integration')`,
 		shotRevisionID, shotID, storyboardID, contextIDs,
-		effectiveHash, profileID, gate2ID, shotHash,
+		effectiveHash, profileID, gate2ID, shotHash, voiceAssetVersionID,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.approval_bindings
@@ -813,6 +859,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	finalizeInput := orchestration.FinalizeEpisodeInput{
 		EpisodeRevisionID: episodeRevisionID.String(),
 		RunIDs:            []string{run.RunID},
+		GenerationPlanID:  plan.Value.GenerationPlanID,
 		Config: orchestration.PostProductionConfig{
 			Enabled:  true,
 			Evidence: postproduction.EvidenceMockOnly,
@@ -824,11 +871,12 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				CapabilityHash:  capabilityHash,
 				Verification:    "mock_only",
 			},
-			SpeechProviderProfileID:   providerProfileID.String(),
-			SpeechBudgetApprovalID:    budgetID.String(),
-			SpeechBudgetMaximumMicros: 1_000,
-			SpeechBudgetCurrency:      "CNY",
-			SubtitleLanguage:          "en",
+			SpeechProviderProfileID:       providerProfileID.String(),
+			SpeechBudgetApprovalID:        budgetID.String(),
+			SpeechBudgetMaximumMicros:     1_000,
+			SpeechBudgetCurrency:          "CNY",
+			SubtitleLanguage:              "en",
+			BackgroundAudioAssetVersionID: musicAssetVersionID.String(),
 		},
 		TraceID: step.TraceID,
 	}
@@ -843,6 +891,37 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		postRequest.Subtitle.Cues[0].EndMillis != 2_000 {
 		t.Fatalf("prepared cue timing = %#v", postRequest.Subtitle.Cues[0])
 	}
+	assertPolicyCode := func(stage string, err error, code controlplane.ErrorCode) {
+		t.Helper()
+		var policy *controlplane.DomainError
+		if !errors.As(err, &policy) || policy.Code != code {
+			t.Fatalf("%s error = %#v, want %s", stage, err, code)
+		}
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`,
+		consentID,
+	)
+	err = store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput)
+	assertPolicyCode("paid submit after consent revocation", err, controlplane.CodeConsentRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'ACTIVE' WHERE id = $1`,
+		consentID,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() - interval '1 second'
+		WHERE id = $1`,
+		voiceLicenseID,
+	)
+	err = store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput)
+	assertPolicyCode("paid submit after license expiry", err, controlplane.CodeLicenseBlocked)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() + interval '1 hour'
+		WHERE id = $1`,
+		voiceLicenseID,
+	)
 	liveInput := finalizeInput
 	liveInput.Config.Evidence = postproduction.EvidenceLive
 	liveInput.Config.SpeechRoute.Verification = "live_provider_call"
@@ -870,13 +949,19 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	postManifest := putPostArtifact(
 		"postproduction_manifest",
 		"application/vnd.video-series.postproduction-manifest+json",
-		`{"schemaVersion":"v1","evidence":"mock_only"}`,
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q}`,
+			episodeRevisionID.String(),
+		),
 		0, 0, 0, 0,
 	)
 	serviceBOM := putPostArtifact(
 		"service_bom",
 		"application/vnd.video-series.service-bom+json",
-		`{"schemaVersion":"v1","evidence":"mock_only","components":[]}`,
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q,"components":[]}`,
+			episodeRevisionID.String(),
+		),
 		0, 0, 0, 0,
 	)
 	postResult := postproduction.Result{
@@ -885,15 +970,16 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		EpisodeRevisionID: episodeRevisionID.String(),
 		Subtitle: putPostArtifact(
 			"subtitle_srt", "application/x-subrip; charset=utf-8",
-			"1\n00:00:00,500 --> 00:00:02,000\nHello fixture\n\n",
+			"1\n00:00:00,500 --> 00:00:02,000\nHello fixture "+
+				episodeRevisionID.String()+"\n\n",
 			5_000, 0, 0, 0,
 		),
 		Dialogue: putPostArtifact(
-			"dialogue_audio", "audio/wav", "fixture dialogue",
+			"dialogue_audio", "audio/wav", "fixture dialogue "+episodeRevisionID.String(),
 			5_000, 0, 0, 0,
 		),
 		FinalVideo: putPostArtifact(
-			"final_video", "video/mp4", "fixture final video",
+			"final_video", "video/mp4", "fixture final video "+episodeRevisionID.String(),
 			5_000, 1280, 720, 24,
 		),
 		Manifest:        postManifest,
@@ -905,6 +991,46 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			State: "STRUCTURAL_PASSED", ActualDurationMillis: 5_000,
 			ManualTimingRequired: true, MeasurementEvidence: postproduction.EvidenceMockOnly,
 		},
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`,
+		consentID,
+	)
+	err = store.CommitEpisodePostProduction(ctx, step, finalizeInput, postResult)
+	assertPolicyCode("post-production commit after consent revocation", err, controlplane.CodeConsentRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'ACTIVE' WHERE id = $1`,
+		consentID,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() - interval '1 second'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
+	err = store.CommitEpisodePostProduction(ctx, step, finalizeInput, postResult)
+	assertPolicyCode("post-production commit after license expiry", err, controlplane.CodeLicenseBlocked)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() + interval '1 hour'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
+	var rejectedPostArtifacts int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.artifacts
+		WHERE content_hash IN ($1, $2, $3, $4, $5)`,
+		postResult.FinalVideo.Digest,
+		postResult.Dialogue.Digest,
+		postResult.Subtitle.Digest,
+		postResult.Manifest.Digest,
+		postResult.ServiceBOM.Digest,
+	).Scan(&rejectedPostArtifacts); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedPostArtifacts != 0 {
+		t.Fatalf("rejected post-production persisted %d artifacts", rejectedPostArtifacts)
 	}
 	if err := store.CommitEpisodePostProduction(ctx, step, finalizeInput, postResult); err != nil {
 		t.Fatal(err)
@@ -927,10 +1053,22 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	step.ActivityID, step.ActivityType = "manifest", orchestration.ActivityCreateGate3
 	gate3Input := orchestration.CreateGate3Input{
 		EpisodeRevisionID: episodeRevisionID.String(), RunIDs: []string{run.RunID},
-		PostProductionManifestHash: postResult.ManifestHash,
-		TraceID:                    step.TraceID,
-		PersistProductTruth:        true,
+		GenerationPlanID:              plan.Value.GenerationPlanID,
+		PostProductionManifestHash:    postResult.ManifestHash,
+		BackgroundAudioAssetVersionID: musicAssetVersionID.String(),
+		TraceID:                       step.TraceID,
+		PersistProductTruth:           true,
 	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`,
+		consentID,
+	)
+	_, err = store.BuildEpisodeManifest(ctx, step, gate3Input)
+	assertPolicyCode("G3 build after consent revocation", err, controlplane.CodeConsentRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'ACTIVE' WHERE id = $1`,
+		consentID,
+	)
 	manifestPayload, err := store.BuildEpisodeManifest(ctx, step, gate3Input)
 	if err != nil {
 		t.Fatal(err)
@@ -939,6 +1077,43 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() - interval '1 second'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
+	err = store.CommitEpisodeManifest(ctx, step, gate3Input, manifestPayload, manifestArtifact)
+	assertPolicyCode("G3 commit after license expiry", err, controlplane.CodeLicenseBlocked)
+	var rejectedManifests, rejectedG3Reviews int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.generation_manifests
+		WHERE scope_type = 'EPISODE' AND scope_revision_id = $1`,
+		episodeRevisionID,
+	).Scan(&rejectedManifests); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.review_tasks
+		WHERE episode_id = $1 AND review_type = 'G3'`,
+		episodeID,
+	).Scan(&rejectedG3Reviews); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedManifests != 0 || rejectedG3Reviews != 0 {
+		t.Fatalf(
+			"rejected G3 persisted manifests=%d reviews=%d",
+			rejectedManifests, rejectedG3Reviews,
+		)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() + interval '1 hour'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
 	if err := store.CommitEpisodeManifest(ctx, step, gate3Input, manifestPayload, manifestArtifact); err != nil {
 		t.Fatal(err)
 	}

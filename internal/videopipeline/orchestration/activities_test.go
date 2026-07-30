@@ -3,6 +3,7 @@ package orchestration
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -30,9 +31,11 @@ type cancellationLedgerFixture struct {
 }
 
 type postProductionLedgerFixture struct {
-	request      postproduction.Request
-	prepareCalls int
-	commitCalls  int
+	request        postproduction.Request
+	authorizeErr   error
+	prepareCalls   int
+	authorizeCalls int
+	commitCalls    int
 }
 
 func (l *postProductionLedgerFixture) PrepareEpisodePostProduction(
@@ -42,6 +45,15 @@ func (l *postProductionLedgerFixture) PrepareEpisodePostProduction(
 ) (postproduction.Request, error) {
 	l.prepareCalls++
 	return l.request, nil
+}
+
+func (l *postProductionLedgerFixture) AuthorizeEpisodePostProduction(
+	context.Context,
+	WorkflowStep,
+	FinalizeEpisodeInput,
+) error {
+	l.authorizeCalls++
+	return l.authorizeErr
 }
 
 func (l *postProductionLedgerFixture) CommitEpisodePostProduction(
@@ -417,10 +429,43 @@ func TestActivities_FinalizeEpisodeCommitsBeforeReturning(t *testing.T) {
 		t.Fatal(err)
 	}
 	if result.ManifestHash != manifestHash || executor.calls != 1 ||
-		ledger.prepareCalls != 1 || ledger.commitCalls != 1 {
+		ledger.prepareCalls != 1 || ledger.authorizeCalls != 1 || ledger.commitCalls != 1 {
 		t.Fatalf(
-			"result=%#v executor=%d prepare=%d commit=%d",
-			result, executor.calls, ledger.prepareCalls, ledger.commitCalls,
+			"result=%#v executor=%d prepare=%d authorize=%d commit=%d",
+			result, executor.calls, ledger.prepareCalls, ledger.authorizeCalls, ledger.commitCalls,
+		)
+	}
+}
+
+func TestActivities_FinalizeEpisodeBlocksBeforeExecutorWhenRightsChangeAfterPrepare(t *testing.T) {
+	t.Parallel()
+	revoked := errors.New("consent revoked after prepare")
+	ledger := &postProductionLedgerFixture{authorizeErr: revoked}
+	executor := &postProductionExecutorFixture{}
+	activities := NewActivities("http://provider.invalid")
+	activities.ConfigurePostProduction(executor, ledger)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.FinalizeEpisode)
+	_, err := env.ExecuteActivity(activities.FinalizeEpisode, FinalizeEpisodeInput{
+		EpisodeRevisionID: "episode-revision-1",
+		RunIDs:            []string{"run-1"},
+		Config: PostProductionConfig{
+			Enabled: true, Evidence: postproduction.EvidenceMockOnly,
+			SpeechRoute: testSpeechRoute(), SpeechProviderProfileID: "speech-profile",
+			SpeechBudgetApprovalID: "speech-budget", SpeechBudgetMaximumMicros: 100,
+			SpeechBudgetCurrency: "CNY", SubtitleLanguage: "zh-CN",
+		},
+		TraceID: "trace-postproduction-revoked",
+	})
+	if err == nil || !strings.Contains(err.Error(), revoked.Error()) {
+		t.Fatalf("ExecuteActivity() error = %v, want revoked authorization", err)
+	}
+	if ledger.prepareCalls != 1 || ledger.authorizeCalls != 1 ||
+		executor.calls != 0 || ledger.commitCalls != 0 {
+		t.Fatalf(
+			"side effects = prepare:%d authorize:%d executor:%d commit:%d",
+			ledger.prepareCalls, ledger.authorizeCalls, executor.calls, ledger.commitCalls,
 		)
 	}
 }
@@ -448,10 +493,11 @@ func TestActivities_FinalizeEpisodeKeepsPendingKeyNonRetryableAndUncommitted(t *
 	if err == nil {
 		t.Fatal("ExecuteActivity() error = nil, want pending_key failure")
 	}
-	if executor.calls != 1 || ledger.prepareCalls != 1 || ledger.commitCalls != 0 {
+	if executor.calls != 1 || ledger.prepareCalls != 1 ||
+		ledger.authorizeCalls != 1 || ledger.commitCalls != 0 {
 		t.Fatalf(
-			"side effects = executor:%d prepare:%d commit:%d",
-			executor.calls, ledger.prepareCalls, ledger.commitCalls,
+			"side effects = executor:%d prepare:%d authorize:%d commit:%d",
+			executor.calls, ledger.prepareCalls, ledger.authorizeCalls, ledger.commitCalls,
 		)
 	}
 }
