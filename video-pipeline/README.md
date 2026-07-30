@@ -61,7 +61,7 @@ go vet ./...
 2. 相同 JobID/输入只得到一个上游任务；
 3. Mock 任务经 polling 归档到 `cas://sha256/...`；
 4. PostgreSQL migration clean 且 Provider/成本表存在；
-5. Temporal Workflow 提交 Provider job、通过结构 QC，并在 G3 signal 后进入 `LOCKED`。
+5. Temporal Workflow 提交 Provider job、通过结构 QC、进入 `WAITING_G3` 后重启 worker，并在持久 G3 signal 后恢复为 `LOCKED`。
 
 ## 目录
 

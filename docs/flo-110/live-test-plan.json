@@ -5,6 +5,62 @@
   "verified_at": "2026-07-30",
   "soft_budget_micros": 560000000,
   "hard_budget_micros": 700000000,
+  "measurement_protocol": {
+    "cold_idle_min_seconds": 1800,
+    "hot_window_max_seconds": 600,
+    "success_denominator": "all_planned_shots",
+    "success_numerator": "shots_succeeded_within_max_attempts",
+    "percentile_method": "nearest_rank",
+    "latency_population": "all_terminal_attempts",
+    "latency_start_event": "submit_start",
+    "latency_end_event": "terminal_state_observed"
+  },
+  "acceptance_criteria": {
+    "minimum_success_rate_basis_points": 9000,
+    "maximum_total_retries": 15,
+    "require_cold_and_hot_samples": true
+  },
+  "quality_rubric": {
+    "scale_min": 1,
+    "scale_max": 5,
+    "required_reviewers": 2,
+    "minimum_dimension_score": 3,
+    "minimum_weighted_average_milli": 4000,
+    "block_on_severe_artifact": true,
+    "dimensions": [
+      {"name": "character_identity", "weight_basis_points": 2000},
+      {"name": "scene_prop_continuity", "weight_basis_points": 2000},
+      {"name": "motion_anatomy", "weight_basis_points": 1500},
+      {"name": "prompt_fidelity", "weight_basis_points": 1500},
+      {"name": "composition_camera", "weight_basis_points": 1500},
+      {"name": "technical_integrity", "weight_basis_points": 1500}
+    ]
+  },
+  "manifest_required_fields": [
+    "manifest_id",
+    "evidence",
+    "shot_id",
+    "request_id",
+    "idempotency_key",
+    "prompt_snapshot_id",
+    "context",
+    "input_assets",
+    "requested_output",
+    "provider.name",
+    "provider.model",
+    "provider.region",
+    "provider.request_id",
+    "provider.job_id",
+    "attempt.number",
+    "attempt.started_at",
+    "attempt.completed_at",
+    "attempt.latency_millis",
+    "status",
+    "actual_output",
+    "output_assets",
+    "usage",
+    "budget"
+  ],
   "categories": [
     {
       "name": "character_dialogue",

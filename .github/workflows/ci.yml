@@ -23,6 +23,9 @@ jobs:
           go-version-file: go.mod
           cache: false
 
+      - name: Scan every repository file for credential literals
+        run: go run ./cmd/provider-preflight --mode scan
+
       - name: Unit, race, contract, vet and secret checks
         run: make video-test
 

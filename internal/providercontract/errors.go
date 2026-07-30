@@ -4,10 +4,35 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 )
+
+// ParseRetryAfter supports both RFC 9110 Retry-After forms. Invalid or stale
+// values are ignored; extremely large values saturate instead of overflowing.
+func ParseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		if seconds > math.MaxInt64/int64(time.Second) {
+			return time.Duration(math.MaxInt64)
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	deadline, err := http.ParseTime(value)
+	if err != nil || !deadline.After(now) {
+		return 0
+	}
+	return deadline.Sub(now)
+}
 
 type ErrorCode string
 

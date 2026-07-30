@@ -21,6 +21,7 @@
 ## 兼容性约束
 
 - 原有 `providercontract.Provider`、`GenerationRequest`、`Job`、预算、错误、Fake、Volcengine 映射和 `pending_key` 语义保留。
+- 已合入 FLO-110 PR #1 最新基线 `ef984ea` 的 Generation Manifest schema、live evidence 门禁、预算溢出保护、callback 单调性与全仓 Secret 扫描；FLO-108 不另建重复实现。
 - 新增的 `CapabilityAlias`、`ModelSnapshot`、`BudgetReservation`、`JobRequest/JobResponse` 是控制面到 Adapter 的 additive envelope，不替代原接口。
 - Secret 继续只由显式运行时环境或 Secret manager 注入；不扫描 Claude Code、用户目录或开发者配置。
 - `liveConfigured=true` 仅表示检测到显式配置；连接、模型权限、能力和价格/配额证据通过前，`liveCallsEnabled` 仍为 `false`。

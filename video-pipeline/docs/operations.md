@@ -44,6 +44,8 @@ Mock Provider healthy
 
 `.env.video` 已被 `.gitignore` 忽略，且只能用于非生产本地值。生产使用 Secret manager/容器 secret injection。
 
+`make video-test` 和 CI 使用 `git ls-files --cached --others --exclude-standard` 枚举仓库根目录下全部 tracked 与未忽略文件，再执行 fail-closed Secret 扫描。新增根目录文件、隐藏目录或未来子目录不需要维护扫描白名单；未忽略的潜在凭证会直接使门禁失败。
+
 ## 3. 健康与就绪
 
 | Probe | 含义 |

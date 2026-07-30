@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestVolcengineProvider_SubmitTextMapping(t *testing.T) {
@@ -205,6 +206,9 @@ func TestVolcengineProvider_PollMapsManifestEvidence(t *testing.T) {
 				"last_frame_url":"https://example.invalid/last.png"
 			},
 			"duration":"5",
+			"resolution":"720p",
+			"ratio":"16:9",
+			"framespersecond":24,
 			"usage":{"total_tokens":250000}
 		}`)
 	}))
@@ -227,6 +231,57 @@ func TestVolcengineProvider_PollMapsManifestEvidence(t *testing.T) {
 	}
 	if job.Output.Usage.VideoTokens != 250_000 || job.Output.Usage.GeneratedMillis != 5_000 {
 		t.Fatalf("Poll() usage = %#v", job.Output.Usage)
+	}
+	if job.Output.Actual.Resolution != "720p" ||
+		job.Output.Actual.AspectRatio != "16:9" ||
+		job.Output.Actual.FPS != 24 ||
+		job.Output.Actual.DurationMillis != 5_000 {
+		t.Fatalf("Poll() actual output = %#v", job.Output.Actual)
+	}
+}
+
+func TestVolcengineProvider_ParsesRetryAfter(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 7, 30, 1, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		header     string
+		want       time.Duration
+		statusCode int
+	}{
+		{name: "delta seconds", header: "7", want: 7 * time.Second, statusCode: http.StatusTooManyRequests},
+		{name: "HTTP date", header: now.Add(11 * time.Second).Format(http.TimeFormat), want: 11 * time.Second, statusCode: http.StatusTooManyRequests},
+		{name: "retryable service error", header: "3", want: 3 * time.Second, statusCode: http.StatusServiceUnavailable},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Retry-After", tt.header)
+				w.WriteHeader(tt.statusCode)
+				fmt.Fprint(w, `{"error":{"code":"RateLimitExceeded","message":"wait"}}`)
+			}))
+			defer server.Close()
+			provider, err := NewVolcengineProvider(VolcengineConfig{
+				BaseURL: server.URL,
+				APIKey:  strings.Join([]string{"test", "runtime", "credential"}, "-"),
+				Models:  VolcengineModels{Image: "runtime-image-model"},
+				Now:     func() time.Time { return now },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := testGenerationRequest()
+			request.Modality = ModalityImage
+			_, err = provider.Submit(t.Context(), request)
+			providerErr, ok := err.(*Error)
+			if !ok {
+				t.Fatalf("Submit() error = %T %v, want *Error", err, err)
+			}
+			if providerErr.RetryAfter != tt.want {
+				t.Fatalf("RetryAfter = %s, want %s", providerErr.RetryAfter, tt.want)
+			}
+		})
 	}
 }
 

@@ -2,6 +2,8 @@ package providercontract
 
 import (
 	"fmt"
+	"math"
+	"math/bits"
 )
 
 const microsPerCNY int64 = 1_000_000
@@ -25,7 +27,7 @@ type BudgetDecision struct {
 
 func (p BudgetPolicy) Evaluate(spentMicros, reservedMicros int64, envelope BudgetEnvelope) (BudgetDecision, error) {
 	if spentMicros < 0 || reservedMicros < 0 || envelope.EstimatedCostMicros < 0 ||
-		envelope.MaxCostMicros < 0 {
+		envelope.MaxCostMicros < 0 || p.SoftLimitMicros < 0 || p.HardLimitMicros < 0 {
 		return BudgetDecision{}, &Error{
 			Code:        CodeInvalidRequest,
 			SafeMessage: "budget values must be non-negative",
@@ -37,7 +39,13 @@ func (p BudgetPolicy) Evaluate(spentMicros, reservedMicros int64, envelope Budge
 			SafeMessage: "request retry limit exceeds policy",
 		}
 	}
-	projected := spentMicros + reservedMicros + envelope.MaxCostMicros
+	projected, ok := checkedAddNonNegative(spentMicros, reservedMicros, envelope.MaxCostMicros)
+	if !ok {
+		return BudgetDecision{ProjectedMicros: math.MaxInt64}, &Error{
+			Code:        CodeBudgetExceeded,
+			SafeMessage: "budget projection exceeds the supported range",
+		}
+	}
 	if p.HardLimitMicros > 0 && projected > p.HardLimitMicros {
 		return BudgetDecision{ProjectedMicros: projected}, &Error{
 			Code:        CodeBudgetExceeded,
@@ -46,26 +54,52 @@ func (p BudgetPolicy) Evaluate(spentMicros, reservedMicros int64, envelope Budge
 	}
 	return BudgetDecision{
 		ProjectedMicros: projected,
-		SoftWarning:     p.SoftLimitMicros > 0 && projected > p.SoftLimitMicros,
+		SoftWarning:     p.SoftLimitMicros > 0 && projected >= p.SoftLimitMicros,
 	}, nil
+}
+
+func checkedAddNonNegative(values ...int64) (int64, bool) {
+	var total int64
+	for _, value := range values {
+		if value < 0 || value > math.MaxInt64-total {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
 }
 
 // CostPerMillion returns a rounded-up cost in CNY micros. Integer arithmetic
 // avoids floating point drift in budget gates.
 func CostPerMillion(units, cnyMicrosPerMillion int64) int64 {
-	if units <= 0 || cnyMicrosPerMillion <= 0 {
-		return 0
-	}
-	const million int64 = 1_000_000
-	return (units*cnyMicrosPerMillion + million - 1) / million
+	return roundedCost(units, cnyMicrosPerMillion, 1_000_000)
 }
 
 func CostPerTenThousand(units, cnyMicrosPerTenThousand int64) int64 {
-	if units <= 0 || cnyMicrosPerTenThousand <= 0 {
+	return roundedCost(units, cnyMicrosPerTenThousand, 10_000)
+}
+
+// roundedCost computes ceil(units*rate/divisor) using a 128-bit intermediate.
+// Results that cannot fit in int64 saturate so budget gates fail closed.
+func roundedCost(units, rate, divisor int64) int64 {
+	if units <= 0 || rate <= 0 || divisor <= 0 {
 		return 0
 	}
-	const tenThousand int64 = 10_000
-	return (units*cnyMicrosPerTenThousand + tenThousand - 1) / tenThousand
+	high, low := bits.Mul64(uint64(units), uint64(rate))
+	if high >= uint64(divisor) {
+		return math.MaxInt64
+	}
+	quotient, remainder := bits.Div64(high, low, uint64(divisor))
+	if quotient > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	if remainder > 0 {
+		if quotient == math.MaxInt64 {
+			return math.MaxInt64
+		}
+		quotient++
+	}
+	return int64(quotient)
 }
 
 func CNY(micros int64) string {

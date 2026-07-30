@@ -33,16 +33,18 @@
 
 - `GenerationRequest` 只接受请求 ID、幂等键、模态、冻结的 prompt/context snapshot、不可变资产 revision、期望输出和预算信封。
 - `Provider` 统一为 `Discover / Submit / Poll / Cancel`。同步文本/图片响应也归一成终态 `Job`，异步视频保留 provider job/request/model 证据。
-- `Job.Output` 记录输出资产和用量；落库前应下载临时 URL、计算 SHA-256，并以真实 hash 替换 `pending_download`。
+- `Job.Output` 分离保存 Provider 返回的实际规格（原始 `resolution` / `ratio` / `framespersecond` / duration）、输出资产和用量；不能用请求规格冒充实际规格。
+- `generation-manifest.schema.json` 与 `NewGenerationManifest / WriteGenerationManifest` 提供 Provider-neutral Manifest schema、校验与不可覆盖的原子落盘点。Manifest 保留 provider/model/region/request/job、attempt 起止时间、snapshot、资产 revision/hash、请求/实际规格、usage/成本与状态，但排除 prompt 正文、临时签名 URL 和调用方自报的 cold/hot 标签。
+- 成功结果必须先下载、校验并以真实 SHA-256 替换 `pending_download`，否则 Manifest 校验拒绝落盘。
 - 供应商字段只存在于 `volcengine.go` 映射层。业务表只保存 provider-neutral ID 和 manifest 引用。
 - TTS 是同一接口的 `audio` 模态，但因它属于独立语音产品，本 PR 不把 Ark Key 误用于语音接口；后续实现独立适配器。
 
 ### 生命周期与一致性规则
 
 1. 编排器先以 `(provider, idempotency_key)` 建唯一记录，再提交 Provider。火山 API 未在本次公开资料中确认跨请求幂等头，因此网络超时后的自动重提必须先查本地记录/Provider 任务，不能盲目双发。
-2. `queued → running → succeeded|failed|cancelled` 只允许单调转换。终态不可由晚到回调回退。
+2. `queued → running → succeeded|failed|cancelled` 只允许单调转换。不同 event ID 的乱序旧回调和终态后的晚到回调都只记录去重事实，不得回退状态或更新时间。
 3. 回调以持久化 `event_id` 去重；当前公开资料没有提供可依赖的回调签名契约，因此回调只作为唤醒信号，GET 轮询结果才是权威状态。
-4. 401/403 不重试；429 rate-limit 遵守 Retry-After 并受最大尝试数约束；quota/content/model/region 错误不自动重试；5xx/timeout 只对可证明幂等的操作退避重试。
+4. 401/403 不重试；429 rate-limit 同时解析 Retry-After 的 delta-seconds 与 HTTP-date 并受最大尝试数约束；quota/content/model/region 错误不自动重试；5xx/timeout 只对可证明幂等的操作退避重试。
 5. 取消与完成竞争时，Provider 已完成的终态优先；官方视频取消限制在 queued 任务。
 6. 原始 Provider 错误体不进入日志、API 响应或 manifest。仅保留标准错误码、安全摘要、HTTP 状态和 provider request ID。
 
@@ -77,7 +79,15 @@
 软阈值 = 560 CNY；硬阈值 = 700 CNY
 ```
 
-达到软阈值停止新批次并人工复核；任何会越过硬阈值的提交在本地拒绝。模型实际 token 计算、账户折扣、失败任务计费与参考视频输入分类均需在首个真实请求后校准。
+投影成本达到（含等于）软阈值即停止新批次并人工复核；任何会越过硬阈值的提交在本地拒绝。预算加法和计价乘法溢出时一律按硬阻断处理，不能回绕放行。模型实际 token 计算、账户折扣、失败任务计费与参考视频输入分类均需在首个真实请求后校准。
+
+### 统计与人工质量口径
+
+- 冷样本：同一 provider/model/region/输出规格的前次尝试完成后至少 1,800 秒才开始的尝试；热样本：同组前次尝试完成后 600 秒内开始的尝试。每组首个无前序记录的尝试和 600～1,800 秒之间的尝试标为 `unclassified`，不得冒充 cold/hot；证据集必须由时间序列推导出至少一个 cold 和一个 hot。
+- 延迟从本地 `submit_start` 到观察到终态为止，所有终态尝试（含失败尝试）均须进入证据核对；cold/hot p95 只分别使用时间序列推导出的 cold/hot 子集，`unclassified` 单独计数而不混入任一 p95。p95 使用 nearest-rank：升序排列后取 `ceil(0.95 × n)`（从 1 开始）的值，不做插值。
+- 成功率分母固定为计划中的全部 15 个镜头，分子为最多 2 次尝试内成功的镜头；门槛为 9,000 basis points，总重试不得超过 15 次。
+- 每个成功镜头由至少 2 名 reviewer ID 非空且互不相同的评审按 1–5 分独立评价角色身份、场景/道具连续性、运动/解剖、prompt 忠实度、构图/机位和技术完整性。重复 reviewer、缺维度或越界分数属于无效证据；任一维度低于 3 分、加权均分低于 4.000，或存在严重伪影即质量不通过。
+- `EvaluateLiveEvidence` 必须接收每次 attempt 的 exact Manifest bytes，重算 SHA-256，并严格核对 shot/attempt/status/时间戳/latency/usage/cost/provider provenance、计划规格和资产 revision。cold/hot 只按同组 Manifest 时间序列推导；任意 hash、缺 Manifest、字段不一致或自报温度标签均拒绝。
 
 ### 一键预检
 
@@ -102,7 +112,7 @@ FLO110_LIVE=1 ./scripts/flo110-preflight.sh
 - 已配置的 Claude Code/Anthropic 凭证不读取、不导出、不复用为火山凭证。现有后端的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 仍只服务现有 Anthropic SDK 客户端。
 - 火山适配器只从进程运行时接收 `ARK_API_KEY` 和账号内完整模型 ID；不写 `.env`、数据库、fixture、日志、trace、issue 或 PR。
 - 语音凭证必须由独立 Secret 引用注入，不能假设 `ARK_API_KEY` 同时授权语音产品。
-- CI 先执行仓库静态密钥扫描，再执行测试；Provider 原始响应最多读取 2 MiB，错误体在适配层丢弃。
+- CI 先通过 Git 清单扫描全部 tracked 文件和未忽略的新文件（包含仓库根目录、隐藏目录与未来新增路径），再执行测试；被 `.gitignore` 明确排除的运行时 Secret 文件不读取。Provider 原始响应最多读取 2 MiB，错误体在适配层丢弃。
 - 开发者若只拥有 Claude Code 会话而没有火山密钥，正确结果就是 `pending_key`，不得借助本机配置探测或复制凭证。
 
 ## 7. 安全、版权与使用条款
