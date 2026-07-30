@@ -604,7 +604,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [schemaVersion, seriesId, shotSpecRevisionIds, candidatesPerShot, routeSnapshot, budgetLimit, executionPolicy, actor]
+        [schemaVersion, seriesId, episodeRevisionId, shotSpecRevisionIds, candidatesPerShot, routeSnapshot, budgetLimit, executionPolicy, actor]
       properties:
         schemaVersion:
           const: v1
@@ -614,6 +614,7 @@ components:
         episodeRevisionId:
           type: string
           format: uuid
+          description: Exact immutable episode revision covered by the content safety decision.
         shotSpecRevisionIds:
           type: array
           minItems: 1
@@ -677,7 +678,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [targetTerritory, productForm, contentSafetyPolicyVersion, contentSafetyApproved]
+        [targetTerritory, productForm, contentSafetyPolicyVersion, contentSafetyDecisionId]
       properties:
         targetTerritory:
           type: string
@@ -688,9 +689,10 @@ components:
         contentSafetyPolicyVersion:
           type: string
           minLength: 1
-        contentSafetyApproved:
-          type: boolean
-          const: true
+        contentSafetyDecisionId:
+          type: string
+          format: uuid
+          description: Immutable authorized SAFETY decision bound to the exact episode and shot revisions.
     CostEstimate:
       type: object
       additionalProperties: false
@@ -863,7 +865,7 @@ components:
           format: uuid
         gate:
           type: string
-          enum: [G1, G2, Q1, G3]
+          enum: [G1, G2, Q1, G3, SAFETY]
         decision:
           type: string
           enum: [APPROVED, REJECTED, RETURNED]
@@ -872,6 +874,17 @@ components:
           minLength: 1
         explanation:
           type: string
+        policyVersion:
+          type: string
+          minLength: 1
+          description: Required for SAFETY decisions.
+        evidenceHash:
+          $ref: "#/components/schemas/SHA256"
+          description: Required for SAFETY decisions and must match its ARTIFACT binding.
+        validUntil:
+          type: string
+          format: date-time
+          description: Required and future-dated for SAFETY approvals.
         bindings:
           type: array
           minItems: 1

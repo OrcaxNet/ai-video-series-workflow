@@ -539,6 +539,8 @@ func (p *Postgres) CompleteProviderJob(
 		if _, err := tx.Exec(ctx, `
 			UPDATE video_pipeline.generation_runs
 			SET state = CASE WHEN state = 'PAUSED' THEN 'PAUSED' ELSE 'SUCCEEDED' END,
+			    failure_class = CASE WHEN state = 'PAUSED' THEN failure_class ELSE NULL END,
+			    failure_code = CASE WHEN state = 'PAUSED' THEN failure_code ELSE NULL END,
 			    started_at = COALESCE(started_at, now()), finished_at = now()
 			WHERE id = $1`,
 			runID,
@@ -1060,6 +1062,24 @@ func (p *Postgres) RecordProviderCancellation(
 		).Scan(&currentState); err != nil {
 			return struct{}{}, fmt.Errorf("lock cancelling generation run: %w", err)
 		}
+		if result.State == "UNKNOWN" {
+			var prepared bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM video_pipeline.provider_jobs pj
+					JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+					WHERE ga.generation_run_id = $1
+				)`,
+				runID,
+			).Scan(&prepared); err != nil {
+				return struct{}{}, fmt.Errorf("check cancellation provider job projection: %w", err)
+			}
+			if !prepared {
+				result.State = "CANCELLED"
+				result.ErrorCode = ""
+			}
+		}
 		switch result.State {
 		case "SUCCEEDED":
 			if _, err := tx.Exec(ctx, `
@@ -1108,7 +1128,8 @@ func (p *Postgres) RecordProviderCancellation(
 				}
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.generation_runs
-					SET state = 'CANCELLED', finished_at = now(), failure_code = NULL
+					SET state = 'CANCELLED', finished_at = now(),
+					    failure_class = NULL, failure_code = NULL
 					WHERE id = $1 AND state <> 'SUCCEEDED'`,
 					runID,
 				); err != nil {
@@ -1197,6 +1218,26 @@ func (p *Postgres) RecordProviderCancellation(
 		)
 	})
 	return err
+}
+
+func (p *Postgres) ProviderJobPrepared(ctx context.Context, runIDRaw string) (bool, error) {
+	runID, err := uuid.Parse(runIDRaw)
+	if err != nil {
+		return false, errors.New("runId must be a UUID")
+	}
+	var prepared bool
+	if err := p.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM video_pipeline.provider_jobs pj
+			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+			WHERE ga.generation_run_id = $1
+		)`,
+		runID,
+	).Scan(&prepared); err != nil {
+		return false, fmt.Errorf("check provider job projection: %w", err)
+	}
+	return prepared, nil
 }
 
 func (p *Postgres) FinalizeShotRun(

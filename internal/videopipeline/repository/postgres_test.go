@@ -54,7 +54,7 @@ func TestRequireExecutionPolicyFailsClosed(t *testing.T) {
 	}
 	validPolicy := controlplane.ExecutionPolicy{
 		TargetTerritory: "CN", ProductForm: "INTERNAL_PREVIEW",
-		ContentSafetyPolicyVersion: "safety-v1", ContentSafetyApproved: true,
+		ContentSafetyPolicyVersion: "safety-v1", ContentSafetyDecisionID: "00000000-0000-4000-8000-000000000001",
 	}
 	tests := []struct {
 		name   string
@@ -77,7 +77,7 @@ func TestRequireExecutionPolicyFailsClosed(t *testing.T) {
 		}(), calls: 1, code: controlplane.CodeCapability},
 		{name: "safety", limits: validLimits, policy: func() controlplane.ExecutionPolicy {
 			p := validPolicy
-			p.ContentSafetyApproved = false
+			p.ContentSafetyDecisionID = ""
 			return p
 		}(), calls: 1, code: controlplane.CodeContentBlocked},
 		{name: "quota", limits: validLimits, policy: validPolicy, calls: 3, code: controlplane.CodeQuotaExceeded},

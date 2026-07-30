@@ -235,9 +235,14 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	scriptID, storyboardID, shotRevisionID := uuid.New(), uuid.New(), uuid.New()
 	gate2ID, budgetID := uuid.New(), uuid.New()
 	providerProfileID, capabilityID := uuid.New(), uuid.New()
+	safetyEvidenceArtifactID := uuid.New()
 	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 	episodeHash := strings.Repeat("1", 64)
 	shotHash := strings.Repeat("2", 64)
+	safetyEvidenceHash := strings.Repeat(
+		strings.ReplaceAll(safetyEvidenceArtifactID.String(), "-", ""),
+		2,
+	)
 	effectiveHash := strings.Repeat("3", 64)
 	profileHash := strings.Repeat("4", 64)
 	capabilityHash := strings.Repeat("5", 64)
@@ -364,6 +369,60 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		        'ACTIVE', now())`,
 		capabilityID, providerProfileID, capabilityHash,
 	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, status)
+		VALUES ($1, $2, $3, 'application/json', 1, 'ACTIVE')`,
+		safetyEvidenceArtifactID, safetyEvidenceHash, "cas://sha256/"+safetyEvidenceHash,
+	)
+
+	createSafetyDecision := func(
+		name string,
+		policyVersion string,
+		validUntil time.Time,
+		actor controlplane.Actor,
+	) string {
+		t.Helper()
+		command := controlplane.CreateApprovalDecisionCommand{
+			SchemaVersion: "v1", SeriesID: seriesID.String(), EpisodeID: episodeID.String(),
+			Gate: "SAFETY", Decision: "APPROVED", ReasonCode: "CONTENT_SAFETY_APPROVED",
+			PolicyVersion: policyVersion, EvidenceHash: safetyEvidenceHash, ValidUntil: &validUntil,
+			Bindings: []controlplane.ApprovalBinding{
+				{ObjectType: "EPISODE_REVISION", RevisionID: episodeRevisionID.String(), ContentHash: episodeHash},
+				{ObjectType: "SHOT_SPEC_REVISION", RevisionID: shotRevisionID.String(), ContentHash: shotHash},
+				{ObjectType: "ARTIFACT", RevisionID: safetyEvidenceArtifactID.String(), ContentHash: safetyEvidenceHash},
+			},
+			Actor: actor,
+		}
+		digest, err := digestValue(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		stored, err := store.CreateApprovalDecision(ctx, command, controlplane.Idempotency{
+			Scope: "workflow-projection-safety:" + name,
+			Key:   uuid.NewString(), RequestHash: digest,
+		}, "workflow-projection-safety-"+name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stored.Value.DecisionID
+	}
+	safetyDecisionID := createSafetyDecision(
+		"valid", "safety-v1", time.Now().UTC().Add(time.Hour),
+		controlplane.Actor{ActorID: "safety-reviewer", Role: "SAFETY_REVIEWER"},
+	)
+	expiredSafetyDecisionID := createSafetyDecision(
+		"expired", "safety-v1", time.Now().UTC().Add(-time.Minute),
+		controlplane.Actor{ActorID: "safety-reviewer", Role: "SAFETY_REVIEWER"},
+	)
+	versionMismatchSafetyDecisionID := createSafetyDecision(
+		"version-mismatch", "safety-v2", time.Now().UTC().Add(time.Hour),
+		controlplane.Actor{ActorID: "safety-reviewer", Role: "SAFETY_REVIEWER"},
+	)
+	unauthorizedSafetyDecisionID := createSafetyDecision(
+		"unauthorized", "safety-v1", time.Now().UTC().Add(time.Hour),
+		controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
+	)
 
 	route := controlplane.ModelRouteSnapshot{
 		CapabilityAlias: "video.primary", ProviderProfileID: providerProfileID.String(),
@@ -372,7 +431,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	executionPolicy := controlplane.ExecutionPolicy{
 		TargetTerritory: "CN", ProductForm: "INTERNAL_PREVIEW",
-		ContentSafetyPolicyVersion: "safety-v1", ContentSafetyApproved: true,
+		ContentSafetyPolicyVersion: "safety-v1", ContentSafetyDecisionID: safetyDecisionID,
 	}
 	planCommand := controlplane.CreateGenerationPlanCommand{
 		SchemaVersion: "v1", SeriesID: seriesID.String(),
@@ -409,10 +468,37 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			code: controlplane.CodeRegionUnavailable,
 		},
 		{
-			name: "content safety",
+			name: "missing content safety decision",
 			command: func() controlplane.CreateGenerationPlanCommand {
 				value := planCommand
-				value.ExecutionPolicy.ContentSafetyApproved = false
+				value.ExecutionPolicy.ContentSafetyDecisionID = uuid.NewString()
+				return value
+			}(),
+			code: controlplane.CodeContentBlocked,
+		},
+		{
+			name: "expired content safety decision",
+			command: func() controlplane.CreateGenerationPlanCommand {
+				value := planCommand
+				value.ExecutionPolicy.ContentSafetyDecisionID = expiredSafetyDecisionID
+				return value
+			}(),
+			code: controlplane.CodeContentBlocked,
+		},
+		{
+			name: "version mismatch content safety decision",
+			command: func() controlplane.CreateGenerationPlanCommand {
+				value := planCommand
+				value.ExecutionPolicy.ContentSafetyDecisionID = versionMismatchSafetyDecisionID
+				return value
+			}(),
+			code: controlplane.CodeContentBlocked,
+		},
+		{
+			name: "unauthorized content safety decision",
+			command: func() controlplane.CreateGenerationPlanCommand {
+				value := planCommand
+				value.ExecutionPolicy.ContentSafetyDecisionID = unauthorizedSafetyDecisionID
 				return value
 			}(),
 			code: controlplane.CodeContentBlocked,
@@ -451,6 +537,20 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			}
 			if providerJobs != 0 {
 				t.Fatalf("provider jobs after prequeue block = %d, want 0", providerJobs)
+			}
+			var planCount int
+			if err := pool.QueryRow(ctx,
+				`SELECT COUNT(*)
+				 FROM video_pipeline.operation_requests
+				 WHERE aggregate_type = 'SERIES'
+				   AND aggregate_id = $1
+				   AND operation_type = 'CREATE_GENERATION_PLAN'`,
+				seriesID,
+			).Scan(&planCount); err != nil {
+				t.Fatal(err)
+			}
+			if planCount != 1 {
+				t.Fatalf("persisted plans after prequeue block = %d, want 1", planCount)
 			}
 		})
 	}
@@ -494,6 +594,44 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err := store.PrepareProviderJob(ctx, step, dispatch); err != nil {
 		t.Fatal(err)
 	}
+	qaPauseActor := controlplane.Actor{ActorID: "qa-operator", Role: "OPERATOR"}
+	qaPauseDigest, _ := digestValue(map[string]any{"runId": run.RunID, "reason": "QA_PAUSE"})
+	if _, err := store.RequestRunPause(
+		ctx, run.RunID, 1, qaPauseActor, "QA_PAUSE",
+		controlplane.Idempotency{
+			Scope: "workflow-projection-qa-pause:" + run.RunID,
+			Key:   uuid.NewString(), RequestHash: qaPauseDigest,
+		},
+		step.TraceID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	qaPausedRun, err := store.GetGenerationRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qaPausedRun.State != "PAUSED" || qaPausedRun.FailureCode != "QA_PAUSE" {
+		t.Fatalf("QA paused run = %#v", qaPausedRun)
+	}
+	qaResumeDigest, _ := digestValue(map[string]any{"runId": run.RunID, "mode": "RESUME_PAUSED"})
+	if _, err := store.RequestRunResume(
+		ctx, run.RunID, 1, qaPauseActor, "RESUME_PAUSED",
+		controlplane.Idempotency{
+			Scope: "workflow-projection-qa-resume:" + run.RunID,
+			Key:   uuid.NewString(), RequestHash: qaResumeDigest,
+		},
+		step.TraceID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	qaResumedRun, err := store.GetGenerationRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qaResumedRun.State != "RUNNING" ||
+		qaResumedRun.FailureClass != "" || qaResumedRun.FailureCode != "" {
+		t.Fatalf("QA resumed run retained pause failure = %#v", qaResumedRun)
+	}
 	cas, err := artifactstore.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -517,6 +655,14 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	if err := store.CompleteProviderJob(ctx, step, dispatch, providerResult); err != nil {
 		t.Fatal(err)
+	}
+	completedAfterPause, err := store.GetGenerationRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if completedAfterPause.State != "SUCCEEDED" ||
+		completedAfterPause.FailureClass != "" || completedAfterPause.FailureCode != "" {
+		t.Fatalf("provider success retained pause failure = %#v", completedAfterPause)
 	}
 	step.ActivityID, step.ActivityType = "qc", orchestration.ActivityRunAutomaticQC
 	qcInput := orchestration.RunQCInput{
@@ -562,6 +708,14 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	if q1State != "APPROVED" {
 		t.Fatalf("Q1 review state = %q, want APPROVED", q1State)
+	}
+	approvedAfterPause, err := store.GetGenerationRun(ctx, run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if approvedAfterPause.State != "SUCCEEDED" ||
+		approvedAfterPause.FailureClass != "" || approvedAfterPause.FailureCode != "" {
+		t.Fatalf("Q1-approved run retained pause failure = %#v", approvedAfterPause)
 	}
 	var storedSize int64
 	var storedWidth, storedHeight int
@@ -700,6 +854,13 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pausedRun, err := store.GetGenerationRun(ctx, publicRun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pausedRun.State != "PAUSED" || pausedRun.FailureCode != "INTEGRATION_PAUSE" {
+		t.Fatalf("paused public run = %#v", pausedRun)
+	}
 	resumeDigest, _ := digestValue(map[string]any{"runId": publicRun.RunID, "mode": "RESUME_PAUSED"})
 	if _, err := store.RequestRunResume(
 		ctx, publicRun.RunID, 2, publicCommand.Actor, "RESUME_PAUSED",
@@ -710,6 +871,13 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		"public-shot-run",
 	); err != nil {
 		t.Fatal(err)
+	}
+	resumedRun, err := store.GetGenerationRun(ctx, publicRun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumedRun.State != "RUNNING" || resumedRun.FailureClass != "" || resumedRun.FailureCode != "" {
+		t.Fatalf("resumed public run retained pause failure = %#v", resumedRun)
 	}
 	cancelDigest, _ := digestValue(map[string]any{"runId": publicRun.RunID, "reason": "INTEGRATION_CANCEL"})
 	cancelOperation, err := store.RequestRunCancellation(
@@ -735,7 +903,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			},
 			ReasonCode: "INTEGRATION_CANCEL", TraceID: "public-shot-run",
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "UNKNOWN", ErrorCode: "CANCEL_NOT_CONFIRMED"},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -743,8 +911,37 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cancelledRun.State != "CANCELLED" {
-		t.Fatalf("cancelled public run state = %q", cancelledRun.State)
+	if cancelledRun.State != "CANCELLED" ||
+		cancelledRun.FailureClass != "" || cancelledRun.FailureCode != "" {
+		t.Fatalf("cancelled public run = %#v", cancelledRun)
+	}
+	var providerJobCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+		WHERE ga.generation_run_id = $1`,
+		publicRun.RunID,
+	).Scan(&providerJobCount); err != nil {
+		t.Fatal(err)
+	}
+	if providerJobCount != 0 {
+		t.Fatalf("provider jobs for immediately cancelled run = %d, want 0", providerJobCount)
+	}
+	var createOperationState, cancelOperationState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+			(SELECT state FROM video_pipeline.operation_requests WHERE id = $1),
+			(SELECT state FROM video_pipeline.operation_requests WHERE id = $2)`,
+		publicOperation.Value.OperationID, cancelOperation.Value.OperationID,
+	).Scan(&createOperationState, &cancelOperationState); err != nil {
+		t.Fatal(err)
+	}
+	if createOperationState != "CANCELLED" || cancelOperationState != "SUCCEEDED" {
+		t.Fatalf(
+			"immediate cancellation operations = create:%s cancel:%s",
+			createOperationState, cancelOperationState,
+		)
 	}
 	if _, err := pool.Exec(ctx, `
 		UPDATE video_pipeline.generation_runs

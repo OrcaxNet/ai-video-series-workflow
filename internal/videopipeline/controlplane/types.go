@@ -59,7 +59,7 @@ type ExecutionPolicy struct {
 	TargetTerritory            string `json:"targetTerritory"`
 	ProductForm                string `json:"productForm"`
 	ContentSafetyPolicyVersion string `json:"contentSafetyPolicyVersion"`
-	ContentSafetyApproved      bool   `json:"contentSafetyApproved"`
+	ContentSafetyDecisionID    string `json:"contentSafetyDecisionId"`
 }
 
 type CostEstimate struct {
@@ -150,6 +150,9 @@ type CreateApprovalDecisionCommand struct {
 	Decision      string            `json:"decision"`
 	ReasonCode    string            `json:"reasonCode"`
 	Explanation   string            `json:"explanation,omitempty"`
+	PolicyVersion string            `json:"policyVersion,omitempty"`
+	EvidenceHash  string            `json:"evidenceHash,omitempty"`
+	ValidUntil    *time.Time        `json:"validUntil,omitempty"`
 	Bindings      []ApprovalBinding `json:"bindings"`
 	Actor         Actor             `json:"actor"`
 }

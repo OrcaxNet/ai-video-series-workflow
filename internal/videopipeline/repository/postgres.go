@@ -529,17 +529,13 @@ func (p *Postgres) CreateGenerationPlan(
 				controlplane.CodeStaleDependency, "shot revision identifiers are invalid", "refresh the shot plan",
 			)
 		}
-		var episodeRevisionID any
-		if command.EpisodeRevisionID != "" {
-			parsedEpisodeRevisionID, err := uuid.Parse(command.EpisodeRevisionID)
-			if err != nil {
-				return controlplane.Stored[controlplane.GenerationPlan]{}, controlplane.NewPolicyError(
-					controlplane.CodeStaleDependency,
-					"episode revision identifier is invalid",
-					"select the exact current episode revision",
-				)
-			}
-			episodeRevisionID = parsedEpisodeRevisionID
+		episodeRevisionID, err := uuid.Parse(command.EpisodeRevisionID)
+		if err != nil {
+			return controlplane.Stored[controlplane.GenerationPlan]{}, controlplane.NewPolicyError(
+				controlplane.CodeContentBlocked,
+				"an exact episode revision is required for content safety approval",
+				"bind a current episode revision and authorized SAFETY decision",
+			)
 		}
 		var shotCount int
 		var durationMS int64
@@ -576,6 +572,11 @@ func (p *Postgres) CreateGenerationPlan(
 		}
 		providerCallCount := shotCount * command.CandidatesPerShot
 		if err := requireExecutionPolicy(limits, command.ExecutionPolicy, providerCallCount); err != nil {
+			return controlplane.Stored[controlplane.GenerationPlan]{}, err
+		}
+		if err := requireContentSafetyDecision(
+			ctx, tx, command.ExecutionPolicy, seriesID, episodeRevisionID, shotIDs, now,
+		); err != nil {
 			return controlplane.Stored[controlplane.GenerationPlan]{}, err
 		}
 		unitsMaximum := float64(durationMS) / 1000 * float64(command.CandidatesPerShot)
@@ -796,15 +797,19 @@ func (p *Postgres) PrepareProduction(
 				"use the exact territory, product form, and safety policy from the plan",
 			)
 		}
-		if err := requireExecutionPolicy(limits, command.ExecutionPolicy, planRecord.Plan.ProviderCallCount); err != nil {
-			return controlplane.Stored[controlplane.Operation]{}, err
-		}
-
 		shotIDs, err := parseUUIDs(command.ShotSpecRevisionIDs)
 		if err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
 				controlplane.CodeStaleDependency, "shot revision identifiers are invalid", "refresh the exact shot revisions",
 			)
+		}
+		if err := requireExecutionPolicy(limits, command.ExecutionPolicy, planRecord.Plan.ProviderCallCount); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if err := requireContentSafetyDecision(
+			ctx, tx, command.ExecutionPolicy, seriesID, episodeRevisionID, shotIDs, now,
+		); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 		var readyCount int
 		if err := tx.QueryRow(ctx, `
@@ -1023,6 +1028,27 @@ func (p *Postgres) CreateGenerationRun(
 			)
 		}
 		if err := requireExecutionPolicy(limits, command.ExecutionPolicy, 1); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		planEpisodeRevisionID, err := uuid.Parse(planRecord.EpisodeRevisionID)
+		if err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+				controlplane.CodeContentBlocked,
+				"generation plan has no exact episode revision safety binding",
+				"create a new plan with an authorized SAFETY decision",
+			)
+		}
+		planShotIDs, err := parseUUIDs(planRecord.ShotSpecRevisionIDs)
+		if err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+				controlplane.CodeContentBlocked,
+				"generation plan safety bindings are invalid",
+				"create a new plan with exact immutable shot revisions",
+			)
+		}
+		if err := requireContentSafetyDecision(
+			ctx, tx, command.ExecutionPolicy, seriesID, planEpisodeRevisionID, planShotIDs, now,
+		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 		if err := requireAssetLicenses(ctx, tx, assetRefs, now, command.ExecutionPolicy); err != nil {
@@ -1258,6 +1284,7 @@ func (p *Postgres) RequestRunResume(
 				OperationType: "RESUME_GENERATION_RUN",
 				Action:        "generation_run.resumed",
 				TargetState:   "RUNNING",
+				ClearFailure:  true,
 				AllowedStates: map[string]struct{}{"PAUSED": {}},
 			})
 		}
@@ -1279,6 +1306,7 @@ type runTransition struct {
 	OperationType string
 	Action        string
 	TargetState   string
+	ClearFailure  bool
 	AllowedStates map[string]struct{}
 }
 
@@ -1344,9 +1372,14 @@ func (p *Postgres) transitionRun(
 		if _, err := tx.Exec(ctx, `
 			UPDATE video_pipeline.generation_runs
 			SET state = $2,
-			    failure_code = CASE WHEN $3 = '' THEN failure_code ELSE $3 END
+			    failure_class = CASE WHEN $4 THEN NULL ELSE failure_class END,
+			    failure_code = CASE
+			      WHEN $4 THEN NULL
+			      WHEN $3 = '' THEN failure_code
+			      ELSE $3
+			    END
 			WHERE id = $1`,
-			runID, transition.TargetState, reasonCode,
+			runID, transition.TargetState, reasonCode, transition.ClearFailure,
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, fmt.Errorf("update generation run state: %w", err)
 		}
@@ -1386,6 +1419,10 @@ func (p *Postgres) CreateApprovalDecision(
 	idempotency controlplane.Idempotency,
 	traceID string,
 ) (controlplane.Stored[controlplane.ApprovalDecision], error) {
+	storedExplanation, err := approvalExplanation(command)
+	if err != nil {
+		return controlplane.Stored[controlplane.ApprovalDecision]{}, err
+	}
 	decisionID := uuid.New()
 	auditID := uuid.New()
 	eventID := uuid.New()
@@ -1451,7 +1488,7 @@ func (p *Postgres) CreateApprovalDecision(
 				(id, series_id, episode_id, gate, decision, reason_code, explanation, actor_id, actor_role, decided_at, trace_id)
 			VALUES ($1, $2, $3, $4, $5, $6, NULLIF($7, ''), $8, $9, $10, $11)`,
 			decisionID, seriesID, episodeID, command.Gate, command.Decision, command.ReasonCode,
-			command.Explanation, command.Actor.ActorID, command.Actor.Role, now, traceID,
+			storedExplanation, command.Actor.ActorID, command.Actor.Role, now, traceID,
 		); err != nil {
 			return controlplane.Stored[controlplane.ApprovalDecision]{}, fmt.Errorf("insert approval decision: %w", err)
 		}
@@ -1471,11 +1508,14 @@ func (p *Postgres) CreateApprovalDecision(
 		}
 		if err := insertAuditAndOutbox(ctx, tx, auditID, eventID, command.Actor, "approval.decided", "APPROVAL_DECISION", decisionID,
 			nil, nil, command.ReasonCode, traceID, map[string]any{
-				"seriesId":  command.SeriesID,
-				"episodeId": command.EpisodeID,
-				"gate":      command.Gate,
-				"decision":  command.Decision,
-				"bindings":  command.Bindings,
+				"seriesId":      command.SeriesID,
+				"episodeId":     command.EpisodeID,
+				"gate":          command.Gate,
+				"decision":      command.Decision,
+				"policyVersion": command.PolicyVersion,
+				"evidenceHash":  command.EvidenceHash,
+				"validUntil":    command.ValidUntil,
+				"bindings":      command.Bindings,
 			}, now); err != nil {
 			return controlplane.Stored[controlplane.ApprovalDecision]{}, err
 		}
@@ -2354,6 +2394,197 @@ func requireAssetLicenses(
 	return nil
 }
 
+type contentSafetyDecisionEnvelope struct {
+	PolicyVersion string    `json:"policyVersion"`
+	EvidenceHash  string    `json:"evidenceHash"`
+	ValidUntil    time.Time `json:"validUntil"`
+	Explanation   string    `json:"explanation,omitempty"`
+}
+
+func approvalExplanation(command controlplane.CreateApprovalDecisionCommand) (string, error) {
+	if strings.ToUpper(command.Gate) != "SAFETY" {
+		return command.Explanation, nil
+	}
+	if strings.TrimSpace(command.PolicyVersion) == "" ||
+		len(command.EvidenceHash) != sha256.Size*2 ||
+		command.ValidUntil == nil {
+		return "", controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"SAFETY decision is missing its immutable policy, evidence, or validity envelope",
+			"submit an authorized SAFETY decision with policyVersion, evidenceHash, and validUntil",
+		)
+	}
+	var episodeBindings, shotBindings, evidenceBindings int
+	for _, binding := range command.Bindings {
+		switch strings.ToUpper(binding.ObjectType) {
+		case "EPISODE_REVISION":
+			episodeBindings++
+		case "SHOT_SPEC_REVISION":
+			shotBindings++
+		case "ARTIFACT":
+			evidenceBindings++
+			if binding.ContentHash != command.EvidenceHash {
+				return "", controlplane.NewPolicyError(
+					controlplane.CodeContentBlocked,
+					"SAFETY evidence hash does not match its immutable artifact binding",
+					"bind the exact evidence artifact",
+				)
+			}
+		}
+	}
+	if command.Decision == "APPROVED" &&
+		(episodeBindings != 1 || shotBindings == 0 || evidenceBindings != 1) {
+		return "", controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"SAFETY approval has incomplete immutable input bindings",
+			"bind exactly one episode revision, every shot revision, and one evidence artifact",
+		)
+	}
+	encoded, err := json.Marshal(contentSafetyDecisionEnvelope{
+		PolicyVersion: command.PolicyVersion,
+		EvidenceHash:  command.EvidenceHash,
+		ValidUntil:    command.ValidUntil.UTC(),
+		Explanation:   command.Explanation,
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode content safety decision evidence: %w", err)
+	}
+	return string(encoded), nil
+}
+
+func requireContentSafetyDecision(
+	ctx context.Context,
+	tx pgx.Tx,
+	policy controlplane.ExecutionPolicy,
+	seriesID uuid.UUID,
+	episodeRevisionID uuid.UUID,
+	shotIDs []uuid.UUID,
+	now time.Time,
+) error {
+	decisionID, err := uuid.Parse(policy.ContentSafetyDecisionID)
+	if err != nil {
+		return controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"content safety decision identifier is missing or invalid",
+			"obtain an authorized SAFETY decision bound to the exact immutable inputs",
+		)
+	}
+	var (
+		decisionSeriesID  uuid.UUID
+		decisionEpisodeID *uuid.UUID
+		decision          string
+		actorRole         string
+		explanation       string
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT series_id, episode_id, decision, actor_role, COALESCE(explanation, '')
+		FROM video_pipeline.approval_decisions
+		WHERE id = $1 AND gate = 'SAFETY'
+		FOR SHARE`,
+		decisionID,
+	).Scan(&decisionSeriesID, &decisionEpisodeID, &decision, &actorRole, &explanation); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewPolicyError(
+				controlplane.CodeContentBlocked,
+				"authorized content safety approval was not found",
+				"create a SAFETY decision before planning or queueing provider work",
+			)
+		}
+		return fmt.Errorf("read content safety decision: %w", err)
+	}
+	if decision != "APPROVED" ||
+		(strings.ToUpper(actorRole) != "SAFETY_REVIEWER" && strings.ToUpper(actorRole) != "ADMIN") {
+		return controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"content safety decision is not an authorized approval",
+			"obtain approval from SAFETY_REVIEWER or ADMIN",
+		)
+	}
+	var evidence contentSafetyDecisionEnvelope
+	if err := json.Unmarshal([]byte(explanation), &evidence); err != nil {
+		return controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"content safety decision evidence is malformed",
+			"replace it with an immutable SAFETY decision",
+		)
+	}
+	if evidence.PolicyVersion != policy.ContentSafetyPolicyVersion ||
+		len(evidence.EvidenceHash) != sha256.Size*2 ||
+		!evidence.ValidUntil.After(now) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"content safety decision is expired or incompatible with the requested policy version",
+			"obtain a current SAFETY decision for the exact policy version",
+		)
+	}
+	var expectedEpisodeID uuid.UUID
+	if err := tx.QueryRow(ctx,
+		`SELECT episode_id FROM video_pipeline.episode_revisions WHERE id = $1`,
+		episodeRevisionID,
+	).Scan(&expectedEpisodeID); err != nil {
+		return controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"content safety episode revision binding is missing",
+			"bind the exact immutable episode revision",
+		)
+	}
+	if decisionSeriesID != seriesID || decisionEpisodeID == nil || *decisionEpisodeID != expectedEpisodeID {
+		return controlplane.NewPolicyError(
+			controlplane.CodeForbidden,
+			"content safety decision belongs to a different series or episode",
+			"obtain a SAFETY decision in the requested production scope",
+		)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT object_type, revision_id, content_hash
+		FROM video_pipeline.approval_bindings
+		WHERE decision_id = $1`,
+		decisionID,
+	)
+	if err != nil {
+		return fmt.Errorf("read content safety bindings: %w", err)
+	}
+	defer rows.Close()
+	boundShots := make(map[uuid.UUID]struct{}, len(shotIDs))
+	episodeBound := false
+	evidenceBound := false
+	for rows.Next() {
+		var objectType, contentHash string
+		var revisionID uuid.UUID
+		if err := rows.Scan(&objectType, &revisionID, &contentHash); err != nil {
+			return fmt.Errorf("scan content safety binding: %w", err)
+		}
+		switch objectType {
+		case "EPISODE_REVISION":
+			episodeBound = episodeBound || revisionID == episodeRevisionID
+		case "SHOT_SPEC_REVISION":
+			boundShots[revisionID] = struct{}{}
+		case "ARTIFACT":
+			evidenceBound = evidenceBound || contentHash == evidence.EvidenceHash
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate content safety bindings: %w", err)
+	}
+	if !episodeBound || !evidenceBound || len(boundShots) != len(shotIDs) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"content safety decision is not bound to the exact episode, shots, and evidence artifact",
+			"review and approve the complete immutable input set",
+		)
+	}
+	for _, shotID := range shotIDs {
+		if _, ok := boundShots[shotID]; !ok {
+			return controlplane.NewPolicyError(
+				controlplane.CodeContentBlocked,
+				"content safety decision does not cover every requested shot revision",
+				"obtain a SAFETY decision for the exact shot set",
+			)
+		}
+	}
+	return nil
+}
+
 func requireExecutionPolicy(
 	limits map[string]any,
 	policy controlplane.ExecutionPolicy,
@@ -2373,7 +2604,7 @@ func requireExecutionPolicy(
 			"select a compatible route or product form",
 		)
 	}
-	if !policy.ContentSafetyApproved ||
+	if policy.ContentSafetyDecisionID == "" ||
 		!containsLimitString(limits, "contentSafetyPolicyVersions", policy.ContentSafetyPolicyVersion) {
 		return controlplane.NewPolicyError(
 			controlplane.CodeContentBlocked,
@@ -2464,6 +2695,14 @@ func validateApprovalBindings(
 							controlplane.CodeGateRequired, "G3 requires a G2_APPROVED episode revision", "complete G2 and production before G3",
 						)
 					}
+				case "SAFETY":
+					if *policyState != "G2_APPROVED" {
+						return controlplane.NewPolicyError(
+							controlplane.CodeGateRequired,
+							"SAFETY requires a G2_APPROVED episode revision",
+							"complete G2 before content safety approval",
+						)
+					}
 				}
 			case "SHOT_SPEC_REVISION":
 				if *policyState == "STALE" {
@@ -2500,6 +2739,14 @@ func validateApprovalBindings(
 				if gate == "G3" && *policyState != "UNLOCKED" {
 					return controlplane.NewPolicyError(
 						controlplane.CodeGateRequired, "G3 can only lock an unlocked immutable manifest", "bind the final unlocked manifest candidate",
+					)
+				}
+			case "ARTIFACT":
+				if gate == "SAFETY" && *policyState != "ACTIVE" {
+					return controlplane.NewPolicyError(
+						controlplane.CodeContentBlocked,
+						"SAFETY evidence artifact is not active",
+						"bind an immutable active evidence artifact",
 					)
 				}
 			}
@@ -2834,6 +3081,8 @@ func approvalBindingQuery(objectType string) (string, error) {
 	case "MANIFEST":
 		return `SELECT manifest_hash, CASE WHEN locked_at IS NULL THEN 'UNLOCKED' ELSE 'LOCKED' END
 		        FROM video_pipeline.generation_manifests WHERE id = $1 FOR SHARE`, nil
+	case "ARTIFACT":
+		return `SELECT content_hash, status FROM video_pipeline.artifacts WHERE id = $1 FOR SHARE`, nil
 	default:
 		return "", controlplane.NewPolicyError(
 			controlplane.CodeCapability,

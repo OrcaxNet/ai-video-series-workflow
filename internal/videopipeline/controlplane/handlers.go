@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -609,6 +610,8 @@ func validateCreatePlan(command CreateGenerationPlanCommand) error {
 		if err := validateUUID("episodeRevisionId", command.EpisodeRevisionID); err != nil {
 			return err
 		}
+	} else {
+		return validationError("episodeRevisionId is required for content safety binding")
 	}
 	if err := uniqueUUIDs("shotSpecRevisionIds", command.ShotSpecRevisionIDs); err != nil {
 		return err
@@ -689,8 +692,11 @@ func validateExecutionPolicy(policy ExecutionPolicy) error {
 	if policy.ProductForm != "INTERNAL_PREVIEW" && policy.ProductForm != "COMMERCIAL_RELEASE" {
 		return validationError("executionPolicy.productForm must be INTERNAL_PREVIEW or COMMERCIAL_RELEASE")
 	}
-	if strings.TrimSpace(policy.ContentSafetyPolicyVersion) == "" || !policy.ContentSafetyApproved {
-		return validationError("executionPolicy requires an approved contentSafetyPolicyVersion")
+	if strings.TrimSpace(policy.ContentSafetyPolicyVersion) == "" {
+		return validationError("executionPolicy.contentSafetyPolicyVersion is required")
+	}
+	if err := validateUUID("executionPolicy.contentSafetyDecisionId", policy.ContentSafetyDecisionID); err != nil {
+		return err
 	}
 	return nil
 }
@@ -719,7 +725,7 @@ func validateApproval(command CreateApprovalDecisionCommand) error {
 	}
 	gate := strings.ToUpper(strings.TrimSpace(command.Gate))
 	if command.EpisodeID == "" {
-		return validationError("episodeId is required for G1, G2, Q1, and G3")
+		return validationError("episodeId is required for G1, G2, Q1, G3, and SAFETY")
 	}
 	bindingTypes := make(map[string]int, len(command.Bindings))
 	bindingKeys := make(map[string]struct{}, len(command.Bindings))
@@ -754,6 +760,29 @@ func validateApproval(command CreateApprovalDecisionCommand) error {
 		case "G3":
 			if bindingTypes["EPISODE_REVISION"] == 0 || bindingTypes["MANIFEST"] == 0 {
 				return validationError("G3 approval requires EPISODE_REVISION and MANIFEST bindings")
+			}
+		case "SAFETY":
+			if bindingTypes["EPISODE_REVISION"] != 1 ||
+				bindingTypes["SHOT_SPEC_REVISION"] == 0 ||
+				bindingTypes["ARTIFACT"] != 1 {
+				return validationError(
+					"SAFETY approval requires exactly one EPISODE_REVISION, at least one SHOT_SPEC_REVISION, and exactly one ARTIFACT binding",
+				)
+			}
+			if strings.TrimSpace(command.PolicyVersion) == "" {
+				return validationError("SAFETY approval requires policyVersion")
+			}
+			if err := validateSHA256("evidenceHash", command.EvidenceHash); err != nil {
+				return err
+			}
+			if command.ValidUntil == nil || !command.ValidUntil.After(time.Now().UTC()) {
+				return validationError("SAFETY approval requires a future validUntil")
+			}
+			for _, binding := range command.Bindings {
+				if strings.EqualFold(binding.ObjectType, "ARTIFACT") &&
+					binding.ContentHash != command.EvidenceHash {
+					return validationError("SAFETY evidenceHash must match the ARTIFACT binding")
+				}
 			}
 		}
 	}

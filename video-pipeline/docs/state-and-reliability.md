@@ -97,9 +97,9 @@ Temporal Activity retry 策略：initial 1s、coefficient 2、max 30s、max 3。
 
 生产 worker 同时将每一步投影到规范化产品表：Prompt 编译冻结四级上下文，Run 校验 G2 计划、冻结路由和预算，ProviderJob 在网络调用前落库，完成后记录 CAS 产物的实际媒体规格、用量和成本。Q1/G3 的 review task 与决策同步闭环；G3 前生成无凭据的 Episode Manifest，并以内容哈希写入 CAS 后锁定。
 
-公开 shot-run 请求先提交 PostgreSQL，再以 `shot-generation-{runId}` 启动或恢复唯一 Temporal Workflow；只有 Temporal 确认后才返回 `202`。pause 会持久化 `PAUSED` 并取消当前 polling Activity，resume 使用相同 Provider JobID 继续 reconcile。cancel 使用 disconnected compensation Activity 调用 Provider cancel：取消胜出时收敛 `CANCELLED`，成功竞态不回退 `SUCCEEDED`，无法确认时进入 `UNKNOWN + CANCEL_NOT_CONFIRMED`，由同一 JobID 后续对账。
+公开 shot-run 请求先提交 PostgreSQL，再以 `shot-generation-{runId}` 启动或恢复唯一 Temporal Workflow；只有 Temporal 确认后才返回 `202`。pause 会持久化 `PAUSED` 并取消当前 polling Activity，resume 使用相同 Provider JobID 继续 reconcile。cancel 使用 disconnected compensation Activity：若 ProviderJob 从未准备则不发外部请求并直接收敛 `CANCELLED`；否则调用 Provider cancel，取消胜出时收敛 `CANCELLED`，成功竞态不回退 `SUCCEEDED`，无法确认时进入 `UNKNOWN + CANCEL_NOT_CONFIRMED`，由同一 JobID 后续对账。
 
-GenerationPlan 还冻结 `ExecutionPolicy`。入队前必须同时满足 capability snapshot 的 `allowedTerritories`、`productForms`、`contentSafetyPolicyVersions` 和 `remainingCalls`，并检查所有 License/Consent 对目标地区与商业形态兼容；任一字段缺失即 fail-closed，且不会启动 Temporal 或产生 ProviderJob。
+GenerationPlan 还冻结 `ExecutionPolicy`。入队前必须同时满足 capability snapshot 的 `allowedTerritories`、`productForms`、`contentSafetyPolicyVersions` 和 `remainingCalls`，并引用一个由 `SAFETY_REVIEWER` 或 `ADMIN` 作出的不可变 `SAFETY` 决策。该决策必须未过期，策略版本一致，并以内容哈希绑定精确的 EpisodeRevision、全部 ShotSpecRevision 与 ACTIVE 证据 Artifact；缺失、越权、过期或版本/绑定不匹配均 fail-closed，且不会启动 Temporal 或产生 ProviderJob。所有 License/Consent 仍须与目标地区及商业形态兼容。
 
 ## 5. UNKNOWN reconciliation
 

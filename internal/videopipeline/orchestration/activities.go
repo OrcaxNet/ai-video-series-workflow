@@ -51,6 +51,7 @@ type ProductionLedger interface {
 	RecordShotIntervention(context.Context, WorkflowStep, EscalateShotInput) error
 	BuildEpisodeManifest(context.Context, WorkflowStep, CreateGate3Input) ([]byte, error)
 	CommitEpisodeManifest(context.Context, WorkflowStep, CreateGate3Input, []byte, artifactstore.Artifact) error
+	ProviderJobPrepared(context.Context, string) (bool, error)
 	RecordProviderCancellation(context.Context, WorkflowStep, CancelProviderJobInput, CancelProviderResult) error
 	FinalizeShotRun(context.Context, WorkflowStep, FinalizeShotRunInput) error
 }
@@ -442,6 +443,22 @@ func (a *Activities) CancelProviderJob(
 		if err != nil {
 			return CancelProviderResult{}, err
 		}
+		if input.Dispatch.PersistProductTruth {
+			if a.Production == nil {
+				return CancelProviderResult{}, errors.New("production ledger is required")
+			}
+			prepared, err := a.Production.ProviderJobPrepared(ctx, input.Dispatch.Run.RunID)
+			if err != nil {
+				return CancelProviderResult{}, err
+			}
+			if !prepared {
+				result := CancelProviderResult{State: "CANCELLED"}
+				if err := a.Production.RecordProviderCancellation(ctx, step, input, result); err != nil {
+					return CancelProviderResult{}, err
+				}
+				return result, nil
+			}
+		}
 		jobID := "provider-job-" + input.Dispatch.Run.RunID
 		response, cancelErr := mockprovider.Cancel(ctx, a.HTTPClient, a.ProviderAdapterURL, jobID)
 		result := CancelProviderResult{State: "UNKNOWN", ErrorCode: "CANCEL_NOT_CONFIRMED"}
@@ -461,9 +478,6 @@ func (a *Activities) CancelProviderJob(
 			}
 		}
 		if input.Dispatch.PersistProductTruth {
-			if a.Production == nil {
-				return CancelProviderResult{}, errors.New("production ledger is required")
-			}
 			if result.State == "SUCCEEDED" {
 				if a.Artifacts == nil {
 					return CancelProviderResult{}, errors.New("artifact store is required")

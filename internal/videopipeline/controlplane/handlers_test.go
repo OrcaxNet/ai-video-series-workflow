@@ -23,6 +23,7 @@ type handlerStore struct {
 
 type approvalHandlerStore struct {
 	Store
+	createCalls int
 }
 
 func (s *approvalHandlerStore) Ping(context.Context) error { return nil }
@@ -33,6 +34,7 @@ func (s *approvalHandlerStore) CreateApprovalDecision(
 	_ Idempotency,
 	traceID string,
 ) (Stored[ApprovalDecision], error) {
+	s.createCalls++
 	return Stored[ApprovalDecision]{
 		Value: ApprovalDecision{
 			CreateApprovalDecisionCommand: command,
@@ -149,7 +151,9 @@ func TestAuthorizeApprovalDoesNotLetAdminBypassGateRole(t *testing.T) {
 	}{
 		{name: "director approves G3", action: ActionApproveG3, role: "DIRECTOR"},
 		{name: "reviewer approves Q1", action: ActionApproveQ1, role: "REVIEWER"},
+		{name: "safety reviewer approves safety", action: ActionApproveSafety, role: "SAFETY_REVIEWER"},
 		{name: "admin cannot bypass G3", action: ActionApproveG3, role: "ADMIN", wantErr: true},
+		{name: "producer cannot approve safety", action: ActionApproveSafety, role: "PRODUCER", wantErr: true},
 		{name: "creator cannot cancel", action: ActionCancelRun, role: "CREATOR", wantErr: true},
 	}
 	for _, test := range tests {

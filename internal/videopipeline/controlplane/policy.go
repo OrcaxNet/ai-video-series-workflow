@@ -31,6 +31,7 @@ const (
 	ActionApproveG2       Action = "approval.g2"
 	ActionApproveQ1       Action = "approval.q1"
 	ActionApproveG3       Action = "approval.g3"
+	ActionApproveSafety   Action = "approval.safety"
 )
 
 var allowedRoles = map[Action]map[string]struct{}{
@@ -46,6 +47,7 @@ var allowedRoles = map[Action]map[string]struct{}{
 	ActionApproveG2:       roles("DIRECTOR", "PRODUCER"),
 	ActionApproveQ1:       roles("REVIEWER", "DIRECTOR"),
 	ActionApproveG3:       roles("DIRECTOR", "PRODUCER"),
+	ActionApproveSafety:   roles("SAFETY_REVIEWER", "ADMIN"),
 }
 
 func roles(values ...string) map[string]struct{} {
@@ -82,8 +84,10 @@ func approvalAction(gate string) (Action, error) {
 		return ActionApproveQ1, nil
 	case "G3":
 		return ActionApproveG3, nil
+	case "SAFETY":
+		return ActionApproveSafety, nil
 	default:
-		return "", validationError("gate must be one of G1, G2, Q1, or G3")
+		return "", validationError("gate must be one of G1, G2, Q1, G3, or SAFETY")
 	}
 }
 
