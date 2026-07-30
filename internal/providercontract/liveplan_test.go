@@ -123,6 +123,22 @@ func TestEvaluateLiveEvidenceRejectsUnboundOrForgedEvidence(t *testing.T) {
 			},
 		},
 		{
+			name: "failed shot without reviewers",
+			mutate: func(t *testing.T, evidence *LiveEvidence) {
+				shot := &evidence.Shots[len(evidence.Shots)-1]
+				markShotFailed(t, shot)
+				shot.Reviews = nil
+			},
+		},
+		{
+			name: "failed shot with duplicate reviewer",
+			mutate: func(t *testing.T, evidence *LiveEvidence) {
+				shot := &evidence.Shots[len(evidence.Shots)-1]
+				markShotFailed(t, shot)
+				shot.Reviews[1].ReviewerID = shot.Reviews[0].ReviewerID
+			},
+		},
+		{
 			name: "arbitrary hash without manifest",
 			mutate: func(_ *testing.T, evidence *LiveEvidence) {
 				evidence.Shots[0].Attempts[0].ManifestBytes = nil
@@ -379,6 +395,17 @@ func rewriteAttemptManifestTimes(
 	attempt.StartedAt = started
 	attempt.CompletedAt = completed
 	attempt.LatencyMillis = completed.Sub(started).Milliseconds()
+}
+
+func markShotFailed(t *testing.T, shot *LiveShotEvidence) {
+	t.Helper()
+	attempt := &shot.Attempts[len(shot.Attempts)-1]
+	attempt.Status = StatusFailed
+	rewriteAttemptManifest(t, attempt, func(manifest *GenerationManifest) {
+		manifest.Status = StatusFailed
+		manifest.Actual = nil
+		manifest.OutputAssets = nil
+	})
 }
 
 func rewriteAttemptManifest(

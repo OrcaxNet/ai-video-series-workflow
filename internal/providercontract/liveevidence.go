@@ -177,15 +177,15 @@ func EvaluateLiveEvidence(plan LiveTestPlan, evidence LiveEvidence) (LiveEvaluat
 			}
 		}
 		evaluation.TotalRetries += len(shotEvidence.Attempts) - 1
+		passed, err := validateQualityReviews(plan.QualityRubric, shotEvidence)
+		if err != nil {
+			return LiveEvaluation{}, fmt.Errorf("shot %q quality reviews: %w", shotEvidence.ShotID, err)
+		}
+		if !passed {
+			evaluation.QualityPassed = false
+		}
 		if succeeded {
 			evaluation.SucceededShots++
-			passed, err := validateQualityReviews(plan.QualityRubric, shotEvidence)
-			if err != nil {
-				return LiveEvaluation{}, fmt.Errorf("shot %q quality reviews: %w", shotEvidence.ShotID, err)
-			}
-			if !passed {
-				evaluation.QualityPassed = false
-			}
 		}
 	}
 	coldLatencies, hotLatencies, unclassified, err := deriveTemperatureLatencies(
