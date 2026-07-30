@@ -42,8 +42,41 @@
         "shot_snapshot_id": {"type": "string", "minLength": 1}
       }
     },
+    "input_revision_hashes": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+    },
     "input_assets": {"type": "array", "items": {"$ref": "#/$defs/asset"}},
     "requested_output": {"$ref": "#/$defs/output"},
+    "model_snapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capability_alias", "provider", "model_id", "route_version", "capability_hash", "verification"],
+      "properties": {
+        "capability_alias": {"enum": ["text.primary", "image.primary", "video.primary", "speech.primary"]},
+        "provider": {"type": "string", "minLength": 1},
+        "model_id": {"type": "string", "minLength": 1},
+        "endpoint_id": {"type": "string"},
+        "route_version": {"type": "string", "minLength": 1},
+        "capability_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "verification": {"type": "string", "minLength": 1}
+      }
+    },
+    "gates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["gate", "decision_id", "binding_id", "binding_hash", "actor_id"],
+        "properties": {
+          "gate": {"enum": ["G1", "G2", "G3"]},
+          "decision_id": {"type": "string", "minLength": 1},
+          "binding_id": {"type": "string", "minLength": 1},
+          "binding_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "actor_id": {"type": "string", "minLength": 1}
+        }
+      }
+    },
     "provider": {
       "type": "object",
       "additionalProperties": false,

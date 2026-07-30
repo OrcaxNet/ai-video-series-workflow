@@ -11,6 +11,7 @@ import (
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/production"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 )
@@ -23,6 +24,14 @@ import (
 type Activities struct {
 	ProviderAdapterURL string
 	HTTPClient         *http.Client
+	PromptSource       PromptSource
+}
+
+// PromptSource loads and compiles exact persisted shot/context/asset
+// revisions. The concrete PostgreSQL repository is injected by the control
+// plane; no provider credential crosses this boundary.
+type PromptSource interface {
+	CompilePrompt(context.Context, string, string) (production.PromptSnapshot, error)
 }
 
 // NewActivities creates bounded Activity clients.
@@ -35,15 +44,47 @@ func (a *Activities) ValidateBatch(_ context.Context, input EpisodeProductionInp
 	return validateWorkflowInput(input)
 }
 
-// CompilePrompt returns an immutable deterministic placeholder snapshot. The
-// production compiler persists the full effective-context and evidence chain.
-func (a *Activities) CompilePrompt(_ context.Context, input CompilePromptInput) (PromptSnapshotRef, error) {
+// CompilePrompt resolves the real immutable production compiler when it is
+// configured. The deterministic fallback is explicitly mock-only and exists
+// solely for the no-key Compose smoke workflow.
+func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput) (PromptSnapshotRef, error) {
 	if input.ShotSpecRevisionID == "" || input.GenerationProfileRef == "" {
 		return PromptSnapshotRef{}, errors.New("shotSpecRevisionId and generationProfileRef are required")
 	}
+	if a.PromptSource != nil {
+		snapshot, err := a.PromptSource.CompilePrompt(ctx, input.ShotSpecRevisionID, input.GenerationProfileRef)
+		if err != nil {
+			return PromptSnapshotRef{}, fmt.Errorf("compile production prompt: %w", err)
+		}
+		if snapshot.ID == "" || snapshot.ContentHash == "" ||
+			snapshot.ShotRevision.ID != input.ShotSpecRevisionID ||
+			snapshot.GenerationProfileRef != input.GenerationProfileRef {
+			return PromptSnapshotRef{}, errors.New("prompt source returned an unpinned snapshot")
+		}
+		return toPromptSnapshotRef(snapshot), nil
+	}
 	sum := sha256.Sum256([]byte(input.ShotSpecRevisionID + "\x00" + input.GenerationProfileRef))
 	digest := hex.EncodeToString(sum[:])
-	return PromptSnapshotRef{ID: "prompt-" + digest[:16], Digest: digest}, nil
+	contextID := func(scope string) string {
+		value := sha256.Sum256([]byte(scope + "\x00" + input.ShotSpecRevisionID))
+		return "mock-context-" + scope + "-" + hex.EncodeToString(value[:8])
+	}
+	return PromptSnapshotRef{
+		ID:             "mock-prompt-" + digest[:16],
+		Digest:         digest,
+		PositivePrompt: "deterministic mock-only shot " + input.ShotSpecRevisionID,
+		Context: providercontract.ContextRefs{
+			SeriesSnapshotID:  contextID("series"),
+			EpisodeSnapshotID: contextID("episode"),
+			SceneSnapshotID:   contextID("scene"),
+			ShotSnapshotID:    contextID("shot"),
+		},
+		Output: providercontract.OutputSpec{
+			Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+			FPS: 24, DurationMillis: 5_000, Format: "mp4",
+		},
+		InputRevisionHashes: map[string]string{"shot_spec": digest},
+	}, nil
 }
 
 // CreateRun creates deterministic IDs for the runnable skeleton. A production
@@ -84,6 +125,17 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 	}
 	activity.RecordHeartbeat(ctx, map[string]any{"phase": "submitting", "runId": input.Run.RunID})
 	jobID := "provider-job-" + input.Run.RunID
+	promptText := input.Prompt.PositivePrompt
+	if input.Prompt.NegativePrompt != "" {
+		promptText += "\nNEGATIVE CONSTRAINTS: " + input.Prompt.NegativePrompt
+	}
+	if promptText == "" {
+		return ProviderResult{}, errors.New("immutable compiled prompt text is required")
+	}
+	outputSpec := input.Prompt.Output
+	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
+		return ProviderResult{}, errors.New("immutable compiled output specification is required")
+	}
 	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, providercontract.JobRequest{
 		SchemaVersion: "v1",
 		JobID:         jobID,
@@ -95,16 +147,12 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 			RequestID:        jobID,
 			IdempotencyKey:   jobID,
 			Modality:         providercontract.ModalityVideo,
-			Prompt:           "immutable prompt snapshot " + input.Prompt.Digest,
+			Prompt:           promptText,
 			PromptSnapshotID: input.Prompt.ID,
-			Output: providercontract.OutputSpec{
-				Width:          1280,
-				Height:         720,
-				AspectRatio:    "16:9",
-				FPS:            24,
-				DurationMillis: 5_000,
-				Format:         "mp4",
-			},
+			Context:          input.Prompt.Context,
+			Assets:           input.Prompt.Assets,
+			Output:           outputSpec,
+			ModelHint:        input.Route.ModelID,
 			Budget: providercontract.BudgetEnvelope{
 				EstimatedCostMicros: input.BudgetMaximumMicros,
 				MaxCostMicros:       input.BudgetMaximumMicros,
@@ -181,6 +229,19 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 		Usage:          result.Usage,
 		Cost:           result.Cost,
 	}, nil
+}
+
+func toPromptSnapshotRef(snapshot production.PromptSnapshot) PromptSnapshotRef {
+	return PromptSnapshotRef{
+		ID:                  snapshot.ID,
+		Digest:              snapshot.ContentHash,
+		PositivePrompt:      snapshot.PositivePrompt,
+		NegativePrompt:      snapshot.NegativePrompt,
+		Context:             snapshot.EffectiveContext.RevisionRefs,
+		Assets:              snapshot.Assets,
+		Output:              snapshot.Output,
+		InputRevisionHashes: snapshot.InputRevisionHashes,
+	}
 }
 
 // RunAutomaticQC is deliberately conservative in the skeleton: a committed,

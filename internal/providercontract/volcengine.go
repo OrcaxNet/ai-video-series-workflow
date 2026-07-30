@@ -203,7 +203,7 @@ func (p *VolcengineProvider) submitText(ctx context.Context, request GenerationR
 		Output: &Output{Usage: Usage{
 			InputTokens:  response.Usage.InputTokens,
 			OutputTokens: response.Usage.OutputTokens,
-		}},
+		}, Text: response.outputText()},
 	}, nil
 }
 
@@ -398,13 +398,36 @@ func (p *VolcengineProvider) do(
 }
 
 type volcResponse struct {
-	ID     string `json:"id"`
-	Model  string `json:"model"`
-	Status string `json:"status"`
-	Usage  struct {
+	ID         string `json:"id"`
+	Model      string `json:"model"`
+	Status     string `json:"status"`
+	OutputText string `json:"output_text"`
+	Output     []struct {
+		Type    string `json:"type"`
+		Content []struct {
+			Type string `json:"type"`
+			Text string `json:"text"`
+		} `json:"content"`
+	} `json:"output"`
+	Usage struct {
 		InputTokens  int64 `json:"input_tokens"`
 		OutputTokens int64 `json:"output_tokens"`
 	} `json:"usage"`
+}
+
+func (r volcResponse) outputText() string {
+	if strings.TrimSpace(r.OutputText) != "" {
+		return strings.TrimSpace(r.OutputText)
+	}
+	var parts []string
+	for _, item := range r.Output {
+		for _, block := range item.Content {
+			if block.Type == "output_text" && strings.TrimSpace(block.Text) != "" {
+				parts = append(parts, strings.TrimSpace(block.Text))
+			}
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 type volcImageResponse struct {

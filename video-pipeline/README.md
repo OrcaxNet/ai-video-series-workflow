@@ -8,6 +8,8 @@
 - 四类能力别名：`text.primary`、`image.primary`、`video.primary`、`speech.primary`；
 - 无密钥状态发现、确定性估算/任务、幂等 replay、polling、取消竞态与回调去重；
 - Episode Workflow：G2 输入校验、逐镜头远程任务、结构 QC、人工复核、G3 signal；
+- FLO-102 主链路：授权内容结构化、不可变 revision、四层上下文/资产解析、
+  PromptSnapshot、Provider 执行、CAS、Manifest 与 QC/G3 publication lock；
 - OpenAPI、AsyncAPI、数据模型、状态机、ADR、FR-P0-01～24 追踪；
 - 无 GPU/无模型 Key 的 Compose、smoke 与 CI。
 
@@ -75,6 +77,7 @@ internal/videopipeline/
   controlplane/                 隔离 HTTP surface
   mockprovider/                 场景注入、异步任务、callback/cancel
   orchestration/                持久流程、预算确认、provider reconciliation
+  production/                   内容/上下文/Prompt/生成/Manifest 主链路与 30 镜金标
   runtimeconfig/                仅显式环境变量配置
 internal/providercontract/      FLO-110 供应商中立契约、预算、错误和路由快照
 video-pipeline/

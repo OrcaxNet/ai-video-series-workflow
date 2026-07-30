@@ -29,10 +29,10 @@ printf '%s' "${completed}" | grep -Eq '"uri":"cas://sha256/[0-9a-f]{64}"'
 postgres_container="${VIDEO_POSTGRES_CONTAINER:-ai-video-series-workflow-postgres-1}"
 migration_version="$(docker exec "${postgres_container}" psql -U video -d video_pipeline -Atc 'SELECT version FROM public.schema_migrations;')"
 migration_dirty="$(docker exec "${postgres_container}" psql -U video -d video_pipeline -Atc 'SELECT dirty FROM public.schema_migrations;')"
-test "${migration_version}" = "1"
+test "${migration_version}" = "2"
 test "${migration_dirty}" = "f"
 table_count="$(docker exec "${postgres_container}" psql -U video -d video_pipeline -Atc "SELECT count(*) FROM information_schema.tables WHERE table_schema='video_pipeline';")"
-test "${table_count}" -ge 42
+test "${table_count}" -ge 46
 
 temporal_container="${VIDEO_TEMPORAL_CONTAINER:-ai-video-series-workflow-temporal-1}"
 temporal_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "${temporal_container}")"
