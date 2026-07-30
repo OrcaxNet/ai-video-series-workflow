@@ -169,7 +169,7 @@ Key 到位后不改领域/Workflow：
 
 1. 通过 Secret manager 注入 `ARK_API_KEY`；语音凭证独立注入；
 2. 配置 allowlisted Ark/Speech base URL 与区域；
-3. connection-test 只返回 fingerprint/masked identity；
+3. Provider Adapter 增量的 connection-test 只允许返回 fingerprint/masked identity；控制面当前不公开占位路由；
 4. discover 实际 text/image/video/speech model/endpoint；
 5. 保存 capability snapshot（ratio/duration/resolution/reference/callback/concurrency）；
 6. 配置 pricing version、quota、QPM/TPM；

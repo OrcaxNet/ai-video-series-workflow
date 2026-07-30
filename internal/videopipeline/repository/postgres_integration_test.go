@@ -360,7 +360,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 supported_inputs, limits, pricing_rule_version, capability_hash,
 			 status, effective_at)
 		VALUES ($1, $2, 'video.primary', 'fixture-video-v1', 'route-v1',
-		        ARRAY['text'], '{"unitPriceMicros":10}', 'pricing-v1', $3,
+		        ARRAY['text'], '{"unitPriceMicros":10,"remainingCalls":100,"allowedTerritories":["CN"],"productForms":["INTERNAL_PREVIEW","COMMERCIAL_RELEASE"],"contentSafetyPolicyVersions":["safety-v1"]}', 'pricing-v1', $3,
 		        'ACTIVE', now())`,
 		capabilityID, providerProfileID, capabilityHash,
 	)
@@ -370,13 +370,18 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		Provider: "MOCK", ModelID: "fixture-video-v1", RouteVersion: "route-v1",
 		CapabilityHash: capabilityHash,
 	}
+	executionPolicy := controlplane.ExecutionPolicy{
+		TargetTerritory: "CN", ProductForm: "INTERNAL_PREVIEW",
+		ContentSafetyPolicyVersion: "safety-v1", ContentSafetyApproved: true,
+	}
 	planCommand := controlplane.CreateGenerationPlanCommand{
 		SchemaVersion: "v1", SeriesID: seriesID.String(),
 		EpisodeRevisionID:   episodeRevisionID.String(),
 		ShotSpecRevisionIDs: []string{shotRevisionID.String()},
 		CandidatesPerShot:   1, RouteSnapshot: route,
-		BudgetLimit: controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
-		Actor:       controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
+		BudgetLimit:     controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
+		ExecutionPolicy: executionPolicy,
+		Actor:           controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
 	}
 	planDigest, err := digestValue(planCommand)
 	if err != nil {
@@ -388,6 +393,66 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}, "workflow-projection")
 	if err != nil {
 		t.Fatal(err)
+	}
+	blockedPlans := []struct {
+		name    string
+		command controlplane.CreateGenerationPlanCommand
+		code    controlplane.ErrorCode
+	}{
+		{
+			name: "territory",
+			command: func() controlplane.CreateGenerationPlanCommand {
+				value := planCommand
+				value.ExecutionPolicy.TargetTerritory = "US"
+				return value
+			}(),
+			code: controlplane.CodeRegionUnavailable,
+		},
+		{
+			name: "content safety",
+			command: func() controlplane.CreateGenerationPlanCommand {
+				value := planCommand
+				value.ExecutionPolicy.ContentSafetyApproved = false
+				return value
+			}(),
+			code: controlplane.CodeContentBlocked,
+		},
+		{
+			name: "quota",
+			command: func() controlplane.CreateGenerationPlanCommand {
+				value := planCommand
+				value.CandidatesPerShot = 101
+				return value
+			}(),
+			code: controlplane.CodeQuotaExceeded,
+		},
+	}
+	for _, blocked := range blockedPlans {
+		blocked := blocked
+		t.Run("prequeue policy "+blocked.name, func(t *testing.T) {
+			digest, err := digestValue(blocked.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = store.CreateGenerationPlan(ctx, blocked.command, controlplane.Idempotency{
+				Scope: "workflow-projection-blocked-plan:" + blocked.name,
+				Key:   uuid.NewString(), RequestHash: digest,
+			}, "workflow-projection")
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != blocked.code {
+				t.Fatalf("blocked plan error = %#v, want %s", err, blocked.code)
+			}
+			var providerJobs int
+			if err := pool.QueryRow(ctx,
+				`SELECT COUNT(*) FROM video_pipeline.provider_jobs WHERE provider_profile_id = $1`,
+				providerProfileID,
+			).Scan(&providerJobs); err != nil {
+				t.Fatal(err)
+			}
+			if providerJobs != 0 {
+				t.Fatalf("provider jobs after prequeue block = %d, want 0", providerJobs)
+			}
+		})
 	}
 
 	step := orchestration.WorkflowStep{
@@ -574,6 +639,143 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	if g3State != "APPROVED" {
 		t.Fatalf("G3 review state = %q, want APPROVED", g3State)
+	}
+
+	publicCommand := controlplane.CreateGenerationRunCommand{
+		SchemaVersion: "v1", ShotSpecRevisionID: shotRevisionID.String(),
+		PromptSnapshotID: prompt.ID, GenerationProfileRevisionID: profileID.String(),
+		GenerationPlanID: plan.Value.GenerationPlanID, RouteSnapshot: route,
+		BudgetApprovalID: budgetID.String(), ExecutionPolicy: executionPolicy,
+		CreativeAttempt: 2,
+		Actor:           controlplane.Actor{ActorID: "operator", Role: "OPERATOR"},
+	}
+	publicDigest, err := digestValue(publicCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicOperation, err := store.CreateGenerationRun(
+		ctx, shotID.String(), 1, publicCommand,
+		controlplane.Idempotency{
+			Scope: "public-shot-run:" + shotID.String(),
+			Key:   uuid.NewString(), RequestHash: publicDigest,
+		},
+		"public-shot-run",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicRecord, err := store.GetShotWorkflowRecord(ctx, publicOperation.Value.AggregateID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publicRecord.PromptHash != prompt.Digest ||
+		publicRecord.RouteSnapshot.ProviderProfileID != providerProfileID.String() ||
+		publicRecord.BudgetApprovalID != budgetID.String() ||
+		publicRecord.BudgetLimit.AmountMicros != 1_000 {
+		t.Fatalf("public shot workflow record = %#v", publicRecord)
+	}
+	if err := store.MarkOperationStarted(
+		ctx, publicOperation.Value.OperationID,
+		publicOperation.Value.TemporalWorkflowID, "temporal-run-public",
+	); err != nil {
+		t.Fatal(err)
+	}
+	publicRun, err := store.GetGenerationRun(ctx, publicRecord.Run.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publicRun.State != "QUEUED" {
+		t.Fatalf("public run state = %q, want QUEUED", publicRun.State)
+	}
+	pauseCommand := map[string]any{"runId": publicRun.RunID, "reason": "integration"}
+	pauseDigest, _ := digestValue(pauseCommand)
+	_, err = store.RequestRunPause(
+		ctx, publicRun.RunID, 2, publicCommand.Actor, "INTEGRATION_PAUSE",
+		controlplane.Idempotency{
+			Scope: "public-shot-pause:" + publicRun.RunID,
+			Key:   uuid.NewString(), RequestHash: pauseDigest,
+		},
+		"public-shot-run",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeDigest, _ := digestValue(map[string]any{"runId": publicRun.RunID, "mode": "RESUME_PAUSED"})
+	if _, err := store.RequestRunResume(
+		ctx, publicRun.RunID, 2, publicCommand.Actor, "RESUME_PAUSED",
+		controlplane.Idempotency{
+			Scope: "public-shot-resume:" + publicRun.RunID,
+			Key:   uuid.NewString(), RequestHash: resumeDigest,
+		},
+		"public-shot-run",
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancelDigest, _ := digestValue(map[string]any{"runId": publicRun.RunID, "reason": "INTEGRATION_CANCEL"})
+	cancelOperation, err := store.RequestRunCancellation(
+		ctx, publicRun.RunID, 2, publicCommand.Actor, "INTEGRATION_CANCEL",
+		controlplane.Idempotency{
+			Scope: "public-shot-cancel:" + publicRun.RunID,
+			Key:   uuid.NewString(), RequestHash: cancelDigest,
+		},
+		"public-shot-run",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	step.ActivityID, step.ActivityType = "cancel-public", orchestration.ActivityCancelProviderJob
+	if err := store.RecordProviderCancellation(
+		ctx, step,
+		orchestration.CancelProviderJobInput{
+			OperationID: cancelOperation.Value.OperationID,
+			Dispatch: orchestration.ExecuteProviderJobInput{
+				Run: orchestration.GenerationRunRef{
+					RunID: publicRun.RunID, RunSpecDigest: publicRun.RunSpecDigest, Attempt: 2,
+				},
+			},
+			ReasonCode: "INTEGRATION_CANCEL", TraceID: "public-shot-run",
+		},
+		orchestration.CancelProviderResult{State: "CANCELLED"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancelledRun, err := store.GetGenerationRun(ctx, publicRun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cancelledRun.State != "CANCELLED" {
+		t.Fatalf("cancelled public run state = %q", cancelledRun.State)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE video_pipeline.generation_runs
+		SET state = 'SUCCEEDED', failure_class = 'INFRASTRUCTURE', failure_code = 'INTEGRATION_CANCEL'
+		WHERE id = $1`,
+		publicRun.RunID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	step.ActivityID = "cancel-public-race"
+	if err := store.RecordProviderCancellation(
+		ctx, step,
+		orchestration.CancelProviderJobInput{
+			OperationID: cancelOperation.Value.OperationID,
+			Dispatch: orchestration.ExecuteProviderJobInput{
+				Run: orchestration.GenerationRunRef{
+					RunID: publicRun.RunID, RunSpecDigest: publicRun.RunSpecDigest, Attempt: 2,
+				},
+			},
+			ReasonCode: "INTEGRATION_CANCEL", TraceID: "public-shot-run",
+		},
+		orchestration.CancelProviderResult{State: "SUCCEEDED"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	racedRun, err := store.GetGenerationRun(ctx, publicRun.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if racedRun.State != "SUCCEEDED" || racedRun.FailureClass != "" || racedRun.FailureCode != "" {
+		t.Fatalf("terminal-success cancellation race = %#v", racedRun)
 	}
 }
 

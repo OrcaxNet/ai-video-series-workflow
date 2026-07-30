@@ -14,10 +14,9 @@
 | 分组 | 代表接口 | 用途 |
 |---|---|---|
 | System | `GET /system/info`, `/providers/status` | 无 Key/Dry-run/版本状态 |
-| Providers | capabilities、connection-test、provider-jobs、callbacks | 路由与远程任务 |
 | Plans | `POST /generation-plans` | 不付费的任务图/估算/预算门 |
 | Series | series/source/impacts | 项目、小说 revision、stale |
-| Production | production-batch、shot run、cancel/resume | Temporal 长任务 |
+| Production | production-batch、shot run、pause/cancel/resume | Temporal 长任务 |
 | Approvals | `POST /approvals` | G1/G2/Q1/G3 精确绑定 |
 | Lineage | manifests | Provider/输入/输出/成本/许可谱系 |
 
@@ -29,7 +28,9 @@
 - 错误为 `application/problem+json`；
 - UI 轮询本地 projection，绝不等待 provider。
 
-## 2. Generation plan → submit
+Provider 的 submit/poll/cancel 是 Temporal worker 到 Provider Adapter 的内部契约，不是本控制面公开 REST。`GET /providers/status` 仅公开不泄密的配置状态；capability 管理、connection-test 和外部 callback ingress 由独立 Adapter 增量负责，因而不会在当前 OpenAPI 中保留运行时 404 的占位路由。
+
+## 2. Generation plan → Temporal dispatch
 
 ### Dry-run plan
 
@@ -48,9 +49,9 @@ immutable plan hash
 
 Dry-run 不创建上游任务。金额未知不是 0；默认要求人工确认。
 
-### Provider submit
+### Internal Provider submit
 
-`POST /api/v1/provider-jobs` 必须引用：
+Temporal Activity 创建内部 ProviderJob 时必须引用：
 
 ```text
 confirmed generation_plan_id
@@ -64,7 +65,9 @@ secret-free request snapshot
 
 内部 adapter 使用稳定 JobID 作为上游幂等键。返回 task ID 前本地已保存 submit intent；超时进入 `UNKNOWN`。
 
-## 3. Provider callback
+## 3. Internal Provider callback/poll
+
+本期产品路径使用持久 polling；callback receipt/state monotonicity 仍保留在 Provider Adapter 契约、Mock 故障矩阵和数据模型中，公开 callback ingress 待 Adapter 具备真实签名验证后单独发布。
 
 Callback URL 不含凭证。必需：
 

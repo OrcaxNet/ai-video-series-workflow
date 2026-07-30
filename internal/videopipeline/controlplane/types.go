@@ -52,6 +52,16 @@ type BudgetLimit struct {
 	Currency     string `json:"currency"`
 }
 
+// ExecutionPolicy is the fail-closed dispatch envelope. It is frozen into the
+// generation plan so a caller cannot change territory, product form, safety
+// approval, or requested quota between planning and provider submission.
+type ExecutionPolicy struct {
+	TargetTerritory            string `json:"targetTerritory"`
+	ProductForm                string `json:"productForm"`
+	ContentSafetyPolicyVersion string `json:"contentSafetyPolicyVersion"`
+	ContentSafetyApproved      bool   `json:"contentSafetyApproved"`
+}
+
 type CostEstimate struct {
 	UnitsMinimum       float64   `json:"unitsMinimum"`
 	UnitsMaximum       float64   `json:"unitsMaximum"`
@@ -71,6 +81,7 @@ type CreateGenerationPlanCommand struct {
 	CandidatesPerShot   int                `json:"candidatesPerShot"`
 	RouteSnapshot       ModelRouteSnapshot `json:"routeSnapshot"`
 	BudgetLimit         BudgetLimit        `json:"budgetLimit"`
+	ExecutionPolicy     ExecutionPolicy    `json:"executionPolicy"`
 	Actor               Actor              `json:"actor"`
 }
 
@@ -81,6 +92,7 @@ type GenerationPlan struct {
 	ShotCount         int                `json:"shotCount"`
 	ProviderCallCount int                `json:"providerCallCount"`
 	RouteSnapshot     ModelRouteSnapshot `json:"routeSnapshot"`
+	ExecutionPolicy   ExecutionPolicy    `json:"executionPolicy"`
 	Estimate          CostEstimate       `json:"estimate"`
 	BudgetDecision    string             `json:"budgetDecision"`
 	PlanHash          string             `json:"planHash"`
@@ -94,6 +106,7 @@ type GenerationPlanRecord struct {
 	CandidatesPerShot   int
 	PricingRuleVersion  string
 	BudgetLimit         BudgetLimit
+	ExecutionPolicy     ExecutionPolicy
 }
 
 type StartProductionCommand struct {
@@ -105,6 +118,7 @@ type StartProductionCommand struct {
 	GenerationPlanID            string             `json:"generationPlanId"`
 	RouteSnapshot               ModelRouteSnapshot `json:"routeSnapshot"`
 	BudgetApprovalID            string             `json:"budgetApprovalId"`
+	ExecutionPolicy             ExecutionPolicy    `json:"executionPolicy"`
 	Actor                       Actor              `json:"actor"`
 }
 
@@ -115,6 +129,8 @@ type CreateGenerationRunCommand struct {
 	GenerationProfileRevisionID string             `json:"generationProfileRevisionId"`
 	GenerationPlanID            string             `json:"generationPlanId"`
 	RouteSnapshot               ModelRouteSnapshot `json:"routeSnapshot"`
+	BudgetApprovalID            string             `json:"budgetApprovalId"`
+	ExecutionPolicy             ExecutionPolicy    `json:"executionPolicy"`
 	CreativeAttempt             int                `json:"creativeAttempt"`
 	FallbackReasonCode          string             `json:"fallbackReasonCode,omitempty"`
 	Actor                       Actor              `json:"actor"`
@@ -171,6 +187,17 @@ type GenerationRun struct {
 	CreatedAt          time.Time `json:"createdAt"`
 }
 
+// ShotWorkflowRecord is the immutable dispatch projection loaded after the API
+// transaction commits and before Temporal starts the stable shot workflow.
+type ShotWorkflowRecord struct {
+	Run              GenerationRun
+	PromptSnapshotID string
+	PromptHash       string
+	RouteSnapshot    ModelRouteSnapshot
+	BudgetApprovalID string
+	BudgetLimit      BudgetLimit
+}
+
 type FreshnessImpact struct {
 	AffectedType       string `json:"affectedType"`
 	AffectedRevisionID string `json:"affectedRevisionId"`
@@ -216,6 +243,8 @@ type Store interface {
 	PrepareProduction(context.Context, string, int, StartProductionCommand, Idempotency, string) (Stored[Operation], error)
 	CreateGenerationRun(context.Context, string, int, CreateGenerationRunCommand, Idempotency, string) (Stored[Operation], error)
 	GetGenerationRun(context.Context, string) (GenerationRun, error)
+	GetShotWorkflowRecord(context.Context, string) (ShotWorkflowRecord, error)
+	RequestRunPause(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
 	RequestRunCancellation(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
 	RequestRunResume(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
 	CreateApprovalDecision(context.Context, CreateApprovalDecisionCommand, Idempotency, string) (Stored[ApprovalDecision], error)
@@ -224,6 +253,7 @@ type Store interface {
 	GetOperation(context.Context, string) (Operation, error)
 	FindActiveEpisodeWorkflow(context.Context, string) (string, error)
 	MarkOperationStarted(context.Context, string, string, string) error
+	MarkOperationSucceeded(context.Context, string) error
 	MarkOperationFailed(context.Context, string, string) error
 }
 
@@ -236,8 +266,10 @@ type WorkflowStart struct {
 // a deterministic fake and production uses the adapter in temporal.go.
 type WorkflowController interface {
 	StartEpisode(context.Context, Operation, StartProductionCommand) (WorkflowStart, error)
+	StartShot(context.Context, Operation) (WorkflowStart, error)
+	Pause(context.Context, string, string, string) error
 	Cancel(context.Context, string, string) error
-	Resume(context.Context, string, string) error
+	Resume(context.Context, string, string, string) error
 	RecordApproval(context.Context, ApprovalDecision) error
 }
 

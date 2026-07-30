@@ -21,12 +21,12 @@ FLO-108 将 FLO-96 的 24 条 P0 制片需求与 FLO-124 的纯模型 API 约束
 | 08 G2 剧本门/批次 | Approval + Workflow | production-batches | G2 binding/operation | RUNNABLE Workflow 强制 G2 |
 | 09 四层上下文 | Context resolver | Workflow input | context/effective snapshot | RUNNABLE 精确四层解析、来源记录与稳定 hash |
 | 10 Prompt 编译 | Prompt compiler | Activity | prompt_snapshots | RUNNABLE 不可变 Prompt/effective-context snapshot 与依赖证据 |
-| 11 Plan/预算/幂等 | Plan/Run services | generation-plans/provider-jobs | idempotency/budget/run | RUNNABLE Mock replay；0 重复 external task |
+| 11 Plan/预算/幂等 | Plan/Run services | generation-plans/shot-runs | idempotency/budget/run | RUNNABLE Mock replay；入队阻断 0 external task |
 | 12 远程生成执行 | Provider Adapter | submit/poll/callback/cancel | provider profile/cap/job/callback | RUNNABLE Mock 全故障；REAL-KEY 火山 |
 | 13 自动 QC | QC Activity | qc event | qc_reports | RUNNABLE 结构 QC；REAL-KEY 媒体/一致性/安全 |
 | 14 受控重试/换模型 | Workflow/Router | same job retry / new attempt | attempts/jobs/model snapshot | RUNNABLE infra max3；自动跨 provider=false |
-| 15 中断恢复 | Temporal/Reconciler | resume/poll | upstream task/state | RUNNABLE slow/unknown；REAL-KEY kill/restart 0 重复 |
-| 16 取消/补偿 | Control Plane/Adapter | cancel | cancel state/orphan/cost | RUNNABLE cancel race；REAL-KEY cancel semantics |
+| 15 中断恢复 | Temporal/Reconciler | pause/resume/poll | upstream task/state | RUNNABLE stable shot Workflow、Activity reconcile、worker restart；REAL-KEY kill/restart 0 重复 |
+| 16 取消/补偿 | Control Plane/Adapter | cancel | cancel state/orphan/cost | RUNNABLE Provider cancel/reconcile 与 terminal race；REAL-KEY cancel semantics |
 | 17 TTS/授权 | speech Adapter/Policy | provider job/artifact | voice asset/consent | CONTRACT+Mock；REAL-KEY voice/timestamps |
 | 18 字幕/口型 | Subtitle/CPU media | operation/revision/artifact | subtitle/audio/QC | CONTRACT；REAL-KEY timestamp；口型可选 |
 | 19 拼接/导出 | CPU Media Worker | delivery operation | MP4/SRT/VTT/audio/manifest | 无 GPU；后续 FFmpeg fixture E2E |
@@ -34,14 +34,14 @@ FLO-108 将 FLO-96 的 24 条 P0 制片需求与 FLO-124 的纯模型 API 约束
 | 21 immutable/stale | Revision graph | impacts API/event | dependencies/freshness | CONTRACT；新 asset v3 不改 v2 引用 |
 | 22 谱系/Manifest | Manifest builder | manifest GET/event | generation_manifests | RUNNABLE provider/model/request/task/usage/cost/实际媒体规格/hash 挂载 |
 | 23 权限/审计/Secret | Auth/RBAC/Redaction | all mutations | audit/provider profile | CONTRACT；Secret scan 0；禁止扫 Claude Code |
-| 24 观测/成本熔断 | OTel/Budget/Cost | provider/cost events | budget/cost/outbox | CONTRACT；plan confirmation、unknown price、probe shot |
+| 24 观测/成本熔断 | OTel/Budget/Cost | provider/cost events | budget/cost/outbox | RUNNABLE plan confirmation、地区/产品形态/安全/配额 fail-closed；REAL-KEY probe shot |
 
 ## 2. FLO-124 验收
 
 | AC | 实现锚点 | 当前验证 |
 |---|---|---|
 | AC-01 无 Key 启动/Dry-run | Compose、`/providers/status` | RUNNABLE smoke：四类 live false，Mock/Dry-run true |
-| AC-02 Key 连接测试/脱敏 | OpenAPI connection-test、Secret policy | CONTRACT；REAL-KEY |
+| AC-02 Key 连接测试/脱敏 | Provider Adapter preflight、Secret policy | Adapter 增量；REAL-KEY |
 | AC-03 参数与能力冲突 | capability snapshot + Shot validator | CONTRACT；Mock capability fixture |
 | AC-04 重复点击只一任务 | provider job unique/idempotent mock | RUNNABLE unit+smoke |
 | AC-05 重启后恢复 task ID | PG provider_jobs + Temporal heartbeat | CONTRACT/Mock recovery；REAL-KEY kill test |

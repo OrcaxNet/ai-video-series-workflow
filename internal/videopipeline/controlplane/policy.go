@@ -11,8 +11,9 @@ import (
 )
 
 var (
-	sha256Pattern   = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	currencyPattern = regexp.MustCompile(`^[A-Z]{3}$`)
+	sha256Pattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	currencyPattern  = regexp.MustCompile(`^[A-Z]{3}$`)
+	territoryPattern = regexp.MustCompile(`^[A-Z]{2}$`)
 )
 
 type Action string
@@ -23,6 +24,7 @@ const (
 	ActionCreatePlan      Action = "generation_plan.create"
 	ActionStartProduction Action = "production.start"
 	ActionCreateRun       Action = "run.create"
+	ActionPauseRun        Action = "run.pause"
 	ActionCancelRun       Action = "run.cancel"
 	ActionResumeRun       Action = "run.resume"
 	ActionApproveG1       Action = "approval.g1"
@@ -37,6 +39,7 @@ var allowedRoles = map[Action]map[string]struct{}{
 	ActionCreatePlan:      roles("PRODUCER", "OPERATOR", "ADMIN"),
 	ActionStartProduction: roles("PRODUCER", "OPERATOR", "ADMIN"),
 	ActionCreateRun:       roles("ARTIST", "PRODUCER", "OPERATOR", "ADMIN"),
+	ActionPauseRun:        roles("PRODUCER", "OPERATOR", "ADMIN"),
 	ActionCancelRun:       roles("PRODUCER", "OPERATOR", "ADMIN"),
 	ActionResumeRun:       roles("PRODUCER", "OPERATOR", "ADMIN"),
 	ActionApproveG1:       roles("DIRECTOR", "PRODUCER"),

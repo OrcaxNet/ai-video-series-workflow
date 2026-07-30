@@ -9,13 +9,16 @@
 - 事务内幂等记录、业务写、审计与版本化 outbox；写冲突采用 serializable transaction 重试；
 - 四类能力别名：`text.primary`、`image.primary`、`video.primary`、`speech.primary`；
 - 无密钥状态发现、确定性估算/任务、幂等 replay、polling、取消竞态与回调去重；
-- Episode Workflow：G2 精确绑定、逐镜头远程任务、结构 QC、Q1/G3 人工复核、pause/resume/cancel；
+- Episode/Shot Workflow：G2 精确绑定、逐镜头远程任务、结构 QC、Q1/G3 人工复核、pause/resume/cancel 与 Provider 取消补偿；
+- 入队前 fail-closed：冻结目标地区、产品形态、内容安全策略和 Provider 剩余配额；阻断路径不会启动 Workflow/Provider；
 - Activity journal：稳定 workflow/activity ID、输入/输出 hash、可重放结果、审计与 outbox；
 - 产品投影：Activity 将 Prompt/Run/ProviderJob/QC/Q1/G3 写入规范化表，产物和 Manifest 进入本地 CAS；
 - OpenAPI、AsyncAPI、数据模型、状态机、ADR、FR-P0-01～24 追踪；
 - 无 GPU/无模型 Key 的 Compose、smoke 与 CI。
 
 当前不声称已实现真实火山调用、前端页面或生成质量。`mock-provider` 只生成确定性 fixture 产物；真实 Key 到位后，由火山 Provider Adapter 实现相同领域契约并完成文末实测清单。
+
+公开 OpenAPI 只包含由本控制面实际提供的产品接口。Provider capability 管理、connection-test、直接 job/callback HTTP 接口不在本服务伪占路由；它们属于 Provider Adapter 的独立增量。当前 Temporal Activity 通过内部 `providercontract` 执行 submit/poll/cancel，并把 ProviderJob、重试、费用和恢复状态投影到 PostgreSQL。
 
 ## 一键启动
 
@@ -69,6 +72,7 @@ go vet ./...
 6. Activity journal 结果可重放且输入漂移被拒绝；
 7. 工作流投影可从 Prompt 一直查询到冻结路由、实际媒体规格、成本、审核与锁定 Manifest；
 8. Temporal Workflow 提交 Provider job、通过结构 QC、进入 `WAITING_G3` 后重启 worker，并在持久 G3 signal 后恢复为 `LOCKED`。
+9. 公开 shot-run API 以稳定 Workflow ID 启动真实 Temporal 执行；pause/resume/cancel、Provider cancel/reconcile 和 Operation/Run 终态均有自动化覆盖。
 
 ## 目录
 

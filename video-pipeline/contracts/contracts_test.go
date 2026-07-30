@@ -37,7 +37,7 @@ func TestContractDocumentsAreValidYAML(t *testing.T) {
 	}
 }
 
-func TestOpenAPIContainsProviderFirstOperationsAndErrors(t *testing.T) {
+func TestOpenAPIContainsRunnableControlPlaneOperationsAndErrors(t *testing.T) {
 	t.Parallel()
 
 	content, err := os.ReadFile("openapi.yaml")
@@ -47,12 +47,10 @@ func TestOpenAPIContainsProviderFirstOperationsAndErrors(t *testing.T) {
 	text := string(content)
 	for _, required := range []string{
 		"/api/v1/providers/status:",
-		"/api/v1/providers/capabilities:",
 		"/api/v1/generation-plans:",
-		"/api/v1/provider-jobs:",
-		"/api/v1/provider-jobs/{providerJobId}/cancel:",
-		"/api/v1/provider-callbacks/{providerProfileId}:",
 		"/api/v1/episodes/{episodeId}/production-batches:",
+		"/api/v1/shots/{shotId}/runs:",
+		"/api/v1/runs/{runId}/pause:",
 		"/api/v1/runs/{runId}/cancel:",
 		"/api/v1/runs/{runId}/resume:",
 		"/api/v1/approvals:",
@@ -66,12 +64,19 @@ func TestOpenAPIContainsProviderFirstOperationsAndErrors(t *testing.T) {
 		"region_unavailable",
 		"model_unavailable",
 		"timeout",
+		"ExecutionPolicy:",
 	} {
 		if !contains(text, required) {
 			t.Errorf("openapi.yaml missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"GPU_WORKER_UNAVAILABLE", "COMFYUI_REJECTED", "Wan2.2-TI2V-5B"} {
+	for _, forbidden := range []string{
+		"GPU_WORKER_UNAVAILABLE", "COMFYUI_REJECTED", "Wan2.2-TI2V-5B",
+		"/api/v1/providers/capabilities:",
+		"/api/v1/providers/{providerProfileId}/connection-test:",
+		"/api/v1/provider-jobs:",
+		"/api/v1/provider-callbacks/{providerProfileId}:",
+	} {
 		if contains(text, forbidden) {
 			t.Errorf("openapi.yaml contains superseded assumption %q", forbidden)
 		}

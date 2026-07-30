@@ -102,6 +102,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST "+APIBase+"/episodes/{episodeId}/production-batches", s.startEpisodeProduction)
 	mux.HandleFunc("POST "+APIBase+"/shots/{shotId}/runs", s.createGenerationRun)
 	mux.HandleFunc("GET "+APIBase+"/runs/{runId}", s.getGenerationRun)
+	mux.HandleFunc("POST "+APIBase+"/runs/{runId}/pause", s.pauseGenerationRun)
 	mux.HandleFunc("POST "+APIBase+"/runs/{runId}/cancel", s.cancelGenerationRun)
 	mux.HandleFunc("POST "+APIBase+"/runs/{runId}/resume", s.resumeGenerationRun)
 	mux.HandleFunc("POST "+APIBase+"/approvals", s.createApprovalDecision)

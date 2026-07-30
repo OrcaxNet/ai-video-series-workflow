@@ -238,6 +238,31 @@ func (s *Server) createGenerationRun(w http.ResponseWriter, r *http.Request) {
 		writeProblem(w, traceID, err)
 		return
 	}
+	if s.workflows == nil {
+		_ = s.store.MarkOperationFailed(r.Context(), stored.Value.OperationID, string(CodeTemporal))
+		writeProblem(w, traceID, domainError(
+			CodeTemporal, http.StatusServiceUnavailable, "Temporal controller is not configured",
+			"restore Temporal and retry with the same idempotency key", nil,
+		))
+		return
+	}
+	started, err := s.workflows.StartShot(r.Context(), stored.Value)
+	if err != nil {
+		writeProblem(w, traceID, &DomainError{
+			Code: CodeTemporal, Status: http.StatusServiceUnavailable, Retryable: true,
+			Detail:          "Temporal did not acknowledge the persisted shot workflow",
+			SuggestedAction: "retry with the same idempotency key; the stable workflow ID prevents duplicate provider work",
+			Cause:           err,
+		})
+		return
+	}
+	if err := s.store.MarkOperationStarted(r.Context(), stored.Value.OperationID, started.WorkflowID, started.RunID); err == nil {
+		stored.Value.State = "RUNNING"
+		stored.Value.TemporalWorkflowID = started.WorkflowID
+		stored.Value.TemporalRunID = started.RunID
+	} else if current, getErr := s.store.GetOperation(r.Context(), stored.Value.OperationID); getErr == nil {
+		stored.Value = current
+	}
 	writeOperation(w, http.StatusAccepted, stored.Value)
 }
 
@@ -258,6 +283,73 @@ func (s *Server) getGenerationRun(w http.ResponseWriter, r *http.Request) {
 type cancelRunCommand struct {
 	Actor      Actor  `json:"actor"`
 	ReasonCode string `json:"reasonCode"`
+}
+
+type pauseRunCommand struct {
+	Actor      Actor  `json:"actor"`
+	ReasonCode string `json:"reasonCode"`
+}
+
+func (s *Server) pauseGenerationRun(w http.ResponseWriter, r *http.Request) {
+	if !s.requireStore(w, r) {
+		return
+	}
+	var command pauseRunCommand
+	if !decodeCommand(w, r, &command) {
+		return
+	}
+	traceID := traceID(r)
+	expected, err := expectedRevision(r)
+	if err == nil {
+		err = s.authorizeCommandActor(r, command.Actor)
+	}
+	if err == nil {
+		err = authorize(ActionPauseRun, command.Actor)
+	}
+	if err == nil && strings.TrimSpace(command.ReasonCode) == "" {
+		err = validationError("reasonCode is required")
+	}
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	command.Actor = normalizedActor(command.Actor)
+	runID := r.PathValue("runId")
+	idempotency, err := commandIdempotency(r, "run:"+runID+":pause", command)
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	stored, err := s.store.RequestRunPause(
+		r.Context(), runID, expected, command.Actor, command.ReasonCode, idempotency, traceID,
+	)
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	if s.workflows == nil || stored.Value.TemporalWorkflowID == "" {
+		writeProblem(w, traceID, domainError(
+			CodeTemporal, http.StatusServiceUnavailable, "run has no active Temporal workflow",
+			"retry after workflow reconciliation", nil,
+		))
+		return
+	}
+	if err := s.workflows.Pause(
+		r.Context(), stored.Value.TemporalWorkflowID, stored.Value.OperationID, command.ReasonCode,
+	); err != nil {
+		writeProblem(w, traceID, &DomainError{
+			Code: CodeTemporal, Status: http.StatusServiceUnavailable, Retryable: true,
+			Detail:          "pause was persisted but Temporal has not acknowledged it",
+			SuggestedAction: "retry with the same idempotency key",
+			Cause:           err,
+		})
+		return
+	}
+	_ = s.store.MarkOperationSucceeded(r.Context(), stored.Value.OperationID)
+	if current, getErr := s.store.GetOperation(r.Context(), stored.Value.OperationID); getErr == nil {
+		stored.Value = current
+	}
+	writeOperation(w, http.StatusAccepted, stored.Value)
 }
 
 func (s *Server) cancelGenerationRun(w http.ResponseWriter, r *http.Request) {
@@ -351,7 +443,9 @@ func (s *Server) resumeGenerationRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.workflows != nil && stored.Value.TemporalWorkflowID != "" {
-		if err := s.workflows.Resume(r.Context(), stored.Value.TemporalWorkflowID, command.RecoveryMode); err != nil {
+		if err := s.workflows.Resume(
+			r.Context(), stored.Value.TemporalWorkflowID, stored.Value.OperationID, command.RecoveryMode,
+		); err != nil {
 			writeProblem(w, traceID, &DomainError{
 				Code: CodeTemporal, Status: http.StatusServiceUnavailable, Retryable: true,
 				Detail:          "recovery was persisted but Temporal has not acknowledged it",
@@ -359,6 +453,10 @@ func (s *Server) resumeGenerationRun(w http.ResponseWriter, r *http.Request) {
 				Cause:           err,
 			})
 			return
+		}
+		_ = s.store.MarkOperationSucceeded(r.Context(), stored.Value.OperationID)
+		if current, getErr := s.store.GetOperation(r.Context(), stored.Value.OperationID); getErr == nil {
+			stored.Value = current
 		}
 	}
 	writeOperation(w, http.StatusAccepted, stored.Value)
@@ -524,6 +622,9 @@ func validateCreatePlan(command CreateGenerationPlanCommand) error {
 	if err := validateVideoRoute(command.RouteSnapshot); err != nil {
 		return err
 	}
+	if err := validateExecutionPolicy(command.ExecutionPolicy); err != nil {
+		return err
+	}
 	return authorize(ActionCreatePlan, command.Actor)
 }
 
@@ -548,6 +649,9 @@ func validateStartProduction(command StartProductionCommand) error {
 	if err := validateVideoRoute(command.RouteSnapshot); err != nil {
 		return err
 	}
+	if err := validateExecutionPolicy(command.ExecutionPolicy); err != nil {
+		return err
+	}
 	return authorize(ActionStartProduction, command.Actor)
 }
 
@@ -560,6 +664,7 @@ func validateCreateRun(command CreateGenerationRunCommand) error {
 		"promptSnapshotId":            command.PromptSnapshotID,
 		"generationProfileRevisionId": command.GenerationProfileRevisionID,
 		"generationPlanId":            command.GenerationPlanID,
+		"budgetApprovalId":            command.BudgetApprovalID,
 	} {
 		if err := validateUUID(name, value); err != nil {
 			return err
@@ -571,7 +676,23 @@ func validateCreateRun(command CreateGenerationRunCommand) error {
 	if err := validateVideoRoute(command.RouteSnapshot); err != nil {
 		return err
 	}
+	if err := validateExecutionPolicy(command.ExecutionPolicy); err != nil {
+		return err
+	}
 	return authorize(ActionCreateRun, command.Actor)
+}
+
+func validateExecutionPolicy(policy ExecutionPolicy) error {
+	if !territoryPattern.MatchString(policy.TargetTerritory) {
+		return validationError("executionPolicy.targetTerritory must be an ISO alpha-2 uppercase code")
+	}
+	if policy.ProductForm != "INTERNAL_PREVIEW" && policy.ProductForm != "COMMERCIAL_RELEASE" {
+		return validationError("executionPolicy.productForm must be INTERNAL_PREVIEW or COMMERCIAL_RELEASE")
+	}
+	if strings.TrimSpace(policy.ContentSafetyPolicyVersion) == "" || !policy.ContentSafetyApproved {
+		return validationError("executionPolicy requires an approved contentSafetyPolicyVersion")
+	}
+	return nil
 }
 
 func validateApproval(command CreateApprovalDecisionCommand) error {

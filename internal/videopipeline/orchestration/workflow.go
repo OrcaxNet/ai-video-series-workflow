@@ -351,8 +351,16 @@ func waitForResume(ctx workflow.Context, status *WorkflowStatus, controls workfl
 	previous := status.State
 	status.State = "PAUSED"
 	for status.Paused {
-		controls.Receive(ctx, &command)
-		applyControl(status, command)
+		selector := workflow.NewSelector(ctx)
+		selector.AddReceive(controls, func(channel workflow.ReceiveChannel, _ bool) {
+			channel.Receive(ctx, &command)
+			applyControl(status, command)
+		})
+		selector.AddReceive(ctx.Done(), func(workflow.ReceiveChannel, bool) {})
+		selector.Select(ctx)
+		if ctx.Err() != nil {
+			return
+		}
 	}
 	status.State = previous
 }

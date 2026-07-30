@@ -51,6 +51,8 @@ type ProductionLedger interface {
 	RecordShotIntervention(context.Context, WorkflowStep, EscalateShotInput) error
 	BuildEpisodeManifest(context.Context, WorkflowStep, CreateGate3Input) ([]byte, error)
 	CommitEpisodeManifest(context.Context, WorkflowStep, CreateGate3Input, []byte, artifactstore.Artifact) error
+	RecordProviderCancellation(context.Context, WorkflowStep, CancelProviderJobInput, CancelProviderResult) error
+	FinalizeShotRun(context.Context, WorkflowStep, FinalizeShotRunInput) error
 }
 
 // Activities executes side effects at the Temporal Activity boundary. Temporal
@@ -260,7 +262,7 @@ func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProvid
 	})
 
 	for !providercontract.Terminal(result.State) {
-		if err := sleepContext(ctx, 100*time.Millisecond); err != nil {
+		if err := sleepContext(ctx, 500*time.Millisecond); err != nil {
 			return ProviderResult{}, err
 		}
 		result, err = mockprovider.Get(ctx, a.HTTPClient, a.ProviderAdapterURL, result.JobID)
@@ -422,6 +424,99 @@ func (a *Activities) CreateGate3(ctx context.Context, input CreateGate3Input) er
 			if err := a.Production.CommitEpisodeManifest(ctx, step, input, manifest, artifact); err != nil {
 				return struct{}{}, err
 			}
+		}
+		return struct{}{}, nil
+	})
+	return err
+}
+
+// CancelProviderJob is an explicit compensation Activity. It uses the same
+// stable provider JobID as submit and records cancellation, terminal-success
+// races, or an UNKNOWN reconciliation state in PostgreSQL.
+func (a *Activities) CancelProviderJob(
+	ctx context.Context,
+	input CancelProviderJobInput,
+) (CancelProviderResult, error) {
+	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (CancelProviderResult, error) {
+		step, err := currentWorkflowStep(ctx, input.TraceID)
+		if err != nil {
+			return CancelProviderResult{}, err
+		}
+		jobID := "provider-job-" + input.Dispatch.Run.RunID
+		response, cancelErr := mockprovider.Cancel(ctx, a.HTTPClient, a.ProviderAdapterURL, jobID)
+		result := CancelProviderResult{State: "UNKNOWN", ErrorCode: "CANCEL_NOT_CONFIRMED"}
+		if cancelErr == nil {
+			result.UpstreamTaskID = response.UpstreamTaskID
+			switch response.State {
+			case providercontract.StatusSucceeded:
+				if len(response.Artifacts) > 0 {
+					result.State = "SUCCEEDED"
+					result.ErrorCode = ""
+				}
+			case providercontract.StatusCancelled:
+				result.State = "CANCELLED"
+				result.ErrorCode = ""
+			default:
+				result.State = "UNKNOWN"
+			}
+		}
+		if input.Dispatch.PersistProductTruth {
+			if a.Production == nil {
+				return CancelProviderResult{}, errors.New("production ledger is required")
+			}
+			if result.State == "SUCCEEDED" {
+				if a.Artifacts == nil {
+					return CancelProviderResult{}, errors.New("artifact store is required")
+				}
+				providerResult := providerResultFromResponse(response)
+				exists, err := a.Artifacts.Exists(providerResult.ArtifactDigest)
+				if err != nil {
+					return CancelProviderResult{}, fmt.Errorf("verify raced provider artifact in CAS: %w", err)
+				}
+				if !exists {
+					return CancelProviderResult{}, errors.New("raced provider result was not committed to CAS")
+				}
+				if err := a.Production.CompleteProviderJob(ctx, step, input.Dispatch, providerResult); err != nil {
+					return CancelProviderResult{}, err
+				}
+			}
+			if err := a.Production.RecordProviderCancellation(ctx, step, input, result); err != nil {
+				return CancelProviderResult{}, err
+			}
+		}
+		return result, nil
+	})
+}
+
+func providerResultFromResponse(response providercontract.JobResponse) ProviderResult {
+	output := response.Artifacts[0]
+	return ProviderResult{
+		UpstreamTaskID: response.UpstreamTaskID,
+		RequestID:      response.RequestID,
+		ArtifactDigest: output.SHA256,
+		ArtifactURI:    output.URI,
+		MediaType:      output.MediaType,
+		ArtifactSize:   output.SizeBytes,
+		Width:          output.Width,
+		Height:         output.Height,
+		DurationMillis: output.DurationMillis,
+		Model:          response.Model,
+		Usage:          response.Usage,
+		Cost:           response.Cost,
+	}
+}
+
+func (a *Activities) FinalizeShotRun(ctx context.Context, input FinalizeShotRunInput) error {
+	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
+		if a.Production == nil {
+			return struct{}{}, errors.New("production ledger is required")
+		}
+		step, err := currentWorkflowStep(ctx, input.TraceID)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if err := a.Production.FinalizeShotRun(ctx, step, input); err != nil {
+			return struct{}{}, err
 		}
 		return struct{}{}, nil
 	})

@@ -538,7 +538,8 @@ func (p *Postgres) CompleteProviderJob(
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE video_pipeline.generation_runs
-			SET state = 'SUCCEEDED', started_at = COALESCE(started_at, now()), finished_at = now()
+			SET state = CASE WHEN state = 'PAUSED' THEN 'PAUSED' ELSE 'SUCCEEDED' END,
+			    started_at = COALESCE(started_at, now()), finished_at = now()
 			WHERE id = $1`,
 			runID,
 		); err != nil {
@@ -1034,6 +1035,262 @@ func (p *Postgres) CommitEpisodeManifest(
 			}
 		}
 		return struct{}{}, nil
+	})
+	return err
+}
+
+func (p *Postgres) RecordProviderCancellation(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	input orchestration.CancelProviderJobInput,
+	result orchestration.CancelProviderResult,
+) error {
+	runID, err := uuid.Parse(input.Dispatch.Run.RunID)
+	if err != nil {
+		return errors.New("runId must be a UUID")
+	}
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		var currentState string
+		if err := tx.QueryRow(ctx, `
+			SELECT state
+			FROM video_pipeline.generation_runs
+			WHERE id = $1
+			FOR UPDATE`,
+			runID,
+		).Scan(&currentState); err != nil {
+			return struct{}{}, fmt.Errorf("lock cancelling generation run: %w", err)
+		}
+		switch result.State {
+		case "SUCCEEDED":
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_runs
+				SET failure_class = NULL, failure_code = NULL
+				WHERE id = $1 AND state = 'SUCCEEDED'`,
+				runID,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("clear terminal-success cancellation reason: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.operation_requests
+				SET state = CASE
+					WHEN operation_type = 'CANCEL_GENERATION_RUN' THEN 'SUCCEEDED'
+					WHEN operation_type = 'CREATE_GENERATION_RUN' THEN 'SUCCEEDED'
+					ELSE state
+				END,
+				updated_at = now()
+				WHERE aggregate_type = 'GENERATION_RUN' AND aggregate_id = $1
+				  AND state IN ('ACCEPTED', 'RUNNING', 'CANCEL_REQUESTED')`,
+				runID,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("finish terminal-success cancellation race: %w", err)
+			}
+		case "CANCELLED":
+			if currentState != "SUCCEEDED" {
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.provider_jobs pj
+					SET state = 'CANCELLED', terminal_at = now(), updated_at = now(),
+					    error_code = NULL, error_snapshot = NULL
+					FROM video_pipeline.generation_attempts ga
+					WHERE pj.generation_attempt_id = ga.id AND ga.generation_run_id = $1
+					  AND pj.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("cancel provider job projection: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'CANCELLED', finished_at = now()
+					WHERE generation_run_id = $1
+					  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("cancel generation attempt: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_runs
+					SET state = 'CANCELLED', finished_at = now(), failure_code = NULL
+					WHERE id = $1 AND state <> 'SUCCEEDED'`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("cancel generation run: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.shot_spec_revisions ssr
+					SET lifecycle_state = 'CANCELLED'
+					FROM video_pipeline.generation_runs gr
+					WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("cancel shot revision: %w", err)
+				}
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.operation_requests
+				SET state = CASE
+					WHEN operation_type = 'CANCEL_GENERATION_RUN' THEN 'SUCCEEDED'
+					WHEN operation_type = 'CREATE_GENERATION_RUN' THEN 'CANCELLED'
+					ELSE 'CANCELLED'
+				END,
+				updated_at = now()
+				WHERE aggregate_type = 'GENERATION_RUN' AND aggregate_id = $1
+				  AND state IN ('ACCEPTED', 'RUNNING', 'CANCEL_REQUESTED')`,
+				runID,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("finish cancellation operations: %w", err)
+			}
+		default:
+			if currentState != "SUCCEEDED" {
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.provider_jobs pj
+					SET state = 'UNKNOWN', error_code = 'CANCEL_NOT_CONFIRMED',
+					    error_snapshot = '{"requiresReconciliation":true}'::jsonb,
+					    next_poll_at = now(), updated_at = now()
+					FROM video_pipeline.generation_attempts ga
+					WHERE pj.generation_attempt_id = ga.id AND ga.generation_run_id = $1
+					  AND pj.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("mark provider cancellation unknown: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'UNKNOWN', failure_code = 'CANCEL_NOT_CONFIRMED'
+					WHERE generation_run_id = $1
+					  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("mark attempt cancellation unknown: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_runs
+					SET state = 'UNKNOWN', failure_class = 'INFRASTRUCTURE',
+					    failure_code = 'CANCEL_NOT_CONFIRMED'
+					WHERE id = $1 AND state <> 'SUCCEEDED'`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("mark run cancellation unknown: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.operation_requests
+					SET state = 'RUNNING', updated_at = now()
+					WHERE aggregate_type = 'GENERATION_RUN' AND aggregate_id = $1
+					  AND operation_type = 'CANCEL_GENERATION_RUN'
+					  AND state = 'ACCEPTED'`,
+					runID,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("mark cancellation reconciliation active: %w", err)
+				}
+			}
+		}
+		return struct{}{}, insertAuditAndOutbox(
+			ctx, tx,
+			uuid.NewSHA1(runID, []byte("provider-cancellation-audit:"+step.ActivityID)),
+			uuid.NewSHA1(runID, []byte("provider-cancellation-outbox:"+step.ActivityID)),
+			controlplane.Actor{ActorID: "temporal-worker", Role: "OPERATOR"},
+			"provider_job.cancellation_reconciled", "GENERATION_RUN", runID,
+			nil, nil, input.ReasonCode, step.TraceID,
+			map[string]any{
+				"state": result.State, "errorCode": result.ErrorCode,
+				"upstreamTaskId": result.UpstreamTaskID,
+			},
+			p.now().UTC(),
+		)
+	})
+	return err
+}
+
+func (p *Postgres) FinalizeShotRun(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	input orchestration.FinalizeShotRunInput,
+) error {
+	runID, err := uuid.Parse(input.RunID)
+	if err != nil {
+		return errors.New("runId must be a UUID")
+	}
+	operationID, err := uuid.Parse(input.OperationID)
+	if err != nil {
+		return errors.New("operationId must be a UUID")
+	}
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		var currentState string
+		if err := tx.QueryRow(ctx,
+			`SELECT state FROM video_pipeline.generation_runs WHERE id = $1 FOR UPDATE`,
+			runID,
+		).Scan(&currentState); err != nil {
+			return struct{}{}, fmt.Errorf("lock finalizing shot run: %w", err)
+		}
+		operationState := "SUCCEEDED"
+		if input.State == "FAILED" {
+			operationState = "FAILED"
+			if currentState != "SUCCEEDED" && currentState != "CANCELLED" {
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_runs
+					SET state = 'FAILED', failure_class = NULLIF($2, ''),
+					    failure_code = NULLIF($3, ''), finished_at = now()
+					WHERE id = $1`,
+					runID, input.FailureClass, input.FailureCode,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("fail shot run: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'FAILED', failure_code = NULLIF($2, ''), finished_at = now()
+					WHERE generation_run_id = $1
+					  AND state NOT IN ('SUCCEEDED', 'CANCELLED')`,
+					runID, input.FailureCode,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("fail shot attempt: %w", err)
+				}
+			}
+		} else if input.State == "SUCCEEDED" && currentState != "SUCCEEDED" {
+			var providerSucceeded bool
+			if err := tx.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM video_pipeline.provider_jobs pj
+					JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+					WHERE ga.generation_run_id = $1 AND pj.state = 'SUCCEEDED'
+				)`,
+				runID,
+			).Scan(&providerSucceeded); err != nil {
+				return struct{}{}, fmt.Errorf("verify provider success before finalizing run: %w", err)
+			}
+			if !providerSucceeded {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"shot workflow cannot succeed before its provider job succeeds",
+				)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_runs
+				SET state = 'SUCCEEDED', failure_class = NULL, failure_code = NULL,
+				    finished_at = COALESCE(finished_at, now())
+				WHERE id = $1 AND state NOT IN ('CANCELLED', 'FAILED')`,
+				runID,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("finalize successful shot run: %w", err)
+			}
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.operation_requests
+			SET state = $2, updated_at = now()
+			WHERE id = $1 AND aggregate_type = 'GENERATION_RUN'
+			  AND aggregate_id = $3 AND state IN ('ACCEPTED', 'RUNNING')`,
+			operationID, operationState, runID,
+		); err != nil {
+			return struct{}{}, fmt.Errorf("finalize shot operation: %w", err)
+		}
+		return struct{}{}, insertAuditAndOutbox(
+			ctx, tx,
+			uuid.NewSHA1(runID, []byte("shot-finalized-audit:"+input.State)),
+			uuid.NewSHA1(runID, []byte("shot-finalized-outbox:"+input.State)),
+			controlplane.Actor{ActorID: "temporal-worker", Role: "OPERATOR"},
+			"generation_run.workflow_finalized", "GENERATION_RUN", runID,
+			nil, nil, input.FailureCode, step.TraceID,
+			map[string]any{"state": input.State, "operationId": input.OperationID},
+			p.now().UTC(),
+		)
 	})
 	return err
 }

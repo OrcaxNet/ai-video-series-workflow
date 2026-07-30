@@ -44,6 +44,10 @@ func main() {
 		orchestration.EpisodeProductionWorkflow,
 		workflow.RegisterOptions{Name: orchestration.WorkflowName},
 	)
+	temporalWorker.RegisterWorkflowWithOptions(
+		orchestration.ShotProductionWorkflow,
+		workflow.RegisterOptions{Name: orchestration.ShotWorkflowName},
+	)
 	activities := orchestration.NewProductionActivities(cfg.ProviderAdapterURL, store, store, artifacts)
 	temporalWorker.RegisterActivityWithOptions(activities.ValidateBatch, activity.RegisterOptions{Name: orchestration.ActivityValidateBatch})
 	temporalWorker.RegisterActivityWithOptions(activities.CompilePrompt, activity.RegisterOptions{Name: orchestration.ActivityCompilePrompt})
@@ -53,6 +57,8 @@ func main() {
 	temporalWorker.RegisterActivityWithOptions(activities.CreateShotReview, activity.RegisterOptions{Name: orchestration.ActivityCreateShotReview})
 	temporalWorker.RegisterActivityWithOptions(activities.EscalateShot, activity.RegisterOptions{Name: orchestration.ActivityEscalateShot})
 	temporalWorker.RegisterActivityWithOptions(activities.CreateGate3, activity.RegisterOptions{Name: orchestration.ActivityCreateGate3})
+	temporalWorker.RegisterActivityWithOptions(activities.CancelProviderJob, activity.RegisterOptions{Name: orchestration.ActivityCancelProviderJob})
+	temporalWorker.RegisterActivityWithOptions(activities.FinalizeShotRun, activity.RegisterOptions{Name: orchestration.ActivityFinalizeShotRun})
 
 	log.Printf("video Temporal worker listening (namespace=%s task_queue=%s)", cfg.Namespace, cfg.TaskQueue)
 	if err := temporalWorker.Run(worker.InterruptCh()); err != nil {

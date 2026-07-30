@@ -574,6 +574,10 @@ func (p *Postgres) CreateGenerationPlan(
 		if err != nil {
 			return controlplane.Stored[controlplane.GenerationPlan]{}, err
 		}
+		providerCallCount := shotCount * command.CandidatesPerShot
+		if err := requireExecutionPolicy(limits, command.ExecutionPolicy, providerCallCount); err != nil {
+			return controlplane.Stored[controlplane.GenerationPlan]{}, err
+		}
 		unitsMaximum := float64(durationMS) / 1000 * float64(command.CandidatesPerShot)
 		unitsMinimum := unitsMaximum
 		estimate := controlplane.CostEstimate{
@@ -605,10 +609,12 @@ func (p *Postgres) CreateGenerationPlan(
 			Candidates         int
 			Route              controlplane.ModelRouteSnapshot
 			Budget             controlplane.BudgetLimit
+			ExecutionPolicy    controlplane.ExecutionPolicy
 			PricingRuleVersion string
 		}{
 			command.SeriesID, command.EpisodeRevisionID, command.ShotSpecRevisionIDs,
-			command.CandidatesPerShot, command.RouteSnapshot, command.BudgetLimit, pricingVersion,
+			command.CandidatesPerShot, command.RouteSnapshot, command.BudgetLimit,
+			command.ExecutionPolicy, pricingVersion,
 		})
 		if err != nil {
 			return controlplane.Stored[controlplane.GenerationPlan]{}, err
@@ -618,8 +624,9 @@ func (p *Postgres) CreateGenerationPlan(
 			State:             state,
 			DryRun:            true,
 			ShotCount:         shotCount,
-			ProviderCallCount: shotCount * command.CandidatesPerShot,
+			ProviderCallCount: providerCallCount,
 			RouteSnapshot:     command.RouteSnapshot,
+			ExecutionPolicy:   command.ExecutionPolicy,
 			Estimate:          estimate,
 			BudgetDecision:    decision,
 			PlanHash:          planHash,
@@ -648,6 +655,7 @@ func (p *Postgres) CreateGenerationPlan(
 				"state":               state,
 				"budgetDecision":      decision,
 				"budgetLimit":         command.BudgetLimit,
+				"executionPolicy":     command.ExecutionPolicy,
 			}, now); err != nil {
 			return controlplane.Stored[controlplane.GenerationPlan]{}, err
 		}
@@ -742,7 +750,8 @@ func (p *Postgres) PrepareProduction(
 		if err := requireActiveProfile(ctx, tx, command.GenerationProfileRevisionID); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
-		if _, _, err := validateRouteSnapshot(ctx, tx, command.RouteSnapshot, now); err != nil {
+		_, limits, err := validateRouteSnapshot(ctx, tx, command.RouteSnapshot, now)
+		if err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 
@@ -780,6 +789,16 @@ func (p *Postgres) PrepareProduction(
 				"create a new plan for the selected provider route",
 			)
 		}
+		if planRecord.ExecutionPolicy != command.ExecutionPolicy {
+			return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"production execution policy differs from the immutable generation plan",
+				"use the exact territory, product form, and safety policy from the plan",
+			)
+		}
+		if err := requireExecutionPolicy(limits, command.ExecutionPolicy, planRecord.Plan.ProviderCallCount); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
 
 		shotIDs, err := parseUUIDs(command.ShotSpecRevisionIDs)
 		if err != nil {
@@ -810,7 +829,7 @@ func (p *Postgres) PrepareProduction(
 				"rebuild and approve the plan using the exact current shot revisions",
 			)
 		}
-		if err := requireShotAssetLicenses(ctx, tx, shotIDs, now); err != nil {
+		if err := requireShotAssetLicenses(ctx, tx, shotIDs, now, command.ExecutionPolicy); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 
@@ -824,6 +843,7 @@ func (p *Postgres) PrepareProduction(
 				"episodeRevisionId": command.EpisodeRevisionID,
 				"generationPlanId":  command.GenerationPlanID,
 				"shotCount":         len(shotIDs),
+				"executionPolicy":   command.ExecutionPolicy,
 			}, now); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
@@ -972,7 +992,8 @@ func (p *Postgres) CreateGenerationRun(
 				"create a new shot revision for the selected generation profile",
 			)
 		}
-		if _, _, err := validateRouteSnapshot(ctx, tx, command.RouteSnapshot, now); err != nil {
+		_, limits, err := validateRouteSnapshot(ctx, tx, command.RouteSnapshot, now)
+		if err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 		planRecord, err := readPlan(ctx, tx, command.GenerationPlanID)
@@ -994,7 +1015,20 @@ func (p *Postgres) CreateGenerationRun(
 				"use the exact within-budget plan route",
 			)
 		}
-		if err := requireAssetLicenses(ctx, tx, assetRefs, now); err != nil {
+		if planRecord.ExecutionPolicy != command.ExecutionPolicy {
+			return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"run execution policy differs from the immutable generation plan",
+				"use the exact territory, product form, and safety policy from the plan",
+			)
+		}
+		if err := requireExecutionPolicy(limits, command.ExecutionPolicy, 1); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if err := requireAssetLicenses(ctx, tx, assetRefs, now, command.ExecutionPolicy); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if err := requireBudgetApproval(ctx, tx, command.BudgetApprovalID, seriesID, episodeID); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 
@@ -1041,9 +1075,9 @@ func (p *Postgres) CreateGenerationRun(
 				(id, shot_spec_revision_id, prompt_snapshot_id, generation_profile_id, temporal_workflow_id,
 				 run_spec_digest, creative_attempt, state, fallback_reason, dry_run, budget_approval_id,
 				 trace_id, created_by, created_at)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, 'VALIDATED', NULLIF($8, ''), true, $9, $10, $11, $12)`,
+			VALUES ($1, $2, $3, $4, $5, $6, $7, 'VALIDATED', NULLIF($8, ''), false, $9, $10, $11, $12)`,
 			runID, shotSpecID, promptID, profileID, workflowID, runDigest, command.CreativeAttempt,
-			command.FallbackReasonCode, command.GenerationPlanID, traceID, command.Actor.ActorID, now,
+			command.FallbackReasonCode, command.BudgetApprovalID, traceID, command.Actor.ActorID, now,
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, translateWriteError("insert generation run", err)
 		}
@@ -1072,6 +1106,8 @@ func (p *Postgres) CreateGenerationRun(
 				"promptSnapshotId":   command.PromptSnapshotID,
 				"runSpecDigest":      runDigest,
 				"creativeAttempt":    command.CreativeAttempt,
+				"generationPlanId":   command.GenerationPlanID,
+				"executionPolicy":    command.ExecutionPolicy,
 				"operationId":        operation.OperationID,
 			}, now); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
@@ -1112,6 +1148,82 @@ func (p *Postgres) GetGenerationRun(ctx context.Context, runIDRaw string) (contr
 	return run, nil
 }
 
+func (p *Postgres) GetShotWorkflowRecord(
+	ctx context.Context,
+	runIDRaw string,
+) (controlplane.ShotWorkflowRecord, error) {
+	runID, err := uuid.Parse(runIDRaw)
+	if err != nil {
+		return controlplane.ShotWorkflowRecord{}, controlplane.NewNotFoundError("generation run", runIDRaw)
+	}
+	var record controlplane.ShotWorkflowRecord
+	var failureClass, failureCode, temporalWorkflowID *string
+	var routeJSON []byte
+	var planID string
+	err = p.pool.QueryRow(ctx, `
+		SELECT gr.id, gr.shot_spec_revision_id, gr.run_spec_digest, gr.creative_attempt,
+		       gr.state, gr.failure_class, gr.failure_code, gr.temporal_workflow_id,
+		       gr.trace_id, gr.created_at, ps.id, ps.content_hash,
+		       ga.model_snapshot, gr.budget_approval_id, audit.payload->>'generationPlanId'
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.prompt_snapshots ps ON ps.id = gr.prompt_snapshot_id
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.generation_run_id = gr.id AND ga.sequence = 1
+		JOIN LATERAL (
+			SELECT payload
+			FROM video_pipeline.audit_events
+			WHERE aggregate_type = 'GENERATION_RUN'
+			  AND aggregate_id = gr.id
+			  AND action = 'generation_run.created'
+			ORDER BY occurred_at
+			LIMIT 1
+		) audit ON true
+		WHERE gr.id = $1`,
+		runID,
+	).Scan(
+		&record.Run.RunID, &record.Run.ShotSpecRevisionID, &record.Run.RunSpecDigest,
+		&record.Run.CreativeAttempt, &record.Run.State, &failureClass, &failureCode,
+		&temporalWorkflowID, &record.Run.TraceID, &record.Run.CreatedAt,
+		&record.PromptSnapshotID, &record.PromptHash, &routeJSON,
+		&record.BudgetApprovalID, &planID,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.ShotWorkflowRecord{}, controlplane.NewNotFoundError("generation run workflow projection", runIDRaw)
+		}
+		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("read shot workflow projection: %w", err)
+	}
+	record.Run.FailureClass = valueOrEmpty(failureClass)
+	record.Run.FailureCode = valueOrEmpty(failureCode)
+	record.Run.TemporalWorkflowID = valueOrEmpty(temporalWorkflowID)
+	if err := json.Unmarshal(routeJSON, &record.RouteSnapshot); err != nil {
+		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("decode shot workflow route: %w", err)
+	}
+	plan, err := p.GetGenerationPlan(ctx, planID)
+	if err != nil {
+		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("read shot workflow plan: %w", err)
+	}
+	record.BudgetLimit = plan.BudgetLimit
+	return record, nil
+}
+
+func (p *Postgres) RequestRunPause(
+	ctx context.Context,
+	runIDRaw string,
+	expectedRevision int,
+	actor controlplane.Actor,
+	reasonCode string,
+	idempotency controlplane.Idempotency,
+	traceID string,
+) (controlplane.Stored[controlplane.Operation], error) {
+	return p.transitionRun(ctx, runIDRaw, expectedRevision, actor, reasonCode, "", idempotency, traceID, runTransition{
+		OperationType: "PAUSE_GENERATION_RUN",
+		Action:        "generation_run.pause_requested",
+		TargetState:   "PAUSED",
+		AllowedStates: map[string]struct{}{"QUEUED": {}, "RUNNING": {}, "RECONCILING": {}},
+	})
+}
+
 func (p *Postgres) RequestRunCancellation(
 	ctx context.Context,
 	runIDRaw string,
@@ -1126,7 +1238,7 @@ func (p *Postgres) RequestRunCancellation(
 		Action:        "generation_run.cancel_requested",
 		TargetState:   "CANCEL_REQUESTED",
 		AllowedStates: map[string]struct{}{
-			"VALIDATED": {}, "QUEUED": {}, "RUNNING": {}, "UNKNOWN": {}, "RECONCILING": {}, "REQUIRES_ACTION": {},
+			"VALIDATED": {}, "QUEUED": {}, "RUNNING": {}, "PAUSED": {}, "UNKNOWN": {}, "RECONCILING": {}, "REQUIRES_ACTION": {},
 		},
 	})
 }
@@ -1141,10 +1253,18 @@ func (p *Postgres) RequestRunResume(
 	traceID string,
 ) (controlplane.Stored[controlplane.Operation], error) {
 	if recoveryMode != "RECONCILE_HISTORY" && recoveryMode != "RETRY_INFRASTRUCTURE" {
+		if recoveryMode == "RESUME_PAUSED" {
+			return p.transitionRun(ctx, runIDRaw, expectedRevision, actor, "", recoveryMode, idempotency, traceID, runTransition{
+				OperationType: "RESUME_GENERATION_RUN",
+				Action:        "generation_run.resumed",
+				TargetState:   "RUNNING",
+				AllowedStates: map[string]struct{}{"PAUSED": {}},
+			})
+		}
 		return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
 			controlplane.CodeRecoveryActive,
 			"unsupported recoveryMode",
-			"use RECONCILE_HISTORY or RETRY_INFRASTRUCTURE",
+			"use RESUME_PAUSED, RECONCILE_HISTORY, or RETRY_INFRASTRUCTURE",
 		)
 	}
 	return p.transitionRun(ctx, runIDRaw, expectedRevision, actor, "", recoveryMode, idempotency, traceID, runTransition{
@@ -1599,17 +1719,55 @@ func (p *Postgres) MarkOperationStarted(ctx context.Context, operationIDRaw, wor
 	if err != nil {
 		return controlplane.NewNotFoundError("operation", operationIDRaw)
 	}
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		var aggregateType, operationType string
+		var aggregateID uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			UPDATE video_pipeline.operation_requests
+			SET state = 'RUNNING', temporal_workflow_id = $2,
+			    temporal_run_id = NULLIF($3, ''), updated_at = $4
+			WHERE id = $1 AND state = 'ACCEPTED'
+			RETURNING aggregate_type, aggregate_id, operation_type`,
+			operationID, workflowID, runID, p.now().UTC(),
+		).Scan(&aggregateType, &aggregateID, &operationType); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return struct{}{}, controlplane.NewConflictError(controlplane.CodeConflict, "operation is no longer ACCEPTED")
+			}
+			return struct{}{}, fmt.Errorf("mark operation running: %w", err)
+		}
+		if aggregateType == "GENERATION_RUN" && operationType == "CREATE_GENERATION_RUN" {
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_runs
+				SET state = CASE WHEN state = 'VALIDATED' THEN 'QUEUED' ELSE state END,
+				    temporal_workflow_id = $2, temporal_run_id = NULLIF($3, ''),
+				    started_at = COALESCE(started_at, $4)
+				WHERE id = $1`,
+				aggregateID, workflowID, runID, p.now().UTC(),
+			); err != nil {
+				return struct{}{}, fmt.Errorf("mark shot run queued: %w", err)
+			}
+		}
+		return struct{}{}, nil
+	})
+	return err
+}
+
+func (p *Postgres) MarkOperationSucceeded(ctx context.Context, operationIDRaw string) error {
+	operationID, err := uuid.Parse(operationIDRaw)
+	if err != nil {
+		return controlplane.NewNotFoundError("operation", operationIDRaw)
+	}
 	tag, err := p.pool.Exec(ctx, `
 		UPDATE video_pipeline.operation_requests
-		SET state = 'RUNNING', temporal_workflow_id = $2, temporal_run_id = NULLIF($3, ''), updated_at = $4
-		WHERE id = $1 AND state = 'ACCEPTED'`,
-		operationID, workflowID, runID, p.now().UTC(),
+		SET state = 'SUCCEEDED', updated_at = $2
+		WHERE id = $1 AND state IN ('ACCEPTED', 'RUNNING', 'CANCEL_REQUESTED')`,
+		operationID, p.now().UTC(),
 	)
 	if err != nil {
-		return fmt.Errorf("mark operation running: %w", err)
+		return fmt.Errorf("mark operation succeeded: %w", err)
 	}
 	if tag.RowsAffected() != 1 {
-		return controlplane.NewConflictError(controlplane.CodeConflict, "operation is no longer ACCEPTED")
+		return controlplane.NewConflictError(controlplane.CodeConflict, "operation is not active")
 	}
 	return nil
 }
@@ -1619,19 +1777,35 @@ func (p *Postgres) MarkOperationFailed(ctx context.Context, operationIDRaw, fail
 	if err != nil {
 		return controlplane.NewNotFoundError("operation", operationIDRaw)
 	}
-	tag, err := p.pool.Exec(ctx, `
-		UPDATE video_pipeline.operation_requests
-		SET state = 'FAILED', updated_at = $2
-		WHERE id = $1 AND state IN ('ACCEPTED', 'RUNNING')`,
-		operationID, p.now().UTC(),
-	)
-	if err != nil {
-		return fmt.Errorf("mark operation failed (%s): %w", failureCode, err)
-	}
-	if tag.RowsAffected() != 1 {
-		return controlplane.NewConflictError(controlplane.CodeConflict, "operation is not active")
-	}
-	return nil
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		var aggregateType, operationType string
+		var aggregateID uuid.UUID
+		if err := tx.QueryRow(ctx, `
+			UPDATE video_pipeline.operation_requests
+			SET state = 'FAILED', updated_at = $2
+			WHERE id = $1 AND state IN ('ACCEPTED', 'RUNNING')
+			RETURNING aggregate_type, aggregate_id, operation_type`,
+			operationID, p.now().UTC(),
+		).Scan(&aggregateType, &aggregateID, &operationType); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return struct{}{}, controlplane.NewConflictError(controlplane.CodeConflict, "operation is not active")
+			}
+			return struct{}{}, fmt.Errorf("mark operation failed (%s): %w", failureCode, err)
+		}
+		if aggregateType == "GENERATION_RUN" && operationType == "CREATE_GENERATION_RUN" {
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_runs
+				SET state = 'FAILED', failure_class = 'INFRASTRUCTURE',
+				    failure_code = $2, finished_at = $3
+				WHERE id = $1 AND state IN ('VALIDATED', 'QUEUED', 'RUNNING')`,
+				aggregateID, failureCode, p.now().UTC(),
+			); err != nil {
+				return struct{}{}, fmt.Errorf("fail generation run after workflow start failure: %w", err)
+			}
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 func withSerializable[T any](ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) (T, error)) (T, error) {
@@ -1833,21 +2007,25 @@ func insertAuditAndOutbox(
 
 func eventTypeForAction(action string) (string, error) {
 	eventTypes := map[string]string{
-		"series.created":                    "video.series.created.v1",
-		"source_revision.created":           "video.revision.created.v1",
-		"generation_plan.created":           "video.generation-plan.created.v1",
-		"episode.production.requested":      "video.production.requested.v1",
-		"generation_run.created":            "video.run.state-changed.v1",
-		"generation_run.cancel_requested":   "video.run.state-changed.v1",
-		"generation_run.recovery_requested": "video.run.state-changed.v1",
-		"prompt_snapshot.created":           "video.revision.created.v1",
-		"provider_job.completed":            "video.provider-job.state-changed.v1",
-		"qc_report.created":                 "video.qc.completed.v1",
-		"manifest.created":                  "video.revision.created.v1",
-		"approval.decided":                  "video.approval.decided.v1",
-		"manifest.locked":                   "video.manifest.locked.v1",
-		"dependency.stale":                  "video.dependency.stale.v1",
-		"workflow_step.completed":           "video.workflow-step.completed.v1",
+		"series.created":                       "video.series.created.v1",
+		"source_revision.created":              "video.revision.created.v1",
+		"generation_plan.created":              "video.generation-plan.created.v1",
+		"episode.production.requested":         "video.production.requested.v1",
+		"generation_run.created":               "video.run.state-changed.v1",
+		"generation_run.cancel_requested":      "video.run.state-changed.v1",
+		"generation_run.recovery_requested":    "video.run.state-changed.v1",
+		"generation_run.pause_requested":       "video.run.state-changed.v1",
+		"generation_run.resumed":               "video.run.state-changed.v1",
+		"generation_run.workflow_finalized":    "video.run.state-changed.v1",
+		"prompt_snapshot.created":              "video.revision.created.v1",
+		"provider_job.completed":               "video.provider-job.state-changed.v1",
+		"provider_job.cancellation_reconciled": "video.provider-job.state-changed.v1",
+		"qc_report.created":                    "video.qc.completed.v1",
+		"manifest.created":                     "video.revision.created.v1",
+		"approval.decided":                     "video.approval.decided.v1",
+		"manifest.locked":                      "video.manifest.locked.v1",
+		"dependency.stale":                     "video.dependency.stale.v1",
+		"workflow_step.completed":              "video.workflow-step.completed.v1",
 	}
 	eventType, ok := eventTypes[action]
 	if !ok {
@@ -2091,7 +2269,13 @@ func requireBudgetApproval(
 	return nil
 }
 
-func requireShotAssetLicenses(ctx context.Context, tx pgx.Tx, shotIDs []uuid.UUID, now time.Time) error {
+func requireShotAssetLicenses(
+	ctx context.Context,
+	tx pgx.Tx,
+	shotIDs []uuid.UUID,
+	now time.Time,
+	policy controlplane.ExecutionPolicy,
+) error {
 	rows, err := tx.Query(ctx,
 		`SELECT asset_version_refs FROM video_pipeline.shot_spec_revisions WHERE id = ANY($1::uuid[])`,
 		shotIDs,
@@ -2111,10 +2295,16 @@ func requireShotAssetLicenses(ctx context.Context, tx pgx.Tx, shotIDs []uuid.UUI
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate shot asset references: %w", err)
 	}
-	return requireAssetLicenses(ctx, tx, assetIDs, now)
+	return requireAssetLicenses(ctx, tx, assetIDs, now, policy)
 }
 
-func requireAssetLicenses(ctx context.Context, tx pgx.Tx, assetIDs []uuid.UUID, now time.Time) error {
+func requireAssetLicenses(
+	ctx context.Context,
+	tx pgx.Tx,
+	assetIDs []uuid.UUID,
+	now time.Time,
+	policy controlplane.ExecutionPolicy,
+) error {
 	if len(assetIDs) == 0 {
 		return nil
 	}
@@ -2126,7 +2316,8 @@ func requireAssetLicenses(ctx context.Context, tx pgx.Tx, assetIDs []uuid.UUID, 
 				OR av.status NOT IN ('APPROVED', 'LOCKED')
 				OR ls.id IS NULL
 				OR ls.policy_status <> 'ALLOWED'
-				OR NOT ls.commercial_use
+				OR ($4 = 'COMMERCIAL_RELEASE' AND NOT ls.commercial_use)
+				OR NOT ($3 = ANY(ls.territories))
 				OR (ls.expires_at IS NOT NULL AND ls.expires_at <= $2)
 			),
 			COUNT(*) FILTER (WHERE
@@ -2134,6 +2325,7 @@ func requireAssetLicenses(ctx context.Context, tx pgx.Tx, assetIDs []uuid.UUID, 
 				AND (
 					ca.id IS NULL
 					OR ca.status <> 'ACTIVE'
+					OR NOT ($3 = ANY(ca.territories))
 					OR (ca.expires_at IS NOT NULL AND ca.expires_at <= $2)
 				)
 			)
@@ -2141,25 +2333,76 @@ func requireAssetLicenses(ctx context.Context, tx pgx.Tx, assetIDs []uuid.UUID, 
 		LEFT JOIN video_pipeline.asset_versions av ON av.id = requested.id
 		LEFT JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
 		LEFT JOIN video_pipeline.consent_assets ca ON ca.id = av.consent_asset_id`,
-		assetIDs, now,
+		assetIDs, now, policy.TargetTerritory, policy.ProductForm,
 	).Scan(&invalidLicense, &invalidConsent); err != nil {
 		return fmt.Errorf("validate asset licenses: %w", err)
 	}
 	if invalidLicense > 0 {
 		return controlplane.NewPolicyError(
 			controlplane.CodeLicenseBlocked,
-			"one or more asset revisions are missing, unapproved, unlicensed, or expired",
-			"replace or approve every exact asset revision before queueing",
+			"one or more asset revisions are missing, unapproved, unlicensed, expired, or incompatible with the target territory/product form",
+			"replace or approve every exact asset revision for the requested territory and product form before queueing",
 		)
 	}
 	if invalidConsent > 0 {
 		return controlplane.NewPolicyError(
 			controlplane.CodeConsentRequired,
-			"one or more bound consent records are revoked, expired, or unavailable",
-			"renew or replace the consent record before queueing",
+			"one or more bound consent records are revoked, expired, unavailable, or incompatible with the target territory",
+			"renew or replace the consent record for the requested territory before queueing",
 		)
 	}
 	return nil
+}
+
+func requireExecutionPolicy(
+	limits map[string]any,
+	policy controlplane.ExecutionPolicy,
+	requestedCalls int,
+) error {
+	if policy.TargetTerritory == "" || !containsLimitString(limits, "allowedTerritories", policy.TargetTerritory) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeRegionUnavailable,
+			"the frozen provider capability does not allow the target territory",
+			"select a route whose immutable capability snapshot allows the target territory",
+		)
+	}
+	if policy.ProductForm == "" || !containsLimitString(limits, "productForms", policy.ProductForm) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeCapability,
+			"the frozen provider capability does not allow the requested product form",
+			"select a compatible route or product form",
+		)
+	}
+	if !policy.ContentSafetyApproved ||
+		!containsLimitString(limits, "contentSafetyPolicyVersions", policy.ContentSafetyPolicyVersion) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeContentBlocked,
+			"content safety approval is missing or incompatible with the route policy",
+			"obtain fail-closed safety approval for a policy version accepted by the route",
+		)
+	}
+	remainingCalls, ok := numericLimit(limits, "remainingCalls")
+	if !ok || remainingCalls < float64(requestedCalls) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeQuotaExceeded,
+			"the frozen provider quota cannot cover the requested calls",
+			"reduce the batch or confirm a capability snapshot with sufficient quota",
+		)
+	}
+	return nil
+}
+
+func containsLimitString(limits map[string]any, key, expected string) bool {
+	values, ok := limits[key].([]any)
+	if !ok {
+		return false
+	}
+	for _, value := range values {
+		if text, ok := value.(string); ok && text == expected {
+			return true
+		}
+	}
+	return false
 }
 
 func validateApprovalBindings(
@@ -2650,11 +2893,12 @@ func decodePlanRecord(
 	auditPayload []byte,
 ) (controlplane.GenerationPlanRecord, error) {
 	var audit struct {
-		EpisodeRevisionID   string                   `json:"episodeRevisionId"`
-		ShotSpecRevisionIDs []string                 `json:"shotSpecRevisionIds"`
-		CandidatesPerShot   int                      `json:"candidatesPerShot"`
-		PricingRuleVersion  string                   `json:"pricingRuleVersion"`
-		BudgetLimit         controlplane.BudgetLimit `json:"budgetLimit"`
+		EpisodeRevisionID   string                       `json:"episodeRevisionId"`
+		ShotSpecRevisionIDs []string                     `json:"shotSpecRevisionIds"`
+		CandidatesPerShot   int                          `json:"candidatesPerShot"`
+		PricingRuleVersion  string                       `json:"pricingRuleVersion"`
+		BudgetLimit         controlplane.BudgetLimit     `json:"budgetLimit"`
+		ExecutionPolicy     controlplane.ExecutionPolicy `json:"executionPolicy"`
 	}
 	if err := json.Unmarshal(auditPayload, &audit); err != nil {
 		return controlplane.GenerationPlanRecord{}, fmt.Errorf("decode generation plan evidence: %w", err)
@@ -2670,6 +2914,7 @@ func decodePlanRecord(
 		CandidatesPerShot:   audit.CandidatesPerShot,
 		PricingRuleVersion:  audit.PricingRuleVersion,
 		BudgetLimit:         audit.BudgetLimit,
+		ExecutionPolicy:     audit.ExecutionPolicy,
 	}, nil
 }
 
