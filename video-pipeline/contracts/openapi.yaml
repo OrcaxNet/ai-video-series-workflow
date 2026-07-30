@@ -5,9 +5,12 @@ info:
   description: |
     Contract-first API for immutable video-production revisions, approvals,
     Temporal operations, generation runs, cancellation/recovery, stale impact,
-    and lineage manifests. The runnable FLO-108 skeleton implements the system
-    discovery/health subset; mutation operations are frozen here for incremental
-    implementation without contract drift.
+    and lineage manifests. FLO-103 implements the Series/Source,
+    GenerationPlan, Episode production batch, GenerationRun
+    cancel/resume/query, Approval, Operation, stale-impact, and Manifest
+    endpoints against PostgreSQL and Temporal. Provider administration and
+    provider-job callback endpoints remain frozen contracts for their owning
+    adapter increment.
 servers:
   - url: http://localhost:18080
     description: Local video control plane
@@ -551,6 +554,9 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: |
+        Production accepts HS256 tokens with sub, role, aud=video-control-plane,
+        and an unexpired exp. Mutation request actor must match signed sub/role.
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -1081,7 +1087,7 @@ components:
     CreateApprovalDecisionRequest:
       type: object
       additionalProperties: false
-      required: [schemaVersion, seriesId, gate, decision, reasonCode, bindings, actor]
+      required: [schemaVersion, seriesId, episodeId, gate, decision, reasonCode, bindings, actor]
       properties:
         schemaVersion:
           const: v1

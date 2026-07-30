@@ -113,6 +113,10 @@ Outbox 是发布来源，at-least-once delivery，consumer 按 `eventId` 去重�
 | 事件 | 生产事务 | 主要消费者 |
 |---|---|---|
 | `video.revision.created.v1` | revision + dependency | UI projection、stale resolver |
+| `video.series.created.v1` | series + operation | UI projection |
+| `video.generation-plan.created.v1` | plan + budget decision | UI、budget |
+| `video.production.requested.v1` | operation + G2 bindings | Temporal、UI |
+| `video.workflow-step.completed.v1` | Activity journal result | recovery、ops |
 | `video.approval.decided.v1` | Gate decision/bindings | Temporal、policy |
 | `video.run.state-changed.v1` | Run transition | UI、metrics |
 | `video.provider-job.state-changed.v1` | ProviderJob transition | poll scheduler、UI、ops |
@@ -142,6 +146,8 @@ Outbox 是发布来源，at-least-once delivery，consumer 按 `eventId` 去重�
 4. DB 只在确认旧应用兼容扩展列后回滚；
 5. Provider 任务继续由 reconciliation 读取 task ID；
 6. Artifact/Manifest 均内容寻址，可回退业务引用而不覆盖文件。
+
+本增量的 schema 回滚顺序是先停写入，再执行 migration v2 down；down 只移除不可变 trigger、Manifest Secret/lock check 和 Artifact retention 元数据，不删除任何 revision、Audit、Manifest 或 CAS 字节。仍需不可变保证时不得单独回滚 v2 后继续写流量。
 
 ## 8. QA 契约边界
 

@@ -17,6 +17,8 @@ const (
 	WorkflowName        = "video.production.episode.v1"
 	DefaultTaskQueue    = "video-production-v1"
 	Gate3DecisionSignal = "video.production.gate3-decision.v1"
+	ShotDecisionSignal  = "video.production.shot-decision.v1"
+	ControlSignal       = "video.production.control.v1"
 	StatusQuery         = "video.production.status.v1"
 
 	ActivityValidateBatch      = "video.activity.validate-batch.v1"
@@ -42,6 +44,7 @@ type EpisodeProductionInput struct {
 	BudgetMaximumMicros  int64                          `json:"budgetMaximumMicros"`
 	BudgetCurrency       string                         `json:"budgetCurrency"`
 	TraceID              string                         `json:"traceId"`
+	RequireShotApproval  bool                           `json:"requireShotApproval,omitempty"`
 }
 
 // EpisodeProductionResult is the durable terminal or intervention state.
@@ -64,8 +67,9 @@ type ShotState struct {
 
 // WorkflowStatus is safe for UI polling and operational diagnostics.
 type WorkflowStatus struct {
-	State string               `json:"state"`
-	Shots map[string]ShotState `json:"shots"`
+	State  string               `json:"state"`
+	Paused bool                 `json:"paused"`
+	Shots  map[string]ShotState `json:"shots"`
 }
 
 // Gate3Decision is sent by the control plane after the exact cut, manifest,
@@ -75,6 +79,26 @@ type Gate3Decision struct {
 	Approved   bool   `json:"approved"`
 	ReasonCode string `json:"reasonCode,omitempty"`
 	ActorID    string `json:"actorId"`
+}
+
+// ShotDecision is an immutable Q1 decision for one exact run and artifact.
+type ShotDecision struct {
+	DecisionID         string `json:"decisionId"`
+	ShotSpecRevisionID string `json:"shotSpecRevisionId"`
+	RunID              string `json:"runId"`
+	Approved           bool   `json:"approved"`
+	ReasonCode         string `json:"reasonCode,omitempty"`
+	ActorID            string `json:"actorId"`
+}
+
+// WorkflowControl pauses or resumes at deterministic Activity boundaries.
+// Cancellation continues to use Temporal cancellation so in-flight Activities
+// receive context cancellation and their heartbeat details remain recoverable.
+type WorkflowControl struct {
+	CommandID  string `json:"commandId"`
+	Action     string `json:"action"`
+	ActorID    string `json:"actorId"`
+	ReasonCode string `json:"reasonCode,omitempty"`
 }
 
 // PromptSnapshotRef identifies an immutable compiled prompt.
@@ -123,6 +147,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	}); err != nil {
 		return EpisodeProductionResult{}, fmt.Errorf("register status query: %w", err)
 	}
+	controlChannel := workflow.GetSignalChannel(ctx, ControlSignal)
 
 	baseOptions := workflow.ActivityOptions{
 		StartToCloseTimeout: 2 * time.Minute,
@@ -149,6 +174,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityValidateBatch, input).Get(ctx, nil); err != nil {
 		return EpisodeProductionResult{}, err
 	}
+	waitForResume(ctx, &status, controlChannel)
 
 	status.State = "PRODUCING"
 	lockedRunIDs := make([]string, 0, len(input.ShotSpecRevisionIDs))
@@ -162,6 +188,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 		if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCompilePrompt, compileInput).Get(ctx, &prompt); err != nil {
 			return EpisodeProductionResult{}, err
 		}
+		waitForResume(ctx, &status, controlChannel)
 
 		var accepted bool
 		for creativeAttempt := 1; creativeAttempt <= 2; creativeAttempt++ {
@@ -180,6 +207,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateRun, createInput).Get(ctx, &run); err != nil {
 				return EpisodeProductionResult{}, err
 			}
+			waitForResume(ctx, &status, controlChannel)
 			shotStatus.State = "RUNNING"
 			shotStatus.RunID = run.RunID
 			status.Shots[shotID] = shotStatus
@@ -199,6 +227,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, providerOptions), ActivityExecuteProviderJob, dispatchInput).Get(ctx, &generated); err != nil {
 				return EpisodeProductionResult{}, err
 			}
+			waitForResume(ctx, &status, controlChannel)
 
 			shotStatus.State = "QC_PENDING"
 			shotStatus.ArtifactDigest = generated.ArtifactDigest
@@ -209,6 +238,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			}).Get(ctx, &qc); err != nil {
 				return EpisodeProductionResult{}, err
 			}
+			waitForResume(ctx, &status, controlChannel)
 			if qc.Passed {
 				if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateShotReview, CreateReviewInput{
 					ShotSpecRevisionID: shotID,
@@ -218,7 +248,18 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 				}).Get(ctx, nil); err != nil {
 					return EpisodeProductionResult{}, err
 				}
-				shotStatus.State = "REVIEW"
+				shotStatus.State = "WAITING_Q1"
+				status.Shots[shotID] = shotStatus
+				if input.RequireShotApproval {
+					decision := waitForShotDecision(ctx, &status, controlChannel, shotID, run.RunID)
+					if !decision.Approved {
+						shotStatus.State = "Q1_REJECTED"
+						shotStatus.FailureCode = decision.ReasonCode
+						status.Shots[shotID] = shotStatus
+						continue
+					}
+				}
+				shotStatus.State = "APPROVED"
 				status.Shots[shotID] = shotStatus
 				lockedRunIDs = append(lockedRunIDs, run.RunID)
 				accepted = true
@@ -256,8 +297,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 		return EpisodeProductionResult{}, err
 	}
 
-	var gate3 Gate3Decision
-	workflow.GetSignalChannel(ctx, Gate3DecisionSignal).Receive(ctx, &gate3)
+	gate3 := waitForGate3Decision(ctx, &status, controlChannel)
 	if gate3.DecisionID == "" || gate3.ActorID == "" {
 		return EpisodeProductionResult{}, temporal.NewNonRetryableApplicationError(
 			"invalid G3 decision signal", "VALIDATION_ERROR", errors.New("decisionId and actorId are required"),
@@ -280,6 +320,96 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 		Gate3Decision: &gate3,
 		Shots:         status.Shots,
 	}, nil
+}
+
+func waitForResume(ctx workflow.Context, status *WorkflowStatus, controls workflow.ReceiveChannel) {
+	var command WorkflowControl
+	for controls.ReceiveAsync(&command) {
+		applyControl(status, command)
+	}
+	if !status.Paused {
+		return
+	}
+	previous := status.State
+	status.State = "PAUSED"
+	for status.Paused {
+		controls.Receive(ctx, &command)
+		applyControl(status, command)
+	}
+	status.State = previous
+}
+
+func applyControl(status *WorkflowStatus, command WorkflowControl) {
+	if command.CommandID == "" || command.ActorID == "" {
+		return
+	}
+	switch command.Action {
+	case "PAUSE":
+		status.Paused = true
+	case "RESUME":
+		status.Paused = false
+	}
+}
+
+func waitForShotDecision(
+	ctx workflow.Context,
+	status *WorkflowStatus,
+	controls workflow.ReceiveChannel,
+	shotID string,
+	runID string,
+) ShotDecision {
+	decisions := workflow.GetSignalChannel(ctx, ShotDecisionSignal)
+	for {
+		waitForResume(ctx, status, controls)
+		var decision ShotDecision
+		selector := workflow.NewSelector(ctx)
+		selector.AddReceive(decisions, func(channel workflow.ReceiveChannel, _ bool) {
+			channel.Receive(ctx, &decision)
+		})
+		selector.AddReceive(controls, func(channel workflow.ReceiveChannel, _ bool) {
+			var command WorkflowControl
+			channel.Receive(ctx, &command)
+			applyControl(status, command)
+		})
+		selector.Select(ctx)
+		if status.Paused {
+			continue
+		}
+		if decision.DecisionID != "" &&
+			decision.ActorID != "" &&
+			decision.ShotSpecRevisionID == shotID &&
+			decision.RunID == runID {
+			return decision
+		}
+	}
+}
+
+func waitForGate3Decision(
+	ctx workflow.Context,
+	status *WorkflowStatus,
+	controls workflow.ReceiveChannel,
+) Gate3Decision {
+	decisions := workflow.GetSignalChannel(ctx, Gate3DecisionSignal)
+	for {
+		waitForResume(ctx, status, controls)
+		var decision Gate3Decision
+		selector := workflow.NewSelector(ctx)
+		selector.AddReceive(decisions, func(channel workflow.ReceiveChannel, _ bool) {
+			channel.Receive(ctx, &decision)
+		})
+		selector.AddReceive(controls, func(channel workflow.ReceiveChannel, _ bool) {
+			var command WorkflowControl
+			channel.Receive(ctx, &command)
+			applyControl(status, command)
+		})
+		selector.Select(ctx)
+		if status.Paused {
+			continue
+		}
+		if decision.DecisionID != "" && decision.ActorID != "" {
+			return decision
+		}
+	}
 }
 
 // Activity inputs are explicit and version-independent product contracts.

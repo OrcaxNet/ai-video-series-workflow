@@ -12,7 +12,7 @@ make video-down
 
 ```text
 PostgreSQL healthy
-  → migration v1 clean
+  → migration v2 clean
 Temporal healthy
 Mock Provider healthy
   → Orchestrator Worker registered
@@ -25,7 +25,12 @@ Mock Provider healthy
 |---|---|---|
 | `VIDEO_CONTROL_PLANE_HTTP_ADDRESS` | `:8080` | Control Plane listen |
 | `VIDEO_POSTGRES_ADDRESS` | `postgres:5432` | 仅 host:port；凭证由独立 DSN/Secret 提供 |
+| `VIDEO_POSTGRES_DSN` | 未设置 | 可选的完整 DSN；生产从 Secret 注入且禁止记录 |
 | `VIDEO_TEMPORAL_ADDRESS` | `temporal:7233` | Temporal |
+| `VIDEO_TEMPORAL_NAMESPACE` | `default` | Workflow namespace |
+| `VIDEO_TEMPORAL_TASK_QUEUE` | `video-production-v1` | 控制面与 worker 共享 queue |
+| `VIDEO_AUTH_HMAC_SECRET` | 本地未设置 | 生产必填、至少 32 bytes；只从 Secret manager 注入 |
+| `VIDEO_AUTH_AUDIENCE` | `video-control-plane` | JWT `aud` 精确值 |
 | `VIDEO_PROVIDER_ADAPTER_URL` | `http://mock-provider:8090` | Provider-neutral adapter |
 | `VIDEO_ARTIFACT_ROOT` | `/var/lib/video-pipeline/artifacts` | 本地 CAS |
 | `ARK_API_KEY` | 未设置 | 火山方舟；只显式注入 |
@@ -41,6 +46,8 @@ Mock Provider healthy
 - 将 Secret 写入 `.env.video.example`、数据库、日志、trace、error、fixture、Manifest；
 - 通过 UI 返回 Secret；
 - 将 signed download URL 写入 outbox/history。
+
+生产业务 API 要求 HS256 Bearer JWT，并校验 `sub`、RBAC `role`、`aud`、`exp`；mutation body 的 `actor` 必须与签名 claims 完全一致，不能由调用方自报身份。`local/development/test` 且未配置认证 Secret 时才允许无 token 的开发模式；`VIDEO_ENVIRONMENT=production` 缺少 Secret 会启动失败。健康、系统信息和脱敏 Provider 状态保持公开。
 
 `.env.video` 已被 `.gitignore` 忽略，且只能用于非生产本地值。生产使用 Secret manager/容器 secret injection。
 
@@ -120,6 +127,7 @@ Metrics：
 - estimate/reservation/actual/release、unverified cost；
 - per provider/model/capability success/429/5xx；
 - CAS bytes/disk headroom、Temporal backlog、outbox lag；
+- Activity journal incomplete age、input-hash conflict；
 - QC pass、Q1/Gate cycle time、3-shot episode completion。
 
 Alerts：
@@ -148,9 +156,10 @@ Alerts：
 2. 查 `UNKNOWN/QUEUED/RUNNING` ProviderJob；
 3. 对已有 CAS hash 先核验；
 4. 用已保存 upstream task ID poll；
-5. 禁止批量 create replacement jobs；
-6. reconcile callback receipts/cost；
-7. 校验 manifests 和 revision dependencies。
+5. 对 incomplete Activity journal 使用同一 JobID reconcile；
+6. 禁止批量 create replacement jobs；
+7. reconcile callback receipts/cost；
+8. 校验 manifests 和 revision dependencies。
 
 RPO/RTO 需在部署环境 SLO 中冻结；M0 只保证流程可演练。
 

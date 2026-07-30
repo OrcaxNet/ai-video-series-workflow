@@ -93,6 +93,8 @@ stateDiagram-v2
 
 Temporal Activity retry 策略：initial 1s、coefficient 2、max 30s、max 3。Provider `Retry-After` 优先于本地退避。Activity heartbeat 保存 phase、ProviderJob ID、upstream task ID、state、progress；不保存 Prompt 或 Secret。
 
+每个 Activity 还以稳定的 `workflowId + activityId` 在 PostgreSQL 预留 journal：只保存输入 SHA-256；成功结果、审计与版本化 outbox 在一个 serializable transaction 中提交。重试先读取已提交结果；若 submit 后进程崩溃但 journal 尚未完成，则使用相同 provider JobID 对账，禁止创建第二个付费任务。相同 ActivityID 出现不同输入 hash 会以冲突终止，避免代码或历史漂移被静默覆盖。
+
 ## 5. UNKNOWN reconciliation
 
 发生以下任一情况必须进入 `UNKNOWN`：
@@ -111,7 +113,7 @@ Temporal Activity retry 策略：initial 1s、coefficient 2、max 30s、max 3。
 5. 仍未知则保留 `UNKNOWN`、安排下一次对账并展示人工动作；
 6. 禁止重新调用 create task，除非人工证明未创建并新建 attempt。
 
-进程重启后 Temporal history 与 ProviderJob 表共同恢复；成功产物重复调用率目标为 0。
+进程重启后 Temporal history、PostgreSQL Activity journal 与 ProviderJob 映射共同恢复；成功产物重复调用率目标为 0。
 
 ## 6. Callback 与 polling 并存
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -15,14 +16,33 @@ import (
 	"go.temporal.io/sdk/temporal"
 )
 
-// Activities is the executable local skeleton for the Activity boundary.
-// Production implementations persist through the control-plane repository;
-// this version keeps no business truth and delegates only versioned provider
-// jobs. The adapter URL can target the included mock or a remote-provider
-// adapter; credentials never enter workflow inputs.
+// WorkflowStep identifies one durable Temporal Activity execution. ActivityID
+// is stable across infrastructure retries, while ActivityType is useful for
+// audit and operations views.
+type WorkflowStep struct {
+	WorkflowID   string
+	ActivityID   string
+	ActivityType string
+	TraceID      string
+}
+
+// WorkflowStepJournal is the PostgreSQL durability boundary around Activities.
+// Begin returns a previously committed JSON result when a Temporal retry has
+// already completed the step. An existing in-progress record is intentionally
+// not considered complete: the Activity reconciles its idempotent provider job.
+type WorkflowStepJournal interface {
+	BeginWorkflowStep(context.Context, WorkflowStep, string) (json.RawMessage, bool, error)
+	CompleteWorkflowStep(context.Context, WorkflowStep, string, json.RawMessage) error
+}
+
+// Activities executes side effects at the Temporal Activity boundary. Temporal
+// persists orchestration history; Journal persists an independently queryable
+// input digest, result, audit record, and outbox event. Credentials never enter
+// workflow inputs or the journal.
 type Activities struct {
 	ProviderAdapterURL string
 	HTTPClient         *http.Client
+	Journal            WorkflowStepJournal
 }
 
 // NewActivities creates bounded Activity clients.
@@ -30,55 +50,76 @@ func NewActivities(providerAdapterURL string) *Activities {
 	return &Activities{ProviderAdapterURL: providerAdapterURL, HTTPClient: mockprovider.DefaultHTTPClient()}
 }
 
+// NewActivitiesWithJournal creates production Activities with durable step
+// replay. A nil journal remains useful for isolated workflow tests.
+func NewActivitiesWithJournal(providerAdapterURL string, journal WorkflowStepJournal) *Activities {
+	activities := NewActivities(providerAdapterURL)
+	activities.Journal = journal
+	return activities
+}
+
 // ValidateBatch rejects unversioned or unapproved production inputs.
-func (a *Activities) ValidateBatch(_ context.Context, input EpisodeProductionInput) error {
-	return validateWorkflowInput(input)
+func (a *Activities) ValidateBatch(ctx context.Context, input EpisodeProductionInput) error {
+	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
+		return struct{}{}, validateWorkflowInput(input)
+	})
+	return err
 }
 
 // CompilePrompt returns an immutable deterministic placeholder snapshot. The
 // production compiler persists the full effective-context and evidence chain.
-func (a *Activities) CompilePrompt(_ context.Context, input CompilePromptInput) (PromptSnapshotRef, error) {
-	if input.ShotSpecRevisionID == "" || input.GenerationProfileRef == "" {
-		return PromptSnapshotRef{}, errors.New("shotSpecRevisionId and generationProfileRef are required")
-	}
-	sum := sha256.Sum256([]byte(input.ShotSpecRevisionID + "\x00" + input.GenerationProfileRef))
-	digest := hex.EncodeToString(sum[:])
-	return PromptSnapshotRef{ID: "prompt-" + digest[:16], Digest: digest}, nil
+func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput) (PromptSnapshotRef, error) {
+	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (PromptSnapshotRef, error) {
+		if input.ShotSpecRevisionID == "" || input.GenerationProfileRef == "" {
+			return PromptSnapshotRef{}, errors.New("shotSpecRevisionId and generationProfileRef are required")
+		}
+		sum := sha256.Sum256([]byte(input.ShotSpecRevisionID + "\x00" + input.GenerationProfileRef))
+		digest := hex.EncodeToString(sum[:])
+		return PromptSnapshotRef{ID: "prompt-" + digest[:16], Digest: digest}, nil
+	})
 }
 
 // CreateRun creates deterministic IDs for the runnable skeleton. A production
 // repository makes this an idempotent PostgreSQL transaction with an outbox row.
-func (a *Activities) CreateRun(_ context.Context, input CreateRunInput) (GenerationRunRef, error) {
-	if input.CreativeAttempt < 1 || input.CreativeAttempt > 2 {
-		return GenerationRunRef{}, errors.New("creativeAttempt must be 1 or 2")
-	}
-	if err := input.Route.Validate(providercontract.CapabilityVideo); err != nil {
-		return GenerationRunRef{}, errors.New("a frozen video.primary route is required")
-	}
-	material := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d",
-		input.ShotSpecRevisionID,
-		input.PromptSnapshot.Digest,
-		input.GenerationProfileRef,
-		input.Route.CapabilityAlias,
-		input.Route.Provider,
-		input.Route.ModelID,
-		input.Route.RouteVersion,
-		input.Route.CapabilityHash,
-		input.CreativeAttempt,
-	)
-	sum := sha256.Sum256([]byte(material))
-	digest := hex.EncodeToString(sum[:])
-	return GenerationRunRef{
-		RunID:         "run-" + digest[:16],
-		RunSpecDigest: digest,
-		Attempt:       input.CreativeAttempt,
-	}, nil
+func (a *Activities) CreateRun(ctx context.Context, input CreateRunInput) (GenerationRunRef, error) {
+	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (GenerationRunRef, error) {
+		if input.CreativeAttempt < 1 || input.CreativeAttempt > 2 {
+			return GenerationRunRef{}, errors.New("creativeAttempt must be 1 or 2")
+		}
+		if err := input.Route.Validate(providercontract.CapabilityVideo); err != nil {
+			return GenerationRunRef{}, errors.New("a frozen video.primary route is required")
+		}
+		material := fmt.Sprintf("%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d",
+			input.ShotSpecRevisionID,
+			input.PromptSnapshot.Digest,
+			input.GenerationProfileRef,
+			input.Route.CapabilityAlias,
+			input.Route.Provider,
+			input.Route.ModelID,
+			input.Route.RouteVersion,
+			input.Route.CapabilityHash,
+			input.CreativeAttempt,
+		)
+		sum := sha256.Sum256([]byte(material))
+		digest := hex.EncodeToString(sum[:])
+		return GenerationRunRef{
+			RunID:         "run-" + digest[:16],
+			RunSpecDigest: digest,
+			Attempt:       input.CreativeAttempt,
+		}, nil
+	})
 }
 
 // ExecuteProviderJob submits and reconciles one idempotent remote API job.
 // Activity retries reuse jobId and upstreamTaskId, so they never create a new
 // paid attempt. UNKNOWN is polled; it is not treated as a failed generation.
 func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
+	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (ProviderResult, error) {
+		return a.executeProviderJob(ctx, input)
+	})
+}
+
+func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
 	if a.HTTPClient == nil {
 		return ProviderResult{}, errors.New("provider HTTP client is required")
 	}
@@ -185,36 +226,99 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 
 // RunAutomaticQC is deliberately conservative in the skeleton: a committed,
 // correctly addressed mock artifact passes structural QC only.
-func (a *Activities) RunAutomaticQC(_ context.Context, input RunQCInput) (QCResult, error) {
-	if input.Provider.ArtifactDigest == "" || input.Provider.ArtifactURI == "" {
-		return QCResult{Passed: false, FailureCode: "QC_MEDIA_MISSING"}, nil
-	}
-	return QCResult{Passed: true}, nil
+func (a *Activities) RunAutomaticQC(ctx context.Context, input RunQCInput) (QCResult, error) {
+	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (QCResult, error) {
+		if input.Provider.ArtifactDigest == "" || input.Provider.ArtifactURI == "" {
+			return QCResult{Passed: false, FailureCode: "QC_MEDIA_MISSING"}, nil
+		}
+		return QCResult{Passed: true}, nil
+	})
 }
 
 // CreateShotReview is a typed boundary for the control-plane ReviewTask write.
-func (a *Activities) CreateShotReview(_ context.Context, input CreateReviewInput) error {
-	if input.ShotSpecRevisionID == "" || input.RunID == "" || input.ArtifactDigest == "" {
-		return errors.New("shot review requires shotSpecRevisionId, runId, and artifactDigest")
-	}
-	return nil
+func (a *Activities) CreateShotReview(ctx context.Context, input CreateReviewInput) error {
+	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
+		if input.ShotSpecRevisionID == "" || input.RunID == "" || input.ArtifactDigest == "" {
+			return struct{}{}, errors.New("shot review requires shotSpecRevisionId, runId, and artifactDigest")
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 // EscalateShot records that two creative attempts were exhausted.
-func (a *Activities) EscalateShot(_ context.Context, input EscalateShotInput) error {
-	if input.ShotSpecRevisionID == "" {
-		return errors.New("shotSpecRevisionId is required")
-	}
-	return nil
+func (a *Activities) EscalateShot(ctx context.Context, input EscalateShotInput) error {
+	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
+		if input.ShotSpecRevisionID == "" {
+			return struct{}{}, errors.New("shotSpecRevisionId is required")
+		}
+		return struct{}{}, nil
+	})
+	return err
 }
 
 // CreateGate3 creates the final review task after every shot has a reviewable
 // immutable artifact.
-func (a *Activities) CreateGate3(_ context.Context, input CreateGate3Input) error {
-	if input.EpisodeRevisionID == "" || len(input.RunIDs) == 0 {
-		return errors.New("G3 review requires episodeRevisionId and runIds")
+func (a *Activities) CreateGate3(ctx context.Context, input CreateGate3Input) error {
+	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
+		if input.EpisodeRevisionID == "" || len(input.RunIDs) == 0 {
+			return struct{}{}, errors.New("G3 review requires episodeRevisionId and runIds")
+		}
+		return struct{}{}, nil
+	})
+	return err
+}
+
+func journalActivity[T any](
+	ctx context.Context,
+	journal WorkflowStepJournal,
+	traceID string,
+	input any,
+	execute func() (T, error),
+) (T, error) {
+	var zero T
+	if journal == nil {
+		return execute()
 	}
-	return nil
+	info := activity.GetInfo(ctx)
+	step := WorkflowStep{
+		WorkflowID:   info.WorkflowExecution.ID,
+		ActivityID:   info.ActivityID,
+		ActivityType: info.ActivityType.Name,
+		TraceID:      traceID,
+	}
+	if step.WorkflowID == "" || step.ActivityID == "" || step.ActivityType == "" {
+		return zero, errors.New("Temporal Activity identity is required for durable journaling")
+	}
+	inputJSON, err := json.Marshal(input)
+	if err != nil {
+		return zero, fmt.Errorf("encode Activity journal input: %w", err)
+	}
+	sum := sha256.Sum256(inputJSON)
+	inputHash := hex.EncodeToString(sum[:])
+	replay, completed, err := journal.BeginWorkflowStep(ctx, step, inputHash)
+	if err != nil {
+		return zero, fmt.Errorf("begin Activity journal: %w", err)
+	}
+	if completed {
+		var result T
+		if err := json.Unmarshal(replay, &result); err != nil {
+			return zero, fmt.Errorf("decode Activity journal result: %w", err)
+		}
+		return result, nil
+	}
+	result, err := execute()
+	if err != nil {
+		return zero, err
+	}
+	output, err := json.Marshal(result)
+	if err != nil {
+		return zero, fmt.Errorf("encode Activity journal result: %w", err)
+	}
+	if err := journal.CompleteWorkflowStep(ctx, step, inputHash, output); err != nil {
+		return zero, fmt.Errorf("complete Activity journal: %w", err)
+	}
+	return result, nil
 }
 
 func classifyProviderError(err error) error {

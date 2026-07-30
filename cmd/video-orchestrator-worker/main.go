@@ -3,9 +3,11 @@
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
@@ -26,13 +28,18 @@ func main() {
 		log.Fatalf("connect to Temporal: %v", err)
 	}
 	defer temporalClient.Close()
+	store, err := repository.Open(context.Background(), cfg.PostgresDSN, repository.PoolConfig{})
+	if err != nil {
+		log.Fatalf("connect to video PostgreSQL: %v", err)
+	}
+	defer store.Close()
 
 	temporalWorker := worker.New(temporalClient, cfg.TaskQueue, worker.Options{})
 	temporalWorker.RegisterWorkflowWithOptions(
 		orchestration.EpisodeProductionWorkflow,
 		workflow.RegisterOptions{Name: orchestration.WorkflowName},
 	)
-	activities := orchestration.NewActivities(cfg.ProviderAdapterURL)
+	activities := orchestration.NewActivitiesWithJournal(cfg.ProviderAdapterURL, store)
 	temporalWorker.RegisterActivityWithOptions(activities.ValidateBatch, activity.RegisterOptions{Name: orchestration.ActivityValidateBatch})
 	temporalWorker.RegisterActivityWithOptions(activities.CompilePrompt, activity.RegisterOptions{Name: orchestration.ActivityCompilePrompt})
 	temporalWorker.RegisterActivityWithOptions(activities.CreateRun, activity.RegisterOptions{Name: orchestration.ActivityCreateRun})

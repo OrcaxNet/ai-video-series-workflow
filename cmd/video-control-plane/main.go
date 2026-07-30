@@ -11,8 +11,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/temporalcontrol"
+	"go.temporal.io/sdk/client"
 )
 
 func main() {
@@ -24,9 +28,33 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
+	store, err := repository.Open(ctx, cfg.PostgresDSN, repository.PoolConfig{})
+	if err != nil {
+		log.Fatalf("connect video product store: %v", err)
+	}
+	defer store.Close()
+	artifacts, err := artifactstore.New(cfg.ArtifactRoot)
+	if err != nil {
+		log.Fatalf("open video artifact store: %v", err)
+	}
+	temporalClient, err := client.Dial(client.Options{HostPort: cfg.TemporalAddress, Namespace: cfg.TemporalNamespace})
+	if err != nil {
+		log.Fatalf("connect to Temporal: %v", err)
+	}
+	defer temporalClient.Close()
+	workflows, err := temporalcontrol.New(temporalClient, cfg.TemporalTaskQueue, store)
+	if err != nil {
+		log.Fatalf("configure Temporal controller: %v", err)
+	}
+	dependencies := []controlplane.Dependency{
+		{Name: "postgresql", Critical: true, Probe: controlplane.ProbeFunc(store.Ping)},
+		{Name: "temporal", Critical: true, Probe: controlplane.TCPProbe(cfg.TemporalAddress)},
+		{Name: "artifact_store", Critical: true, Probe: controlplane.DirectoryProbe(cfg.ArtifactRoot)},
+		{Name: "provider_adapter", Critical: true, Probe: controlplane.HTTPProbe(cfg.ProviderAdapterURL + "/health/ready")},
+	}
 	server := &http.Server{
 		Addr:              cfg.HTTPAddress,
-		Handler:           controlplane.New(cfg).Handler(),
+		Handler:           controlplane.NewWithRuntime(cfg, dependencies, store, workflows, artifacts).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,

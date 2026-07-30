@@ -203,8 +203,9 @@ cost ledger → provider job → generation attempt → run → shot → scene �
 ## 8. 删除、归档与保留
 
 - revision 与成本 ledger 不物理覆盖；
+- migration v2 的 trigger 拒绝 revision/snapshot、Approval、Audit 的 payload 更新或物理删除；只允许明确列出的状态推进；
 - 被 Manifest/Gate/其他 revision 引用的 artifact 不删除；
 - 上游临时 URL 不保存；
-- 无引用下载/取消产物先标 `ORPHAN_CANDIDATE`，保留期后 GC；
+- 无引用下载/取消产物先标 `ORPHAN_CANDIDATE` 并设置 `orphaned_at/retention_until`；保留期前或仍有 FK 引用时数据库拒绝删除；
 - Secret 生命周期独立于项目数据库备份；
 - idempotency、callback receipts、audit/outbox 设置合规保留与分区策略。
