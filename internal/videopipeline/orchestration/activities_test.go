@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
@@ -31,6 +32,21 @@ type cancellationLedgerFixture struct {
 	prepared      bool
 	preparedCalls int
 	recorded      []CancelProviderResult
+}
+
+type providerPreparationLedgerFixture struct {
+	ProductionLedger
+	prepareErr   error
+	prepareCalls int
+}
+
+func (l *providerPreparationLedgerFixture) PrepareProviderJob(
+	context.Context,
+	WorkflowStep,
+	ExecuteProviderJobInput,
+) error {
+	l.prepareCalls++
+	return l.prepareErr
 }
 
 type postProductionLedgerFixture struct {
@@ -636,6 +652,51 @@ func TestActivities_CreateGate3PreservesRightsErrorContract(t *testing.T) {
 				t.Fatalf("commit calls = %d, want %d", ledger.commitCalls, wantCommitCalls)
 			}
 		})
+	}
+}
+
+func TestActivities_ExecuteProviderJobPreservesVideoBudgetErrorBeforeProvider(
+	t *testing.T,
+) {
+	t.Parallel()
+	var providerCalls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		_ *http.Request,
+	) {
+		providerCalls.Add(1)
+		http.Error(response, "provider must not be called", http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+
+	ledger := &providerPreparationLedgerFixture{
+		prepareErr: controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"fixture VIDEO budget changed after run creation",
+			"approve the exact frozen plan envelope",
+		),
+	}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.ExecuteProviderJob)
+	_, err := env.ExecuteActivity(activities.ExecuteProviderJob, ExecuteProviderJobInput{
+		Run:                 GenerationRunRef{RunID: "run-budget-boundary"},
+		BudgetApprovalID:    "approval-budget-boundary",
+		BudgetMaximumMicros: 100,
+		BudgetCurrency:      "CNY",
+		TraceID:             "trace-video-budget-boundary",
+		PersistProductTruth: true,
+	})
+	assertNonRetryableApplicationError(
+		t, err, string(controlplane.CodeBudgetExceeded),
+	)
+	if ledger.prepareCalls != 1 || providerCalls.Load() != 0 {
+		t.Fatalf(
+			"VIDEO budget boundary side effects = prepare:%d provider:%d, want 1/0",
+			ledger.prepareCalls,
+			providerCalls.Load(),
+		)
 	}
 }
 

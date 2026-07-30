@@ -216,7 +216,7 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 				return ProviderResult{}, err
 			}
 			if err := a.Production.PrepareProviderJob(ctx, step, input); err != nil {
-				return ProviderResult{}, err
+				return ProviderResult{}, classifyPostProductionError(err)
 			}
 		}
 		result, err := a.executeProviderJob(ctx, input)

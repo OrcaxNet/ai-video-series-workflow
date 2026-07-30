@@ -2442,11 +2442,11 @@ func requireBudgetApproval(
 			"approve the exact plan currency before paid submission",
 		)
 	}
-	if *approvedMicros < required.AmountMicros {
+	if *approvedMicros != required.AmountMicros {
 		return controlplane.NewPolicyError(
 			controlplane.CodeBudgetExceeded,
-			"budget approval amount is below the immutable plan limit",
-			"approve at least the frozen plan upper limit before paid submission",
+			"budget approval amount differs from the immutable plan limit",
+			"approve the exact frozen plan upper limit before paid submission",
 		)
 	}
 	return nil

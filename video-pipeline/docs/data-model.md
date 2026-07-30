@@ -118,7 +118,7 @@ erDiagram
 | 表 | 角色 |
 |---|---|
 | `generation_profiles` | 本地 CPU 媒体规则、能力 alias、QC/预算/许可策略，不含硬件类或本地模型 |
-| `generation_runs` | 一次镜头创作输入；含 workflow、run digest、dry_run、budget approval |
+| `generation_runs` | 一次镜头创作输入；含 workflow、run digest、dry_run、budget approval；冻结 Generation Plan ID 写入不可变 `generation_run.created` audit |
 | `generation_attempts` | 输入 hash、model snapshot、参数 diff；provider retry 不新建创作 attempt |
 | `artifacts` | CAS hash/URI/MIME/size/media spec/状态 |
 | `run_artifacts` | INPUT/OUTPUT/TAIL_FRAME/PROXY/AUDIO/SUBTITLE/MANIFEST |
