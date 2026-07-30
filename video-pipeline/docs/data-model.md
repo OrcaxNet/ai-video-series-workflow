@@ -123,7 +123,7 @@ erDiagram
 | `artifacts` | CAS hash/URI/MIME/size/media spec/状态 |
 | `run_artifacts` | INPUT/OUTPUT/TAIL_FRAME/PROXY/AUDIO/SUBTITLE/MANIFEST |
 | `qc_reports` | 技术/连续性/内容/音画结构指标 |
-| `review_tasks` | SHOT(Q1)、G1/G2/G3、LICENSE、BUDGET |
+| `review_tasks` | SHOT(Q1)、G1/G2/G3、LICENSE、BUDGET；预算审批精确绑定 Generation Plan、VIDEO/SPEECH scope、额度与币种 |
 | `approval_decisions` / `approval_bindings` | actor/reason + 精确 revision/hash |
 | `generation_manifests` | Shot/Episode 全谱系和锁定 hash |
 

@@ -629,6 +629,10 @@ components:
           $ref: "#/components/schemas/ModelRouteSnapshot"
         budgetLimit:
           $ref: "#/components/schemas/BudgetLimit"
+        speechBudgetLimit:
+          allOf:
+            - $ref: "#/components/schemas/BudgetLimit"
+          description: Optional immutable TTS envelope; required when post-production speech is enabled.
         executionPolicy:
           $ref: "#/components/schemas/ExecutionPolicy"
         actor:
@@ -659,6 +663,10 @@ components:
           $ref: "#/components/schemas/ExecutionPolicy"
         estimate:
           $ref: "#/components/schemas/CostEstimate"
+        speechBudgetLimit:
+          allOf:
+            - $ref: "#/components/schemas/BudgetLimit"
+          description: Immutable TTS envelope included in the plan hash.
         budgetDecision:
           enum: [WITHIN_BUDGET, AMOUNT_UNKNOWN_REQUIRES_CONFIRMATION, EXCEEDS_BUDGET]
         planHash:

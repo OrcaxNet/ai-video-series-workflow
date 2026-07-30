@@ -273,7 +273,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	seriesID, episodeID, episodeRevisionID := uuid.New(), uuid.New(), uuid.New()
 	sceneID, shotID := uuid.New(), uuid.New()
 	scriptID, storyboardID, shotRevisionID := uuid.New(), uuid.New(), uuid.New()
-	gate1ID, gate2ID, budgetID := uuid.New(), uuid.New(), uuid.New()
+	gate1ID, gate2ID, budgetID, speechBudgetID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	providerProfileID, capabilityID := uuid.New(), uuid.New()
 	safetyEvidenceArtifactID := uuid.New()
 	voiceLicenseID, musicLicenseID, consentID := uuid.New(), uuid.New(), uuid.New()
@@ -450,8 +450,10 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.review_tasks
 			(id, series_id, episode_id, review_type, state, assigned_role, decided_at)
-		VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER', now())`,
-		budgetID, seriesID, episodeID,
+		VALUES
+			($1, $3, $4, 'BUDGET', 'APPROVED', 'PRODUCER', now()),
+			($2, $3, $4, 'BUDGET', 'APPROVED', 'PRODUCER', now())`,
+		budgetID, speechBudgetID, seriesID, episodeID,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.provider_profiles
@@ -538,9 +540,10 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		EpisodeRevisionID:   episodeRevisionID.String(),
 		ShotSpecRevisionIDs: []string{shotRevisionID.String()},
 		CandidatesPerShot:   1, RouteSnapshot: route,
-		BudgetLimit:     controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
-		ExecutionPolicy: executionPolicy,
-		Actor:           controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
+		BudgetLimit:       controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
+		SpeechBudgetLimit: &controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
+		ExecutionPolicy:   executionPolicy,
+		Actor:             controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
 	}
 	planDigest, err := digestValue(planCommand)
 	if err != nil {
@@ -553,6 +556,29 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if plan.Value.SpeechBudgetLimit == nil ||
+		plan.Value.SpeechBudgetLimit.AmountMicros != 1_000 ||
+		plan.Value.SpeechBudgetLimit.Currency != "CNY" {
+		t.Fatalf("generation plan speech budget = %#v", plan.Value.SpeechBudgetLimit)
+	}
+	storedPlan, err := store.GetGenerationPlan(ctx, plan.Value.GenerationPlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedPlan.SpeechBudgetLimit == nil ||
+		storedPlan.SpeechBudgetLimit.AmountMicros != 1_000 ||
+		storedPlan.SpeechBudgetLimit.Currency != "CNY" {
+		t.Fatalf("stored generation plan speech budget = %#v", storedPlan.SpeechBudgetLimit)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.review_tasks
+		SET generation_plan_id = $3,
+		    budget_scope = CASE id WHEN $1 THEN 'VIDEO' ELSE 'SPEECH' END,
+		    budget_limit_micros = 1000,
+		    budget_currency = 'CNY'
+		WHERE id IN ($1, $2)`,
+		budgetID, speechBudgetID, plan.Value.GenerationPlanID,
+	)
 	blockedPlans := []struct {
 		name    string
 		command controlplane.CreateGenerationPlanCommand
@@ -872,7 +898,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				Verification:    "mock_only",
 			},
 			SpeechProviderProfileID:       providerProfileID.String(),
-			SpeechBudgetApprovalID:        budgetID.String(),
+			SpeechBudgetApprovalID:        speechBudgetID.String(),
 			SpeechBudgetMaximumMicros:     1_000,
 			SpeechBudgetCurrency:          "CNY",
 			SubtitleLanguage:              "en",
@@ -897,6 +923,115 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		if !errors.As(err, &policy) || policy.Code != code {
 			t.Fatalf("%s error = %#v, want %s", stage, err, code)
 		}
+	}
+	alternatePlan, err := store.CreateGenerationPlan(
+		ctx,
+		planCommand,
+		controlplane.Idempotency{
+			Scope:       "workflow-projection-alternate-speech-plan:" + seriesID.String(),
+			Key:         uuid.NewString(),
+			RequestHash: planDigest,
+		},
+		"workflow-projection",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budgetRegressions := []struct {
+		name   string
+		mutate func()
+	}{
+		{
+			name: "legacy old approval",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET generation_plan_id = NULL, budget_scope = NULL,
+					    budget_limit_micros = NULL, budget_currency = NULL
+					WHERE id = $1`,
+					speechBudgetID,
+				)
+			},
+		},
+		{
+			name: "different generation plan",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET generation_plan_id = $2
+					WHERE id = $1`,
+					speechBudgetID, alternatePlan.Value.GenerationPlanID,
+				)
+			},
+		},
+		{
+			name: "wrong spend scope",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_scope = 'VIDEO'
+					WHERE id = $1`,
+					speechBudgetID,
+				)
+			},
+		},
+		{
+			name: "insufficient amount",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_limit_micros = $2
+					WHERE id = $1`,
+					speechBudgetID, 999,
+				)
+			},
+		},
+		{
+			name: "currency mismatch",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_currency = 'USD'
+					WHERE id = $1`,
+					speechBudgetID,
+				)
+			},
+		},
+	}
+	for _, regression := range budgetRegressions {
+		regression := regression
+		t.Run("paid speech budget "+regression.name, func(t *testing.T) {
+			regression.mutate()
+			err := store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput)
+			assertPolicyCode(regression.name, err, controlplane.CodeBudgetExceeded)
+			mustExec(t, ctx, pool, `
+				UPDATE video_pipeline.review_tasks
+				SET generation_plan_id = $2, budget_scope = 'SPEECH',
+				    budget_limit_micros = 1000, budget_currency = 'CNY'
+				WHERE id = $1`,
+				speechBudgetID, plan.Value.GenerationPlanID,
+			)
+		})
+	}
+	for _, mismatch := range []struct {
+		name     string
+		amount   int64
+		currency string
+	}{
+		{name: "amount differs from plan", amount: 1_001, currency: "CNY"},
+		{name: "currency differs from plan", amount: 1_000, currency: "USD"},
+	} {
+		mismatch := mismatch
+		t.Run("paid speech plan "+mismatch.name, func(t *testing.T) {
+			input := finalizeInput
+			input.Config.SpeechBudgetMaximumMicros = mismatch.amount
+			input.Config.SpeechBudgetCurrency = mismatch.currency
+			err := store.AuthorizeEpisodePostProduction(ctx, step, input)
+			assertPolicyCode(mismatch.name, err, controlplane.CodeBudgetExceeded)
+		})
+	}
+	if err := store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput); err != nil {
+		t.Fatalf("current exact speech budget authorization: %v", err)
 	}
 	mustExec(t, ctx, pool, `
 		UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`,
@@ -1016,6 +1151,65 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		WHERE id = $1`,
 		musicLicenseID,
 	)
+	fixtureDigest := func(label string) string {
+		t.Helper()
+		digest, err := digestValue(map[string]string{
+			"label": label,
+			"nonce": uuid.NewString(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return digest
+	}
+	inactiveArtifactRegressions := []struct {
+		name   string
+		status string
+		digest string
+	}{
+		{name: "orphan candidate", status: "ORPHAN_CANDIDATE", digest: fixtureDigest("orphan")},
+		{name: "archived", status: "ARCHIVED", digest: fixtureDigest("archived")},
+		{name: "disabled", status: "DISABLED", digest: fixtureDigest("disabled")},
+	}
+	for _, regression := range inactiveArtifactRegressions {
+		regression := regression
+		t.Run("post-production CAS conflict "+regression.name, func(t *testing.T) {
+			conflictingResult := postResult
+			conflictingResult.FinalVideo.Digest = regression.digest
+			conflictingResult.FinalVideo.URI = "cas://sha256/" + regression.digest
+			inactiveArtifactID := uuid.New()
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.artifacts
+					(id, content_hash, artifact_uri, media_type, size_bytes,
+					 media_spec, status, orphaned_at, retention_until)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now() + interval '1 hour')`,
+				inactiveArtifactID,
+				conflictingResult.FinalVideo.Digest,
+				conflictingResult.FinalVideo.URI,
+				conflictingResult.FinalVideo.MediaType,
+				conflictingResult.FinalVideo.SizeBytes,
+				map[string]any{
+					"kind":                       "final_video",
+					"postProductionManifestHash": conflictingResult.ManifestHash,
+				},
+				regression.status,
+			)
+			err := store.CommitEpisodePostProduction(ctx, step, finalizeInput, conflictingResult)
+			assertPolicyCode(regression.name, err, controlplane.CodeConflict)
+			var links int
+			if err := pool.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM video_pipeline.run_artifacts
+				WHERE generation_run_id = $1 AND artifact_id = $2`,
+				run.RunID, inactiveArtifactID,
+			).Scan(&links); err != nil {
+				t.Fatal(err)
+			}
+			if links != 0 {
+				t.Fatalf("non-ACTIVE artifact links = %d, want 0", links)
+			}
+		})
+	}
 	var rejectedPostArtifacts int
 	if err := pool.QueryRow(ctx, `
 		SELECT COUNT(*)
@@ -1049,6 +1243,45 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if linkedPostArtifacts != 5 {
 		t.Fatalf("linked post-production artifacts = %d, want 5", linkedPostArtifacts)
 	}
+	oldPostManifestHash := fixtureDigest("old post-production manifest")
+	oldFinalVideoHash := fixtureDigest("old final video")
+	oldSubtitleHash := fixtureDigest("old subtitle")
+	oldPostManifestID, oldFinalVideoID, oldSubtitleID := uuid.New(), uuid.New(), uuid.New()
+	oldPostManifestURI := "cas://sha256/" + oldPostManifestHash
+	oldFinalVideoURI := "cas://sha256/" + oldFinalVideoHash
+	oldSubtitleURI := "cas://sha256/" + oldSubtitleHash
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES
+			($1, $2, $3, 'application/json', 1,
+			 jsonb_build_object(
+			   'kind', 'postproduction_manifest',
+			   'postProductionManifestHash', $7::text
+			 ), 'ACTIVE'),
+			($4, $5, $6, 'video/mp4', 1,
+			 jsonb_build_object(
+			   'kind', 'final_video',
+			   'postProductionManifestHash', $7::text
+			 ), 'ACTIVE'),
+			($8, $9, $10, 'application/x-subrip', 1,
+			 jsonb_build_object(
+			   'kind', 'subtitle_srt',
+			   'postProductionManifestHash', $7::text
+			 ), 'ACTIVE')`,
+		oldPostManifestID, oldPostManifestHash, oldPostManifestURI,
+		oldFinalVideoID, oldFinalVideoHash, oldFinalVideoURI, oldPostManifestHash,
+		oldSubtitleID, oldSubtitleHash, oldSubtitleURI,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.run_artifacts
+			(generation_run_id, artifact_id, role)
+		VALUES
+			($1, $2, 'MANIFEST'),
+			($1, $3, 'OUTPUT'),
+			($1, $4, 'SUBTITLE')`,
+		run.RunID, oldPostManifestID, oldFinalVideoID, oldSubtitleID,
+	)
 
 	step.ActivityID, step.ActivityType = "manifest", orchestration.ActivityCreateGate3
 	gate3Input := orchestration.CreateGate3Input{
@@ -1073,10 +1306,61 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var builtManifest struct {
+		PostProductionManifestHash string   `json:"postProductionManifestHash"`
+		Outputs                    []string `json:"outputs"`
+	}
+	if err := json.Unmarshal(manifestPayload, &builtManifest); err != nil {
+		t.Fatal(err)
+	}
+	if builtManifest.PostProductionManifestHash != postResult.ManifestHash ||
+		len(builtManifest.Outputs) != 1 ||
+		builtManifest.Outputs[0] != postResult.FinalVideo.URI {
+		t.Fatalf("G3 current post-production binding = %#v", builtManifest)
+	}
+	if bytes.Contains(manifestPayload, []byte(oldPostManifestURI)) ||
+		bytes.Contains(manifestPayload, []byte(oldFinalVideoURI)) ||
+		bytes.Contains(manifestPayload, []byte(oldSubtitleURI)) {
+		t.Fatal("G3 manifest leaked an old post-production revision")
+	}
 	manifestArtifact, err := cas.Put(ctx, bytes.NewReader(manifestPayload))
 	if err != nil {
 		t.Fatal(err)
 	}
+	disabledManifestPayload := append(append([]byte(nil), manifestPayload...), '\n')
+	disabledManifestArtifact, err := cas.Put(ctx, bytes.NewReader(disabledManifestPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledManifestArtifactID := uuid.New()
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES ($1, $2, $3, 'application/json', $4,
+		        '{"kind":"generation-manifest"}', 'DISABLED')`,
+		disabledManifestArtifactID,
+		disabledManifestArtifact.Digest,
+		disabledManifestArtifact.URI,
+		disabledManifestArtifact.Size,
+	)
+	err = store.CommitEpisodeManifest(
+		ctx, step, gate3Input, disabledManifestPayload, disabledManifestArtifact,
+	)
+	assertPolicyCode("G3 non-ACTIVE CAS conflict", err, controlplane.CodeConflict)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.artifacts
+		SET status = 'ARCHIVED'
+		WHERE content_hash = $1`,
+		postResult.FinalVideo.Digest,
+	)
+	err = store.CommitEpisodeManifest(ctx, step, gate3Input, manifestPayload, manifestArtifact)
+	assertPolicyCode("G3 commit after final video archival", err, controlplane.CodeGateRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.artifacts
+		SET status = 'ACTIVE'
+		WHERE content_hash = $1`,
+		postResult.FinalVideo.Digest,
+	)
 	mustExec(t, ctx, pool, `
 		UPDATE video_pipeline.license_snapshots
 		SET expires_at = now() - interval '1 second'
@@ -2266,10 +2550,28 @@ func cloneIntegrationShotCommand(
 	if err != nil {
 		t.Fatal(err)
 	}
+	clonedBudgetID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.review_tasks
+			(id, series_id, episode_id, review_type, state, assigned_role,
+			 decided_at, generation_plan_id, budget_scope,
+			 budget_limit_micros, budget_currency)
+		VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER',
+		        now(), $4, 'VIDEO', $5, $6)`,
+		clonedBudgetID,
+		planRecord.SeriesID,
+		episodeID,
+		plan.Value.GenerationPlanID,
+		planRecord.BudgetLimit.AmountMicros,
+		planRecord.BudgetLimit.Currency,
+	); err != nil {
+		t.Fatal(err)
+	}
 	cloned := source
 	cloned.ShotSpecRevisionID = newShotRevisionID.String()
 	cloned.PromptSnapshotID = newPromptID.String()
 	cloned.GenerationPlanID = plan.Value.GenerationPlanID
+	cloned.BudgetApprovalID = clonedBudgetID.String()
 	cloned.ExecutionPolicy = executionPolicy
 	cloned.CreativeAttempt = 1
 	return newShotID.String(), cloned

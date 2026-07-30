@@ -672,6 +672,34 @@ func TestActivities_FinalizeEpisodeKeepsPendingKeyNonRetryableAndUncommitted(t *
 	}
 }
 
+func TestActivities_FinalizeEpisodePreservesSpeechBudgetErrorContract(t *testing.T) {
+	t.Parallel()
+	ledger := &postProductionLedgerFixture{
+		authorizeErr: controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"fixture speech budget mismatch",
+			"approve the current speech envelope",
+		),
+		authorizeErrAt: 1,
+	}
+	executor := &postProductionExecutorFixture{}
+	activities := NewActivities("http://provider.invalid")
+	activities.ConfigurePostProduction(executor, ledger)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.FinalizeEpisode)
+	_, err := env.ExecuteActivity(
+		activities.FinalizeEpisode,
+		testFinalizeEpisodeInput("trace-speech-budget"),
+	)
+	assertNonRetryableApplicationError(
+		t, err, string(controlplane.CodeBudgetExceeded),
+	)
+	if executor.calls != 0 {
+		t.Fatalf("post-production executor calls = %d, want 0", executor.calls)
+	}
+}
+
 func testFinalizeEpisodeInput(traceID string) FinalizeEpisodeInput {
 	return FinalizeEpisodeInput{
 		EpisodeRevisionID: "episode-revision-1",

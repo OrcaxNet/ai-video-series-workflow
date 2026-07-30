@@ -24,6 +24,10 @@ G1/G2 approved inputs
 `postProduction` 为可选增量。启用时必须冻结独立的 `speech.primary`
 路由、预算审批和证据等级：
 
+创建 Generation Plan 时还必须把相同的 `speechBudgetLimit` 纳入请求；
+额度与币种会进入不可变 plan hash 和审计证据。启动生产时的
+`postProduction.speechBudgetLimit` 必须与 Plan 完全一致。
+
 ```json
 {
   "postProduction": {
@@ -92,6 +96,10 @@ Consent。`mock_only` 可省略 `voiceRef` 并使用明确标注的合成 tone�
   AssetVersion、VOICE/AUDIO、可选背景 MUSIC/AUDIO、LicenseSnapshot 和
   Consent。地区、产品形态、系列归属、审批状态、撤销和过期任一不兼容时返回
   `LICENSE_BLOCKED` 或 `CONSENT_REQUIRED`，不会调用 Provider。
+- 每条 TTS 付费提交还会在同一事务内复查 BUDGET review 精确绑定当前
+  Generation Plan、`SPEECH` scope、冻结额度与币种。旧版未绑定审批、旧
+  Plan 审批、视频预算审批、额度不足或异币种审批均返回
+  `budget_exceeded`，不会调用 Provider。
 - 后期 Commit 在写入最终视频、SRT、对白、后期 Manifest、Service BOM 之前，
   G3 则在构建 Manifest 前和持久化 Manifest/创建 Review 的同一事务中重复上述
   当前授权检查。Prepare 后发生的撤销或过期因此不能留下可发布数据库产物或
@@ -101,7 +109,13 @@ Consent。`mock_only` 可省略 `voiceRef` 并使用明确标注的合成 tone�
   不可重试的 ApplicationError；合同错误码不会退化为 Go 类型名
   `DomainError`，工作流也不会对真实撤权或过期执行无意义重试。
 - 提交事务还会重新检查每个 Run 仍为成功且 QC 通过，避免准备后状态漂移。
-- G3 只在后期 Manifest 已关联到所有贡献 Run 后创建。缺失 G1/G2、许可、预算、路由、成功镜头、QC 或 Manifest 均 fail closed。
+- G3 只在当前后期 Manifest 已关联到所有贡献 Run，且恰好解析到一个
+  `status=ACTIVE`、`postProductionManifestHash` 完全一致的 final video 后创建。
+  同 Run 的旧后期/字幕 revision 不会进入新的 Generation Manifest。
+  缺失 G1/G2、许可、预算、路由、成功镜头、QC 或 Manifest 均 fail closed。
+- Artifact hash 冲突只允许复用 `ACTIVE` CAS 记录；`ORPHAN_CANDIDATE`、
+  `ARCHIVED`、`DISABLED` 不会被隐式恢复或重新链接。Manifest 读取和 G3
+  Build/Commit 同样只纳入 ACTIVE artifact。
 - `evidence=pending_key` 在语音 Provider 边界之前返回不可重试的
   `PENDING_KEY`，不会伪造样片、质量或费用。
 - 结构 QC 只验证容器、720p/24fps、时长和轨道；它不会冒充 CER 或时间边界测量，因此始终保留 `manualTimingRequired=true`，直到真实金标报告满足门槛。
@@ -189,17 +203,23 @@ VIDEO_TEST_POSTGRES_DSN='postgres://…' make video-integration-test
 
 ## 7. 数据库与回滚
 
-本切片不新增 migration。它复用现有 `artifacts`、`run_artifacts`、
-`generation_manifests`、`provider_jobs`、`cost_records`、`approvals`、
-`audit_events` 和 `outbox_events`，以新的 `media_spec.kind` 和事件类型保存后期产物。
+Migration `000005_budget_approval_binding` 为 `review_tasks` 增加可空的
+`generation_plan_id`、`budget_scope`、`budget_limit_micros` 和
+`budget_currency`。历史 BUDGET review 保持全空、可读但不能授权新的付费
+提交；必须新建绑定当前 Plan 与 `VIDEO`/`SPEECH` scope 的审批。Migration
+不回填或提升任何旧审批，也不修改 Artifact 状态。
 
 回滚顺序：
 
-1. 新请求省略 `postProduction` 或设 `enabled=false`；
-2. 部署上一版 Control Plane/Worker；
-3. 不删除 CAS、审计、Provider job、费用或已提交 Manifest；
-4. 未完成的 Activity 由 Temporal 保留，可在兼容 Worker 恢复或显式取消。
+1. 先停止新的付费 Provider submit，并让在途 Activity 完成或显式取消；
+2. 新请求省略 `postProduction` 或设 `enabled=false`；
+3. 部署上一版 Control Plane/Worker；
+4. 确认旧应用不再写/读精确预算绑定后，才执行 migration 5 down；
+5. 不删除 CAS、审计、Provider job、费用或已提交 Manifest；未完成的
+   Activity 由 Temporal 保留，可在兼容 Worker 恢复或显式取消。
 
-回滚不需要 down migration，也不会覆盖或删除历史 revision。已知风险是
-FFmpeg/libass 版本差异、真实 TTS 时间戳与费用能力未知，以及当前真实 Key
-缺失；这些都必须通过固定镜像 digest 和第 6 节实测关闭。
+Migration 5 down 仅移除新增预算绑定列与索引，不删除 review task；但旧
+二进制只检查任意 APPROVED BUDGET ID，会重新打开弱预算边界，因此禁止在
+付费提交开启时回滚应用。其余已知风险是 FFmpeg/libass 版本差异、真实 TTS
+时间戳与费用能力未知，以及当前真实 Key 缺失；这些都必须通过固定镜像
+digest 和第 6 节实测关闭。

@@ -649,6 +649,11 @@ func validateCreatePlan(command CreateGenerationPlanCommand) error {
 	if command.BudgetLimit.AmountMicros < 0 || !currencyPattern.MatchString(command.BudgetLimit.Currency) {
 		return validationError("budgetLimit requires a non-negative amountMicros and ISO currency")
 	}
+	if command.SpeechBudgetLimit != nil &&
+		(command.SpeechBudgetLimit.AmountMicros <= 0 ||
+			!currencyPattern.MatchString(command.SpeechBudgetLimit.Currency)) {
+		return validationError("speechBudgetLimit requires a positive amountMicros and ISO currency")
+	}
 	if err := validateVideoRoute(command.RouteSnapshot); err != nil {
 		return err
 	}

@@ -81,6 +81,7 @@ type CreateGenerationPlanCommand struct {
 	CandidatesPerShot   int                `json:"candidatesPerShot"`
 	RouteSnapshot       ModelRouteSnapshot `json:"routeSnapshot"`
 	BudgetLimit         BudgetLimit        `json:"budgetLimit"`
+	SpeechBudgetLimit   *BudgetLimit       `json:"speechBudgetLimit,omitempty"`
 	ExecutionPolicy     ExecutionPolicy    `json:"executionPolicy"`
 	Actor               Actor              `json:"actor"`
 }
@@ -94,6 +95,7 @@ type GenerationPlan struct {
 	RouteSnapshot     ModelRouteSnapshot `json:"routeSnapshot"`
 	ExecutionPolicy   ExecutionPolicy    `json:"executionPolicy"`
 	Estimate          CostEstimate       `json:"estimate"`
+	SpeechBudgetLimit *BudgetLimit       `json:"speechBudgetLimit,omitempty"`
 	BudgetDecision    string             `json:"budgetDecision"`
 	PlanHash          string             `json:"planHash"`
 }
@@ -106,6 +108,7 @@ type GenerationPlanRecord struct {
 	CandidatesPerShot   int
 	PricingRuleVersion  string
 	BudgetLimit         BudgetLimit
+	SpeechBudgetLimit   *BudgetLimit
 	ExecutionPolicy     ExecutionPolicy
 }
 

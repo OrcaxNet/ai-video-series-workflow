@@ -262,7 +262,10 @@ func (p *Postgres) CreateWorkflowRun(
 				"workflow route differs from the immutable generation plan",
 			)
 		}
-		if err := requireBudgetApproval(ctx, tx, input.BudgetApprovalID, seriesID, episodeID); err != nil {
+		if err := requireBudgetApproval(
+			ctx, tx, input.BudgetApprovalID, seriesID, episodeID,
+			input.GenerationPlanID, "VIDEO", plan.BudgetLimit,
+		); err != nil {
 			return orchestration.GenerationRunRef{}, err
 		}
 		runDigest, err := digestValue(map[string]any{
@@ -506,10 +509,19 @@ func (p *Postgres) CompleteProviderJob(
 			return struct{}{}, fmt.Errorf("insert provider artifact: %w", err)
 		}
 		if err := tx.QueryRow(ctx,
-			`SELECT id FROM video_pipeline.artifacts WHERE content_hash = $1`,
+			`SELECT id
+			 FROM video_pipeline.artifacts
+			 WHERE content_hash = $1 AND status = 'ACTIVE'
+			 FOR SHARE`,
 			result.ArtifactDigest,
 		).Scan(&artifactID); err != nil {
-			return struct{}{}, fmt.Errorf("resolve provider artifact: %w", err)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"provider artifact hash is bound to a non-ACTIVE CAS record",
+				)
+			}
+			return struct{}{}, fmt.Errorf("resolve ACTIVE provider artifact: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO video_pipeline.run_artifacts
@@ -854,6 +866,7 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			           AND (ca.expires_at IS NULL OR ca.expires_at > now())
 			       ))
 			  )
+			  AND a.status = 'ACTIVE'
 			  AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video'
 			ORDER BY a.created_at
 			LIMIT 1`,
@@ -994,6 +1007,11 @@ func (p *Postgres) AuthorizeEpisodePostProduction(
 		); err != nil {
 			return struct{}{}, err
 		}
+		if err := p.requireCurrentPostProductionBudget(
+			ctx, tx, episodeRevisionID, input.GenerationPlanID, input.Config,
+		); err != nil {
+			return struct{}{}, err
+		}
 		return struct{}{}, nil
 	})
 	return err
@@ -1036,6 +1054,11 @@ func (p *Postgres) CommitEpisodePostProduction(
 			runIDs,
 			input.GenerationPlanID,
 			input.Config.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		if err := p.requireCurrentPostProductionBudget(
+			ctx, tx, episodeRevisionID, input.GenerationPlanID, input.Config,
 		); err != nil {
 			return struct{}{}, err
 		}
@@ -1104,12 +1127,25 @@ func (p *Postgres) CommitEpisodePostProduction(
 				SELECT id, artifact_uri, media_type, size_bytes,
 				       COALESCE(media_spec->>'kind', '')
 				FROM video_pipeline.artifacts
-				WHERE content_hash = $1`,
+				WHERE content_hash = $1
+				  AND status = 'ACTIVE'
+				FOR SHARE`,
 				output.artifact.Digest,
 			).Scan(
 				&artifactID, &storedURI, &storedMediaType, &storedSize, &storedKind,
 			); err != nil {
-				return struct{}{}, fmt.Errorf("resolve %s artifact: %w", output.artifact.Kind, err)
+				if errors.Is(err, pgx.ErrNoRows) {
+					return struct{}{}, controlplane.NewConflictError(
+						controlplane.CodeConflict,
+						fmt.Sprintf(
+							"%s artifact hash is bound to a non-ACTIVE CAS record",
+							output.artifact.Kind,
+						),
+					)
+				}
+				return struct{}{}, fmt.Errorf(
+					"resolve ACTIVE %s artifact: %w", output.artifact.Kind, err,
+				)
 			}
 			if storedURI != output.artifact.URI ||
 				storedMediaType != output.artifact.MediaType ||
@@ -1189,31 +1225,14 @@ func (p *Postgres) BuildEpisodeManifest(
 		); err != nil {
 			return struct{}{}, err
 		}
+		if _, err := requireActivePostProductionArtifacts(
+			ctx, tx, runIDs, input.PostProductionManifestHash,
+		); err != nil {
+			return struct{}{}, err
+		}
 		return struct{}{}, nil
 	}); err != nil {
 		return nil, err
-	}
-	if input.PostProductionManifestHash != "" {
-		var linkedRuns int
-		if err := p.pool.QueryRow(ctx, `
-			SELECT COUNT(DISTINCT ra.generation_run_id)
-			FROM video_pipeline.run_artifacts ra
-			JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
-			WHERE ra.generation_run_id = ANY($1::uuid[])
-			  AND ra.role = 'MANIFEST'
-			  AND a.content_hash = $2
-			  AND a.media_spec->>'kind' = 'postproduction_manifest'`,
-			runIDs, input.PostProductionManifestHash,
-		).Scan(&linkedRuns); err != nil {
-			return nil, fmt.Errorf("verify post-production manifest: %w", err)
-		}
-		if linkedRuns != len(runIDs) {
-			return nil, controlplane.NewPolicyError(
-				controlplane.CodeGateRequired,
-				"post-production manifest is not linked to every exact run",
-				"complete deterministic post-production before opening G3",
-			)
-		}
 	}
 	executions := make([]json.RawMessage, 0, len(runIDs))
 	for _, runID := range runIDs {
@@ -1255,6 +1274,17 @@ func (p *Postgres) BuildEpisodeManifest(
 			    FROM video_pipeline.run_artifacts ra
 			    JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
 			    WHERE ra.generation_run_id = gr.id
+			      AND a.status = 'ACTIVE'
+			      AND (
+			        COALESCE(a.media_spec->>'kind', 'shot_video') NOT IN (
+			          'final_video', 'subtitle_srt', 'dialogue_audio',
+			          'postproduction_manifest', 'service_bom', 'generation-manifest'
+			        )
+			        OR (
+			          $3 <> ''
+			          AND a.media_spec->>'postProductionManifestHash' = $3
+			        )
+			      )
 			  ), '[]'::jsonb),
 			  'qcReports', COALESCE((
 			    SELECT jsonb_agg(to_jsonb(qr) ORDER BY qr.created_at)
@@ -1300,7 +1330,7 @@ func (p *Postgres) BuildEpisodeManifest(
 			    SELECT 1 FROM video_pipeline.qc_reports qr
 			    WHERE qr.generation_run_id = gr.id AND qr.state = 'PASSED'
 			  )`,
-			runID, episodeRevisionID,
+			runID, episodeRevisionID, input.PostProductionManifestHash,
 		).Scan(&execution); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, controlplane.NewPolicyError(
@@ -1353,7 +1383,8 @@ func (p *Postgres) BuildEpisodeManifest(
 			SELECT COALESCE(a.media_spec->'speechCost', '{}'::jsonb)
 			FROM video_pipeline.artifacts a
 			WHERE a.content_hash = $1
-			  AND a.media_spec->>'kind' = 'postproduction_manifest'`,
+			  AND a.media_spec->>'kind' = 'postproduction_manifest'
+			  AND a.status = 'ACTIVE'`,
 			input.PostProductionManifestHash,
 		).Scan(&rawCost); err != nil {
 			return nil, fmt.Errorf("assemble post-production cost summary: %w", err)
@@ -1382,7 +1413,14 @@ func (p *Postgres) BuildEpisodeManifest(
 		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
 		WHERE ra.generation_run_id = ANY($1::uuid[])
 		  AND ra.role = 'OUTPUT'
-		  AND ($2 = '' OR a.media_spec->>'kind' = 'final_video')
+		  AND a.status = 'ACTIVE'
+		  AND (
+		    ($2 = '' AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video')
+		    OR
+		    ($2 <> ''
+		     AND a.media_spec->>'kind' = 'final_video'
+		     AND a.media_spec->>'postProductionManifestHash' = $2)
+		  )
 		ORDER BY a.artifact_uri`,
 		runIDs, input.PostProductionManifestHash,
 	)
@@ -1400,6 +1438,13 @@ func (p *Postgres) BuildEpisodeManifest(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate manifest outputs: %w", err)
+	}
+	if input.PostProductionManifestHash != "" && len(outputs) != 1 {
+		return nil, controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"G3 requires exactly one ACTIVE final video for the current post-production manifest",
+			"commit the exact current post-production revision before opening G3",
+		)
 	}
 	inputs := []string{"episode-revision:" + input.EpisodeRevisionID}
 	for _, runID := range input.RunIDs {
@@ -1435,6 +1480,16 @@ func (p *Postgres) CommitEpisodeManifest(
 	if !json.Valid(payload) || artifact.URI != "cas://sha256/"+artifact.Digest {
 		return errors.New("manifest payload or CAS identity is invalid")
 	}
+	var binding struct {
+		PostProductionManifestHash string   `json:"postProductionManifestHash"`
+		Outputs                    []string `json:"outputs"`
+	}
+	if err := json.Unmarshal(payload, &binding); err != nil {
+		return fmt.Errorf("decode manifest artifact bindings: %w", err)
+	}
+	if binding.PostProductionManifestHash != input.PostProductionManifestHash {
+		return errors.New("manifest payload does not bind the requested post-production manifest")
+	}
 	episodeRevisionID, err := uuid.Parse(input.EpisodeRevisionID)
 	if err != nil {
 		return errors.New("episodeRevisionId must be a UUID")
@@ -1453,6 +1508,20 @@ func (p *Postgres) CommitEpisodeManifest(
 			input.BackgroundAudioAssetVersionID,
 		); err != nil {
 			return struct{}{}, err
+		}
+		finalVideoURI, err := requireActivePostProductionArtifacts(
+			ctx, tx, runIDs, input.PostProductionManifestHash,
+		)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if input.PostProductionManifestHash != "" &&
+			(len(binding.Outputs) != 1 || binding.Outputs[0] != finalVideoURI) {
+			return struct{}{}, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest outputs no longer match the ACTIVE current final video",
+				"rebuild the generation manifest from current post-production truth",
+			)
 		}
 		var seriesID, episodeID uuid.UUID
 		if err := tx.QueryRow(ctx, `
@@ -1480,10 +1549,19 @@ func (p *Postgres) CommitEpisodeManifest(
 			return struct{}{}, fmt.Errorf("insert manifest artifact: %w", err)
 		}
 		if err := tx.QueryRow(ctx,
-			`SELECT id FROM video_pipeline.artifacts WHERE content_hash = $1`,
+			`SELECT id
+			 FROM video_pipeline.artifacts
+			 WHERE content_hash = $1 AND status = 'ACTIVE'
+			 FOR SHARE`,
 			artifact.Digest,
 		).Scan(&artifactID); err != nil {
-			return struct{}{}, fmt.Errorf("resolve manifest artifact: %w", err)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"generation manifest hash is bound to a non-ACTIVE CAS record",
+				)
+			}
+			return struct{}{}, fmt.Errorf("resolve ACTIVE manifest artifact: %w", err)
 		}
 		manifestID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("manifest:"+artifact.Digest))
 		tag, err := tx.Exec(ctx, `
@@ -1540,6 +1618,106 @@ func (p *Postgres) CommitEpisodeManifest(
 		return struct{}{}, nil
 	})
 	return err
+}
+
+func requireActivePostProductionArtifacts(
+	ctx context.Context,
+	tx pgx.Tx,
+	runIDs []uuid.UUID,
+	manifestHash string,
+) (string, error) {
+	if manifestHash == "" {
+		return "", nil
+	}
+	manifestRows, err := tx.Query(ctx, `
+		SELECT ra.generation_run_id
+		FROM video_pipeline.run_artifacts ra
+		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+		WHERE ra.generation_run_id = ANY($1::uuid[])
+		  AND ra.role = 'MANIFEST'
+		  AND a.content_hash = $2
+		  AND a.media_spec->>'kind' = 'postproduction_manifest'
+		  AND a.status = 'ACTIVE'
+		ORDER BY ra.generation_run_id
+		FOR SHARE OF a`,
+		runIDs, manifestHash,
+	)
+	if err != nil {
+		return "", fmt.Errorf("verify ACTIVE post-production manifest: %w", err)
+	}
+	manifestRunSet := make(map[uuid.UUID]struct{}, len(runIDs))
+	for manifestRows.Next() {
+		var runID uuid.UUID
+		if err := manifestRows.Scan(&runID); err != nil {
+			manifestRows.Close()
+			return "", fmt.Errorf("scan ACTIVE post-production manifest link: %w", err)
+		}
+		manifestRunSet[runID] = struct{}{}
+	}
+	manifestIterationErr := manifestRows.Err()
+	manifestRows.Close()
+	if manifestIterationErr != nil {
+		return "", fmt.Errorf("iterate ACTIVE post-production manifest links: %w", manifestIterationErr)
+	}
+	if len(manifestRunSet) != len(runIDs) {
+		return "", controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"ACTIVE post-production manifest is not linked to every exact run",
+			"complete deterministic post-production before opening G3",
+		)
+	}
+	finalRows, err := tx.Query(ctx, `
+		SELECT ra.generation_run_id, a.id, a.artifact_uri
+		FROM video_pipeline.run_artifacts ra
+		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+		WHERE ra.generation_run_id = ANY($1::uuid[])
+		  AND ra.role = 'OUTPUT'
+		  AND a.media_spec->>'kind' = 'final_video'
+		  AND a.media_spec->>'postProductionManifestHash' = $2
+		  AND a.status = 'ACTIVE'
+		ORDER BY ra.generation_run_id, a.id
+		FOR SHARE OF a`,
+		runIDs, manifestHash,
+	)
+	if err != nil {
+		return "", fmt.Errorf("verify ACTIVE current final video: %w", err)
+	}
+	finalRunSet := make(map[uuid.UUID]struct{}, len(runIDs))
+	finalArtifactSet := make(map[uuid.UUID]struct{}, 1)
+	var finalVideoURI string
+	for finalRows.Next() {
+		var runID, artifactID uuid.UUID
+		var artifactURI string
+		if err := finalRows.Scan(&runID, &artifactID, &artifactURI); err != nil {
+			finalRows.Close()
+			return "", fmt.Errorf("scan ACTIVE current final video link: %w", err)
+		}
+		finalRunSet[runID] = struct{}{}
+		finalArtifactSet[artifactID] = struct{}{}
+		if finalVideoURI == "" {
+			finalVideoURI = artifactURI
+		} else if finalVideoURI != artifactURI {
+			finalRows.Close()
+			return "", controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"current post-production manifest resolves to multiple final video URIs",
+				"commit one exact deterministic final video before opening G3",
+			)
+		}
+	}
+	finalIterationErr := finalRows.Err()
+	finalRows.Close()
+	if finalIterationErr != nil {
+		return "", fmt.Errorf("iterate ACTIVE current final video links: %w", finalIterationErr)
+	}
+	if len(finalRunSet) != len(runIDs) || len(finalArtifactSet) != 1 || finalVideoURI == "" {
+		return "", controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"current post-production manifest does not resolve to one ACTIVE final video",
+			"commit the exact current post-production revision before opening G3",
+		)
+	}
+	return finalVideoURI, nil
 }
 
 func (p *Postgres) requireCurrentEpisodeAssetRights(
@@ -1691,6 +1869,46 @@ func (p *Postgres) requireCurrentEpisodeAssetRights(
 		}
 	}
 	return requireAssetLicenses(ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy)
+}
+
+func (p *Postgres) requireCurrentPostProductionBudget(
+	ctx context.Context,
+	tx pgx.Tx,
+	episodeRevisionID uuid.UUID,
+	generationPlanID string,
+	config orchestration.PostProductionConfig,
+) error {
+	plan, err := readPlan(ctx, tx, generationPlanID)
+	if err != nil {
+		return err
+	}
+	required := controlplane.BudgetLimit{
+		AmountMicros: config.SpeechBudgetMaximumMicros,
+		Currency:     config.SpeechBudgetCurrency,
+	}
+	if plan.EpisodeRevisionID != episodeRevisionID.String() ||
+		!sameBudgetLimit(plan.SpeechBudgetLimit, required) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"post-production speech budget is outside the immutable generation plan",
+			"create a current plan for the exact episode, TTS amount, and currency",
+		)
+	}
+	var seriesID, episodeID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT ep.series_id, ep.id
+		FROM video_pipeline.episode_revisions er
+		JOIN video_pipeline.episodes ep ON ep.id = er.episode_id
+		WHERE er.id = $1
+		FOR SHARE OF er, ep`,
+		episodeRevisionID,
+	).Scan(&seriesID, &episodeID); err != nil {
+		return fmt.Errorf("resolve post-production budget scope: %w", err)
+	}
+	return requireBudgetApproval(
+		ctx, tx, config.SpeechBudgetApprovalID, seriesID, episodeID,
+		generationPlanID, "SPEECH", required,
+	)
 }
 
 func lockPostProductionRights(

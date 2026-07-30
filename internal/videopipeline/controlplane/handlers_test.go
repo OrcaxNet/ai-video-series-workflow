@@ -226,6 +226,74 @@ func TestValidateStartProductionPostProductionBoundary(t *testing.T) {
 	}
 }
 
+func TestValidateCreatePlanSpeechBudgetBoundary(t *testing.T) {
+	t.Parallel()
+	valid := func() CreateGenerationPlanCommand {
+		return CreateGenerationPlanCommand{
+			SchemaVersion:       "v1",
+			SeriesID:            uuid.NewString(),
+			EpisodeRevisionID:   uuid.NewString(),
+			ShotSpecRevisionIDs: []string{uuid.NewString()},
+			CandidatesPerShot:   1,
+			RouteSnapshot: ModelRouteSnapshot{
+				CapabilityAlias:   "video.primary",
+				ProviderProfileID: uuid.NewString(),
+				Provider:          "mock", ModelID: "video-v1", RouteVersion: "route-v1",
+				CapabilityHash: strings.Repeat("a", 64),
+			},
+			BudgetLimit:       BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
+			SpeechBudgetLimit: &BudgetLimit{AmountMicros: 500, Currency: "CNY"},
+			ExecutionPolicy: ExecutionPolicy{
+				TargetTerritory: "CN", ProductForm: "INTERNAL_PREVIEW",
+				ContentSafetyPolicyVersion: "safety-v1",
+				ContentSafetyDecisionID:    uuid.NewString(),
+			},
+			Actor: Actor{ActorID: "producer", Role: "PRODUCER"},
+		}
+	}
+	tests := []struct {
+		name    string
+		mutate  func(*CreateGenerationPlanCommand)
+		wantErr bool
+	}{
+		{name: "valid speech envelope"},
+		{
+			name: "valid plan without post-production",
+			mutate: func(command *CreateGenerationPlanCommand) {
+				command.SpeechBudgetLimit = nil
+			},
+		},
+		{
+			name: "rejects zero speech envelope",
+			mutate: func(command *CreateGenerationPlanCommand) {
+				command.SpeechBudgetLimit.AmountMicros = 0
+			},
+			wantErr: true,
+		},
+		{
+			name: "rejects non ISO speech currency",
+			mutate: func(command *CreateGenerationPlanCommand) {
+				command.SpeechBudgetLimit.Currency = "yuan"
+			},
+			wantErr: true,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			command := valid()
+			if test.mutate != nil {
+				test.mutate(&command)
+			}
+			err := validateCreatePlan(command)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("validateCreatePlan() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestAuthorizeApprovalDoesNotLetAdminBypassGateRole(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

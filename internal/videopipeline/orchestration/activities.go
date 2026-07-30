@@ -775,7 +775,9 @@ func classifyPostProductionError(err error) error {
 	var domainErr *controlplane.DomainError
 	if errors.As(err, &domainErr) {
 		switch domainErr.Code {
-		case controlplane.CodeConsentRequired, controlplane.CodeLicenseBlocked:
+		case controlplane.CodeConsentRequired,
+			controlplane.CodeLicenseBlocked,
+			controlplane.CodeBudgetExceeded:
 			return temporal.NewNonRetryableApplicationError(
 				domainErr.Error(),
 				string(domainErr.Code),

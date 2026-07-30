@@ -12,7 +12,7 @@ make video-down
 
 ```text
 PostgreSQL healthy
-  → migration v2 clean
+  → migration v5 clean
 Temporal healthy
 Mock Provider healthy
   → Orchestrator Worker registered
