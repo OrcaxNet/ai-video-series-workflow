@@ -323,8 +323,9 @@ func TestGenerationRunner_GatesBudgetRecoveryIdempotencyManifestAndPublication(t
 	lin := fixtureAsset(t, catalog, "lin", providercontract.ModalityImage, providercontract.AssetRoleReferenceImage)
 	layers := fixtureContexts(t, store, catalog, lin.Revision.ID, "episode-single", "scene-single", "single-01", at)
 	shot := fixture.Groups[0].Shots[0]
+	promptRegistry := NewPromptRegistry()
 	prompt, err := (&PromptCompiler{
-		Resolver: NewContextResolver(catalog), Catalog: catalog, Registry: NewPromptRegistry(),
+		Resolver: NewContextResolver(catalog), Catalog: catalog, Registry: promptRegistry,
 	}).Compile(PromptCompileInput{
 		ShotRevision: compilation.Shots[shot.ID], Shot: shot, ContextLayers: layers,
 		TemplateRef: "video-shot-v1", GenerationProfileRef: "profile-720p24-v1",
@@ -335,14 +336,14 @@ func TestGenerationRunner_GatesBudgetRecoveryIdempotencyManifestAndPublication(t
 	}
 
 	provider := providercontract.NewFakeProvider(providercontract.FakeRecovery)
-	runner := NewGenerationRunner(provider, fixtureCommitter{})
+	runner := NewGenerationRunner(provider, fixtureCommitter{}, promptRegistry)
 	clock := at
 	runner.Now = func() time.Time {
 		clock = clock.Add(time.Millisecond)
 		return clock
 	}
 	runner.Wait = func(context.Context, time.Duration) error { return nil }
-	input := fixtureGenerationInput(compilation.Source, compilation.Shots[shot.ID], prompt, at)
+	input := fixtureGenerationInput(t, compilation.Source, compilation.Shots[shot.ID], prompt, at)
 	record, err := runner.Execute(t.Context(), input)
 	if err != nil {
 		t.Fatal(err)
@@ -378,6 +379,7 @@ func TestGenerationRunner_GatesBudgetRecoveryIdempotencyManifestAndPublication(t
 	missingGate := input
 	missingGate.RunID = "run-missing-gate"
 	missingGate.IdempotencyKey = missingGate.RunID
+	missingGate.BudgetReservation = fixtureBudgetReservation(t, missingGate)
 	missingGate.Gate2.Approved = false
 	if _, err := runner.Execute(t.Context(), missingGate); !errors.Is(err, ErrPolicyBlocked) {
 		t.Fatalf("missing G2 error = %v", err)
@@ -385,9 +387,29 @@ func TestGenerationRunner_GatesBudgetRecoveryIdempotencyManifestAndPublication(t
 	overBudget := input
 	overBudget.RunID = "run-over-budget"
 	overBudget.IdempotencyKey = overBudget.RunID
+	overBudget.BudgetReservation = fixtureBudgetReservation(t, overBudget)
 	overBudget.BudgetPolicy.HardLimitMicros = 1
 	if _, err := runner.Execute(t.Context(), overBudget); providercontract.ErrorCodeOf(err) != providercontract.CodeBudgetExceeded {
 		t.Fatalf("budget error = %v", err)
+	}
+	actualCostProvider := &actualCostProvider{
+		Provider: providercontract.NewFakeProvider(providercontract.FakeSuccess),
+		cost:     input.Budget.EstimatedCostMicros + 1,
+	}
+	actualCostRunner := NewGenerationRunner(actualCostProvider, fixtureCommitter{}, promptRegistry)
+	actualCostRunner.Wait = func(context.Context, time.Duration) error { return nil }
+	actualCostInput := input
+	actualCostInput.RunID = "run-actual-cost-over-reservation"
+	actualCostInput.IdempotencyKey = actualCostInput.RunID
+	actualCostInput.BudgetReservation = fixtureBudgetReservationAmount(
+		t,
+		actualCostInput,
+		actualCostInput.Budget.EstimatedCostMicros,
+	)
+	actualCostRecord, actualCostErr := actualCostRunner.Execute(t.Context(), actualCostInput)
+	if providercontract.ErrorCodeOf(actualCostErr) != providercontract.CodeBudgetExceeded ||
+		actualCostRecord.State != RunFailed {
+		t.Fatalf("actual cost record=%#v error=%v", actualCostRecord, actualCostErr)
 	}
 
 	locker := NewPublicationLocker()
@@ -412,6 +434,102 @@ func TestGenerationRunner_GatesBudgetRecoveryIdempotencyManifestAndPublication(t
 	}
 }
 
+func TestGenerationRunner_PreflightRejectsPromptTamperingAndUnderfundedReservation(t *testing.T) {
+	t.Parallel()
+	fixture := loadGolden(t)
+	source, draft := goldenCompilationDraft(fixture)
+	at := time.Unix(1_800_000_000, 0).UTC()
+	store := NewRevisionStore()
+	compilation, err := (&ContentCompiler{
+		Store: store, Generator: FixtureContentGenerator{Draft: draft},
+	}).Compile(t.Context(), source, DefaultCompileOptions(at))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog := NewAssetCatalog()
+	lin := fixtureAsset(t, catalog, "lin-preflight", providercontract.ModalityImage, providercontract.AssetRoleReferenceImage)
+	shot := fixture.Groups[0].Shots[0]
+	promptRegistry := NewPromptRegistry()
+	prompt, err := (&PromptCompiler{
+		Resolver: NewContextResolver(catalog), Catalog: catalog, Registry: promptRegistry,
+	}).Compile(PromptCompileInput{
+		ShotRevision: compilation.Shots[shot.ID], Shot: shot,
+		ContextLayers: fixtureContexts(t, store, catalog, lin.Revision.ID, "episode-preflight", "scene-preflight", "shot-preflight", at),
+		TemplateRef:   "video-shot-v1", GenerationProfileRef: "profile-720p24-v1",
+		Output: fixtureOutput(), CreatedAt: at,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		mutate      func(*testing.T, *GenerationInput)
+		wantError   error
+		wantErrCode providercontract.ErrorCode
+	}{
+		{
+			name: "prompt text changed while retaining frozen identity",
+			mutate: func(_ *testing.T, input *GenerationInput) {
+				input.Prompt.PositivePrompt += " unapproved mutation"
+			},
+			wantError: ErrConflict,
+		},
+		{
+			name: "self-consistent prompt is not in persistent registry",
+			mutate: func(t *testing.T, input *GenerationInput) {
+				t.Helper()
+				input.Prompt.PositivePrompt += " unregistered mutation"
+				digest, hashErr := promptSnapshotContentHash(input.Prompt)
+				if hashErr != nil {
+					t.Fatal(hashErr)
+				}
+				input.Prompt.ContentHash = digest
+				input.Prompt.ID = derivedID("prompt", digest)
+				input.BudgetReservation = fixtureBudgetReservation(t, *input)
+			},
+			wantError: ErrStaleReference,
+		},
+		{
+			name: "reservation is one micro below current estimate",
+			mutate: func(t *testing.T, input *GenerationInput) {
+				t.Helper()
+				input.BudgetReservation = fixtureBudgetReservationAmount(
+					t,
+					*input,
+					input.Budget.EstimatedCostMicros-1,
+				)
+			},
+			wantErrCode: providercontract.CodeBudgetExceeded,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &submitCountingProvider{
+				Provider: providercontract.NewFakeProvider(providercontract.FakeSuccess),
+			}
+			runner := NewGenerationRunner(provider, fixtureCommitter{}, promptRegistry)
+			runner.Wait = func(context.Context, time.Duration) error { return nil }
+			input := fixtureGenerationInput(t, compilation.Source, compilation.Shots[shot.ID], prompt, at)
+			input.RunID += "-" + strings.ReplaceAll(test.name, " ", "-")
+			input.IdempotencyKey = input.RunID
+			input.BudgetReservation = fixtureBudgetReservation(t, input)
+			test.mutate(t, &input)
+
+			_, executeErr := runner.Execute(t.Context(), input)
+			if test.wantError != nil && !errors.Is(executeErr, test.wantError) {
+				t.Fatalf("Execute() error = %v, want %v", executeErr, test.wantError)
+			}
+			if test.wantErrCode != "" && providercontract.ErrorCodeOf(executeErr) != test.wantErrCode {
+				t.Fatalf("Execute() error = %v, want code %s", executeErr, test.wantErrCode)
+			}
+			if provider.submits != 0 {
+				t.Fatalf("provider Submit() calls = %d, want 0", provider.submits)
+			}
+		})
+	}
+}
+
 func TestGenerationRunner_ErrorScenariosHaveOneTerminalRecord(t *testing.T) {
 	t.Parallel()
 	fixture := loadGolden(t)
@@ -427,8 +545,9 @@ func TestGenerationRunner_ErrorScenariosHaveOneTerminalRecord(t *testing.T) {
 	catalog := NewAssetCatalog()
 	lin := fixtureAsset(t, catalog, "lin-errors", providercontract.ModalityImage, providercontract.AssetRoleReferenceImage)
 	shot := fixture.Groups[0].Shots[0]
+	promptRegistry := NewPromptRegistry()
 	prompt, err := (&PromptCompiler{
-		Resolver: NewContextResolver(catalog), Catalog: catalog, Registry: NewPromptRegistry(),
+		Resolver: NewContextResolver(catalog), Catalog: catalog, Registry: promptRegistry,
 	}).Compile(PromptCompileInput{
 		ShotRevision: compilation.Shots[shot.ID], Shot: shot,
 		ContextLayers: fixtureContexts(t, store, catalog, lin.Revision.ID, "episode-errors", "scene-errors", "shot-errors", at),
@@ -457,16 +576,17 @@ func TestGenerationRunner_ErrorScenariosHaveOneTerminalRecord(t *testing.T) {
 		test := test
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
-			runner := NewGenerationRunner(providercontract.NewFakeProvider(test.scenario), fixtureCommitter{})
+			runner := NewGenerationRunner(providercontract.NewFakeProvider(test.scenario), fixtureCommitter{}, promptRegistry)
 			clock := at
 			runner.Now = func() time.Time {
 				clock = clock.Add(time.Millisecond)
 				return clock
 			}
 			runner.Wait = func(context.Context, time.Duration) error { return nil }
-			input := fixtureGenerationInput(compilation.Source, compilation.Shots[shot.ID], prompt, at)
+			input := fixtureGenerationInput(t, compilation.Source, compilation.Shots[shot.ID], prompt, at)
 			input.RunID = "run-error-" + test.name
 			input.IdempotencyKey = input.RunID
+			input.BudgetReservation = fixtureBudgetReservation(t, input)
 			first, firstErr := runner.Execute(t.Context(), input)
 			if providercontract.ErrorCodeOf(firstErr) != test.code || first.State != RunFailed {
 				t.Fatalf("first execute record=%#v error=%v", first, firstErr)
@@ -509,7 +629,7 @@ func TestGoldenThirtyShots_CompleteMockLineage(t *testing.T) {
 	promptCompiler := PromptCompiler{
 		Resolver: NewContextResolver(catalog), Catalog: catalog, Registry: NewPromptRegistry(),
 	}
-	runner := NewGenerationRunner(providercontract.NewFakeProvider(providercontract.FakeSuccess), fixtureCommitter{})
+	runner := NewGenerationRunner(providercontract.NewFakeProvider(providercontract.FakeSuccess), fixtureCommitter{}, promptCompiler.Registry)
 	clock := at
 	runner.Now = func() time.Time {
 		clock = clock.Add(time.Millisecond)
@@ -552,9 +672,10 @@ func TestGoldenThirtyShots_CompleteMockLineage(t *testing.T) {
 			if compileErr != nil {
 				t.Fatalf("compile %s: %v", shot.ID, compileErr)
 			}
-			runInput := fixtureGenerationInput(compilation.Source, compilation.Shots[shot.ID], prompt, at)
+			runInput := fixtureGenerationInput(t, compilation.Source, compilation.Shots[shot.ID], prompt, at)
 			runInput.RunID = "run-" + shot.ID
 			runInput.IdempotencyKey = runInput.RunID
+			runInput.BudgetReservation = fixtureBudgetReservation(t, runInput)
 			record, runErr := runner.Execute(t.Context(), runInput)
 			if runErr != nil {
 				t.Fatalf("execute %s: %v", shot.ID, runErr)
@@ -815,9 +936,10 @@ func fixtureQuality(run RunRecord, at time.Time) QualityEvidence {
 	}
 }
 
-func fixtureGenerationInput(source, shot RevisionRef, prompt PromptSnapshot, at time.Time) GenerationInput {
+func fixtureGenerationInput(t *testing.T, source, shot RevisionRef, prompt PromptSnapshot, at time.Time) GenerationInput {
+	t.Helper()
 	runID := "run-" + shot.AggregateID
-	return GenerationInput{
+	input := GenerationInput{
 		RunID: runID, IdempotencyKey: runID, SourceRevision: source, ShotRevision: shot, Prompt: prompt,
 		Authorization: AuthorizationEvidence{
 			SourceRevisionID: source.ID, SourceHash: source.ContentHash,
@@ -832,13 +954,56 @@ func fixtureGenerationInput(source, shot RevisionRef, prompt PromptSnapshot, at 
 		BudgetPolicy: providercontract.BudgetPolicy{
 			SoftLimitMicros: 10_000_000, HardLimitMicros: 20_000_000, MaxAttempts: 3,
 		},
-		BudgetReservation: providercontract.BudgetReservation{
-			ReservationID: "budget-" + runID, Currency: "CNY", AmountMicros: 10_000_000,
-			PricingVersion: "mock-pricing-v1", ConfirmedBy: "budget-reviewer",
-		},
 		Evidence: providercontract.EvidenceMockOnly,
 		MaxPolls: 3,
 	}
+	input.BudgetReservation = fixtureBudgetReservation(t, input)
+	return input
+}
+
+func fixtureBudgetReservation(t *testing.T, input GenerationInput) providercontract.BudgetReservation {
+	t.Helper()
+	return fixtureBudgetReservationAmount(t, input, 10_000_000)
+}
+
+func fixtureBudgetReservationAmount(t *testing.T, input GenerationInput, amountMicros int64) providercontract.BudgetReservation {
+	t.Helper()
+	reservation, err := providercontract.BindBudgetReservation(providercontract.BudgetReservation{
+		ReservationID: "budget-" + input.RunID, Currency: "CNY", AmountMicros: amountMicros,
+		PricingVersion: "mock-pricing-v1", ConfirmedBy: "budget-reviewer",
+	}, providercontract.BudgetBindingInput{
+		RunID:     input.RunID,
+		InputHash: input.Prompt.ContentHash,
+		Model:     input.Route,
+		Budget:    input.Budget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return reservation
+}
+
+type submitCountingProvider struct {
+	providercontract.Provider
+	submits int
+}
+
+func (p *submitCountingProvider) Submit(ctx context.Context, request providercontract.GenerationRequest) (providercontract.Job, error) {
+	p.submits++
+	return p.Provider.Submit(ctx, request)
+}
+
+type actualCostProvider struct {
+	providercontract.Provider
+	cost int64
+}
+
+func (p *actualCostProvider) Poll(ctx context.Context, jobID string) (providercontract.Job, error) {
+	job, err := p.Provider.Poll(ctx, jobID)
+	if err == nil && job.Output != nil {
+		job.Output.Usage.ProviderCostMicros = p.cost
+	}
+	return job, err
 }
 
 type fixtureCommitter struct{}

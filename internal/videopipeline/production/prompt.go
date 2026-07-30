@@ -15,7 +15,7 @@ import (
 
 const (
 	PromptSchemaVersion   = "v1"
-	PromptCompilerVersion = "prompt-compiler-v1"
+	PromptCompilerVersion = "prompt-compiler-v2"
 )
 
 type PromptAssetBinding struct {
@@ -67,6 +67,127 @@ func (p PromptSnapshot) Ref() RevisionRef {
 		Number:      p.RevisionNumber,
 		ContentHash: p.ContentHash,
 	}
+}
+
+// ValidateIntegrity recomputes both hashes from the fields carried by the
+// snapshot. It deliberately excludes only registry chain metadata
+// (RevisionNumber) from the content identity.
+func (p PromptSnapshot) ValidateIntegrity() error {
+	if p.SchemaVersion != PromptSchemaVersion ||
+		p.CompilerVersion != PromptCompilerVersion ||
+		!nonEmpty(p.ID, p.TemplateRef, p.GenerationProfileRef, p.PositivePrompt) ||
+		p.CreatedAt.IsZero() {
+		return validationf("complete immutable prompt snapshot is required")
+	}
+	if err := p.ShotRevision.Validate(); err != nil {
+		return err
+	}
+	if p.ShotRevision.Kind != KindShotSpec {
+		return validationf("prompt snapshot must reference a shot revision")
+	}
+	if err := validateOutput(p.Output, p.Output.DurationMillis); err != nil {
+		return err
+	}
+	if !validSHA256(p.EffectiveContext.ContentHash) ||
+		!nonEmpty(
+			p.EffectiveContext.ID,
+			p.EffectiveContext.RevisionRefs.SeriesSnapshotID,
+			p.EffectiveContext.RevisionRefs.EpisodeSnapshotID,
+			p.EffectiveContext.RevisionRefs.SceneSnapshotID,
+			p.EffectiveContext.RevisionRefs.ShotSnapshotID,
+		) {
+		return validationf("prompt snapshot has incomplete effective context")
+	}
+	for name, digest := range p.InputRevisionHashes {
+		if strings.TrimSpace(name) == "" || !validSHA256(digest) {
+			return validationf("prompt snapshot input revision hashes are invalid")
+		}
+	}
+	for _, asset := range p.Assets {
+		if !nonEmpty(asset.ID, asset.Revision, asset.SHA256, asset.LicenseReference) ||
+			!validSHA256(asset.SHA256) {
+			return validationf("prompt snapshot asset evidence is incomplete")
+		}
+	}
+	expectedNormalized, err := promptNormalizedInputHash(p)
+	if err != nil {
+		return err
+	}
+	if p.NormalizedInputHash != expectedNormalized {
+		return conflictf("prompt snapshot normalized input hash does not match its immutable fields")
+	}
+	expectedContent, err := promptSnapshotContentHash(p)
+	if err != nil {
+		return err
+	}
+	if p.ContentHash != expectedContent || p.ID != derivedID("prompt", expectedContent) {
+		return conflictf(
+			"prompt snapshot content hash or ID does not match its immutable content (content=%s expected=%s id=%s expected_id=%s)",
+			p.ContentHash,
+			expectedContent,
+			p.ID,
+			derivedID("prompt", expectedContent),
+		)
+	}
+	return nil
+}
+
+func promptNormalizedInputHash(snapshot PromptSnapshot) (string, error) {
+	material := struct {
+		CompilerVersion          string                      `json:"compiler_version"`
+		TemplateRef              string                      `json:"template_ref"`
+		GenerationProfileRef     string                      `json:"generation_profile_ref"`
+		ShotRevision             RevisionRef                 `json:"shot_revision"`
+		EffectiveContext         EffectiveContext            `json:"effective_context"`
+		Assets                   []providercontract.AssetRef `json:"assets"`
+		AssetAliases             map[string]string           `json:"asset_aliases"`
+		PreviousPromptSnapshotID string                      `json:"previous_prompt_snapshot_id,omitempty"`
+		PreviousPromptHash       string                      `json:"previous_prompt_hash,omitempty"`
+		TailFrameHash            string                      `json:"tail_frame_hash,omitempty"`
+		Output                   providercontract.OutputSpec `json:"output"`
+		InputRevisionHashes      map[string]string           `json:"input_revision_hashes"`
+	}{
+		CompilerVersion:          snapshot.CompilerVersion,
+		TemplateRef:              snapshot.TemplateRef,
+		GenerationProfileRef:     snapshot.GenerationProfileRef,
+		ShotRevision:             snapshot.ShotRevision,
+		EffectiveContext:         snapshot.EffectiveContext,
+		Assets:                   snapshot.Assets,
+		AssetAliases:             snapshot.AssetAliases,
+		PreviousPromptSnapshotID: snapshot.PreviousPromptSnapshotID,
+		PreviousPromptHash:       snapshot.PreviousPromptHash,
+		TailFrameHash:            snapshot.TailFrameHash,
+		Output:                   snapshot.Output,
+		InputRevisionHashes:      snapshot.InputRevisionHashes,
+	}
+	return contentHash(material)
+}
+
+func promptSnapshotContentHash(snapshot PromptSnapshot) (string, error) {
+	subtitles := snapshot.SubtitleTimeline
+	if len(subtitles) == 0 {
+		subtitles = nil
+	}
+	material := struct {
+		SchemaVersion       string                      `json:"schema_version"`
+		CompilerVersion     string                      `json:"compiler_version"`
+		NormalizedInputHash string                      `json:"normalized_input_hash"`
+		PositivePrompt      string                      `json:"positive_prompt"`
+		NegativePrompt      string                      `json:"negative_prompt"`
+		ModelPayload        map[string]any              `json:"model_payload"`
+		Subtitles           []SubtitleCue               `json:"subtitles"`
+		Output              providercontract.OutputSpec `json:"output"`
+	}{
+		SchemaVersion:       snapshot.SchemaVersion,
+		CompilerVersion:     snapshot.CompilerVersion,
+		NormalizedInputHash: snapshot.NormalizedInputHash,
+		PositivePrompt:      snapshot.PositivePrompt,
+		NegativePrompt:      snapshot.NegativePrompt,
+		ModelPayload:        snapshot.ModelPayload,
+		Subtitles:           subtitles,
+		Output:              snapshot.Output,
+	}
+	return contentHash(material)
 }
 
 type PromptCompileInput struct {
@@ -205,58 +326,7 @@ func (c *PromptCompiler) Compile(input PromptCompileInput) (PromptSnapshot, erro
 			"exit_state":           input.Shot.Continuity.ExitState,
 		},
 	}
-	normalizedMaterial := struct {
-		CompilerVersion    string                      `json:"compiler_version"`
-		TemplateRef        string                      `json:"template_ref"`
-		ProfileRef         string                      `json:"profile_ref"`
-		ShotRevision       RevisionRef                 `json:"shot_revision"`
-		Shot               ShotSpec                    `json:"shot"`
-		EffectiveContext   EffectiveContext            `json:"effective_context"`
-		Assets             []providercontract.AssetRef `json:"assets"`
-		PreviousPromptHash string                      `json:"previous_prompt_hash,omitempty"`
-		TailFrameHash      string                      `json:"tail_frame_hash,omitempty"`
-		Output             providercontract.OutputSpec `json:"output"`
-	}{
-		CompilerVersion:    PromptCompilerVersion,
-		TemplateRef:        input.TemplateRef,
-		ProfileRef:         input.GenerationProfileRef,
-		ShotRevision:       input.ShotRevision,
-		Shot:               input.Shot,
-		EffectiveContext:   effective,
-		Assets:             assets,
-		PreviousPromptHash: previousHash,
-		TailFrameHash:      tailFrameHash,
-		Output:             input.Output,
-	}
-	normalizedHash, err := contentHash(normalizedMaterial)
-	if err != nil {
-		return PromptSnapshot{}, err
-	}
-	snapshotMaterial := struct {
-		SchemaVersion       string                      `json:"schema_version"`
-		CompilerVersion     string                      `json:"compiler_version"`
-		NormalizedInputHash string                      `json:"normalized_input_hash"`
-		PositivePrompt      string                      `json:"positive_prompt"`
-		NegativePrompt      string                      `json:"negative_prompt"`
-		ModelPayload        map[string]any              `json:"model_payload"`
-		Subtitles           []SubtitleCue               `json:"subtitles"`
-		Output              providercontract.OutputSpec `json:"output"`
-	}{
-		SchemaVersion:       PromptSchemaVersion,
-		CompilerVersion:     PromptCompilerVersion,
-		NormalizedInputHash: normalizedHash,
-		PositivePrompt:      positive,
-		NegativePrompt:      negative,
-		ModelPayload:        modelPayload,
-		Subtitles:           subtitles,
-		Output:              input.Output,
-	}
-	digest, err := contentHash(snapshotMaterial)
-	if err != nil {
-		return PromptSnapshot{}, err
-	}
 	snapshot := PromptSnapshot{
-		ID:                       derivedID("prompt", digest),
 		SchemaVersion:            PromptSchemaVersion,
 		CompilerVersion:          PromptCompilerVersion,
 		TemplateRef:              input.TemplateRef,
@@ -274,11 +344,20 @@ func (c *PromptCompiler) Compile(input PromptCompileInput) (PromptSnapshot, erro
 		Output:                   input.Output,
 		ModelPayload:             modelPayload,
 		InputRevisionHashes:      inputHashes,
-		NormalizedInputHash:      normalizedHash,
-		ContentHash:              digest,
 		EvidenceIDs:              sortedUnique(input.EvidenceIDs),
 		CreatedAt:                input.CreatedAt.UTC(),
 	}
+	normalizedHash, err := promptNormalizedInputHash(snapshot)
+	if err != nil {
+		return PromptSnapshot{}, err
+	}
+	snapshot.NormalizedInputHash = normalizedHash
+	digest, err := promptSnapshotContentHash(snapshot)
+	if err != nil {
+		return PromptSnapshot{}, err
+	}
+	snapshot.ContentHash = digest
+	snapshot.ID = derivedID("prompt", digest)
 	return c.Registry.Put(snapshot)
 }
 
@@ -289,6 +368,9 @@ func BuildGenerationRequest(
 	callbackURL string,
 	budget providercontract.BudgetEnvelope,
 ) (providercontract.GenerationRequest, error) {
+	if err := snapshot.ValidateIntegrity(); err != nil {
+		return providercontract.GenerationRequest{}, err
+	}
 	if err := snapshot.Ref().Validate(); err != nil {
 		return providercontract.GenerationRequest{}, err
 	}
@@ -425,9 +507,8 @@ func NewPromptRegistry() *PromptRegistry {
 }
 
 func (r *PromptRegistry) Put(snapshot PromptSnapshot) (PromptSnapshot, error) {
-	if !nonEmpty(snapshot.ID, snapshot.ContentHash, snapshot.NormalizedInputHash, snapshot.ShotRevision.ID) ||
-		!validSHA256(snapshot.ContentHash) || !validSHA256(snapshot.NormalizedInputHash) {
-		return PromptSnapshot{}, validationf("complete immutable prompt snapshot is required")
+	if err := snapshot.ValidateIntegrity(); err != nil {
+		return PromptSnapshot{}, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -439,7 +520,11 @@ func (r *PromptRegistry) Put(snapshot PromptSnapshot) (PromptSnapshot, error) {
 	}
 	chain := r.byShot[snapshot.ShotRevision.AggregateID]
 	snapshot.RevisionNumber = len(chain) + 1
-	r.byID[snapshot.ID] = clonePromptSnapshot(snapshot)
+	cloned := clonePromptSnapshot(snapshot)
+	if err := cloned.ValidateIntegrity(); err != nil {
+		return PromptSnapshot{}, fmt.Errorf("clone prompt snapshot: %w", err)
+	}
+	r.byID[snapshot.ID] = cloned
 	r.byShot[snapshot.ShotRevision.AggregateID] = append(chain, snapshot.ID)
 	return clonePromptSnapshot(snapshot), nil
 }
@@ -449,6 +534,42 @@ func (r *PromptRegistry) Get(id string) (PromptSnapshot, bool) {
 	defer r.mu.RUnlock()
 	snapshot, ok := r.byID[id]
 	return clonePromptSnapshot(snapshot), ok
+}
+
+// PromptSnapshotSource is implemented by the in-memory registry and by the
+// persistent PromptSnapshot repository injected into the generation runner.
+type PromptSnapshotSource interface {
+	Get(string) (PromptSnapshot, bool)
+}
+
+// VerifyExactPromptSnapshot rejects a self-consistent but unregistered
+// snapshot as well as any mutation of a persisted immutable record.
+func VerifyExactPromptSnapshot(source PromptSnapshotSource, candidate PromptSnapshot) error {
+	if source == nil {
+		return validationf("persistent prompt snapshot source is required")
+	}
+	if err := candidate.ValidateIntegrity(); err != nil {
+		return err
+	}
+	stored, ok := source.Get(candidate.ID)
+	if !ok {
+		return fmt.Errorf("%w: prompt snapshot %q is not persisted", ErrStaleReference, candidate.ID)
+	}
+	if err := stored.ValidateIntegrity(); err != nil {
+		return fmt.Errorf("persisted prompt snapshot integrity: %w", err)
+	}
+	candidateHash, err := contentHash(candidate)
+	if err != nil {
+		return err
+	}
+	storedHash, err := contentHash(stored)
+	if err != nil {
+		return err
+	}
+	if candidateHash != storedHash {
+		return conflictf("prompt snapshot %q differs from its persisted immutable record", candidate.ID)
+	}
+	return nil
 }
 
 func (r *PromptRegistry) History(shotID string) []PromptSnapshot {

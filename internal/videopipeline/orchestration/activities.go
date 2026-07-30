@@ -56,6 +56,9 @@ func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput
 		if err != nil {
 			return PromptSnapshotRef{}, fmt.Errorf("compile production prompt: %w", err)
 		}
+		if err := snapshot.ValidateIntegrity(); err != nil {
+			return PromptSnapshotRef{}, fmt.Errorf("verify production prompt snapshot: %w", err)
+		}
 		if snapshot.ID == "" || snapshot.ContentHash == "" ||
 			snapshot.ShotRevision.ID != input.ShotSpecRevisionID ||
 			snapshot.GenerationProfileRef != input.GenerationProfileRef {
@@ -136,37 +139,50 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
 		return ProviderResult{}, errors.New("immutable compiled output specification is required")
 	}
-	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, providercontract.JobRequest{
-		SchemaVersion: "v1",
-		JobID:         jobID,
-		RunID:         input.Run.RunID,
-		Capability:    providercontract.CapabilityVideo,
-		InputHash:     input.Run.RunSpecDigest,
-		Model:         input.Route,
-		Request: providercontract.GenerationRequest{
-			RequestID:        jobID,
-			IdempotencyKey:   jobID,
-			Modality:         providercontract.ModalityVideo,
-			Prompt:           promptText,
-			PromptSnapshotID: input.Prompt.ID,
-			Context:          input.Prompt.Context,
-			Assets:           input.Prompt.Assets,
-			Output:           outputSpec,
-			ModelHint:        input.Route.ModelID,
-			Budget: providercontract.BudgetEnvelope{
-				EstimatedCostMicros: input.BudgetMaximumMicros,
-				MaxCostMicros:       input.BudgetMaximumMicros,
-				MaxAttempts:         2,
-			},
+	generationRequest := providercontract.GenerationRequest{
+		RequestID:        jobID,
+		IdempotencyKey:   jobID,
+		Modality:         providercontract.ModalityVideo,
+		Prompt:           promptText,
+		PromptSnapshotID: input.Prompt.ID,
+		Context:          input.Prompt.Context,
+		Assets:           input.Prompt.Assets,
+		Output:           outputSpec,
+		ModelHint:        input.Route.ModelID,
+		Budget: providercontract.BudgetEnvelope{
+			EstimatedCostMicros: input.BudgetMaximumMicros,
+			MaxCostMicros:       input.BudgetMaximumMicros,
+			MaxAttempts:         2,
 		},
-		BudgetReservation: providercontract.BudgetReservation{
+	}
+	budgetReservation, err := providercontract.BindBudgetReservation(
+		providercontract.BudgetReservation{
 			ReservationID:  input.BudgetApprovalID,
 			Currency:       input.BudgetCurrency,
 			AmountMicros:   input.BudgetMaximumMicros,
 			PricingVersion: "workflow-approved-v1",
 			ConfirmedBy:    input.BudgetApprovalID,
 		},
-		TraceID: input.TraceID,
+		providercontract.BudgetBindingInput{
+			RunID:     input.Run.RunID,
+			InputHash: input.Run.RunSpecDigest,
+			Model:     input.Route,
+			Budget:    generationRequest.Budget,
+		},
+	)
+	if err != nil {
+		return ProviderResult{}, fmt.Errorf("bind budget approval: %w", err)
+	}
+	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, providercontract.JobRequest{
+		SchemaVersion:     "v1",
+		JobID:             jobID,
+		RunID:             input.Run.RunID,
+		Capability:        providercontract.CapabilityVideo,
+		InputHash:         input.Run.RunSpecDigest,
+		Model:             input.Route,
+		Request:           generationRequest,
+		BudgetReservation: budgetReservation,
+		TraceID:           input.TraceID,
 	})
 	if err != nil {
 		return ProviderResult{}, classifyProviderError(err)

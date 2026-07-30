@@ -47,11 +47,17 @@
   上一 Prompt hash、尾帧 hash、模板、生成 Profile 和输出规格。
 - 编译结果同时包含稳定 Prompt、negative constraints、字幕时间轴、
   provider-neutral model payload、输入 hash 表和 Prompt diff。
+- 付费提交前，`GenerationRunner` 必须从持久化 `PromptSnapshotSource` 按 ID
+  取回记录，重算 `normalized_input_hash` 与 `content_hash`，并逐字段核对调用方
+  输入；旧 ID/hash 下的篡改或未入库的新 snapshot 均失败关闭。
 
 ### Provider 执行、CAS 与谱系
 
 - `GenerationRunner` 在任何付费调用前校验来源授权、G1、G2、预算预留、
-  路由快照和运行时能力发现。
+  路由快照和运行时能力发现。预算预留绑定 run、Prompt content hash、模型
+  路由和估算包络，且金额必须覆盖当前 estimate、不得超过请求上限；
+  `ReservedMicros` 仅表示其他未结预留。Provider 返回的实际费用超过已批准
+  预留时，Run 以 `budget_exceeded` 失败关闭，不能进入成功 Manifest/G3。
 - 不确定 submit 使用原 idempotency key 重试；poll 错误不会创建新的创作
   attempt；同 key 不同输入返回 conflict。
 - 401/403、429、5xx、超时、配额、内容安全、地区和模型不可用使用
@@ -104,7 +110,9 @@ make video-test
 
 30 镜测试逐镜完成内容 revision、Prompt 编译、异步 Fake Provider、CAS、
 Manifest 和 G3 lock；另有授权、上下文覆盖、引用冲突、Prompt diff、stale、
-回滚、幂等、恢复和 API 错误分类测试。
+回滚、幂等、恢复和 API 错误分类测试。负向预检同时断言篡改/未持久化
+PromptSnapshot 与低于估算的预算预留都在 Provider `Submit` 调用计数为 0 时
+失败。
 
 Fake/fixture 证据仅为 `mock_only`，不能证明真实画质、p95、成功率、模型可用性
 或费用。火山 Key 到位前这些指标保持 `pending_key`。真实运行需要：

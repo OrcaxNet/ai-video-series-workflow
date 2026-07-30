@@ -111,6 +111,7 @@ type RunRecord struct {
 	InputRevisionHashes map[string]string                  `json:"input_revision_hashes"`
 	Capability          providercontract.Capability        `json:"capability"`
 	Model               providercontract.ModelSnapshot     `json:"model_snapshot"`
+	BudgetReservation   providercontract.BudgetReservation `json:"budget_reservation"`
 	Request             providercontract.GenerationRequest `json:"request"`
 	Attempts            []AttemptRecord                    `json:"attempts"`
 	ProviderJob         *providercontract.Job              `json:"provider_job,omitempty"`
@@ -135,10 +136,13 @@ type GenerationInput struct {
 	BudgetPolicy      providercontract.BudgetPolicy
 	BudgetReservation providercontract.BudgetReservation
 	SpentMicros       int64
-	ReservedMicros    int64
-	CallbackURL       string
-	Evidence          string
-	MaxPolls          int
+	// ReservedMicros is the sum of other outstanding reservations. The
+	// reservation for this run is validated separately against its estimate
+	// and immutable PromptSnapshot/model binding.
+	ReservedMicros int64
+	CallbackURL    string
+	Evidence       string
+	MaxPolls       int
 }
 
 type ManifestRecord struct {
@@ -259,6 +263,7 @@ func (l *RunLedger) Get(runID string) (RunRecord, bool) {
 type GenerationRunner struct {
 	Provider  providercontract.Provider
 	Committer ArtifactCommitter
+	Prompts   PromptSnapshotSource
 	Manifests *ManifestStore
 	Ledger    *RunLedger
 	Now       func() time.Time
@@ -266,10 +271,11 @@ type GenerationRunner struct {
 	mu        sync.Mutex
 }
 
-func NewGenerationRunner(provider providercontract.Provider, committer ArtifactCommitter) *GenerationRunner {
+func NewGenerationRunner(provider providercontract.Provider, committer ArtifactCommitter, prompts PromptSnapshotSource) *GenerationRunner {
 	return &GenerationRunner{
 		Provider:  provider,
 		Committer: committer,
+		Prompts:   prompts,
 		Manifests: NewManifestStore(),
 		Ledger:    NewRunLedger(),
 		Now:       time.Now,
@@ -283,15 +289,38 @@ func (r *GenerationRunner) Execute(ctx context.Context, input GenerationInput) (
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	if r.Provider == nil || r.Committer == nil || r.Manifests == nil || r.Ledger == nil || r.Now == nil || r.Wait == nil {
-		return RunRecord{}, validationf("provider, CAS committer, stores, clock, and wait function are required")
+	if r.Provider == nil || r.Committer == nil || r.Prompts == nil ||
+		r.Manifests == nil || r.Ledger == nil || r.Now == nil || r.Wait == nil {
+		return RunRecord{}, validationf("provider, CAS committer, prompt source, stores, clock, and wait function are required")
 	}
 	startedAt := r.Now().UTC()
 	request, capability, err := r.preflight(ctx, input, startedAt)
 	if err != nil {
 		return RunRecord{}, err
 	}
-	requestHash, err := contentHash(request)
+	requestHash, err := contentHash(struct {
+		Request           providercontract.GenerationRequest `json:"request"`
+		SourceRevision    RevisionRef                        `json:"source_revision"`
+		ShotRevision      RevisionRef                        `json:"shot_revision"`
+		PromptHash        string                             `json:"prompt_hash"`
+		Authorization     AuthorizationEvidence              `json:"authorization"`
+		Gate1             GateApproval                       `json:"gate1"`
+		Gate2             GateApproval                       `json:"gate2"`
+		Route             providercontract.ModelSnapshot     `json:"route"`
+		BudgetReservation providercontract.BudgetReservation `json:"budget_reservation"`
+		Evidence          string                             `json:"evidence"`
+	}{
+		Request:           request,
+		SourceRevision:    input.SourceRevision,
+		ShotRevision:      input.ShotRevision,
+		PromptHash:        input.Prompt.ContentHash,
+		Authorization:     input.Authorization,
+		Gate1:             input.Gate1,
+		Gate2:             input.Gate2,
+		Route:             input.Route,
+		BudgetReservation: input.BudgetReservation,
+		Evidence:          input.Evidence,
+	})
 	if err != nil {
 		return RunRecord{}, err
 	}
@@ -308,6 +337,7 @@ func (r *GenerationRunner) Execute(ctx context.Context, input GenerationInput) (
 		InputRevisionHashes: mapsClone(input.Prompt.InputRevisionHashes),
 		Capability:          capability,
 		Model:               input.Route,
+		BudgetReservation:   input.BudgetReservation,
 		Request:             request,
 		StartedAt:           startedAt,
 	}
@@ -416,6 +446,18 @@ func (r *GenerationRunner) Execute(ctx context.Context, input GenerationInput) (
 		!nonEmpty(job.ProviderRegion, job.ProviderRequestID) {
 		return r.fail(record, conflictf("provider result does not match the frozen model/region/request snapshot"))
 	}
+	if job.Output != nil {
+		actualCost := job.Output.Usage.ProviderCostMicros
+		if actualCost < 0 {
+			return r.fail(record, validationf("provider returned a negative actual cost"))
+		}
+		if actualCost > input.BudgetReservation.AmountMicros {
+			return r.fail(record, &providercontract.Error{
+				Code:        providercontract.CodeBudgetExceeded,
+				SafeMessage: "provider actual cost exceeds the approved reservation",
+			})
+		}
+	}
 
 	if job.Status == providercontract.StatusSucceeded {
 		if job.Output == nil || len(job.Output.Assets) == 0 {
@@ -505,6 +547,9 @@ func (r *GenerationRunner) preflight(ctx context.Context, input GenerationInput,
 		input.Prompt.ShotRevision.ID != input.ShotRevision.ID {
 		return providercontract.GenerationRequest{}, providercontract.Capability{}, conflictf("source, shot, and prompt revisions are not aligned")
 	}
+	if err := VerifyExactPromptSnapshot(r.Prompts, input.Prompt); err != nil {
+		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
+	}
 	if err := input.Authorization.Validate(input.SourceRevision, at); err != nil {
 		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
 	}
@@ -526,20 +571,22 @@ func (r *GenerationRunner) preflight(ctx context.Context, input GenerationInput,
 	if input.Evidence == providercontract.EvidenceLiveProvider && input.Route.Verification == "mock_only" {
 		return providercontract.GenerationRequest{}, providercontract.Capability{}, policyf("mock route cannot produce live provider evidence")
 	}
-	if err := input.BudgetReservation.Validate(); err != nil {
-		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
-	}
-	if input.BudgetReservation.AmountMicros > input.Budget.MaxCostMicros {
-		return providercontract.GenerationRequest{}, providercontract.Capability{}, policyf("budget reservation exceeds the request maximum")
-	}
-	if _, err := input.BudgetPolicy.Evaluate(input.SpentMicros, input.ReservedMicros, input.Budget); err != nil {
-		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
-	}
 	request, err := BuildGenerationRequest(input.Prompt, input.RunID, input.IdempotencyKey, input.CallbackURL, input.Budget)
 	if err != nil {
 		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
 	}
 	request.ModelHint = input.Route.ModelID
+	if err := input.BudgetReservation.ValidateFor(providercontract.BudgetBindingInput{
+		RunID:     input.RunID,
+		InputHash: input.Prompt.ContentHash,
+		Model:     input.Route,
+		Budget:    input.Budget,
+	}); err != nil {
+		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
+	}
+	if _, err := input.BudgetPolicy.Evaluate(input.SpentMicros, input.ReservedMicros, input.Budget); err != nil {
+		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
+	}
 	capabilities, err := r.Provider.Discover(ctx)
 	if err != nil {
 		return providercontract.GenerationRequest{}, providercontract.Capability{}, err
