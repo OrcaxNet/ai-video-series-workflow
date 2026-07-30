@@ -5,9 +5,13 @@ info:
   description: |
     Contract-first API for immutable video-production revisions, approvals,
     Temporal operations, generation runs, cancellation/recovery, stale impact,
-    and lineage manifests. The runnable FLO-108 skeleton implements the system
-    discovery/health subset; mutation operations are frozen here for incremental
-    implementation without contract drift.
+    and lineage manifests. FLO-103 implements the Series/Source,
+    GenerationPlan, Episode production batch, GenerationRun
+    pause/cancel/resume/query, Approval, Operation, stale-impact, and Manifest
+    endpoints against PostgreSQL and Temporal. Provider administration and
+    direct provider-job/callback operations are intentionally not public
+    control-plane endpoints: the Temporal worker owns that internal adapter
+    boundary and persists its job/callback reconciliation projections.
 servers:
   - url: http://localhost:18080
     description: Local video control plane
@@ -101,56 +105,6 @@ paths:
                   secretPolicy:
                     type: object
                     additionalProperties: true
-  /api/v1/providers/capabilities:
-    get:
-      tags: [Providers]
-      operationId: listProviderCapabilities
-      responses:
-        "200":
-          description: Versioned route and model capability snapshots
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [capabilities]
-                properties:
-                  capabilities:
-                    type: array
-                    items:
-                      $ref: "#/components/schemas/ProviderCapabilitySnapshot"
-  /api/v1/providers/{providerProfileId}/connection-test:
-    post:
-      tags: [Providers]
-      operationId: testProviderConnection
-      parameters:
-        - $ref: "#/components/parameters/ProviderProfileID"
-        - $ref: "#/components/parameters/IdempotencyKey"
-      responses:
-        "200":
-          description: Masked identity and model access result
-          content:
-            application/json:
-              schema:
-                type: object
-                required: [providerProfileId, credentialFingerprint, state, capabilities]
-                properties:
-                  providerProfileId:
-                    type: string
-                    format: uuid
-                  credentialFingerprint:
-                    type: string
-                  state:
-                    enum: [READY, NOT_CONFIGURED, DENIED, UNAVAILABLE]
-                  capabilities:
-                    type: array
-                    items:
-                      type: string
-        "401":
-          $ref: "#/components/responses/ProviderActionRequired"
-        "403":
-          $ref: "#/components/responses/ProviderActionRequired"
-        "503":
-          $ref: "#/components/responses/DependencyUnavailable"
   /api/v1/generation-plans:
     post:
       tags: [Production]
@@ -178,103 +132,6 @@ paths:
           $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/PolicyBlocked"
-  /api/v1/provider-jobs:
-    post:
-      tags: [Providers]
-      operationId: submitProviderJob
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SubmitProviderJobRequest"
-      responses:
-        "202":
-          description: Provider task was persisted before external submission
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProviderJob"
-        "401":
-          $ref: "#/components/responses/ProviderActionRequired"
-        "403":
-          $ref: "#/components/responses/ProviderActionRequired"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "422":
-          $ref: "#/components/responses/PolicyBlocked"
-        "429":
-          $ref: "#/components/responses/ProviderRetryable"
-        "503":
-          $ref: "#/components/responses/ProviderRetryable"
-  /api/v1/provider-jobs/{providerJobId}:
-    get:
-      tags: [Providers]
-      operationId: getProviderJob
-      parameters:
-        - $ref: "#/components/parameters/ProviderJobID"
-      responses:
-        "200":
-          description: Unified provider task projection
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProviderJob"
-        "404":
-          $ref: "#/components/responses/NotFound"
-  /api/v1/provider-jobs/{providerJobId}/cancel:
-    post:
-      tags: [Providers]
-      operationId: cancelProviderJob
-      parameters:
-        - $ref: "#/components/parameters/ProviderJobID"
-        - $ref: "#/components/parameters/IdempotencyKey"
-      responses:
-        "202":
-          description: Cancellation accepted or reconciliation scheduled
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ProviderJob"
-        "409":
-          $ref: "#/components/responses/Conflict"
-  /api/v1/provider-callbacks/{providerProfileId}:
-    post:
-      security: []
-      tags: [Providers]
-      operationId: receiveProviderCallback
-      description: |
-        Signature verification is adapter-specific. callbackId and payloadHash
-        deduplicate delivery; sequence and terminal-state rules reject stale or
-        regressive callbacks.
-      parameters:
-        - $ref: "#/components/parameters/ProviderProfileID"
-        - name: X-Provider-Callback-Id
-          in: header
-          required: true
-          schema:
-            type: string
-        - name: X-Provider-Signature
-          in: header
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              additionalProperties: true
-      responses:
-        "202":
-          description: Callback accepted, including duplicate/stale no-op
-        "400":
-          $ref: "#/components/responses/ValidationError"
-        "401":
-          $ref: "#/components/responses/ProviderActionRequired"
   /api/v1/series:
     post:
       tags: [Series]
@@ -414,6 +271,34 @@ paths:
                 $ref: "#/components/schemas/GenerationRun"
         "404":
           $ref: "#/components/responses/NotFound"
+  /api/v1/runs/{runId}/pause:
+    post:
+      tags: [Production]
+      operationId: pauseGenerationRun
+      x-fr: [FR-P0-15]
+      parameters:
+        - $ref: "#/components/parameters/RunID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/ExpectedRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [actor, reasonCode]
+              properties:
+                actor:
+                  $ref: "#/components/schemas/Actor"
+                reasonCode:
+                  type: string
+                  minLength: 1
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "409":
+          $ref: "#/components/responses/Conflict"
   /api/v1/runs/{runId}/cancel:
     post:
       tags: [Production]
@@ -464,7 +349,7 @@ paths:
                   $ref: "#/components/schemas/Actor"
                 recoveryMode:
                   type: string
-                  enum: [RECONCILE_HISTORY, RETRY_INFRASTRUCTURE]
+                  enum: [RESUME_PAUSED, RECONCILE_HISTORY, RETRY_INFRASTRUCTURE]
       responses:
         "202":
           $ref: "#/components/responses/OperationAccepted"
@@ -551,6 +436,9 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+      description: |
+        Production accepts HS256 tokens with sub, role, aud=video-control-plane,
+        and an unexpired exp. Mutation request actor must match signed sub/role.
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
@@ -593,20 +481,6 @@ components:
         format: uuid
     RunID:
       name: runId
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-    ProviderProfileID:
-      name: providerProfileId
-      in: path
-      required: true
-      schema:
-        type: string
-        format: uuid
-    ProviderJobID:
-      name: providerJobId
       in: path
       required: true
       schema:
@@ -706,40 +580,6 @@ components:
           type: array
           items:
             type: string
-    ProviderCapabilitySnapshot:
-      type: object
-      additionalProperties: false
-      required:
-        [capabilitySnapshotId, alias, provider, modelId, routeVersion, snapshotHash, effectiveAt, limits, supportedInputs]
-      properties:
-        capabilitySnapshotId:
-          type: string
-          format: uuid
-        alias:
-          $ref: "#/components/schemas/CapabilityAlias"
-        provider:
-          type: string
-        modelId:
-          type: string
-        endpointId:
-          type: string
-        routeVersion:
-          type: string
-        snapshotHash:
-          $ref: "#/components/schemas/SHA256"
-        effectiveAt:
-          type: string
-          format: date-time
-        expiresAt:
-          type: string
-          format: date-time
-        limits:
-          type: object
-          additionalProperties: true
-        supportedInputs:
-          type: array
-          items:
-            type: string
     ModelRouteSnapshot:
       type: object
       additionalProperties: false
@@ -764,7 +604,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [schemaVersion, seriesId, shotSpecRevisionIds, candidatesPerShot, routeSnapshot, budgetLimit, actor]
+        [schemaVersion, seriesId, episodeRevisionId, shotSpecRevisionIds, candidatesPerShot, routeSnapshot, budgetLimit, executionPolicy, actor]
       properties:
         schemaVersion:
           const: v1
@@ -774,6 +614,7 @@ components:
         episodeRevisionId:
           type: string
           format: uuid
+          description: Exact immutable episode revision covered by the content safety decision.
         shotSpecRevisionIds:
           type: array
           minItems: 1
@@ -788,13 +629,15 @@ components:
           $ref: "#/components/schemas/ModelRouteSnapshot"
         budgetLimit:
           $ref: "#/components/schemas/BudgetLimit"
+        executionPolicy:
+          $ref: "#/components/schemas/ExecutionPolicy"
         actor:
           $ref: "#/components/schemas/Actor"
     GenerationPlan:
       type: object
       additionalProperties: false
       required:
-        [generationPlanId, state, dryRun, shotCount, providerCallCount, routeSnapshot, estimate, budgetDecision, planHash]
+        [generationPlanId, state, dryRun, shotCount, providerCallCount, routeSnapshot, executionPolicy, estimate, budgetDecision, planHash]
       properties:
         generationPlanId:
           type: string
@@ -812,6 +655,8 @@ components:
           minimum: 1
         routeSnapshot:
           $ref: "#/components/schemas/ModelRouteSnapshot"
+        executionPolicy:
+          $ref: "#/components/schemas/ExecutionPolicy"
         estimate:
           $ref: "#/components/schemas/CostEstimate"
         budgetDecision:
@@ -829,6 +674,25 @@ components:
         currency:
           type: string
           pattern: '^[A-Z]{3}$'
+    ExecutionPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        [targetTerritory, productForm, contentSafetyPolicyVersion, contentSafetyDecisionId]
+      properties:
+        targetTerritory:
+          type: string
+          pattern: '^[A-Z]{2}$'
+        productForm:
+          type: string
+          enum: [INTERNAL_PREVIEW, COMMERCIAL_RELEASE]
+        contentSafetyPolicyVersion:
+          type: string
+          minLength: 1
+        contentSafetyDecisionId:
+          type: string
+          format: uuid
+          description: Immutable authorized SAFETY decision bound to the exact episode and shot revisions.
     CostEstimate:
       type: object
       additionalProperties: false
@@ -856,108 +720,9 @@ components:
         validUntil:
           type: string
           format: date-time
-    SubmitProviderJobRequest:
-      type: object
-      additionalProperties: false
-      required:
-        [schemaVersion, generationAttemptId, generationPlanId, capability, inputHash, routeSnapshot, requestSnapshot, actor]
-      properties:
-        schemaVersion:
-          const: v1
-        generationAttemptId:
-          type: string
-          format: uuid
-        generationPlanId:
-          type: string
-          format: uuid
-        capability:
-          $ref: "#/components/schemas/CapabilityAlias"
-        inputHash:
-          $ref: "#/components/schemas/SHA256"
-        routeSnapshot:
-          $ref: "#/components/schemas/ModelRouteSnapshot"
-        requestSnapshot:
-          type: object
-          description: Secret-free request; credentials and signed URLs are forbidden.
-          additionalProperties: true
-        actor:
-          $ref: "#/components/schemas/Actor"
-    ProviderJob:
-      type: object
-      additionalProperties: false
-      required:
-        [providerJobId, generationAttemptId, capability, inputHash, modelSnapshot, state, retryCount, traceId, createdAt]
-      properties:
-        providerJobId:
-          type: string
-          format: uuid
-        generationAttemptId:
-          type: string
-          format: uuid
-        capability:
-          $ref: "#/components/schemas/CapabilityAlias"
-        inputHash:
-          $ref: "#/components/schemas/SHA256"
-        modelSnapshot:
-          $ref: "#/components/schemas/ModelRouteSnapshot"
-        upstreamTaskId:
-          type: string
-        upstreamRequestId:
-          type: string
-        state:
-          $ref: "#/components/schemas/ProviderJobState"
-        progress:
-          type: integer
-          minimum: 0
-          maximum: 100
-        retryCount:
-          type: integer
-          minimum: 0
-          maximum: 3
-        error:
-          $ref: "#/components/schemas/ProviderFailure"
-        traceId:
-          type: string
-        createdAt:
-          type: string
-          format: date-time
-        updatedAt:
-          type: string
-          format: date-time
-    ProviderFailure:
-      type: object
-      additionalProperties: false
-      required: [errorCode, retryable, requiresAction, suggestedAction]
-      properties:
-        errorCode:
-          type: string
-          enum:
-            - unauthenticated
-            - forbidden
-            - rate_limited
-            - quota_exceeded
-            - budget_exceeded
-            - content_blocked
-            - region_unavailable
-            - model_unavailable
-            - provider_unavailable
-            - invalid_request
-            - timeout
-        retryable:
-          type: boolean
-        requiresAction:
-          type: boolean
-        retryAfterSeconds:
-          type: integer
-          minimum: 1
-        suggestedAction:
-          type: string
     CapabilityAlias:
       type: string
       enum: [text.primary, image.primary, video.primary, speech.primary]
-    ProviderJobState:
-      type: string
-      enum: [DRAFT, VALIDATED, QUEUED, RUNNING, SUCCEEDED, FAILED, UNKNOWN, REQUIRES_ACTION, CANCELLED]
     Actor:
       type: object
       additionalProperties: false
@@ -968,7 +733,7 @@ components:
           minLength: 1
         role:
           type: string
-          enum: [CREATOR, DIRECTOR, ARTIST, PRODUCER, REVIEWER, OPERATOR, ADMIN]
+          enum: [CREATOR, DIRECTOR, ARTIST, PRODUCER, REVIEWER, SAFETY_REVIEWER, OPERATOR, ADMIN]
     CreateSeriesRequest:
       type: object
       additionalProperties: false
@@ -1018,7 +783,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [schemaVersion, episodeRevisionId, shotSpecRevisionIds, generationProfileRevisionId, gate2DecisionId, generationPlanId, routeSnapshot, budgetApprovalId, actor]
+        [schemaVersion, episodeRevisionId, shotSpecRevisionIds, generationProfileRevisionId, gate2DecisionId, generationPlanId, routeSnapshot, budgetApprovalId, executionPolicy, actor]
       properties:
         schemaVersion:
           const: v1
@@ -1046,13 +811,15 @@ components:
         budgetApprovalId:
           type: string
           format: uuid
+        executionPolicy:
+          $ref: "#/components/schemas/ExecutionPolicy"
         actor:
           $ref: "#/components/schemas/Actor"
     CreateGenerationRunRequest:
       type: object
       additionalProperties: false
       required:
-        [schemaVersion, shotSpecRevisionId, promptSnapshotId, generationProfileRevisionId, generationPlanId, routeSnapshot, creativeAttempt, actor]
+        [schemaVersion, shotSpecRevisionId, promptSnapshotId, generationProfileRevisionId, generationPlanId, routeSnapshot, budgetApprovalId, executionPolicy, creativeAttempt, actor]
       properties:
         schemaVersion:
           const: v1
@@ -1070,6 +837,11 @@ components:
           format: uuid
         routeSnapshot:
           $ref: "#/components/schemas/ModelRouteSnapshot"
+        budgetApprovalId:
+          type: string
+          format: uuid
+        executionPolicy:
+          $ref: "#/components/schemas/ExecutionPolicy"
         creativeAttempt:
           type: integer
           minimum: 1
@@ -1081,7 +853,7 @@ components:
     CreateApprovalDecisionRequest:
       type: object
       additionalProperties: false
-      required: [schemaVersion, seriesId, gate, decision, reasonCode, bindings, actor]
+      required: [schemaVersion, seriesId, episodeId, gate, decision, reasonCode, bindings, actor]
       properties:
         schemaVersion:
           const: v1
@@ -1093,7 +865,7 @@ components:
           format: uuid
         gate:
           type: string
-          enum: [G1, G2, Q1, G3]
+          enum: [G1, G2, Q1, G3, SAFETY]
         decision:
           type: string
           enum: [APPROVED, REJECTED, RETURNED]
@@ -1102,6 +874,17 @@ components:
           minLength: 1
         explanation:
           type: string
+        policyVersion:
+          type: string
+          minLength: 1
+          description: Required for SAFETY decisions.
+        evidenceHash:
+          $ref: "#/components/schemas/SHA256"
+          description: Required for SAFETY decisions and must match its ARTIFACT binding.
+        validUntil:
+          type: string
+          format: date-time
+          description: Required and future-dated for SAFETY approvals.
         bindings:
           type: array
           minItems: 1
@@ -1151,7 +934,7 @@ components:
         state:
           type: string
           enum:
-            [DRAFT, VALIDATED, QUEUED, RUNNING, UNKNOWN, RECONCILING, REQUIRES_ACTION, CANCEL_REQUESTED, CANCELLED, SUCCEEDED, FAILED]
+            [DRAFT, VALIDATED, QUEUED, RUNNING, PAUSED, UNKNOWN, RECONCILING, REQUIRES_ACTION, CANCEL_REQUESTED, CANCELLED, SUCCEEDED, FAILED]
         failureClass:
           type: string
           enum:

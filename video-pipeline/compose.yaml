@@ -122,6 +122,13 @@ services:
       VIDEO_TEMPORAL_NAMESPACE: default
       VIDEO_TEMPORAL_TASK_QUEUE: video-production-v1
       VIDEO_PROVIDER_ADAPTER_URL: http://mock-provider:8090
+      VIDEO_POSTGRES_ADDRESS: postgres:5432
+      VIDEO_POSTGRES_USER: ${VIDEO_POSTGRES_USER:-video}
+      VIDEO_POSTGRES_PASSWORD: ${VIDEO_POSTGRES_PASSWORD:-video-local-only}
+      VIDEO_POSTGRES_DATABASE: ${VIDEO_POSTGRES_DATABASE:-video_pipeline}
+      VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+    volumes:
+      - video-artifacts:/var/lib/video-pipeline/artifacts
     depends_on:
       temporal:
         condition: service_healthy
@@ -150,7 +157,12 @@ services:
       VIDEO_BUILD_VERSION: ${VIDEO_BUILD_VERSION:-dev}
       VIDEO_CONTROL_PLANE_HTTP_ADDRESS: :8080
       VIDEO_POSTGRES_ADDRESS: postgres:5432
+      VIDEO_POSTGRES_USER: ${VIDEO_POSTGRES_USER:-video}
+      VIDEO_POSTGRES_PASSWORD: ${VIDEO_POSTGRES_PASSWORD:-video-local-only}
+      VIDEO_POSTGRES_DATABASE: ${VIDEO_POSTGRES_DATABASE:-video_pipeline}
       VIDEO_TEMPORAL_ADDRESS: temporal:7233
+      VIDEO_TEMPORAL_NAMESPACE: default
+      VIDEO_TEMPORAL_TASK_QUEUE: video-production-v1
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
       VIDEO_PROVIDER_ADAPTER_URL: http://mock-provider:8090
       VIDEO_REQUIRE_DEPENDENCIES: "true"
@@ -189,7 +201,7 @@ services:
 
 networks:
   video-backplane:
-    name: ai-video-series-backplane
+    name: ${VIDEO_NETWORK_NAME:-ai-video-series-backplane}
     driver: bridge
 
 volumes:

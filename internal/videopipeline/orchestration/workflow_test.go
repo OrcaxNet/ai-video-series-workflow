@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"testing"
 	"time"
 
@@ -74,6 +75,104 @@ func TestEpisodeProductionWorkflow_RejectsDuplicateShot(t *testing.T) {
 	}
 }
 
+func TestEpisodeProductionWorkflow_WaitsForExactQ1Decision(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	registerHappyPathActivities(env)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(ShotDecisionSignal, ShotDecision{
+			DecisionID:         "decision-q1-wrong",
+			ShotSpecRevisionID: "another-shot",
+			RunID:              "run-shot-revision-1-1",
+			Approved:           true,
+			ActorID:            "reviewer-1",
+		})
+	}, time.Second)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(ShotDecisionSignal, ShotDecision{
+			DecisionID:         "decision-q1-1",
+			ShotSpecRevisionID: "shot-revision-1",
+			RunID:              "run-shot-revision-1-1",
+			Approved:           true,
+			ActorID:            "reviewer-1",
+		})
+	}, 2*time.Second)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(Gate3DecisionSignal, Gate3Decision{
+			DecisionID: "decision-g3-1",
+			Approved:   true,
+			ActorID:    "producer-1",
+		})
+	}, 3*time.Second)
+
+	input := EpisodeProductionInput{
+		SchemaVersion:        "v1",
+		SeriesID:             "series-1",
+		EpisodeRevisionID:    "episode-revision-1",
+		ShotSpecRevisionIDs:  []string{"shot-revision-1"},
+		GenerationProfileRef: "profile-revision-1",
+		Gate2DecisionID:      "decision-g2-1",
+		ProviderRoute:        testProviderRoute(),
+		BudgetApprovalID:     "budget-approval-1",
+		BudgetMaximumMicros:  500,
+		BudgetCurrency:       "CNY",
+		TraceID:              "trace-q1",
+		RequireShotApproval:  true,
+	}
+	env.ExecuteWorkflow(EpisodeProductionWorkflow, input)
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v", err)
+	}
+	var result EpisodeProductionResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "LOCKED" || result.Shots["shot-revision-1"].State != "APPROVED" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestEpisodeProductionWorkflow_Q1RejectionDoesNotApproveRejectedRuns(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	registerHappyPathActivities(env)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(ShotDecisionSignal, ShotDecision{
+			DecisionID: "decision-q1-1", ShotSpecRevisionID: "shot-revision-1",
+			RunID: "run-shot-revision-1-1", Approved: false, ReasonCode: "CONTINUITY", ActorID: "reviewer-1",
+		})
+	}, time.Second)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(ShotDecisionSignal, ShotDecision{
+			DecisionID: "decision-q1-2", ShotSpecRevisionID: "shot-revision-1",
+			RunID: "run-shot-revision-1-2", Approved: false, ReasonCode: "CONTINUITY", ActorID: "reviewer-1",
+		})
+	}, 2*time.Second)
+
+	env.ExecuteWorkflow(EpisodeProductionWorkflow, EpisodeProductionInput{
+		SchemaVersion: "v1", SeriesID: "series-1", EpisodeRevisionID: "episode-revision-1",
+		ShotSpecRevisionIDs: []string{"shot-revision-1"}, GenerationProfileRef: "profile-revision-1",
+		Gate2DecisionID: "decision-g2-1", ProviderRoute: testProviderRoute(),
+		BudgetApprovalID: "budget-approval-1", BudgetMaximumMicros: 500, BudgetCurrency: "CNY",
+		TraceID: "trace-q1-reject", RequireShotApproval: true,
+	})
+
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v", err)
+	}
+	var result EpisodeProductionResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "NEEDS_INTERVENTION" || len(result.LockedRunIDs) != 0 {
+		t.Fatalf("rejected versions polluted approved baseline: %#v", result)
+	}
+	if state := result.Shots["shot-revision-1"]; state.State != "Q1_REJECTED" || state.FailureCode != "CONTINUITY" {
+		t.Fatalf("shot state = %#v", state)
+	}
+}
+
 func registerHappyPathActivities(env *testsuite.TestWorkflowEnvironment) {
 	env.RegisterActivityWithOptions(func(context.Context, EpisodeProductionInput) error {
 		return nil
@@ -85,7 +184,7 @@ func registerHappyPathActivities(env *testsuite.TestWorkflowEnvironment) {
 	env.RegisterActivityWithOptions(func(_ context.Context, input CreateRunInput) (GenerationRunRef, error) {
 		sum := sha256.Sum256([]byte(input.ShotSpecRevisionID))
 		return GenerationRunRef{
-			RunID:         "run-" + input.ShotSpecRevisionID,
+			RunID:         fmt.Sprintf("run-%s-%d", input.ShotSpecRevisionID, input.CreativeAttempt),
 			RunSpecDigest: hex.EncodeToString(sum[:]),
 			Attempt:       input.CreativeAttempt,
 		}, nil

@@ -52,6 +52,26 @@ func TestLoadControlPlane(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "requires authentication secret in production",
+			values: map[string]string{
+				"VIDEO_ENVIRONMENT": "production",
+			},
+			wantErr: true,
+		},
+		{
+			name: "accepts production authentication configuration",
+			values: map[string]string{
+				"VIDEO_ENVIRONMENT":      "production",
+				"VIDEO_AUTH_HMAC_SECRET": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+			},
+			check: func(t *testing.T, cfg ControlPlane) {
+				t.Helper()
+				if cfg.AuthAudience != "video-control-plane" || len(cfg.AuthHMACSecret) != 32 {
+					t.Fatalf("unexpected auth config")
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {

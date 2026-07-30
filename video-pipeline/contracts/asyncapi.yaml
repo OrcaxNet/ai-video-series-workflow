@@ -17,8 +17,16 @@ channels:
   productionEvents:
     address: video.production.events.v1
     messages:
+      seriesCreated:
+        $ref: "#/components/messages/SeriesCreated"
       revisionCreated:
         $ref: "#/components/messages/RevisionCreated"
+      generationPlanCreated:
+        $ref: "#/components/messages/GenerationPlanCreated"
+      productionRequested:
+        $ref: "#/components/messages/ProductionRequested"
+      workflowStepCompleted:
+        $ref: "#/components/messages/WorkflowStepCompleted"
       approvalDecided:
         $ref: "#/components/messages/ApprovalDecided"
       runStateChanged:
@@ -41,7 +49,11 @@ operations:
     channel:
       $ref: "#/channels/productionEvents"
     messages:
+      - $ref: "#/channels/productionEvents/messages/seriesCreated"
       - $ref: "#/channels/productionEvents/messages/revisionCreated"
+      - $ref: "#/channels/productionEvents/messages/generationPlanCreated"
+      - $ref: "#/channels/productionEvents/messages/productionRequested"
+      - $ref: "#/channels/productionEvents/messages/workflowStepCompleted"
       - $ref: "#/channels/productionEvents/messages/approvalDecided"
       - $ref: "#/channels/productionEvents/messages/runStateChanged"
       - $ref: "#/channels/productionEvents/messages/providerJobStateChanged"
@@ -52,6 +64,46 @@ operations:
       - $ref: "#/channels/productionEvents/messages/manifestLocked"
 components:
   messages:
+    SeriesCreated:
+      name: video.series.created.v1
+      title: Series aggregate created
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.series.created.v1
+    GenerationPlanCreated:
+      name: video.generation-plan.created.v1
+      title: Immutable generation plan and budget decision created
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.generation-plan.created.v1
+    ProductionRequested:
+      name: video.production.requested.v1
+      title: G2-bound episode production requested
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.production.requested.v1
+    WorkflowStepCompleted:
+      name: video.workflow-step.completed.v1
+      title: Durable Temporal Activity result committed
+      payload:
+        allOf:
+          - $ref: "#/components/schemas/EventEnvelope"
+          - type: object
+            properties:
+              eventType:
+                const: video.workflow-step.completed.v1
     RevisionCreated:
       name: video.revision.created.v1
       title: Immutable revision created

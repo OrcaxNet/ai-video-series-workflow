@@ -1,17 +1,24 @@
-# AI 视频剧集 API-first 骨架
+# AI 视频剧集 API-first 控制面
 
 这是 FLO-108 的隔离后端切片，按 FLO-124 的最新约束实现：本地没有 GPU，也不运行任何生成式模型。文本、图片、视频和语音通过统一 Provider Adapter 调用远程 API；火山引擎是首选路由，但不是领域层硬依赖。当前无真实 Key 时使用 Dry-run 和固定响应 Mock Provider。
 
 当前可运行：
 
 - PostgreSQL 控制面真相、Temporal 持久编排、内容寻址产物存储；
+- Series/Source、GenerationPlan、Episode production、GenerationRun、Approval、Operation、Impact、Manifest API；
+- 事务内幂等记录、业务写、审计与版本化 outbox；写冲突采用 serializable transaction 重试；
 - 四类能力别名：`text.primary`、`image.primary`、`video.primary`、`speech.primary`；
 - 无密钥状态发现、确定性估算/任务、幂等 replay、polling、取消竞态与回调去重；
-- Episode Workflow：G2 输入校验、逐镜头远程任务、结构 QC、人工复核、G3 signal；
+- Episode/Shot Workflow：G2 精确绑定、逐镜头远程任务、结构 QC、Q1/G3 人工复核、pause/resume/cancel 与 Provider 取消补偿；
+- 入队前 fail-closed：冻结目标地区、产品形态、内容安全策略和 Provider 剩余配额；阻断路径不会启动 Workflow/Provider；
+- Activity journal：稳定 workflow/activity ID、输入/输出 hash、可重放结果、审计与 outbox；
+- 产品投影：Activity 将 Prompt/Run/ProviderJob/QC/Q1/G3 写入规范化表，产物和 Manifest 进入本地 CAS；
 - OpenAPI、AsyncAPI、数据模型、状态机、ADR、FR-P0-01～24 追踪；
 - 无 GPU/无模型 Key 的 Compose、smoke 与 CI。
 
 当前不声称已实现真实火山调用、前端页面或生成质量。`mock-provider` 只生成确定性 fixture 产物；真实 Key 到位后，由火山 Provider Adapter 实现相同领域契约并完成文末实测清单。
+
+公开 OpenAPI 只包含由本控制面实际提供的产品接口。Provider capability 管理、connection-test、直接 job/callback HTTP 接口不在本服务伪占路由；它们属于 Provider Adapter 的独立增量。当前 Temporal Activity 通过内部 `providercontract` 执行 submit/poll/cancel，并把 ProviderJob、重试、费用和恢复状态投影到 PostgreSQL。
 
 ## 一键启动
 
@@ -60,8 +67,12 @@ go vet ./...
 1. 无 Key 时四类 live capability 均为 `liveConfigured=false`，Dry-run/Mock 可用；
 2. 相同 JobID/输入只得到一个上游任务；
 3. Mock 任务经 polling 归档到 `cas://sha256/...`；
-4. PostgreSQL migration clean 且 Provider/成本表存在；
-5. Temporal Workflow 提交 Provider job、通过结构 QC、进入 `WAITING_G3` 后重启 worker，并在持久 G3 signal 后恢复为 `LOCKED`。
+4. PostgreSQL migration v2 clean、42 张控制面表、不可变 trigger 与 CAS retention guard 存在；
+5. 并发相同幂等键只提交一份 Series/audit/outbox，不同请求冲突，策略失败整体回滚；
+6. Activity journal 结果可重放且输入漂移被拒绝；
+7. 工作流投影可从 Prompt 一直查询到冻结路由、实际媒体规格、成本、审核与锁定 Manifest；
+8. Temporal Workflow 提交 Provider job、通过结构 QC、进入 `WAITING_G3` 后重启 worker，并在持久 G3 signal 后恢复为 `LOCKED`。
+9. 公开 shot-run API 以稳定 Workflow ID 启动真实 Temporal 执行；pause/resume/cancel、Provider cancel/reconcile 和 Operation/Run 终态均有自动化覆盖。
 
 ## 目录
 
@@ -72,10 +83,12 @@ cmd/
   video-orchestrator-worker/    Temporal Workflow/Activities
 internal/videopipeline/
   artifactstore/                SHA-256 CAS 与原子提交
-  controlplane/                 隔离 HTTP surface
+  controlplane/                 REST handler、policy、RFC7807
   mockprovider/                 场景注入、异步任务、callback/cancel
   orchestration/                持久流程、预算确认、provider reconciliation
+  repository/                   pgx 数据层、幂等/audit/outbox/谱系
   runtimeconfig/                仅显式环境变量配置
+  temporalcontrol/              REST command 到 Workflow/signal/cancel
 internal/providercontract/      FLO-110 供应商中立契约、预算、错误和路由快照
 video-pipeline/
   config/default.yaml           路由、重试、预算、Secret 与 Mock 策略
@@ -96,6 +109,8 @@ video-pipeline/
 | 豆包语音 | `DOUBAO_TTS_APP_ID`、`DOUBAO_TTS_ACCESS_TOKEN` |
 
 当前 Compose 不传入这些变量，也不启用任何 live adapter；Claude adapter 在 M0 只保留路由与 Secret 契约。前端、数据库、日志、trace、错误、fixture 与 Manifest 只保存 provider profile ID、不可逆凭证指纹、model/endpoint 快照、request/task ID、用量/费用和输入输出 hash，禁止保存 Authorization、Key、token、cookie 或临时签名 URL。
+
+本地 `VIDEO_ENVIRONMENT=local` 默认允许无 JWT 开发；生产必须通过 `VIDEO_AUTH_HMAC_SECRET` 启用 HS256 Bearer 校验，且 signed `sub/role` 必须与 mutation 的审计 actor 一致。
 
 ## 真实火山 Key 到位后的最小实测
 
