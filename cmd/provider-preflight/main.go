@@ -9,8 +9,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -63,12 +63,7 @@ func main() {
 	case "validate-plan":
 		result, err = validatePlan(*planPath)
 	case "scan":
-		result, err = scanRepository([]string{
-			"cmd/provider-preflight",
-			"docs/flo-110",
-			"internal/providercontract",
-			"scripts/flo110-preflight.sh",
-		})
+		result, err = scanRepository(ctx, ".")
 	case "live-auth":
 		result, err = runLiveAuth(ctx, *confirmLive)
 	default:
@@ -155,6 +150,17 @@ func runMock(ctx context.Context) (report, error) {
 		return report{}, errors.New("duplicate callback was not deduplicated")
 	}
 	result.Checks = append(result.Checks, checkResult{Name: "duplicate callback", Status: "passed"})
+	stale := providercontract.Callback{
+		EventID:   "event-preflight-stale",
+		JobID:     callbackJob.ID,
+		Status:    providercontract.StatusQueued,
+		CreatedAt: callback.CreatedAt.Add(-time.Second),
+	}
+	if applied, current, err := callbackProvider.ApplyCallback(stale); err != nil ||
+		applied || current.Status != providercontract.StatusRunning {
+		return report{}, errors.New("out-of-order callback regressed the job lifecycle")
+	}
+	result.Checks = append(result.Checks, checkResult{Name: "out-of-order callback monotonicity", Status: "passed"})
 
 	cancelProvider := providercontract.NewFakeProvider(providercontract.FakeSuccess)
 	cancelJob, err := cancelProvider.Submit(ctx, mockRequest())
@@ -206,51 +212,80 @@ func validatePlan(path string) (report, error) {
 	}, nil
 }
 
-func scanRepository(paths []string) (report, error) {
+func scanRepository(ctx context.Context, path string) (report, error) {
+	rootCommand := exec.CommandContext(ctx, "git", "-C", path, "rev-parse", "--show-toplevel")
+	rootOutput, err := rootCommand.Output()
+	if err != nil {
+		return report{}, fmt.Errorf("resolve Git repository root: %w", err)
+	}
+	root := strings.TrimSpace(string(rootOutput))
+	filesCommand := exec.CommandContext(
+		ctx,
+		"git",
+		"-C",
+		root,
+		"ls-files",
+		"-z",
+		"--cached",
+		"--others",
+		"--exclude-standard",
+	)
+	output, err := filesCommand.Output()
+	if err != nil {
+		return report{}, fmt.Errorf("list repository files: %w", err)
+	}
 	result := report{Evidence: "static_scan", Status: "passed"}
-	for _, root := range paths {
-		info, err := os.Stat(root)
-		if err != nil {
-			return report{}, fmt.Errorf("stat %s: %w", root, err)
-		}
-		if !info.IsDir() {
-			if err := scanFile(root); err != nil {
-				return report{}, err
-			}
-			result.Checks = append(result.Checks, checkResult{Name: root, Status: "passed"})
+	count := 0
+	for _, name := range strings.Split(string(output), "\x00") {
+		if name == "" {
 			continue
 		}
-		err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
+		fullPath := filepath.Join(root, filepath.FromSlash(name))
+		info, statErr := os.Lstat(fullPath)
+		if statErr != nil {
+			return report{}, fmt.Errorf("stat %s: %w", name, statErr)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, readErr := os.Readlink(fullPath)
+			if readErr != nil {
+				return report{}, fmt.Errorf("read symlink %s: %w", name, readErr)
 			}
-			if entry.IsDir() {
-				return nil
+			if providercontract.ContainsPotentialSecret(target) {
+				return report{}, fmt.Errorf("potential credential literal found in %s", name)
 			}
-			return scanFile(path)
-		})
-		if err != nil {
+			count++
+			continue
+		}
+		if !info.Mode().IsRegular() {
+			return report{}, fmt.Errorf("%s is not a regular file", name)
+		}
+		if err := scanFile(fullPath, name); err != nil {
 			return report{}, err
 		}
-		result.Checks = append(result.Checks, checkResult{Name: root, Status: "passed"})
+		count++
 	}
+	result.Checks = append(result.Checks, checkResult{
+		Name:   "repository files",
+		Status: "passed",
+		Detail: fmt.Sprintf("scanned %d tracked and unignored files", count),
+	})
 	return result, nil
 }
 
-func scanFile(path string) error {
+func scanFile(path, displayPath string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
 	if info.Size() > 2<<20 {
-		return fmt.Errorf("%s exceeds the scanner size limit", path)
+		return fmt.Errorf("%s exceeds the scanner size limit", displayPath)
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	if providercontract.ContainsPotentialSecret(string(data)) {
-		return fmt.Errorf("potential credential literal found in %s", path)
+		return fmt.Errorf("potential credential literal found in %s", displayPath)
 	}
 	return nil
 }

@@ -1,6 +1,9 @@
 package providercontract
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 func TestBudgetPolicy_Evaluate(t *testing.T) {
 	t.Parallel()
@@ -31,6 +34,13 @@ func TestBudgetPolicy_Evaluate(t *testing.T) {
 			wantWarn: true,
 		},
 		{
+			name:     "soft warning at exact boundary",
+			spent:    50_000_000,
+			reserved: 10_000_000,
+			envelope: BudgetEnvelope{MaxCostMicros: 20_000_000, MaxAttempts: 2},
+			wantWarn: true,
+		},
+		{
 			name:     "hard block",
 			spent:    80_000_000,
 			reserved: 10_000_000,
@@ -48,6 +58,12 @@ func TestBudgetPolicy_Evaluate(t *testing.T) {
 			envelope: BudgetEnvelope{MaxCostMicros: 1, MaxAttempts: 1},
 			wantErr:  CodeInvalidRequest,
 		},
+		{
+			name:     "addition overflow blocks",
+			spent:    math.MaxInt64 - 5,
+			envelope: BudgetEnvelope{MaxCostMicros: 10, MaxAttempts: 1},
+			wantErr:  CodeBudgetExceeded,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -63,6 +79,21 @@ func TestBudgetPolicy_Evaluate(t *testing.T) {
 	}
 }
 
+func TestBudgetPolicy_OverflowProjectionFailsClosed(t *testing.T) {
+	t.Parallel()
+	decision, err := (BudgetPolicy{HardLimitMicros: math.MaxInt64}).Evaluate(
+		math.MaxInt64-5,
+		0,
+		BudgetEnvelope{MaxCostMicros: 10, MaxAttempts: 1},
+	)
+	if ErrorCodeOf(err) != CodeBudgetExceeded {
+		t.Fatalf("Evaluate() error = %v, want budget_exceeded", err)
+	}
+	if decision.ProjectedMicros != math.MaxInt64 {
+		t.Fatalf("projected = %d, want MaxInt64", decision.ProjectedMicros)
+	}
+}
+
 func TestCostFunctions(t *testing.T) {
 	t.Parallel()
 	if got := CostPerMillion(250_000, 28_000_000); got != 7_000_000 {
@@ -73,5 +104,13 @@ func TestCostFunctions(t *testing.T) {
 	}
 	if got := CNY(2_500_500); got != "2.500500" {
 		t.Fatalf("CNY() = %q, want 2.500500", got)
+	}
+	for name, cost := range map[string]int64{
+		"per million overflow":      CostPerMillion(math.MaxInt64, math.MaxInt64),
+		"per ten thousand overflow": CostPerTenThousand(math.MaxInt64, math.MaxInt64),
+	} {
+		if cost != math.MaxInt64 {
+			t.Errorf("%s = %d, want saturated MaxInt64", name, cost)
+		}
 	}
 }

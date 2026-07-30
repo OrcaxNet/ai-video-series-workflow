@@ -3,6 +3,7 @@ package providercontract
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -101,6 +102,7 @@ func (f *FakeProvider) Submit(ctx context.Context, request GenerationRequest) (J
 		Status:            StatusQueued,
 		Provider:          "fake",
 		ProviderModel:     "fake-video-v1",
+		ProviderRegion:    "local-fixture",
 		ProviderRequestID: "fake-request-" + id,
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -149,6 +151,15 @@ func (f *FakeProvider) Poll(ctx context.Context, id string) (Job, error) {
 				SHA256:           "352b94f7134554825a7c426e579d12943a48c30db1666120353f5f24aa9c59b3",
 				LicenseReference: "fixture-license",
 			}},
+			Actual: OutputSpec{
+				Width:          1280,
+				Height:         720,
+				Resolution:     "720p",
+				AspectRatio:    "16:9",
+				FPS:            24,
+				DurationMillis: 5_000,
+				Format:         "mp4",
+			},
 			Usage: Usage{
 				VideoTokens:        250_000,
 				GeneratedMillis:    5_000,
@@ -198,9 +209,18 @@ func (f *FakeProvider) ApplyCallback(callback Callback) (applied bool, job Job, 
 	if !ok {
 		return false, Job{}, &Error{Code: CodeNotFound, SafeMessage: "provider job was not found"}
 	}
+	if strings.TrimSpace(callback.EventID) == "" || !callback.Status.Valid() {
+		return false, record.job, &Error{Code: CodeInvalidRequest, SafeMessage: "callback event and status are invalid"}
+	}
 	f.callbackEvents[callback.EventID] = struct{}{}
-	if !record.job.Status.Terminal() {
-		record.job.Status = callback.Status
+	if record.job.Status.Terminal() || callback.Status.rank() < record.job.Status.rank() {
+		return false, record.job, nil
+	}
+	if callback.Status == record.job.Status && !callback.CreatedAt.After(record.job.UpdatedAt) {
+		return false, record.job, nil
+	}
+	record.job.Status = callback.Status
+	if callback.CreatedAt.After(record.job.UpdatedAt) {
 		record.job.UpdatedAt = callback.CreatedAt
 	}
 	return true, record.job, nil

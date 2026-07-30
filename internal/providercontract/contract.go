@@ -33,6 +33,23 @@ func (s JobStatus) Terminal() bool {
 	return s == StatusSucceeded || s == StatusFailed || s == StatusCancelled
 }
 
+func (s JobStatus) Valid() bool {
+	return s == StatusQueued || s == StatusRunning || s.Terminal()
+}
+
+func (s JobStatus) rank() int {
+	switch s {
+	case StatusQueued:
+		return 0
+	case StatusRunning:
+		return 1
+	case StatusSucceeded, StatusFailed, StatusCancelled:
+		return 2
+	default:
+		return -1
+	}
+}
+
 type AssetRole string
 
 const (
@@ -68,6 +85,7 @@ type ContextRefs struct {
 type OutputSpec struct {
 	Width          int    `json:"width,omitempty"`
 	Height         int    `json:"height,omitempty"`
+	Resolution     string `json:"resolution,omitempty"`
 	AspectRatio    string `json:"aspect_ratio,omitempty"`
 	FPS            int    `json:"fps,omitempty"`
 	DurationMillis int    `json:"duration_millis,omitempty"`
@@ -134,6 +152,7 @@ type Usage struct {
 
 type Output struct {
 	Assets []AssetRef `json:"assets"`
+	Actual OutputSpec `json:"actual"`
 	Usage  Usage      `json:"usage"`
 }
 
@@ -146,6 +165,7 @@ type Job struct {
 	Status            JobStatus `json:"status"`
 	Provider          string    `json:"provider"`
 	ProviderModel     string    `json:"provider_model"`
+	ProviderRegion    string    `json:"provider_region,omitempty"`
 	ProviderRequestID string    `json:"provider_request_id,omitempty"`
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`

@@ -28,8 +28,10 @@ type VolcengineModels struct {
 type VolcengineConfig struct {
 	BaseURL    string
 	APIKey     string
+	Region     string
 	Models     VolcengineModels
 	HTTPClient *http.Client
+	Now        func() time.Time
 }
 
 // VolcengineProvider implements the Ark wire mapping. The API key is retained
@@ -38,8 +40,10 @@ type VolcengineConfig struct {
 type VolcengineProvider struct {
 	baseURL string
 	apiKey  string
+	region  string
 	models  VolcengineModels
 	client  *http.Client
+	now     func() time.Time
 }
 
 func NewVolcengineProvider(config VolcengineConfig) (*VolcengineProvider, error) {
@@ -58,11 +62,21 @@ func NewVolcengineProvider(config VolcengineConfig) (*VolcengineProvider, error)
 	if client == nil {
 		client = &http.Client{Timeout: 2 * time.Minute}
 	}
+	region := strings.TrimSpace(config.Region)
+	if region == "" && baseURL == defaultVolcengineBaseURL {
+		region = "cn-beijing"
+	}
+	now := config.Now
+	if now == nil {
+		now = time.Now
+	}
 	return &VolcengineProvider{
 		baseURL: baseURL,
 		apiKey:  config.APIKey,
+		region:  region,
 		models:  config.Models,
 		client:  client,
+		now:     now,
 	}, nil
 }
 
@@ -134,7 +148,9 @@ func (p *VolcengineProvider) Poll(ctx context.Context, id string) (Job, error) {
 	if err != nil {
 		return Job{}, err
 	}
-	return response.toJob(requestID), nil
+	job := response.toJob(requestID)
+	job.ProviderRegion = p.region
+	return job, nil
 }
 
 func (p *VolcengineProvider) Cancel(ctx context.Context, id string) (Job, error) {
@@ -147,6 +163,7 @@ func (p *VolcengineProvider) Cancel(ctx context.Context, id string) (Job, error)
 		return Job{}, err
 	}
 	job := response.toJob(requestID)
+	job.ProviderRegion = p.region
 	if job.ID == "" {
 		job.ID = id
 		job.Provider = "volcengine_ark"
@@ -171,7 +188,7 @@ func (p *VolcengineProvider) submitText(ctx context.Context, request GenerationR
 	if err != nil {
 		return Job{}, err
 	}
-	now := time.Now().UTC()
+	now := p.now().UTC()
 	return Job{
 		ID:                response.ID,
 		RequestID:         request.RequestID,
@@ -179,6 +196,7 @@ func (p *VolcengineProvider) submitText(ctx context.Context, request GenerationR
 		Status:            mapStatus(response.Status),
 		Provider:          "volcengine_ark",
 		ProviderModel:     firstNonEmpty(response.Model, model),
+		ProviderRegion:    p.region,
 		ProviderRequestID: providerRequestID,
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -211,7 +229,7 @@ func (p *VolcengineProvider) submitImage(ctx context.Context, request Generation
 	if err != nil {
 		return Job{}, err
 	}
-	now := time.Now().UTC()
+	now := p.now().UTC()
 	output := &Output{
 		Usage: Usage{
 			OutputTokens:    response.Usage.OutputTokens,
@@ -236,6 +254,7 @@ func (p *VolcengineProvider) submitImage(ctx context.Context, request Generation
 		Status:            StatusSucceeded,
 		Provider:          "volcengine_ark",
 		ProviderModel:     firstNonEmpty(response.Model, model),
+		ProviderRegion:    p.region,
 		ProviderRequestID: providerRequestID,
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -256,7 +275,7 @@ func (p *VolcengineProvider) submitVideo(ctx context.Context, request Generation
 	if err != nil {
 		return Job{}, err
 	}
-	now := time.Now().UTC()
+	now := p.now().UTC()
 	return Job{
 		ID:                response.ID,
 		RequestID:         request.RequestID,
@@ -264,6 +283,7 @@ func (p *VolcengineProvider) submitVideo(ctx context.Context, request Generation
 		Status:            StatusQueued,
 		Provider:          "volcengine_ark",
 		ProviderModel:     model,
+		ProviderRegion:    p.region,
 		ProviderRequestID: providerRequestID,
 		CreatedAt:         now,
 		UpdatedAt:         now,
@@ -359,7 +379,11 @@ func (p *VolcengineProvider) do(
 		_ = json.Unmarshal(data, &errorBody)
 		code := firstNonEmpty(errorBody.Error.Code, errorBody.Code)
 		message := firstNonEmpty(errorBody.Error.Message, errorBody.Message)
-		return providerRequestID, MapHTTPError(response.StatusCode, code, providerRequestID, message)
+		mapped := MapHTTPError(response.StatusCode, code, providerRequestID, message)
+		if mapped.Retryable {
+			mapped.RetryAfter = ParseRetryAfter(response.Header.Get("Retry-After"), p.now())
+		}
+		return providerRequestID, mapped
 	}
 	if output != nil && len(bytes.TrimSpace(data)) > 0 {
 		if err := json.Unmarshal(data, output); err != nil {
@@ -404,8 +428,11 @@ type volcVideoTask struct {
 		VideoURL     string `json:"video_url"`
 		LastFrameURL string `json:"last_frame_url"`
 	} `json:"content"`
-	Duration string `json:"duration"`
-	Usage    struct {
+	Duration        string `json:"duration"`
+	Resolution      string `json:"resolution"`
+	Ratio           string `json:"ratio"`
+	FramesPerSecond int    `json:"framespersecond"`
+	Usage           struct {
 		TotalTokens int64 `json:"total_tokens"`
 	} `json:"usage"`
 	Error *struct {
@@ -431,10 +458,19 @@ func (t volcVideoTask) toJob(providerRequestID string) Job {
 	}
 	if job.Status == StatusSucceeded {
 		durationMillis, _ := strconv.ParseInt(t.Duration, 10, 64)
-		output := &Output{Usage: Usage{
-			VideoTokens:     t.Usage.TotalTokens,
-			GeneratedMillis: durationMillis * 1000,
-		}}
+		output := &Output{
+			Actual: OutputSpec{
+				Resolution:     t.Resolution,
+				AspectRatio:    t.Ratio,
+				FPS:            t.FramesPerSecond,
+				DurationMillis: int(durationMillis * 1000),
+				Format:         "mp4",
+			},
+			Usage: Usage{
+				VideoTokens:     t.Usage.TotalTokens,
+				GeneratedMillis: durationMillis * 1000,
+			},
+		}
 		if t.Content.VideoURL != "" {
 			output.Assets = append(output.Assets, AssetRef{
 				ID:               t.ID + "-video",

@@ -115,6 +115,37 @@ func TestFakeProvider_DuplicateCallback(t *testing.T) {
 	}
 }
 
+func TestFakeProvider_OutOfOrderCallbackCannotRegressStatus(t *testing.T) {
+	t.Parallel()
+	provider := NewFakeProvider(FakeDuplicateCallback)
+	submitted, err := provider.Submit(t.Context(), testGenerationRequest())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runningAt := time.Unix(1_800_000_010, 0).UTC()
+	applied, running, err := provider.ApplyCallback(Callback{
+		EventID:   "event-running",
+		JobID:     submitted.ID,
+		Status:    StatusRunning,
+		CreatedAt: runningAt,
+	})
+	if err != nil || !applied || running.Status != StatusRunning {
+		t.Fatalf("running callback applied=%t job=%#v err=%v", applied, running, err)
+	}
+	applied, afterStale, err := provider.ApplyCallback(Callback{
+		EventID:   "event-queued-stale",
+		JobID:     submitted.ID,
+		Status:    StatusQueued,
+		CreatedAt: runningAt.Add(-time.Second),
+	})
+	if err != nil || applied {
+		t.Fatalf("stale callback applied=%t err=%v", applied, err)
+	}
+	if afterStale.Status != StatusRunning || !afterStale.UpdatedAt.Equal(runningAt) {
+		t.Fatalf("job regressed after stale callback: %#v", afterStale)
+	}
+}
+
 func TestFakeProvider_CancelAndTerminalRace(t *testing.T) {
 	t.Parallel()
 	t.Run("queued cancellation is idempotent", func(t *testing.T) {
