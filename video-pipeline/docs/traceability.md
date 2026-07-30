@@ -28,8 +28,8 @@ FLO-108 将 FLO-96 的 24 条 P0 制片需求与 FLO-124 的纯模型 API 约束
 | 15 中断恢复 | Temporal/Reconciler | pause/resume/poll | upstream task/state | RUNNABLE stable shot Workflow、Activity reconcile、worker restart；REAL-KEY kill/restart 0 重复 |
 | 16 取消/补偿 | Control Plane/Adapter | cancel | cancel state/orphan/cost | RUNNABLE Provider cancel/reconcile 与 terminal race；REAL-KEY cancel semantics |
 | 17 TTS/授权 | speech Adapter/Policy | provider job/artifact | voice asset/consent | CONTRACT+Mock；REAL-KEY voice/timestamps |
-| 18 字幕/口型 | Subtitle/CPU media | operation/revision/artifact | subtitle/audio/QC | CONTRACT；REAL-KEY timestamp；口型可选 |
-| 19 拼接/导出 | CPU Media Worker | delivery operation | MP4/SRT/VTT/audio/manifest | 无 GPU；后续 FFmpeg fixture E2E |
+| 18 字幕/口型 | Subtitle/CPU media | production postProduction | subtitle/audio/QC | RUNNABLE immutable UTF-8 SRT + independent dialogue；REAL-KEY CER/timestamp；口型可选 |
+| 19 拼接/导出 | CPU Media Worker | post-production Activity/event | MP4/SRT/audio/manifest/BOM | RUNNABLE deterministic FFmpeg fixture E2E；REAL-KEY 3×45–60s |
 | 20 Q1/G3 锁版 | Review/Policy/Manifest | approvals + G3 signal | review/decision/manifest | RUNNABLE Q1/G3 review task、精确绑定与 `LOCKED` |
 | 21 immutable/stale | Revision graph | impacts API/event | dependencies/freshness | CONTRACT；新 asset v3 不改 v2 引用 |
 | 22 谱系/Manifest | Manifest builder | manifest GET/event | generation_manifests | RUNNABLE provider/model/request/task/usage/cost/实际媒体规格/hash 挂载 |
@@ -54,7 +54,7 @@ FLO-108 将 FLO-96 的 24 条 P0 制片需求与 FLO-124 的纯模型 API 约束
 | AC-12 批量提交前估算 | generation plan/budget | CONTRACT + Mock estimate |
 | AC-13 预算不足 0 submit | reservation gate | SQL/API CONTRACT |
 | AC-14 单镜头新 attempt | Run/Attempt dependency | CONTRACT |
-| AC-15 3 镜 MP4/SRT/VTT/Manifest | CPU media boundary | 后续 M1 REAL-KEY |
+| AC-15 3 镜 MP4/SRT/Dialogue/Manifest | CPU media boundary | Mock deterministic E2E；3 次 M1 REAL-KEY `pending_key` |
 
 ## 3. 被 FLO-124 覆盖的 FLO-96 假设
 

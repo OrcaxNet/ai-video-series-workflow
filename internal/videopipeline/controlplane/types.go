@@ -81,6 +81,7 @@ type CreateGenerationPlanCommand struct {
 	CandidatesPerShot   int                `json:"candidatesPerShot"`
 	RouteSnapshot       ModelRouteSnapshot `json:"routeSnapshot"`
 	BudgetLimit         BudgetLimit        `json:"budgetLimit"`
+	SpeechBudgetLimit   *BudgetLimit       `json:"speechBudgetLimit,omitempty"`
 	ExecutionPolicy     ExecutionPolicy    `json:"executionPolicy"`
 	Actor               Actor              `json:"actor"`
 }
@@ -94,6 +95,7 @@ type GenerationPlan struct {
 	RouteSnapshot     ModelRouteSnapshot `json:"routeSnapshot"`
 	ExecutionPolicy   ExecutionPolicy    `json:"executionPolicy"`
 	Estimate          CostEstimate       `json:"estimate"`
+	SpeechBudgetLimit *BudgetLimit       `json:"speechBudgetLimit,omitempty"`
 	BudgetDecision    string             `json:"budgetDecision"`
 	PlanHash          string             `json:"planHash"`
 }
@@ -106,20 +108,34 @@ type GenerationPlanRecord struct {
 	CandidatesPerShot   int
 	PricingRuleVersion  string
 	BudgetLimit         BudgetLimit
+	SpeechBudgetLimit   *BudgetLimit
 	ExecutionPolicy     ExecutionPolicy
 }
 
 type StartProductionCommand struct {
-	SchemaVersion               string             `json:"schemaVersion"`
-	EpisodeRevisionID           string             `json:"episodeRevisionId"`
-	ShotSpecRevisionIDs         []string           `json:"shotSpecRevisionIds"`
-	GenerationProfileRevisionID string             `json:"generationProfileRevisionId"`
-	Gate2DecisionID             string             `json:"gate2DecisionId"`
-	GenerationPlanID            string             `json:"generationPlanId"`
-	RouteSnapshot               ModelRouteSnapshot `json:"routeSnapshot"`
-	BudgetApprovalID            string             `json:"budgetApprovalId"`
-	ExecutionPolicy             ExecutionPolicy    `json:"executionPolicy"`
-	Actor                       Actor              `json:"actor"`
+	SchemaVersion               string                 `json:"schemaVersion"`
+	EpisodeRevisionID           string                 `json:"episodeRevisionId"`
+	ShotSpecRevisionIDs         []string               `json:"shotSpecRevisionIds"`
+	GenerationProfileRevisionID string                 `json:"generationProfileRevisionId"`
+	Gate2DecisionID             string                 `json:"gate2DecisionId"`
+	GenerationPlanID            string                 `json:"generationPlanId"`
+	RouteSnapshot               ModelRouteSnapshot     `json:"routeSnapshot"`
+	BudgetApprovalID            string                 `json:"budgetApprovalId"`
+	ExecutionPolicy             ExecutionPolicy        `json:"executionPolicy"`
+	PostProduction              *PostProductionCommand `json:"postProduction,omitempty"`
+	Actor                       Actor                  `json:"actor"`
+}
+
+type PostProductionCommand struct {
+	Enabled                       bool               `json:"enabled"`
+	Evidence                      string             `json:"evidence"`
+	SpeechRouteSnapshot           ModelRouteSnapshot `json:"speechRouteSnapshot"`
+	SpeechBudgetApprovalID        string             `json:"speechBudgetApprovalId"`
+	SpeechBudgetLimit             BudgetLimit        `json:"speechBudgetLimit"`
+	SubtitleLanguage              string             `json:"subtitleLanguage"`
+	BurnSubtitles                 bool               `json:"burnSubtitles"`
+	BackgroundAudioAssetVersionID string             `json:"backgroundAudioAssetVersionId,omitempty"`
+	EnforcePoCDuration            bool               `json:"enforcePoCDuration"`
 }
 
 type CreateGenerationRunCommand struct {

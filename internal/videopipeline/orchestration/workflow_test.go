@@ -5,10 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/testsuite"
 )
@@ -173,6 +175,56 @@ func TestEpisodeProductionWorkflow_Q1RejectionDoesNotApproveRejectedRuns(t *test
 	}
 }
 
+func TestEpisodeProductionWorkflow_FinalizesBeforeGate3(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	registerHappyPathActivities(env)
+	manifestHash := strings.Repeat("a", 64)
+	env.RegisterActivityWithOptions(
+		func(_ context.Context, input FinalizeEpisodeInput) (postproduction.Result, error) {
+			if input.RunIDs[0] != "run-shot-revision-1-1" {
+				return postproduction.Result{}, fmt.Errorf("unexpected run order: %v", input.RunIDs)
+			}
+			return postproduction.Result{
+				SchemaVersion:     postproduction.SchemaVersion,
+				Evidence:          postproduction.EvidenceMockOnly,
+				EpisodeRevisionID: input.EpisodeRevisionID,
+				ManifestHash:      manifestHash,
+			}, nil
+		},
+		activity.RegisterOptions{Name: ActivityFinalizeEpisode},
+	)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(Gate3DecisionSignal, Gate3Decision{
+			DecisionID: "decision-g3-post", Approved: true, ActorID: "producer-1",
+		})
+	}, time.Second)
+	env.ExecuteWorkflow(EpisodeProductionWorkflow, EpisodeProductionInput{
+		SchemaVersion: "v1", SeriesID: "series-1", EpisodeRevisionID: "episode-revision-1",
+		ShotSpecRevisionIDs: []string{"shot-revision-1"}, GenerationProfileRef: "profile-revision-1",
+		Gate2DecisionID: "decision-g2-1", ProviderRoute: testProviderRoute(),
+		BudgetApprovalID: "budget-approval-1", BudgetMaximumMicros: 500, BudgetCurrency: "CNY",
+		TraceID: "trace-postproduction",
+		PostProduction: &PostProductionConfig{
+			Enabled: true, Evidence: postproduction.EvidenceMockOnly,
+			SpeechRoute: testSpeechRoute(), SpeechProviderProfileID: "speech-profile",
+			SpeechBudgetApprovalID: "speech-budget", SpeechBudgetMaximumMicros: 100,
+			SpeechBudgetCurrency: "CNY", SubtitleLanguage: "zh-CN", BurnSubtitles: true,
+		},
+	})
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v", err)
+	}
+	var result EpisodeProductionResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "LOCKED" || result.PostProduction == nil ||
+		result.PostProduction.ManifestHash != manifestHash {
+		t.Fatalf("post-production result = %#v", result)
+	}
+}
+
 func registerHappyPathActivities(env *testsuite.TestWorkflowEnvironment) {
 	env.RegisterActivityWithOptions(func(context.Context, EpisodeProductionInput) error {
 		return nil
@@ -220,6 +272,18 @@ func testProviderRoute() providercontract.ModelSnapshot {
 		CapabilityAlias: "video.primary",
 		Provider:        "mock",
 		ModelID:         "fixture-video-v1",
+		RouteVersion:    "mock-routes-v1",
+		CapabilityHash:  hex.EncodeToString(sum[:]),
+		Verification:    "mock_only",
+	}
+}
+
+func testSpeechRoute() providercontract.ModelSnapshot {
+	sum := sha256.Sum256([]byte("speech-capability"))
+	return providercontract.ModelSnapshot{
+		CapabilityAlias: string(providercontract.CapabilitySpeech),
+		Provider:        "mock",
+		ModelID:         "fixture-speech-v1",
 		RouteVersion:    "mock-routes-v1",
 		CapabilityHash:  hex.EncodeToString(sum[:]),
 		Verification:    "mock_only",

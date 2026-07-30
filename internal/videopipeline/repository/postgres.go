@@ -610,12 +610,13 @@ func (p *Postgres) CreateGenerationPlan(
 			Candidates         int
 			Route              controlplane.ModelRouteSnapshot
 			Budget             controlplane.BudgetLimit
+			SpeechBudget       *controlplane.BudgetLimit
 			ExecutionPolicy    controlplane.ExecutionPolicy
 			PricingRuleVersion string
 		}{
 			command.SeriesID, command.EpisodeRevisionID, command.ShotSpecRevisionIDs,
 			command.CandidatesPerShot, command.RouteSnapshot, command.BudgetLimit,
-			command.ExecutionPolicy, pricingVersion,
+			command.SpeechBudgetLimit, command.ExecutionPolicy, pricingVersion,
 		})
 		if err != nil {
 			return controlplane.Stored[controlplane.GenerationPlan]{}, err
@@ -629,6 +630,7 @@ func (p *Postgres) CreateGenerationPlan(
 			RouteSnapshot:     command.RouteSnapshot,
 			ExecutionPolicy:   command.ExecutionPolicy,
 			Estimate:          estimate,
+			SpeechBudgetLimit: cloneBudgetLimit(command.SpeechBudgetLimit),
 			BudgetDecision:    decision,
 			PlanHash:          planHash,
 		}
@@ -656,6 +658,7 @@ func (p *Postgres) CreateGenerationPlan(
 				"state":               state,
 				"budgetDecision":      decision,
 				"budgetLimit":         command.BudgetLimit,
+				"speechBudgetLimit":   command.SpeechBudgetLimit,
 				"executionPolicy":     command.ExecutionPolicy,
 			}, now); err != nil {
 			return controlplane.Stored[controlplane.GenerationPlan]{}, err
@@ -745,15 +748,32 @@ func (p *Postgres) PrepareProduction(
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
-		if err := requireBudgetApproval(ctx, tx, command.BudgetApprovalID, seriesID, episodeID); err != nil {
-			return controlplane.Stored[controlplane.Operation]{}, err
-		}
 		if err := requireActiveProfile(ctx, tx, command.GenerationProfileRevisionID); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 		_, limits, err := validateRouteSnapshot(ctx, tx, command.RouteSnapshot, now)
 		if err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if command.PostProduction != nil && command.PostProduction.Enabled {
+			post := command.PostProduction
+			if post.SpeechRouteSnapshot.CapabilityAlias != "speech.primary" {
+				return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+					controlplane.CodeCapability,
+					"post-production route is not speech.primary",
+					"freeze a current speech capability snapshot",
+				)
+			}
+			if _, _, err := validateRouteSnapshot(
+				ctx, tx, post.SpeechRouteSnapshot, now,
+			); err != nil {
+				return controlplane.Stored[controlplane.Operation]{}, err
+			}
+			if err := requirePostProductionEvidenceMode(
+				ctx, tx, post.SpeechRouteSnapshot.ProviderProfileID, post.Evidence,
+			); err != nil {
+				return controlplane.Stored[controlplane.Operation]{}, err
+			}
 		}
 
 		planRecord, err := readPlan(ctx, tx, command.GenerationPlanID)
@@ -796,6 +816,28 @@ func (p *Postgres) PrepareProduction(
 				"production execution policy differs from the immutable generation plan",
 				"use the exact territory, product form, and safety policy from the plan",
 			)
+		}
+		if err := requireBudgetApproval(
+			ctx, tx, command.BudgetApprovalID, seriesID, episodeID,
+			command.GenerationPlanID, "VIDEO", planRecord.BudgetLimit,
+		); err != nil {
+			return controlplane.Stored[controlplane.Operation]{}, err
+		}
+		if command.PostProduction != nil && command.PostProduction.Enabled {
+			post := command.PostProduction
+			if !sameBudgetLimit(planRecord.SpeechBudgetLimit, post.SpeechBudgetLimit) {
+				return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+					controlplane.CodeBudgetExceeded,
+					"post-production speech budget differs from the immutable generation plan",
+					"create a new plan with the exact TTS amount and currency",
+				)
+			}
+			if err := requireBudgetApproval(
+				ctx, tx, post.SpeechBudgetApprovalID, seriesID, episodeID,
+				command.GenerationPlanID, "SPEECH", post.SpeechBudgetLimit,
+			); err != nil {
+				return controlplane.Stored[controlplane.Operation]{}, err
+			}
 		}
 		shotIDs, err := parseUUIDs(command.ShotSpecRevisionIDs)
 		if err != nil {
@@ -849,6 +891,7 @@ func (p *Postgres) PrepareProduction(
 				"generationPlanId":  command.GenerationPlanID,
 				"shotCount":         len(shotIDs),
 				"executionPolicy":   command.ExecutionPolicy,
+				"postProduction":    command.PostProduction,
 			}, now); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
@@ -1054,7 +1097,10 @@ func (p *Postgres) CreateGenerationRun(
 		if err := requireAssetLicenses(ctx, tx, assetRefs, now, command.ExecutionPolicy); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
-		if err := requireBudgetApproval(ctx, tx, command.BudgetApprovalID, seriesID, episodeID); err != nil {
+		if err := requireBudgetApproval(
+			ctx, tx, command.BudgetApprovalID, seriesID, episodeID,
+			command.GenerationPlanID, "VIDEO", planRecord.BudgetLimit,
+		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 
@@ -1676,6 +1722,7 @@ func (p *Postgres) GetManifest(ctx context.Context, scopeType, revisionIDRaw str
 		FROM video_pipeline.generation_manifests gm
 		JOIN video_pipeline.artifacts a ON a.id = gm.artifact_id
 		WHERE gm.scope_type = $1 AND gm.scope_revision_id = $2
+		  AND a.status = 'ACTIVE'
 		ORDER BY gm.created_at DESC
 		LIMIT 1`,
 		strings.ToUpper(scopeType), revisionID,
@@ -2067,6 +2114,7 @@ func eventTypeForAction(action string) (string, error) {
 		"manifest.locked":                      "video.manifest.locked.v1",
 		"dependency.stale":                     "video.dependency.stale.v1",
 		"workflow_step.completed":              "video.workflow-step.completed.v1",
+		"episode.postproduction.completed":     "video.episode.postproduction-completed.v1",
 	}
 	eventType, ok := eventTypes[action]
 	if !ok {
@@ -2196,6 +2244,56 @@ func validateRouteSnapshot(
 	return version, limits, nil
 }
 
+func requirePostProductionEvidenceMode(
+	ctx context.Context,
+	tx pgx.Tx,
+	profileIDRaw string,
+	evidence string,
+) error {
+	profileID, err := uuid.Parse(profileIDRaw)
+	if err != nil {
+		return controlplane.NewPolicyError(
+			controlplane.CodeCapability,
+			"post-production provider profile identifier is invalid",
+			"select the frozen speech capability profile",
+		)
+	}
+	var mode, health string
+	if err := tx.QueryRow(ctx, `
+		SELECT mode, health
+		FROM video_pipeline.provider_profiles
+		WHERE id = $1
+		FOR SHARE`,
+		profileID,
+	).Scan(&mode, &health); err != nil {
+		return fmt.Errorf("read post-production provider mode: %w", err)
+	}
+	if err := validatePostProductionEvidenceMode(evidence, mode, health); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validatePostProductionEvidenceMode(evidence, mode, health string) error {
+	valid := false
+	switch evidence {
+	case "mock_only":
+		valid = mode == "MOCK"
+	case "live_provider_call":
+		valid = mode == "LIVE" && health == "READY"
+	case "pending_key":
+		valid = mode == "DRY_RUN" || mode == "LIVE"
+	}
+	if valid {
+		return nil
+	}
+	return controlplane.NewPolicyError(
+		controlplane.CodeCapability,
+		"post-production evidence does not match the provider profile mode",
+		"use MOCK only for mock_only, LIVE/READY only for live evidence, and DRY_RUN/LIVE for pending_key",
+	)
+}
+
 func requireApprovedDecision(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -2277,6 +2375,9 @@ func requireBudgetApproval(
 	approvalIDRaw string,
 	seriesID uuid.UUID,
 	episodeID uuid.UUID,
+	generationPlanIDRaw string,
+	budgetScope string,
+	required controlplane.BudgetLimit,
 ) error {
 	approvalID, err := uuid.Parse(approvalIDRaw)
 	if err != nil {
@@ -2284,9 +2385,19 @@ func requireBudgetApproval(
 			controlplane.CodeBudgetExceeded, "budget approval identifier is invalid", "confirm the immutable generation plan budget",
 		)
 	}
+	generationPlanID, err := uuid.Parse(generationPlanIDRaw)
+	if err != nil {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded, "generation plan identifier is invalid", "confirm the immutable generation plan budget",
+		)
+	}
 	var state string
+	var approvedPlanID *uuid.UUID
+	var approvedScope, approvedCurrency *string
+	var approvedMicros *int64
 	if err := tx.QueryRow(ctx, `
-		SELECT state
+		SELECT state, generation_plan_id, budget_scope,
+		       budget_limit_micros, budget_currency
 		FROM video_pipeline.review_tasks
 		WHERE id = $1
 		  AND review_type = 'BUDGET'
@@ -2294,7 +2405,9 @@ func requireBudgetApproval(
 		  AND (episode_id IS NULL OR episode_id = $3)
 		FOR SHARE`,
 		approvalID, seriesID, episodeID,
-	).Scan(&state); err != nil {
+	).Scan(
+		&state, &approvedPlanID, &approvedScope, &approvedMicros, &approvedCurrency,
+	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return controlplane.NewPolicyError(
 				controlplane.CodeBudgetExceeded, "budget approval was not found", "approve the plan upper estimate before queueing",
@@ -2305,6 +2418,35 @@ func requireBudgetApproval(
 	if state != "APPROVED" {
 		return controlplane.NewPolicyError(
 			controlplane.CodeBudgetExceeded, "budget approval is not APPROVED", "approve or reduce the plan budget",
+		)
+	}
+	if approvedPlanID == nil || approvedScope == nil ||
+		approvedMicros == nil || approvedCurrency == nil {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"legacy budget approval is not bound to an immutable plan envelope",
+			"approve the exact current plan, budget scope, amount, and currency",
+		)
+	}
+	if *approvedPlanID != generationPlanID || *approvedScope != budgetScope {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"budget approval belongs to an old plan or a different spend scope",
+			"approve the exact current plan and provider spend scope",
+		)
+	}
+	if *approvedCurrency != required.Currency {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"budget approval currency differs from the immutable plan",
+			"approve the exact plan currency before paid submission",
+		)
+	}
+	if *approvedMicros != required.AmountMicros {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"budget approval amount differs from the immutable plan limit",
+			"approve the exact frozen plan upper limit before paid submission",
 		)
 	}
 	return nil
@@ -2801,10 +2943,12 @@ func validateApprovalBindings(
 		var linkedCount int
 		if err := tx.QueryRow(ctx, `
 			SELECT COUNT(*)
-			FROM video_pipeline.generation_manifests
-			WHERE id = ANY($1::uuid[])
-			  AND scope_type = 'EPISODE'
-			  AND scope_revision_id = ANY($2::uuid[])`,
+			FROM video_pipeline.generation_manifests gm
+			JOIN video_pipeline.artifacts a ON a.id = gm.artifact_id
+			WHERE gm.id = ANY($1::uuid[])
+			  AND gm.scope_type = 'EPISODE'
+			  AND gm.scope_revision_id = ANY($2::uuid[])
+			  AND a.status = 'ACTIVE'`,
 			manifestIDs, episodeRevisionIDs,
 		).Scan(&linkedCount); err != nil {
 			return fmt.Errorf("validate G3 manifest/episode binding: %w", err)
@@ -3081,7 +3225,10 @@ func approvalBindingQuery(objectType string) (string, error) {
 		return `SELECT report_hash, state FROM video_pipeline.qc_reports WHERE id = $1 FOR SHARE`, nil
 	case "MANIFEST":
 		return `SELECT manifest_hash, CASE WHEN locked_at IS NULL THEN 'UNLOCKED' ELSE 'LOCKED' END
-		        FROM video_pipeline.generation_manifests WHERE id = $1 FOR SHARE`, nil
+		        FROM video_pipeline.generation_manifests gm
+		        JOIN video_pipeline.artifacts a ON a.id = gm.artifact_id
+		        WHERE gm.id = $1 AND a.status = 'ACTIVE'
+		        FOR SHARE OF gm, a`, nil
 	case "ARTIFACT":
 		return `SELECT content_hash, status FROM video_pipeline.artifacts WHERE id = $1 FOR SHARE`, nil
 	default:
@@ -3148,6 +3295,7 @@ func decodePlanRecord(
 		CandidatesPerShot   int                          `json:"candidatesPerShot"`
 		PricingRuleVersion  string                       `json:"pricingRuleVersion"`
 		BudgetLimit         controlplane.BudgetLimit     `json:"budgetLimit"`
+		SpeechBudgetLimit   *controlplane.BudgetLimit    `json:"speechBudgetLimit"`
 		ExecutionPolicy     controlplane.ExecutionPolicy `json:"executionPolicy"`
 	}
 	if err := json.Unmarshal(auditPayload, &audit); err != nil {
@@ -3164,8 +3312,17 @@ func decodePlanRecord(
 		CandidatesPerShot:   audit.CandidatesPerShot,
 		PricingRuleVersion:  audit.PricingRuleVersion,
 		BudgetLimit:         audit.BudgetLimit,
+		SpeechBudgetLimit:   cloneBudgetLimit(audit.SpeechBudgetLimit),
 		ExecutionPolicy:     audit.ExecutionPolicy,
 	}, nil
+}
+
+func cloneBudgetLimit(limit *controlplane.BudgetLimit) *controlplane.BudgetLimit {
+	if limit == nil {
+		return nil
+	}
+	cloned := *limit
+	return &cloned
 }
 
 func sameRoute(left, right controlplane.ModelRouteSnapshot) bool {
@@ -3176,6 +3333,12 @@ func sameRoute(left, right controlplane.ModelRouteSnapshot) bool {
 		left.EndpointID == right.EndpointID &&
 		left.RouteVersion == right.RouteVersion &&
 		left.CapabilityHash == right.CapabilityHash
+}
+
+func sameBudgetLimit(left *controlplane.BudgetLimit, right controlplane.BudgetLimit) bool {
+	return left != nil &&
+		left.AmountMicros == right.AmountMicros &&
+		left.Currency == right.Currency
 }
 
 func equalStrings(left, right []string) bool {

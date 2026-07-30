@@ -144,6 +144,16 @@ func validateVideoRoute(route ModelRouteSnapshot) error {
 	return nil
 }
 
+func validateSpeechRoute(route ModelRouteSnapshot) error {
+	if err := validateRoute(route); err != nil {
+		return err
+	}
+	if route.CapabilityAlias != "speech.primary" {
+		return validationError("postProduction.speechRouteSnapshot.capabilityAlias must be speech.primary")
+	}
+	return nil
+}
+
 func uniqueUUIDs(name string, values []string) error {
 	if len(values) == 0 {
 		return validationError(name + " must contain at least one item")

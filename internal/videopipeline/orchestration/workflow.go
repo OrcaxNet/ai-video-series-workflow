@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -28,6 +29,7 @@ const (
 	ActivityRunAutomaticQC     = "video.activity.run-automatic-qc.v1"
 	ActivityCreateShotReview   = "video.activity.create-shot-review.v1"
 	ActivityEscalateShot       = "video.activity.escalate-shot.v1"
+	ActivityFinalizeEpisode    = "video.activity.finalize-episode.v1"
 	ActivityCreateGate3        = "video.activity.create-gate3-review.v1"
 )
 
@@ -48,15 +50,17 @@ type EpisodeProductionInput struct {
 	TraceID              string                         `json:"traceId"`
 	RequireShotApproval  bool                           `json:"requireShotApproval,omitempty"`
 	PersistProductTruth  bool                           `json:"persistProductTruth,omitempty"`
+	PostProduction       *PostProductionConfig          `json:"postProduction,omitempty"`
 }
 
 // EpisodeProductionResult is the durable terminal or intervention state.
 type EpisodeProductionResult struct {
-	State         string               `json:"state"`
-	LockedRunIDs  []string             `json:"lockedRunIds"`
-	FailedShotID  string               `json:"failedShotId,omitempty"`
-	Gate3Decision *Gate3Decision       `json:"gate3Decision,omitempty"`
-	Shots         map[string]ShotState `json:"shots"`
+	State          string                 `json:"state"`
+	LockedRunIDs   []string               `json:"lockedRunIds"`
+	FailedShotID   string                 `json:"failedShotId,omitempty"`
+	PostProduction *postproduction.Result `json:"postProduction,omitempty"`
+	Gate3Decision  *Gate3Decision         `json:"gate3Decision,omitempty"`
+	Shots          map[string]ShotState   `json:"shots"`
 }
 
 // ShotState is exposed through the workflow query handler.
@@ -140,6 +144,44 @@ type QCResult struct {
 	FailureCode string `json:"failureCode,omitempty"`
 }
 
+// PostProductionConfig freezes the independent speech route, budget, subtitle
+// behavior, and optional licensed background asset before Temporal starts.
+type PostProductionConfig struct {
+	Enabled                       bool                           `json:"enabled"`
+	Evidence                      string                         `json:"evidence"`
+	SpeechRoute                   providercontract.ModelSnapshot `json:"speechRoute"`
+	SpeechProviderProfileID       string                         `json:"speechProviderProfileId"`
+	SpeechBudgetApprovalID        string                         `json:"speechBudgetApprovalId"`
+	SpeechBudgetMaximumMicros     int64                          `json:"speechBudgetMaximumMicros"`
+	SpeechBudgetCurrency          string                         `json:"speechBudgetCurrency"`
+	SubtitleLanguage              string                         `json:"subtitleLanguage"`
+	BurnSubtitles                 bool                           `json:"burnSubtitles"`
+	BackgroundAudioAssetVersionID string                         `json:"backgroundAudioAssetVersionId,omitempty"`
+	EnforcePoCDuration            bool                           `json:"enforcePoCDuration"`
+}
+
+func (c PostProductionConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if err := c.SpeechRoute.Validate(providercontract.CapabilitySpeech); err != nil {
+		return errors.New("a frozen speech.primary route is required")
+	}
+	if c.Evidence != postproduction.EvidenceMockOnly &&
+		c.Evidence != postproduction.EvidenceLive &&
+		c.Evidence != postproduction.EvidencePendingKey {
+		return errors.New("post-production evidence is invalid")
+	}
+	if c.SpeechProviderProfileID == "" || c.SpeechBudgetApprovalID == "" ||
+		c.SpeechBudgetMaximumMicros <= 0 || len(c.SpeechBudgetCurrency) != 3 {
+		return errors.New("post-production speech profile and approved budget are required")
+	}
+	if c.SubtitleLanguage == "" {
+		return errors.New("post-production subtitle language is required")
+	}
+	return nil
+}
+
 // EpisodeProductionWorkflow runs a G2-approved production batch.
 func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInput) (EpisodeProductionResult, error) {
 	if err := validateWorkflowInput(input); err != nil {
@@ -169,6 +211,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			NonRetryableErrorTypes: []string{
 				"VALIDATION_ERROR",
 				"LICENSE_BLOCKED",
+				"CONSENT_REQUIRED",
 				string(providercontract.CodeBudgetExceeded),
 				string(providercontract.CodeUnauthenticated),
 				string(providercontract.CodeForbidden),
@@ -305,10 +348,48 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 		}
 	}
 
+	var delivery *postproduction.Result
+	if input.PostProduction != nil && input.PostProduction.Enabled {
+		status.State = "POST_PRODUCTION"
+		postOptions := baseOptions
+		postOptions.StartToCloseTimeout = 45 * time.Minute
+		postOptions.HeartbeatTimeout = 30 * time.Second
+		var finalized postproduction.Result
+		if err := workflow.ExecuteActivity(
+			workflow.WithActivityOptions(ctx, postOptions),
+			ActivityFinalizeEpisode,
+			FinalizeEpisodeInput{
+				EpisodeRevisionID:   input.EpisodeRevisionID,
+				RunIDs:              lockedRunIDs,
+				GenerationPlanID:    input.GenerationPlanID,
+				Config:              *input.PostProduction,
+				TraceID:             input.TraceID,
+				PersistProductTruth: input.PersistProductTruth,
+			},
+		).Get(ctx, &finalized); err != nil {
+			return EpisodeProductionResult{
+				State: "POST_PRODUCTION_FAILED", LockedRunIDs: lockedRunIDs, Shots: status.Shots,
+			}, err
+		}
+		delivery = &finalized
+	}
+
 	status.State = "WAITING_G3"
+	postProductionManifestHash := ""
+	if delivery != nil {
+		postProductionManifestHash = delivery.ManifestHash
+	}
 	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateGate3, CreateGate3Input{
-		EpisodeRevisionID:   input.EpisodeRevisionID,
-		RunIDs:              lockedRunIDs,
+		EpisodeRevisionID:          input.EpisodeRevisionID,
+		RunIDs:                     lockedRunIDs,
+		GenerationPlanID:           input.GenerationPlanID,
+		PostProductionManifestHash: postProductionManifestHash,
+		BackgroundAudioAssetVersionID: func() string {
+			if input.PostProduction == nil {
+				return ""
+			}
+			return input.PostProduction.BackgroundAudioAssetVersionID
+		}(),
 		TraceID:             input.TraceID,
 		PersistProductTruth: input.PersistProductTruth,
 	}).Get(ctx, nil); err != nil {
@@ -324,19 +405,21 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	if !gate3.Approved {
 		status.State = "G3_REJECTED"
 		return EpisodeProductionResult{
-			State:         status.State,
-			LockedRunIDs:  lockedRunIDs,
-			Gate3Decision: &gate3,
-			Shots:         status.Shots,
+			State:          status.State,
+			LockedRunIDs:   lockedRunIDs,
+			PostProduction: delivery,
+			Gate3Decision:  &gate3,
+			Shots:          status.Shots,
 		}, nil
 	}
 
 	status.State = "LOCKED"
 	return EpisodeProductionResult{
-		State:         status.State,
-		LockedRunIDs:  lockedRunIDs,
-		Gate3Decision: &gate3,
-		Shots:         status.Shots,
+		State:          status.State,
+		LockedRunIDs:   lockedRunIDs,
+		PostProduction: delivery,
+		Gate3Decision:  &gate3,
+		Shots:          status.Shots,
 	}, nil
 }
 
@@ -499,10 +582,22 @@ type EscalateShotInput struct {
 }
 
 type CreateGate3Input struct {
-	EpisodeRevisionID   string   `json:"episodeRevisionId"`
-	RunIDs              []string `json:"runIds"`
-	TraceID             string   `json:"traceId"`
-	PersistProductTruth bool     `json:"persistProductTruth,omitempty"`
+	EpisodeRevisionID             string   `json:"episodeRevisionId"`
+	RunIDs                        []string `json:"runIds"`
+	GenerationPlanID              string   `json:"generationPlanId,omitempty"`
+	PostProductionManifestHash    string   `json:"postProductionManifestHash,omitempty"`
+	BackgroundAudioAssetVersionID string   `json:"backgroundAudioAssetVersionId,omitempty"`
+	TraceID                       string   `json:"traceId"`
+	PersistProductTruth           bool     `json:"persistProductTruth,omitempty"`
+}
+
+type FinalizeEpisodeInput struct {
+	EpisodeRevisionID   string               `json:"episodeRevisionId"`
+	RunIDs              []string             `json:"runIds"`
+	GenerationPlanID    string               `json:"generationPlanId,omitempty"`
+	Config              PostProductionConfig `json:"config"`
+	TraceID             string               `json:"traceId"`
+	PersistProductTruth bool                 `json:"persistProductTruth,omitempty"`
 }
 
 func validateWorkflowInput(input EpisodeProductionInput) error {
@@ -534,6 +629,11 @@ func validateWorkflowInput(input EpisodeProductionInput) error {
 			return fmt.Errorf("duplicate shotSpecRevisionId %q", shotID)
 		}
 		seen[shotID] = struct{}{}
+	}
+	if input.PostProduction != nil {
+		if err := input.PostProduction.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

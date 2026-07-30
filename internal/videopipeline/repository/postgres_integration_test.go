@@ -25,6 +25,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/temporalcontrol"
 	"github.com/google/uuid"
@@ -34,6 +35,7 @@ import (
 	"go.temporal.io/sdk/activity"
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/testsuite"
 	"go.temporal.io/sdk/worker"
 	"go.temporal.io/sdk/workflow"
 )
@@ -272,9 +274,12 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	seriesID, episodeID, episodeRevisionID := uuid.New(), uuid.New(), uuid.New()
 	sceneID, shotID := uuid.New(), uuid.New()
 	scriptID, storyboardID, shotRevisionID := uuid.New(), uuid.New(), uuid.New()
-	gate2ID, budgetID := uuid.New(), uuid.New()
+	gate1ID, gate2ID, budgetID, speechBudgetID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	providerProfileID, capabilityID := uuid.New(), uuid.New()
 	safetyEvidenceArtifactID := uuid.New()
+	voiceLicenseID, musicLicenseID, consentID := uuid.New(), uuid.New(), uuid.New()
+	voiceAssetID, voiceAssetVersionID := uuid.New(), uuid.New()
+	musicAssetID, musicAssetVersionID := uuid.New(), uuid.New()
 	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 	episodeHash := strings.Repeat("1", 64)
 	shotHash := strings.Repeat("2", 64)
@@ -307,6 +312,49 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		INSERT INTO video_pipeline.episodes (id, series_id, ordinal, title)
 		VALUES ($1, $2, 1, 'episode')`,
 		episodeID, seriesID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.license_snapshots
+			(id, subject_type, subject_ref, license_id, license_hash,
+			 policy_status, territories, commercial_use, expires_at, source_uri)
+		VALUES
+			($1, 'VOICE', $2, 'voice-license', $3, 'ALLOWED', ARRAY['CN'], true,
+			 now() + interval '1 hour', 'license://integration/voice'),
+			($4, 'MUSIC', $5, 'music-license', $6, 'ALLOWED', ARRAY['CN'], true,
+			 now() + interval '1 hour', 'license://integration/music')`,
+		voiceLicenseID, voiceAssetVersionID.String(), strings.Repeat("d", 64),
+		musicLicenseID, musicAssetVersionID.String(), strings.Repeat("e", 64),
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.consent_assets
+			(id, subject_ref, consent_type, content_hash, artifact_uri,
+			 territories, expires_at, status)
+		VALUES ($1, $2, 'VOICE_CLONE', $3, $4, ARRAY['CN'],
+		        now() + interval '1 hour', 'ACTIVE')`,
+		consentID, voiceAssetVersionID.String(), strings.Repeat("9", 64),
+		"cas://sha256/"+strings.Repeat("9", 64),
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.assets
+			(id, series_id, asset_type, scope_type, scope_id)
+		VALUES
+			($1, $2, 'VOICE', 'SERIES', $2),
+			($3, $2, 'MUSIC', 'SERIES', $2)`,
+		voiceAssetID, seriesID, musicAssetID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.asset_versions
+			(id, asset_id, revision, status, content_hash, artifact_uri, media_type,
+			 source_ref, license_snapshot_id, consent_asset_id, created_by)
+		VALUES
+			($1, $2, 1, 'APPROVED', $3, $4, 'audio/wav',
+			 'integration-voice', $5, $6, 'integration'),
+			($7, $8, 1, 'APPROVED', $9, $10, 'audio/wav',
+			 'integration-music', $11, NULL, 'integration')`,
+		voiceAssetVersionID, voiceAssetID, strings.Repeat("f", 64),
+		"cas://sha256/"+strings.Repeat("f", 64), voiceLicenseID, consentID,
+		musicAssetVersionID, musicAssetID, strings.Repeat("7", 64),
+		"cas://sha256/"+strings.Repeat("7", 64), musicLicenseID,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.episode_revisions
@@ -353,6 +401,14 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		gate2ID, seriesID, episodeID,
 	)
 	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.approval_decisions
+			(id, series_id, episode_id, gate, decision, reason_code,
+			 actor_id, actor_role, trace_id)
+		VALUES ($1, $2, $3, 'G1', 'APPROVED', 'integration',
+		        'art-director', 'ART_DIRECTOR', 'workflow-projection')`,
+		gate1ID, seriesID, episodeID,
+	)
+	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.episode_script_revisions
 			(id, episode_id, revision, status, schema_version, payload, content_hash, created_by)
 		VALUES ($1, $2, 1, 'APPROVED', 'v1', '{}'::jsonb, $3, 'integration')`,
@@ -373,10 +429,10 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 gate2_decision_id, content_hash, created_by)
 		VALUES ($1, $2, $3, 1, 'READY', 'FRESH',
 		        5000, '16:9_720P24', 24, 1280, 720, 1,
-		        1, '{"action":"walk"}', '{}', $4,
+		        1, '{"action":"walk","dialogue":[{"id":"line-1","speaker":"A","text":"Hello fixture","startMillis":500,"endMillis":2000}]}', ARRAY[$9::uuid], $4,
 		        $5, '{}'::jsonb, '{}'::jsonb, $6, $7, $8, 'integration')`,
 		shotRevisionID, shotID, storyboardID, contextIDs,
-		effectiveHash, profileID, gate2ID, shotHash,
+		effectiveHash, profileID, gate2ID, shotHash, voiceAssetVersionID,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.approval_bindings
@@ -387,10 +443,18 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		gate2ID, episodeRevisionID, episodeHash, shotRevisionID, shotHash,
 	)
 	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.approval_bindings
+			(decision_id, object_type, revision_id, content_hash)
+		VALUES ($1, 'EPISODE_REVISION', $2, $3)`,
+		gate1ID, episodeRevisionID, episodeHash,
+	)
+	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.review_tasks
 			(id, series_id, episode_id, review_type, state, assigned_role, decided_at)
-		VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER', now())`,
-		budgetID, seriesID, episodeID,
+		VALUES
+			($1, $3, $4, 'BUDGET', 'APPROVED', 'PRODUCER', now()),
+			($2, $3, $4, 'BUDGET', 'APPROVED', 'PRODUCER', now())`,
+		budgetID, speechBudgetID, seriesID, episodeID,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.provider_profiles
@@ -477,9 +541,10 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		EpisodeRevisionID:   episodeRevisionID.String(),
 		ShotSpecRevisionIDs: []string{shotRevisionID.String()},
 		CandidatesPerShot:   1, RouteSnapshot: route,
-		BudgetLimit:     controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
-		ExecutionPolicy: executionPolicy,
-		Actor:           controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
+		BudgetLimit:       controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
+		SpeechBudgetLimit: &controlplane.BudgetLimit{AmountMicros: 1_000, Currency: "CNY"},
+		ExecutionPolicy:   executionPolicy,
+		Actor:             controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
 	}
 	planDigest, err := digestValue(planCommand)
 	if err != nil {
@@ -492,6 +557,29 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if plan.Value.SpeechBudgetLimit == nil ||
+		plan.Value.SpeechBudgetLimit.AmountMicros != 1_000 ||
+		plan.Value.SpeechBudgetLimit.Currency != "CNY" {
+		t.Fatalf("generation plan speech budget = %#v", plan.Value.SpeechBudgetLimit)
+	}
+	storedPlan, err := store.GetGenerationPlan(ctx, plan.Value.GenerationPlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if storedPlan.SpeechBudgetLimit == nil ||
+		storedPlan.SpeechBudgetLimit.AmountMicros != 1_000 ||
+		storedPlan.SpeechBudgetLimit.Currency != "CNY" {
+		t.Fatalf("stored generation plan speech budget = %#v", storedPlan.SpeechBudgetLimit)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.review_tasks
+		SET generation_plan_id = $3,
+		    budget_scope = CASE id WHEN $1 THEN 'VIDEO' ELSE 'SPEECH' END,
+		    budget_limit_micros = 1000,
+		    budget_currency = 'CNY'
+		WHERE id IN ($1, $2)`,
+		budgetID, speechBudgetID, plan.Value.GenerationPlanID,
+	)
 	blockedPlans := []struct {
 		name    string
 		command controlplane.CreateGenerationPlanCommand
@@ -593,6 +681,25 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			}
 		})
 	}
+	alternateVideoPlanCommand := planCommand
+	alternateVideoPlanCommand.CandidatesPerShot = 2
+	alternateVideoPlanDigest, err := digestValue(alternateVideoPlanCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alternateVideoPlan, err := store.CreateGenerationPlan(
+		ctx,
+		alternateVideoPlanCommand,
+		controlplane.Idempotency{
+			Scope:       "workflow-projection-alternate-video-plan:" + seriesID.String(),
+			Key:         uuid.NewString(),
+			RequestHash: alternateVideoPlanDigest,
+		},
+		"workflow-projection-alternate-video-plan",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	step := orchestration.WorkflowStep{
 		WorkflowID: "workflow-" + uuid.NewString(),
@@ -651,6 +758,194 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		BudgetCurrency: "CNY", ProviderProfileID: providerProfileID.String(),
 		TraceID: step.TraceID, PersistProductTruth: true,
 	}
+	var videoProviderCalls atomic.Int32
+	blockedProvider := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		_ *http.Request,
+	) {
+		videoProviderCalls.Add(1)
+		http.Error(response, "VIDEO budget boundary called provider", http.StatusInternalServerError)
+	}))
+	defer blockedProvider.Close()
+	videoActivities := orchestration.NewProductionActivities(
+		blockedProvider.URL, nil, store, nil,
+	)
+	var videoActivitySuite testsuite.WorkflowTestSuite
+	videoActivityEnvironment := videoActivitySuite.NewTestActivityEnvironment()
+	videoActivityEnvironment.RegisterActivity(videoActivities.ExecuteProviderJob)
+	restoreVideoApproval := func() {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.review_tasks
+			SET state = 'APPROVED',
+			    decided_at = now(),
+			    generation_plan_id = $2,
+			    budget_scope = 'VIDEO',
+			    budget_limit_micros = 1000,
+			    budget_currency = 'CNY'
+			WHERE id = $1`,
+			budgetID, plan.Value.GenerationPlanID,
+		)
+	}
+	videoBudgetRegressions := []struct {
+		name        string
+		mutate      func()
+		mutateInput func(*orchestration.ExecuteProviderJobInput)
+	}{
+		{
+			name: "legacy NULL approval after run creation",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET generation_plan_id = NULL, budget_scope = NULL,
+					    budget_limit_micros = NULL, budget_currency = NULL
+					WHERE id = $1`,
+					budgetID,
+				)
+			},
+		},
+		{
+			name: "approval revoked after run creation",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET state = 'CANCELLED', decided_at = now()
+					WHERE id = $1`,
+					budgetID,
+				)
+			},
+		},
+		{
+			name: "approval rebound to different same-budget plan",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET generation_plan_id = $2
+					WHERE id = $1`,
+					budgetID, alternateVideoPlan.Value.GenerationPlanID,
+				)
+			},
+		},
+		{
+			name: "approval scope changed",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_scope = 'SPEECH'
+					WHERE id = $1`,
+					budgetID,
+				)
+			},
+		},
+		{
+			name: "approval amount below plan",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_limit_micros = 999
+					WHERE id = $1`,
+					budgetID,
+				)
+			},
+		},
+		{
+			name: "approval amount above plan",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_limit_micros = 1001
+					WHERE id = $1`,
+					budgetID,
+				)
+			},
+		},
+		{
+			name: "approval currency changed",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_currency = 'USD'
+					WHERE id = $1`,
+					budgetID,
+				)
+			},
+		},
+		{
+			name: "dispatch amount below plan",
+			mutateInput: func(input *orchestration.ExecuteProviderJobInput) {
+				input.BudgetMaximumMicros = 999
+			},
+		},
+		{
+			name: "dispatch amount above plan",
+			mutateInput: func(input *orchestration.ExecuteProviderJobInput) {
+				input.BudgetMaximumMicros = 1001
+			},
+		},
+		{
+			name: "dispatch currency differs from plan",
+			mutateInput: func(input *orchestration.ExecuteProviderJobInput) {
+				input.BudgetCurrency = "USD"
+			},
+		},
+		{
+			name: "dispatch approval differs from persisted run",
+			mutateInput: func(input *orchestration.ExecuteProviderJobInput) {
+				input.BudgetApprovalID = speechBudgetID.String()
+			},
+		},
+	}
+	for _, regression := range videoBudgetRegressions {
+		regression := regression
+		t.Run("provider submit budget "+regression.name, func(t *testing.T) {
+			restoreVideoApproval()
+			if regression.mutate != nil {
+				regression.mutate()
+			}
+			blockedDispatch := dispatch
+			if regression.mutateInput != nil {
+				regression.mutateInput(&blockedDispatch)
+			}
+			_, activityErr := videoActivityEnvironment.ExecuteActivity(
+				videoActivities.ExecuteProviderJob,
+				blockedDispatch,
+			)
+			var applicationErr *temporal.ApplicationError
+			if !errors.As(activityErr, &applicationErr) ||
+				applicationErr.Type() != string(controlplane.CodeBudgetExceeded) ||
+				!applicationErr.NonRetryable() {
+				t.Fatalf(
+					"VIDEO budget Activity error = %#v, want non-retryable %s",
+					activityErr,
+					controlplane.CodeBudgetExceeded,
+				)
+			}
+			var reservations, jobs int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT COUNT(*)
+				   FROM video_pipeline.budget_reservations
+				   WHERE generation_run_id = $1),
+				  (SELECT COUNT(*)
+				   FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`,
+				run.RunID,
+			).Scan(&reservations, &jobs); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || videoProviderCalls.Load() != 0 {
+				t.Fatalf(
+					"blocked VIDEO submit side effects = reservations:%d jobs:%d provider:%d",
+					reservations,
+					jobs,
+					videoProviderCalls.Load(),
+				)
+			}
+		})
+	}
+	restoreVideoApproval()
 	step.ActivityID, step.ActivityType = "provider", orchestration.ActivityExecuteProviderJob
 	if err := store.PrepareProviderJob(ctx, step, dispatch); err != nil {
 		t.Fatal(err)
@@ -794,19 +1089,780 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		t.Fatalf("stored artifact spec = size:%d %dx%d", storedSize, storedWidth, storedHeight)
 	}
 
+	step.ActivityID, step.ActivityType = "post-production", orchestration.ActivityFinalizeEpisode
+	finalizeInput := orchestration.FinalizeEpisodeInput{
+		EpisodeRevisionID: episodeRevisionID.String(),
+		RunIDs:            []string{run.RunID},
+		GenerationPlanID:  plan.Value.GenerationPlanID,
+		Config: orchestration.PostProductionConfig{
+			Enabled:  true,
+			Evidence: postproduction.EvidenceMockOnly,
+			SpeechRoute: providercontract.ModelSnapshot{
+				CapabilityAlias: string(providercontract.CapabilitySpeech),
+				Provider:        "MOCK",
+				ModelID:         "fixture-speech-v1",
+				RouteVersion:    "route-v1",
+				CapabilityHash:  capabilityHash,
+				Verification:    "mock_only",
+			},
+			SpeechProviderProfileID:       providerProfileID.String(),
+			SpeechBudgetApprovalID:        speechBudgetID.String(),
+			SpeechBudgetMaximumMicros:     1_000,
+			SpeechBudgetCurrency:          "CNY",
+			SubtitleLanguage:              "en",
+			BackgroundAudioAssetVersionID: musicAssetVersionID.String(),
+		},
+		TraceID: step.TraceID,
+	}
+	postRequest, err := store.PrepareEpisodePostProduction(ctx, step, finalizeInput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(postRequest.Clips) != 1 || len(postRequest.Subtitle.Cues) != 1 {
+		t.Fatalf("prepared post-production request = %#v", postRequest)
+	}
+	if postRequest.Subtitle.Cues[0].StartMillis != 500 ||
+		postRequest.Subtitle.Cues[0].EndMillis != 2_000 {
+		t.Fatalf("prepared cue timing = %#v", postRequest.Subtitle.Cues[0])
+	}
+	assertPolicyCode := func(
+		test *testing.T,
+		stage string,
+		err error,
+		code controlplane.ErrorCode,
+	) {
+		test.Helper()
+		var policy *controlplane.DomainError
+		if !errors.As(err, &policy) || policy.Code != code {
+			test.Fatalf("%s error = %#v, want %s", stage, err, code)
+		}
+	}
+	alternatePlan, err := store.CreateGenerationPlan(
+		ctx,
+		planCommand,
+		controlplane.Idempotency{
+			Scope:       "workflow-projection-alternate-speech-plan:" + seriesID.String(),
+			Key:         uuid.NewString(),
+			RequestHash: planDigest,
+		},
+		"workflow-projection",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	budgetRegressions := []struct {
+		name   string
+		mutate func()
+	}{
+		{
+			name: "legacy old approval",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET generation_plan_id = NULL, budget_scope = NULL,
+					    budget_limit_micros = NULL, budget_currency = NULL
+					WHERE id = $1`,
+					speechBudgetID,
+				)
+			},
+		},
+		{
+			name: "different generation plan",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET generation_plan_id = $2
+					WHERE id = $1`,
+					speechBudgetID, alternatePlan.Value.GenerationPlanID,
+				)
+			},
+		},
+		{
+			name: "wrong spend scope",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_scope = 'VIDEO'
+					WHERE id = $1`,
+					speechBudgetID,
+				)
+			},
+		},
+		{
+			name: "insufficient amount",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_limit_micros = $2
+					WHERE id = $1`,
+					speechBudgetID, 999,
+				)
+			},
+		},
+		{
+			name: "currency mismatch",
+			mutate: func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.review_tasks
+					SET budget_currency = 'USD'
+					WHERE id = $1`,
+					speechBudgetID,
+				)
+			},
+		},
+	}
+	for _, regression := range budgetRegressions {
+		regression := regression
+		t.Run("paid speech budget "+regression.name, func(t *testing.T) {
+			regression.mutate()
+			err := store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput)
+			assertPolicyCode(t, regression.name, err, controlplane.CodeBudgetExceeded)
+			mustExec(t, ctx, pool, `
+				UPDATE video_pipeline.review_tasks
+				SET generation_plan_id = $2, budget_scope = 'SPEECH',
+				    budget_limit_micros = 1000, budget_currency = 'CNY'
+				WHERE id = $1`,
+				speechBudgetID, plan.Value.GenerationPlanID,
+			)
+		})
+	}
+	for _, mismatch := range []struct {
+		name     string
+		amount   int64
+		currency string
+	}{
+		{name: "amount differs from plan", amount: 1_001, currency: "CNY"},
+		{name: "currency differs from plan", amount: 1_000, currency: "USD"},
+	} {
+		mismatch := mismatch
+		t.Run("paid speech plan "+mismatch.name, func(t *testing.T) {
+			input := finalizeInput
+			input.Config.SpeechBudgetMaximumMicros = mismatch.amount
+			input.Config.SpeechBudgetCurrency = mismatch.currency
+			err := store.AuthorizeEpisodePostProduction(ctx, step, input)
+			assertPolicyCode(t, mismatch.name, err, controlplane.CodeBudgetExceeded)
+		})
+	}
+	if err := store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput); err != nil {
+		t.Fatalf("current exact speech budget authorization: %v", err)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`,
+		consentID,
+	)
+	err = store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput)
+	assertPolicyCode(t, "paid submit after consent revocation", err, controlplane.CodeConsentRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'ACTIVE' WHERE id = $1`,
+		consentID,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() - interval '1 second'
+		WHERE id = $1`,
+		voiceLicenseID,
+	)
+	err = store.AuthorizeEpisodePostProduction(ctx, step, finalizeInput)
+	assertPolicyCode(t, "paid submit after license expiry", err, controlplane.CodeLicenseBlocked)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() + interval '1 hour'
+		WHERE id = $1`,
+		voiceLicenseID,
+	)
+	liveInput := finalizeInput
+	liveInput.Config.Evidence = postproduction.EvidenceLive
+	liveInput.Config.SpeechRoute.Verification = "live_provider_call"
+	_, err = store.PrepareEpisodePostProduction(ctx, step, liveInput)
+	var voicePolicy *controlplane.DomainError
+	if !errors.As(err, &voicePolicy) || voicePolicy.Code != controlplane.CodeConsentRequired {
+		t.Fatalf("live unbound voice error = %#v, want %s", err, controlplane.CodeConsentRequired)
+	}
+	putPostArtifact := func(
+		kind, mediaType, payload string,
+		duration int64,
+		width, height, fps int,
+	) postproduction.Artifact {
+		t.Helper()
+		committed, err := cas.Put(ctx, strings.NewReader(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return postproduction.Artifact{
+			Kind: kind, Digest: committed.Digest, URI: committed.URI,
+			MediaType: mediaType, SizeBytes: committed.Size,
+			DurationMillis: duration, Width: width, Height: height, FPS: fps,
+		}
+	}
+	postManifest := putPostArtifact(
+		"postproduction_manifest",
+		"application/vnd.video-series.postproduction-manifest+json",
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q}`,
+			episodeRevisionID.String(),
+		),
+		0, 0, 0, 0,
+	)
+	serviceBOM := putPostArtifact(
+		"service_bom",
+		"application/vnd.video-series.service-bom+json",
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q,"components":[]}`,
+			episodeRevisionID.String(),
+		),
+		0, 0, 0, 0,
+	)
+	postResult := postproduction.Result{
+		SchemaVersion:     postproduction.SchemaVersion,
+		Evidence:          postproduction.EvidenceMockOnly,
+		EpisodeRevisionID: episodeRevisionID.String(),
+		Subtitle: putPostArtifact(
+			"subtitle_srt", "application/x-subrip; charset=utf-8",
+			"1\n00:00:00,500 --> 00:00:02,000\nHello fixture "+
+				episodeRevisionID.String()+"\n\n",
+			5_000, 0, 0, 0,
+		),
+		Dialogue: putPostArtifact(
+			"dialogue_audio", "audio/wav", "fixture dialogue "+episodeRevisionID.String(),
+			5_000, 0, 0, 0,
+		),
+		FinalVideo: putPostArtifact(
+			"final_video", "video/mp4", "fixture final video "+episodeRevisionID.String(),
+			5_000, 1280, 720, 24,
+		),
+		Manifest:        postManifest,
+		ServiceBOM:      serviceBOM,
+		CommandPlanHash: strings.Repeat("d", 64),
+		ManifestHash:    postManifest.Digest,
+		ServiceBOMHash:  serviceBOM.Digest,
+		QC: postproduction.QCReport{
+			State: "STRUCTURAL_PASSED", ActualDurationMillis: 5_000,
+			ManualTimingRequired: true, MeasurementEvidence: postproduction.EvidenceMockOnly,
+		},
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`,
+		consentID,
+	)
+	err = store.CommitEpisodePostProduction(ctx, step, finalizeInput, postResult)
+	assertPolicyCode(t, "post-production commit after consent revocation", err, controlplane.CodeConsentRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'ACTIVE' WHERE id = $1`,
+		consentID,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() - interval '1 second'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
+	err = store.CommitEpisodePostProduction(ctx, step, finalizeInput, postResult)
+	assertPolicyCode(t, "post-production commit after license expiry", err, controlplane.CodeLicenseBlocked)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() + interval '1 hour'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
+	fixtureDigest := func(label string) string {
+		t.Helper()
+		digest, err := digestValue(map[string]string{
+			"label": label,
+			"nonce": uuid.NewString(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return digest
+	}
+	inactiveArtifactRegressions := []struct {
+		name   string
+		status string
+		digest string
+	}{
+		{name: "orphan candidate", status: "ORPHAN_CANDIDATE", digest: fixtureDigest("orphan")},
+		{name: "archived", status: "ARCHIVED", digest: fixtureDigest("archived")},
+		{name: "disabled", status: "DISABLED", digest: fixtureDigest("disabled")},
+	}
+	for _, regression := range inactiveArtifactRegressions {
+		regression := regression
+		t.Run("post-production CAS conflict "+regression.name, func(t *testing.T) {
+			conflictingResult := postResult
+			conflictingResult.FinalVideo.Digest = regression.digest
+			conflictingResult.FinalVideo.URI = "cas://sha256/" + regression.digest
+			inactiveArtifactID := uuid.New()
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.artifacts
+					(id, content_hash, artifact_uri, media_type, size_bytes,
+					 media_spec, status, orphaned_at, retention_until)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now() + interval '1 hour')`,
+				inactiveArtifactID,
+				conflictingResult.FinalVideo.Digest,
+				conflictingResult.FinalVideo.URI,
+				conflictingResult.FinalVideo.MediaType,
+				conflictingResult.FinalVideo.SizeBytes,
+				map[string]any{
+					"kind":                       "final_video",
+					"postProductionManifestHash": conflictingResult.ManifestHash,
+				},
+				regression.status,
+			)
+			err := store.CommitEpisodePostProduction(ctx, step, finalizeInput, conflictingResult)
+			assertPolicyCode(t, regression.name, err, controlplane.CodeConflict)
+			var links int
+			if err := pool.QueryRow(ctx, `
+				SELECT COUNT(*)
+				FROM video_pipeline.run_artifacts
+				WHERE generation_run_id = $1 AND artifact_id = $2`,
+				run.RunID, inactiveArtifactID,
+			).Scan(&links); err != nil {
+				t.Fatal(err)
+			}
+			if links != 0 {
+				t.Fatalf("non-ACTIVE artifact links = %d, want 0", links)
+			}
+		})
+	}
+	var rejectedPostArtifacts int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.artifacts
+		WHERE content_hash IN ($1, $2, $3, $4, $5)`,
+		postResult.FinalVideo.Digest,
+		postResult.Dialogue.Digest,
+		postResult.Subtitle.Digest,
+		postResult.Manifest.Digest,
+		postResult.ServiceBOM.Digest,
+	).Scan(&rejectedPostArtifacts); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedPostArtifacts != 0 {
+		t.Fatalf("rejected post-production persisted %d artifacts", rejectedPostArtifacts)
+	}
+	if err := store.CommitEpisodePostProduction(ctx, step, finalizeInput, postResult); err != nil {
+		t.Fatal(err)
+	}
+	var linkedPostArtifacts int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.run_artifacts ra
+		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+		WHERE ra.generation_run_id = $1
+		  AND a.media_spec->>'postProductionManifestHash' = $2`,
+		run.RunID, postResult.ManifestHash,
+	).Scan(&linkedPostArtifacts); err != nil {
+		t.Fatal(err)
+	}
+	if linkedPostArtifacts != 5 {
+		t.Fatalf("linked post-production artifacts = %d, want 5", linkedPostArtifacts)
+	}
+	oldPostManifestHash := fixtureDigest("old post-production manifest")
+	oldFinalVideoHash := fixtureDigest("old final video")
+	oldSubtitleHash := fixtureDigest("old subtitle")
+	oldPostManifestID, oldFinalVideoID, oldSubtitleID := uuid.New(), uuid.New(), uuid.New()
+	oldPostManifestURI := "cas://sha256/" + oldPostManifestHash
+	oldFinalVideoURI := "cas://sha256/" + oldFinalVideoHash
+	oldSubtitleURI := "cas://sha256/" + oldSubtitleHash
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES
+			($1, $2, $3, 'application/json', 1,
+			 jsonb_build_object(
+			   'kind', 'postproduction_manifest',
+			   'postProductionManifestHash', $7::text
+			 ), 'ACTIVE'),
+			($4, $5, $6, 'video/mp4', 1,
+			 jsonb_build_object(
+			   'kind', 'final_video',
+			   'postProductionManifestHash', $7::text
+			 ), 'ACTIVE'),
+			($8, $9, $10, 'application/x-subrip', 1,
+			 jsonb_build_object(
+			   'kind', 'subtitle_srt',
+			   'postProductionManifestHash', $7::text
+			 ), 'ACTIVE')`,
+		oldPostManifestID, oldPostManifestHash, oldPostManifestURI,
+		oldFinalVideoID, oldFinalVideoHash, oldFinalVideoURI, oldPostManifestHash,
+		oldSubtitleID, oldSubtitleHash, oldSubtitleURI,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.run_artifacts
+			(generation_run_id, artifact_id, role)
+		VALUES
+			($1, $2, 'MANIFEST'),
+			($1, $3, 'OUTPUT'),
+			($1, $4, 'SUBTITLE')`,
+		run.RunID, oldPostManifestID, oldFinalVideoID, oldSubtitleID,
+	)
+	extraHashlessArtifactID := uuid.New()
+	extraHashlessArtifactHash := fixtureDigest("hashless provider auxiliary")
+	extraHashlessArtifactURI := "cas://sha256/" + extraHashlessArtifactHash
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES ($1, $2, $3, 'application/octet-stream', 1,
+		        '{"kind":"provider_auxiliary"}', 'ACTIVE')`,
+		extraHashlessArtifactID,
+		extraHashlessArtifactHash,
+		extraHashlessArtifactURI,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.run_artifacts
+			(generation_run_id, artifact_id, role)
+		VALUES ($1, $2, 'PROXY')`,
+		run.RunID,
+		extraHashlessArtifactID,
+	)
+
 	step.ActivityID, step.ActivityType = "manifest", orchestration.ActivityCreateGate3
 	gate3Input := orchestration.CreateGate3Input{
 		EpisodeRevisionID: episodeRevisionID.String(), RunIDs: []string{run.RunID},
-		TraceID: step.TraceID, PersistProductTruth: true,
+		GenerationPlanID:              plan.Value.GenerationPlanID,
+		PostProductionManifestHash:    postResult.ManifestHash,
+		BackgroundAudioAssetVersionID: musicAssetVersionID.String(),
+		TraceID:                       step.TraceID,
+		PersistProductTruth:           true,
 	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`,
+		consentID,
+	)
+	_, err = store.BuildEpisodeManifest(ctx, step, gate3Input)
+	assertPolicyCode(t, "G3 build after consent revocation", err, controlplane.CodeConsentRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.consent_assets SET status = 'ACTIVE' WHERE id = $1`,
+		consentID,
+	)
 	manifestPayload, err := store.BuildEpisodeManifest(ctx, step, gate3Input)
 	if err != nil {
 		t.Fatal(err)
+	}
+	var builtManifest struct {
+		PostProductionManifestHash string   `json:"postProductionManifestHash"`
+		Outputs                    []string `json:"outputs"`
+		ProviderExecutions         []struct {
+			Artifacts []struct {
+				ID          string `json:"id"`
+				ContentHash string `json:"content_hash"`
+				ArtifactURI string `json:"artifact_uri"`
+				Role        string `json:"role"`
+				MediaSpec   struct {
+					Kind                       string `json:"kind"`
+					PostProductionManifestHash string `json:"postProductionManifestHash"`
+				} `json:"media_spec"`
+			} `json:"artifacts"`
+		} `json:"providerExecutions"`
+	}
+	if err := json.Unmarshal(manifestPayload, &builtManifest); err != nil {
+		t.Fatal(err)
+	}
+	if builtManifest.PostProductionManifestHash != postResult.ManifestHash ||
+		len(builtManifest.Outputs) != 1 ||
+		builtManifest.Outputs[0] != postResult.FinalVideo.URI {
+		t.Fatalf("G3 current post-production binding = %#v", builtManifest)
+	}
+	currentPostProductionKinds := make(map[string]int)
+	for _, execution := range builtManifest.ProviderExecutions {
+		for _, artifact := range execution.Artifacts {
+			if artifact.MediaSpec.PostProductionManifestHash == postResult.ManifestHash {
+				currentPostProductionKinds[artifact.MediaSpec.Kind]++
+			}
+		}
+	}
+	for _, requiredKind := range []string{
+		"final_video",
+		"subtitle_srt",
+		"dialogue_audio",
+		"postproduction_manifest",
+		"service_bom",
+	} {
+		if currentPostProductionKinds[requiredKind] != 1 {
+			t.Fatalf(
+				"G3 current post-production kind %s count = %d, want 1",
+				requiredKind,
+				currentPostProductionKinds[requiredKind],
+			)
+		}
+	}
+	if bytes.Contains(manifestPayload, []byte(oldPostManifestURI)) ||
+		bytes.Contains(manifestPayload, []byte(oldFinalVideoURI)) ||
+		bytes.Contains(manifestPayload, []byte(oldSubtitleURI)) {
+		t.Fatal("G3 manifest leaked an old post-production revision")
+	}
+	frozenHashlessArtifacts := map[string]struct {
+		id, uri, kind, role string
+	}{
+		providerResult.ArtifactDigest: {
+			id: uuid.NewSHA1(
+				uuid.NameSpaceOID,
+				[]byte("artifact:"+providerResult.ArtifactDigest),
+			).String(),
+			uri: providerResult.ArtifactURI, kind: "shot_video", role: "OUTPUT",
+		},
+		extraHashlessArtifactHash: {
+			id:  extraHashlessArtifactID.String(),
+			uri: extraHashlessArtifactURI, kind: "provider_auxiliary", role: "PROXY",
+		},
+	}
+	for _, execution := range builtManifest.ProviderExecutions {
+		for _, artifact := range execution.Artifacts {
+			expected, ok := frozenHashlessArtifacts[artifact.ContentHash]
+			if !ok {
+				continue
+			}
+			if artifact.ID != expected.id ||
+				artifact.ArtifactURI != expected.uri ||
+				artifact.Role != expected.role ||
+				artifact.MediaSpec.Kind != expected.kind ||
+				artifact.MediaSpec.PostProductionManifestHash != "" {
+				t.Fatalf("G3 frozen hashless artifact = %#v, want %#v", artifact, expected)
+			}
+			delete(frozenHashlessArtifacts, artifact.ContentHash)
+		}
+	}
+	if len(frozenHashlessArtifacts) != 0 {
+		t.Fatalf("G3 omitted frozen hashless artifacts = %#v", frozenHashlessArtifacts)
 	}
 	manifestArtifact, err := cas.Put(ctx, bytes.NewReader(manifestPayload))
 	if err != nil {
 		t.Fatal(err)
 	}
+	assertNoG3CommitSideEffects := func(test *testing.T, name string) {
+		test.Helper()
+		var generationManifests, g3Reviews, generationManifestLinks int
+		if err := pool.QueryRow(ctx, `
+			SELECT
+			  (SELECT COUNT(*)
+			   FROM video_pipeline.generation_manifests
+			   WHERE scope_type = 'EPISODE' AND scope_revision_id = $1),
+			  (SELECT COUNT(*)
+			   FROM video_pipeline.review_tasks
+			   WHERE episode_id = $2 AND review_type = 'G3'),
+			  (SELECT COUNT(*)
+			   FROM video_pipeline.run_artifacts ra
+			   JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+			   WHERE ra.generation_run_id = $3
+			     AND a.media_spec->>'kind' = 'generation-manifest')`,
+			episodeRevisionID, episodeID, run.RunID,
+		).Scan(
+			&generationManifests,
+			&g3Reviews,
+			&generationManifestLinks,
+		); err != nil {
+			test.Fatal(err)
+		}
+		if generationManifests != 0 || g3Reviews != 0 || generationManifestLinks != 0 {
+			test.Fatalf(
+				"%s persisted generation manifests=%d G3=%d new run links=%d",
+				name,
+				generationManifests,
+				g3Reviews,
+				generationManifestLinks,
+			)
+		}
+	}
+	postProductionDigests := map[string]string{
+		"subtitle_srt":            postResult.Subtitle.Digest,
+		"dialogue_audio":          postResult.Dialogue.Digest,
+		"postproduction_manifest": postResult.Manifest.Digest,
+		"service_bom":             postResult.ServiceBOM.Digest,
+	}
+	for kind, digest := range postProductionDigests {
+		kind, digest := kind, digest
+		for _, inactiveStatus := range []string{
+			"ORPHAN_CANDIDATE",
+			"ARCHIVED",
+			"DISABLED",
+		} {
+			inactiveStatus := inactiveStatus
+			t.Run(
+				"G3 commit rejects "+kind+" "+inactiveStatus,
+				func(t *testing.T) {
+					mustExec(t, ctx, pool, `
+						UPDATE video_pipeline.artifacts
+						SET status = $2,
+						    orphaned_at = CASE
+						      WHEN $2::text = 'ORPHAN_CANDIDATE' THEN now()
+						      ELSE orphaned_at
+						    END,
+						    retention_until = CASE
+						      WHEN $2::text = 'ORPHAN_CANDIDATE' THEN now() + interval '1 hour'
+						      ELSE retention_until
+						    END
+						WHERE content_hash = $1`,
+						digest, inactiveStatus,
+					)
+					err := store.CommitEpisodeManifest(
+						ctx,
+						step,
+						gate3Input,
+						manifestPayload,
+						manifestArtifact,
+					)
+					assertPolicyCode(
+						t,
+						"G3 commit "+kind+" "+inactiveStatus,
+						err,
+						controlplane.CodeGateRequired,
+					)
+					assertNoG3CommitSideEffects(t, kind+" "+inactiveStatus)
+					mustExec(t, ctx, pool, `
+						UPDATE video_pipeline.artifacts
+						SET status = 'ACTIVE'
+						WHERE content_hash = $1`,
+						digest,
+					)
+				},
+			)
+		}
+	}
+	for _, inactiveStatus := range []string{
+		"ORPHAN_CANDIDATE",
+		"ARCHIVED",
+		"DISABLED",
+	} {
+		inactiveStatus := inactiveStatus
+		t.Run(
+			"G3 commit rejects raw provider output "+inactiveStatus,
+			func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.artifacts
+					SET status = $2,
+					    orphaned_at = CASE
+					      WHEN $2::text = 'ORPHAN_CANDIDATE' THEN now()
+					      ELSE orphaned_at
+					    END,
+					    retention_until = CASE
+					      WHEN $2::text = 'ORPHAN_CANDIDATE' THEN now() + interval '1 hour'
+					      ELSE retention_until
+					    END
+					WHERE content_hash = $1`,
+					providerResult.ArtifactDigest,
+					inactiveStatus,
+				)
+				err := store.CommitEpisodeManifest(
+					ctx,
+					step,
+					gate3Input,
+					manifestPayload,
+					manifestArtifact,
+				)
+				assertPolicyCode(
+					t,
+					"G3 raw provider output "+inactiveStatus,
+					err,
+					controlplane.CodeGateRequired,
+				)
+				assertNoG3CommitSideEffects(t, "raw provider output "+inactiveStatus)
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.artifacts
+					SET status = 'ACTIVE'
+					WHERE content_hash = $1`,
+					providerResult.ArtifactDigest,
+				)
+			},
+		)
+	}
+	t.Run("G3 commit rejects inactive hashless payload artifact", func(t *testing.T) {
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.artifacts
+			SET status = 'DISABLED'
+			WHERE id = $1`,
+			extraHashlessArtifactID,
+		)
+		err := store.CommitEpisodeManifest(
+			ctx,
+			step,
+			gate3Input,
+			manifestPayload,
+			manifestArtifact,
+		)
+		assertPolicyCode(
+			t,
+			"G3 inactive hashless payload artifact",
+			err,
+			controlplane.CodeGateRequired,
+		)
+		assertNoG3CommitSideEffects(t, "inactive hashless payload artifact")
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.artifacts
+			SET status = 'ACTIVE'
+			WHERE id = $1`,
+			extraHashlessArtifactID,
+		)
+	})
+	disabledManifestPayload := append(append([]byte(nil), manifestPayload...), '\n')
+	disabledManifestArtifact, err := cas.Put(ctx, bytes.NewReader(disabledManifestPayload))
+	if err != nil {
+		t.Fatal(err)
+	}
+	disabledManifestArtifactID := uuid.New()
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES ($1, $2, $3, 'application/json', $4,
+		        '{"kind":"generation-manifest"}', 'DISABLED')`,
+		disabledManifestArtifactID,
+		disabledManifestArtifact.Digest,
+		disabledManifestArtifact.URI,
+		disabledManifestArtifact.Size,
+	)
+	err = store.CommitEpisodeManifest(
+		ctx, step, gate3Input, disabledManifestPayload, disabledManifestArtifact,
+	)
+	assertPolicyCode(t, "G3 non-ACTIVE CAS conflict", err, controlplane.CodeConflict)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.artifacts
+		SET status = 'ARCHIVED'
+		WHERE content_hash = $1`,
+		postResult.FinalVideo.Digest,
+	)
+	err = store.CommitEpisodeManifest(ctx, step, gate3Input, manifestPayload, manifestArtifact)
+	assertPolicyCode(t, "G3 commit after final video archival", err, controlplane.CodeGateRequired)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.artifacts
+		SET status = 'ACTIVE'
+		WHERE content_hash = $1`,
+		postResult.FinalVideo.Digest,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() - interval '1 second'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
+	err = store.CommitEpisodeManifest(ctx, step, gate3Input, manifestPayload, manifestArtifact)
+	assertPolicyCode(t, "G3 commit after license expiry", err, controlplane.CodeLicenseBlocked)
+	var rejectedManifests, rejectedG3Reviews int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.generation_manifests
+		WHERE scope_type = 'EPISODE' AND scope_revision_id = $1`,
+		episodeRevisionID,
+	).Scan(&rejectedManifests); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.review_tasks
+		WHERE episode_id = $1 AND review_type = 'G3'`,
+		episodeID,
+	).Scan(&rejectedG3Reviews); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedManifests != 0 || rejectedG3Reviews != 0 {
+		t.Fatalf(
+			"rejected G3 persisted manifests=%d reviews=%d",
+			rejectedManifests, rejectedG3Reviews,
+		)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.license_snapshots
+		SET expires_at = now() + interval '1 hour'
+		WHERE id = $1`,
+		musicLicenseID,
+	)
 	if err := store.CommitEpisodeManifest(ctx, step, gate3Input, manifestPayload, manifestArtifact); err != nil {
 		t.Fatal(err)
 	}
@@ -1959,10 +3015,28 @@ func cloneIntegrationShotCommand(
 	if err != nil {
 		t.Fatal(err)
 	}
+	clonedBudgetID := uuid.New()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.review_tasks
+			(id, series_id, episode_id, review_type, state, assigned_role,
+			 decided_at, generation_plan_id, budget_scope,
+			 budget_limit_micros, budget_currency)
+		VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER',
+		        now(), $4, 'VIDEO', $5, $6)`,
+		clonedBudgetID,
+		planRecord.SeriesID,
+		episodeID,
+		plan.Value.GenerationPlanID,
+		planRecord.BudgetLimit.AmountMicros,
+		planRecord.BudgetLimit.Currency,
+	); err != nil {
+		t.Fatal(err)
+	}
 	cloned := source
 	cloned.ShotSpecRevisionID = newShotRevisionID.String()
 	cloned.PromptSnapshotID = newPromptID.String()
 	cloned.GenerationPlanID = plan.Value.GenerationPlanID
+	cloned.BudgetApprovalID = clonedBudgetID.String()
 	cloned.ExecutionPolicy = executionPolicy
 	cloned.CreativeAttempt = 1
 	return newShotID.String(), cloned

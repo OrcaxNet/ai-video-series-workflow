@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -259,7 +262,10 @@ func (p *Postgres) CreateWorkflowRun(
 				"workflow route differs from the immutable generation plan",
 			)
 		}
-		if err := requireBudgetApproval(ctx, tx, input.BudgetApprovalID, seriesID, episodeID); err != nil {
+		if err := requireBudgetApproval(
+			ctx, tx, input.BudgetApprovalID, seriesID, episodeID,
+			input.GenerationPlanID, "VIDEO", plan.BudgetLimit,
+		); err != nil {
 			return orchestration.GenerationRunRef{}, err
 		}
 		runDigest, err := digestValue(map[string]any{
@@ -328,6 +334,7 @@ func (p *Postgres) CreateWorkflowRun(
 					"promptSnapshotId":   input.PromptSnapshot.ID,
 					"runSpecDigest":      runDigest,
 					"creativeAttempt":    input.CreativeAttempt,
+					"generationPlanId":   input.GenerationPlanID,
 				},
 				p.now().UTC(),
 			); err != nil {
@@ -356,16 +363,36 @@ func (p *Postgres) PrepareProviderJob(
 	}
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
 		var attemptID uuid.UUID
-		var runDigest, runState string
+		var seriesID, episodeID uuid.UUID
+		var runDigest, runState, persistedBudgetApprovalID, generationPlanID string
 		if err := tx.QueryRow(ctx, `
-			SELECT ga.id, gr.run_spec_digest, gr.state
+			SELECT ga.id, gr.run_spec_digest, gr.state, gr.budget_approval_id,
+			       COALESCE(audit.payload->>'generationPlanId', ''),
+			       ep.series_id, ep.id
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.generation_attempts ga
 			  ON ga.generation_run_id = gr.id AND ga.sequence = 1
+			JOIN video_pipeline.shot_spec_revisions ssr
+			  ON ssr.id = gr.shot_spec_revision_id
+			JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+			JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+			JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+			LEFT JOIN LATERAL (
+				SELECT payload
+				FROM video_pipeline.audit_events
+				WHERE aggregate_type = 'GENERATION_RUN'
+				  AND aggregate_id = gr.id
+				  AND action = 'generation_run.created'
+				ORDER BY occurred_at
+				LIMIT 1
+			) audit ON true
 			WHERE gr.id = $1
 			FOR UPDATE OF gr, ga`,
 			runID,
-		).Scan(&attemptID, &runDigest, &runState); err != nil {
+		).Scan(
+			&attemptID, &runDigest, &runState, &persistedBudgetApprovalID,
+			&generationPlanID, &seriesID, &episodeID,
+		); err != nil {
 			return struct{}{}, fmt.Errorf("lock provider run: %w", err)
 		}
 		if runDigest != input.Run.RunSpecDigest {
@@ -373,6 +400,38 @@ func (p *Postgres) PrepareProviderJob(
 				controlplane.CodeRevisionConflict,
 				"provider dispatch digest differs from the persisted run",
 			)
+		}
+		if generationPlanID == "" {
+			return struct{}{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"generation run has no immutable generation plan binding",
+				"create a new run from the exact approved plan",
+			)
+		}
+		if input.BudgetApprovalID != persistedBudgetApprovalID {
+			return struct{}{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"provider dispatch budget approval differs from the persisted run",
+				"use the exact approval frozen when the run was created",
+			)
+		}
+		plan, err := readPlan(ctx, tx, generationPlanID)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if input.BudgetMaximumMicros != plan.BudgetLimit.AmountMicros ||
+			input.BudgetCurrency != plan.BudgetLimit.Currency {
+			return struct{}{}, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"provider dispatch budget differs from the immutable generation plan",
+				"use the exact VIDEO amount and currency frozen by the plan",
+			)
+		}
+		if err := requireBudgetApproval(
+			ctx, tx, persistedBudgetApprovalID, seriesID, episodeID,
+			generationPlanID, "VIDEO", plan.BudgetLimit,
+		); err != nil {
+			return struct{}{}, err
 		}
 		if runState == "SUCCEEDED" {
 			return struct{}{}, nil
@@ -503,10 +562,19 @@ func (p *Postgres) CompleteProviderJob(
 			return struct{}{}, fmt.Errorf("insert provider artifact: %w", err)
 		}
 		if err := tx.QueryRow(ctx,
-			`SELECT id FROM video_pipeline.artifacts WHERE content_hash = $1`,
+			`SELECT id
+			 FROM video_pipeline.artifacts
+			 WHERE content_hash = $1 AND status = 'ACTIVE'
+			 FOR SHARE`,
 			result.ArtifactDigest,
 		).Scan(&artifactID); err != nil {
-			return struct{}{}, fmt.Errorf("resolve provider artifact: %w", err)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"provider artifact hash is bound to a non-ACTIVE CAS record",
+				)
+			}
+			return struct{}{}, fmt.Errorf("resolve ACTIVE provider artifact: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO video_pipeline.run_artifacts
@@ -743,6 +811,444 @@ func (p *Postgres) RecordShotIntervention(
 	return err
 }
 
+// PrepareEpisodePostProduction resolves the exact successful shot outputs,
+// four-level context snapshots, prompt snapshots, approved gates, dialogue,
+// and optional licensed background audio into one immutable work request.
+func (p *Postgres) PrepareEpisodePostProduction(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	input orchestration.FinalizeEpisodeInput,
+) (postproduction.Request, error) {
+	episodeRevisionID, err := uuid.Parse(input.EpisodeRevisionID)
+	if err != nil {
+		return postproduction.Request{}, errors.New("episodeRevisionId must be a UUID")
+	}
+	runIDs, err := parseUUIDs(input.RunIDs)
+	if err != nil {
+		return postproduction.Request{}, errors.New("post-production run IDs must be UUIDs")
+	}
+	var episodeHash string
+	if err := p.pool.QueryRow(ctx, `
+		SELECT content_hash
+		FROM video_pipeline.episode_revisions
+		WHERE id = $1 AND status = 'G2_APPROVED'`,
+		episodeRevisionID,
+	).Scan(&episodeHash); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return postproduction.Request{}, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"post-production episode is not G2_APPROVED",
+				"approve the exact episode revision at G2",
+			)
+		}
+		return postproduction.Request{}, fmt.Errorf("read post-production episode: %w", err)
+	}
+
+	clips := make([]postproduction.Clip, 0, len(runIDs))
+	cues := make([]postproduction.Cue, 0)
+	sourceRevisionIDs := make([]string, 0, len(runIDs))
+	voiceAssetIDs := make(map[uuid.UUID]struct{})
+	var timelineOffset int64
+	for index, runID := range runIDs {
+		var (
+			clip                           postproduction.Clip
+			narrative                      []byte
+			assetVersionRefs               []uuid.UUID
+			artifactDigest                 string
+			artifactURI                    string
+			mediaType                      string
+			licenseReference               string
+			sizeBytes                      int64
+			width, height, framesPerSecond int
+		)
+		if err := p.pool.QueryRow(ctx, `
+			SELECT gr.id, ssr.id, ssr.content_hash, ssr.duration_ms, ssr.narrative,
+			       ssr.asset_version_refs,
+			       ps.id, ps.content_hash, ecs.id, ecs.content_hash,
+			       a.content_hash, a.artifact_uri, a.media_type, a.size_bytes,
+			       COALESCE((a.media_spec->>'width')::integer, ssr.width),
+			       COALESCE((a.media_spec->>'height')::integer, ssr.height),
+			       ssr.fps,
+			       COALESCE((
+			         SELECT string_agg(ls.license_id || ':' || ls.license_hash, ';' ORDER BY ls.id)
+			         FROM unnest(ssr.asset_version_refs) requested(id)
+			         JOIN video_pipeline.asset_versions av ON av.id = requested.id
+			         JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
+			         WHERE ls.policy_status = 'ALLOWED'
+			           AND (ls.expires_at IS NULL OR ls.expires_at > now())
+			           AND (av.consent_asset_id IS NULL OR EXISTS (
+			             SELECT 1
+			             FROM video_pipeline.consent_assets ca
+			             WHERE ca.id = av.consent_asset_id
+			               AND ca.status = 'ACTIVE'
+			               AND (ca.expires_at IS NULL OR ca.expires_at > now())
+			           ))
+			       ), 'provider-output:no-input-assets')
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id = gr.shot_spec_revision_id
+			JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+			JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+			JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+			JOIN video_pipeline.episode_revisions er ON er.id = $2 AND er.episode_id = ep.id
+			JOIN video_pipeline.prompt_snapshots ps ON ps.id = gr.prompt_snapshot_id
+			JOIN video_pipeline.effective_context_snapshots ecs ON ecs.id = ps.effective_context_snapshot_id
+			JOIN video_pipeline.run_artifacts ra
+			  ON ra.generation_run_id = gr.id AND ra.role = 'OUTPUT'
+			JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+			WHERE gr.id = $1
+			  AND gr.state = 'SUCCEEDED'
+			  AND EXISTS (
+			    SELECT 1 FROM video_pipeline.qc_reports qr
+			    WHERE qr.generation_run_id = gr.id AND qr.state = 'PASSED'
+			  )
+			  AND NOT EXISTS (
+			    SELECT 1
+			    FROM unnest(ssr.asset_version_refs) requested(id)
+			    LEFT JOIN video_pipeline.asset_versions av ON av.id = requested.id
+			    LEFT JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
+			    WHERE av.id IS NULL
+			       OR av.status <> 'APPROVED'
+			       OR ls.id IS NULL
+			       OR ls.policy_status <> 'ALLOWED'
+			       OR (ls.expires_at IS NOT NULL AND ls.expires_at <= now())
+			       OR (av.consent_asset_id IS NOT NULL AND NOT EXISTS (
+			         SELECT 1
+			         FROM video_pipeline.consent_assets ca
+			         WHERE ca.id = av.consent_asset_id
+			           AND ca.status = 'ACTIVE'
+			           AND (ca.expires_at IS NULL OR ca.expires_at > now())
+			       ))
+			  )
+			  AND a.status = 'ACTIVE'
+			  AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video'
+			ORDER BY a.created_at
+			LIMIT 1`,
+			runID, episodeRevisionID,
+		).Scan(
+			&clip.RunID, &clip.ShotSpecRevisionID, &clip.ShotSpecHash,
+			&clip.DurationMillis, &narrative, &assetVersionRefs,
+			&clip.PromptSnapshotID, &clip.PromptSnapshotHash,
+			&clip.ContextSnapshotID, &clip.ContextSnapshotHash,
+			&artifactDigest, &artifactURI, &mediaType, &sizeBytes,
+			&width, &height, &framesPerSecond, &licenseReference,
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return postproduction.Request{}, controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"post-production run is outside the episode or lacks successful QC output",
+					"finish and approve every exact shot run before finalization",
+				)
+			}
+			return postproduction.Request{}, fmt.Errorf("resolve post-production run %s: %w", runID, err)
+		}
+		if clip.RunID != input.RunIDs[index] {
+			return postproduction.Request{}, errors.New("post-production run order changed during resolution")
+		}
+		clip.Artifact = postproduction.Artifact{
+			Kind: "shot_video", Digest: artifactDigest, URI: artifactURI,
+			MediaType: mediaType, SizeBytes: sizeBytes, DurationMillis: clip.DurationMillis,
+			Width: width, Height: height, FPS: framesPerSecond,
+		}
+		clip.LicenseReference = licenseReference
+		shotCues, err := dialogueCues(
+			narrative, clip.ShotSpecRevisionID, timelineOffset, clip.DurationMillis,
+		)
+		if err != nil {
+			return postproduction.Request{}, err
+		}
+		if err := collectVoiceAssetBindings(
+			shotCues,
+			assetVersionRefs,
+			input.Config.Evidence == postproduction.EvidenceLive,
+			voiceAssetIDs,
+		); err != nil {
+			return postproduction.Request{}, fmt.Errorf(
+				"shot %s voice authorization: %w", clip.ShotSpecRevisionID, err,
+			)
+		}
+		cues = append(cues, shotCues...)
+		clips = append(clips, clip)
+		sourceRevisionIDs = append(sourceRevisionIDs, clip.ShotSpecRevisionID)
+		timelineOffset += clip.DurationMillis
+	}
+	if err := p.validateVoiceAssets(ctx, episodeRevisionID, voiceAssetIDs); err != nil {
+		return postproduction.Request{}, err
+	}
+	cueHash, err := digestValue(map[string]any{
+		"episodeRevisionId": input.EpisodeRevisionID,
+		"sourceRevisions":   sourceRevisionIDs,
+		"cues":              cues,
+	})
+	if err != nil {
+		return postproduction.Request{}, err
+	}
+	subtitleID := uuid.NewSHA1(episodeRevisionID, []byte("subtitle:"+cueHash))
+	subtitle, err := postproduction.NewSubtitleRevision(
+		subtitleID.String(), "", 1, input.Config.SubtitleLanguage, sourceRevisionIDs, cues,
+	)
+	if err != nil {
+		return postproduction.Request{}, err
+	}
+	gates, err := p.postProductionGateBindings(ctx, episodeRevisionID)
+	if err != nil {
+		return postproduction.Request{}, err
+	}
+	var background *postproduction.Artifact
+	if input.Config.BackgroundAudioAssetVersionID != "" {
+		resolved, err := p.resolveBackgroundAudio(
+			ctx, episodeRevisionID, input.Config.BackgroundAudioAssetVersionID,
+		)
+		if err != nil {
+			return postproduction.Request{}, err
+		}
+		background = &resolved
+	}
+	request := postproduction.Request{
+		SchemaVersion:       postproduction.SchemaVersion,
+		Evidence:            input.Config.Evidence,
+		EpisodeRevisionID:   input.EpisodeRevisionID,
+		EpisodeRevisionHash: episodeHash,
+		RunIDs:              append([]string(nil), input.RunIDs...),
+		Clips:               clips,
+		Subtitle:            subtitle,
+		BackgroundAudio:     background,
+		Speech: postproduction.SpeechConfig{
+			Route:               input.Config.SpeechRoute,
+			ProviderProfileID:   input.Config.SpeechProviderProfileID,
+			BudgetApprovalID:    input.Config.SpeechBudgetApprovalID,
+			BudgetMaximumMicros: input.Config.SpeechBudgetMaximumMicros,
+			BudgetCurrency:      input.Config.SpeechBudgetCurrency,
+		},
+		Output: postproduction.OutputPolicy{
+			Width: 1280, Height: 720, FPS: 24, Format: "mp4",
+			BurnSubtitles: input.Config.BurnSubtitles, AudioSampleRate: 48_000,
+			AudioChannels: 2, EnforcePoCDuration: input.Config.EnforcePoCDuration,
+		},
+		Gates:   gates,
+		TraceID: step.TraceID,
+	}
+	if err := request.Validate(); err != nil {
+		return postproduction.Request{}, fmt.Errorf("prepared post-production request: %w", err)
+	}
+	return request, nil
+}
+
+// AuthorizeEpisodePostProduction is the paid-submit authorization boundary.
+// It locks and rechecks every exact contributing asset, license, and consent
+// under the immutable plan policy in one SERIALIZABLE transaction.
+func (p *Postgres) AuthorizeEpisodePostProduction(
+	ctx context.Context,
+	_ orchestration.WorkflowStep,
+	input orchestration.FinalizeEpisodeInput,
+) error {
+	episodeRevisionID, err := uuid.Parse(input.EpisodeRevisionID)
+	if err != nil {
+		return errors.New("episodeRevisionId must be a UUID")
+	}
+	runIDs, err := parseUUIDs(input.RunIDs)
+	if err != nil {
+		return errors.New("post-production run IDs must be UUIDs")
+	}
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.Config.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		if err := p.requireCurrentPostProductionBudget(
+			ctx, tx, episodeRevisionID, input.GenerationPlanID, input.Config,
+		); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	return err
+}
+
+// CommitEpisodePostProduction records only CAS identities and provider-safe
+// evidence. It rechecks the episode/run gate inside one SERIALIZABLE
+// transaction and links final video, SRT, dialogue, Manifest, and Service BOM
+// to every contributing run without changing their immutable revisions.
+func (p *Postgres) CommitEpisodePostProduction(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	input orchestration.FinalizeEpisodeInput,
+	result postproduction.Result,
+) error {
+	if err := result.Validate(); err != nil {
+		return err
+	}
+	episodeRevisionID, err := uuid.Parse(input.EpisodeRevisionID)
+	if err != nil {
+		return errors.New("episodeRevisionId must be a UUID")
+	}
+	runIDs, err := parseUUIDs(input.RunIDs)
+	if err != nil {
+		return errors.New("post-production run IDs must be UUIDs")
+	}
+	if result.EpisodeRevisionID != input.EpisodeRevisionID ||
+		result.Evidence != input.Config.Evidence {
+		return errors.New("post-production result does not match the frozen workflow input")
+	}
+	speechCost, err := summarizeSpeechCost(result.SpeechAttempts)
+	if err != nil {
+		return err
+	}
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.Config.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		if err := p.requireCurrentPostProductionBudget(
+			ctx, tx, episodeRevisionID, input.GenerationPlanID, input.Config,
+		); err != nil {
+			return struct{}{}, err
+		}
+		var eligibleRuns int
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(*)
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id = gr.shot_spec_revision_id
+			JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+			JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+			JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+			JOIN video_pipeline.episode_revisions er ON er.id = $2 AND er.episode_id = ep.id
+			WHERE gr.id = ANY($1::uuid[])
+			  AND er.status = 'G2_APPROVED'
+			  AND gr.state = 'SUCCEEDED'
+			  AND EXISTS (
+			    SELECT 1 FROM video_pipeline.qc_reports qr
+			    WHERE qr.generation_run_id = gr.id AND qr.state = 'PASSED'
+			  )`,
+			runIDs, episodeRevisionID,
+		).Scan(&eligibleRuns); err != nil {
+			return struct{}{}, fmt.Errorf("validate post-production inputs: %w", err)
+		}
+		if eligibleRuns != len(runIDs) {
+			return struct{}{}, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"post-production inputs changed before commit",
+				"restart from the current approved episode and successful runs",
+			)
+		}
+		type artifactRole struct {
+			artifact postproduction.Artifact
+			role     string
+		}
+		outputs := []artifactRole{
+			{artifact: result.FinalVideo, role: "OUTPUT"},
+			{artifact: result.Dialogue, role: "AUDIO"},
+			{artifact: result.Subtitle, role: "SUBTITLE"},
+			{artifact: result.Manifest, role: "MANIFEST"},
+			{artifact: result.ServiceBOM, role: "MANIFEST"},
+		}
+		for _, output := range outputs {
+			artifactID := uuid.NewSHA1(
+				uuid.NameSpaceOID, []byte("artifact:"+output.artifact.Digest),
+			)
+			mediaSpec := map[string]any{
+				"kind": output.artifact.Kind, "durationMillis": output.artifact.DurationMillis,
+				"width": output.artifact.Width, "height": output.artifact.Height,
+				"fps": output.artifact.FPS, "evidence": result.Evidence,
+				"postProductionManifestHash": result.ManifestHash,
+				"speechCost":                 speechCost,
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO video_pipeline.artifacts
+					(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+				VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE')
+				ON CONFLICT (content_hash) DO NOTHING`,
+				artifactID, output.artifact.Digest, output.artifact.URI,
+				output.artifact.MediaType, output.artifact.SizeBytes, mediaSpec,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("insert %s artifact: %w", output.artifact.Kind, err)
+			}
+			var storedURI, storedMediaType, storedKind string
+			var storedSize int64
+			if err := tx.QueryRow(ctx, `
+				SELECT id, artifact_uri, media_type, size_bytes,
+				       COALESCE(media_spec->>'kind', '')
+				FROM video_pipeline.artifacts
+				WHERE content_hash = $1
+				  AND status = 'ACTIVE'
+				FOR SHARE`,
+				output.artifact.Digest,
+			).Scan(
+				&artifactID, &storedURI, &storedMediaType, &storedSize, &storedKind,
+			); err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					return struct{}{}, controlplane.NewConflictError(
+						controlplane.CodeConflict,
+						fmt.Sprintf(
+							"%s artifact hash is bound to a non-ACTIVE CAS record",
+							output.artifact.Kind,
+						),
+					)
+				}
+				return struct{}{}, fmt.Errorf(
+					"resolve ACTIVE %s artifact: %w", output.artifact.Kind, err,
+				)
+			}
+			if storedURI != output.artifact.URI ||
+				storedMediaType != output.artifact.MediaType ||
+				storedSize != output.artifact.SizeBytes ||
+				storedKind != output.artifact.Kind {
+				return struct{}{}, fmt.Errorf(
+					"artifact %s content hash is already bound to incompatible metadata",
+					output.artifact.Kind,
+				)
+			}
+			for _, runID := range runIDs {
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO video_pipeline.run_artifacts
+						(generation_run_id, artifact_id, role)
+					VALUES ($1, $2, $3)
+					ON CONFLICT DO NOTHING`,
+					runID, artifactID, output.role,
+				); err != nil {
+					return struct{}{}, fmt.Errorf("link %s artifact: %w", output.artifact.Kind, err)
+				}
+			}
+		}
+		auditID := uuid.NewSHA1(
+			episodeRevisionID, []byte("postproduction:"+result.ManifestHash),
+		)
+		if err := insertAuditAndOutbox(
+			ctx, tx,
+			auditID,
+			uuid.NewSHA1(auditID, []byte("outbox")),
+			controlplane.Actor{ActorID: "temporal-worker", Role: "OPERATOR"},
+			"episode.postproduction.completed", "EPISODE_REVISION", episodeRevisionID,
+			nil, nil, "", step.TraceID,
+			map[string]any{
+				"runIds": input.RunIDs, "evidence": result.Evidence,
+				"finalVideoHash": result.FinalVideo.Digest,
+				"subtitleHash":   result.Subtitle.Digest,
+				"dialogueHash":   result.Dialogue.Digest,
+				"manifestHash":   result.ManifestHash,
+				"serviceBomHash": result.ServiceBOMHash,
+				"speechCost":     speechCost,
+			},
+			p.now().UTC(),
+		); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	})
+	return err
+}
+
 // BuildEpisodeManifest reads only committed product truth and returns canonical
 // secret-free JSON. CAS commit happens before the database manifest reference.
 func (p *Postgres) BuildEpisodeManifest(
@@ -757,6 +1263,29 @@ func (p *Postgres) BuildEpisodeManifest(
 	runIDs, err := parseUUIDs(input.RunIDs)
 	if err != nil {
 		return nil, errors.New("manifest run IDs must be UUIDs")
+	}
+	// Reject invalid current rights before any generation manifest bytes are
+	// written to CAS. CommitEpisodeManifest repeats this inside its write
+	// transaction to close the build/commit race.
+	if _, err := withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		if _, err := requireActivePostProductionArtifacts(
+			ctx, tx, runIDs, input.PostProductionManifestHash,
+		); err != nil {
+			return struct{}{}, err
+		}
+		return struct{}{}, nil
+	}); err != nil {
+		return nil, err
 	}
 	executions := make([]json.RawMessage, 0, len(runIDs))
 	for _, runID := range runIDs {
@@ -794,10 +1323,27 @@ func (p *Postgres) BuildEpisodeManifest(
 			    WHERE ga.generation_run_id = gr.id
 			  ), '[]'::jsonb),
 			  'artifacts', COALESCE((
-			    SELECT jsonb_agg(to_jsonb(a) || jsonb_build_object('role', ra.role) ORDER BY ra.role, a.id)
+			    SELECT jsonb_agg(
+			      to_jsonb(a) || jsonb_build_object(
+			        'role', ra.role,
+			        'media_spec', a.media_spec || jsonb_build_object(
+			          'kind', COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video')
+			        )
+			      )
+			      ORDER BY ra.role, a.id
+			    )
 			    FROM video_pipeline.run_artifacts ra
 			    JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
 			    WHERE ra.generation_run_id = gr.id
+			      AND a.status = 'ACTIVE'
+			      AND COALESCE(a.media_spec->>'kind', '') <> 'generation-manifest'
+			      AND (
+			        NOT (a.media_spec ? 'postProductionManifestHash')
+			        OR (
+			          $3 <> ''
+			          AND a.media_spec->>'postProductionManifestHash' = $3
+			        )
+			      )
 			  ), '[]'::jsonb),
 			  'qcReports', COALESCE((
 			    SELECT jsonb_agg(to_jsonb(qr) ORDER BY qr.created_at)
@@ -843,7 +1389,7 @@ func (p *Postgres) BuildEpisodeManifest(
 			    SELECT 1 FROM video_pipeline.qc_reports qr
 			    WHERE qr.generation_run_id = gr.id AND qr.state = 'PASSED'
 			  )`,
-			runID, episodeRevisionID,
+			runID, episodeRevisionID, input.PostProductionManifestHash,
 		).Scan(&execution); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return nil, controlplane.NewPolicyError(
@@ -889,14 +1435,53 @@ func (p *Postgres) BuildEpisodeManifest(
 	).Scan(&totalMicros, &currency); err != nil {
 		return nil, fmt.Errorf("assemble manifest cost summary: %w", err)
 	}
+	var postProductionCost speechCostEvidence
+	if input.PostProductionManifestHash != "" {
+		var rawCost []byte
+		if err := p.pool.QueryRow(ctx, `
+			SELECT COALESCE(a.media_spec->'speechCost', '{}'::jsonb)
+			FROM video_pipeline.artifacts a
+			WHERE a.content_hash = $1
+			  AND a.media_spec->>'kind' = 'postproduction_manifest'
+			  AND a.status = 'ACTIVE'`,
+			input.PostProductionManifestHash,
+		).Scan(&rawCost); err != nil {
+			return nil, fmt.Errorf("assemble post-production cost summary: %w", err)
+		}
+		if err := json.Unmarshal(rawCost, &postProductionCost); err != nil {
+			return nil, fmt.Errorf("decode post-production cost summary: %w", err)
+		}
+	}
+	combinedMicros := totalMicros
+	combinedCurrency := currency
+	currencyMismatch := false
+	if postProductionCost.ActualMicros != nil {
+		switch {
+		case combinedCurrency == "":
+			combinedMicros = *postProductionCost.ActualMicros
+			combinedCurrency = postProductionCost.Currency
+		case combinedCurrency == postProductionCost.Currency:
+			combinedMicros += *postProductionCost.ActualMicros
+		default:
+			currencyMismatch = true
+		}
+	}
 	rows, err := p.pool.Query(ctx, `
-		SELECT a.artifact_uri
+		SELECT DISTINCT a.artifact_uri
 		FROM video_pipeline.run_artifacts ra
 		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
 		WHERE ra.generation_run_id = ANY($1::uuid[])
 		  AND ra.role = 'OUTPUT'
-		ORDER BY ra.generation_run_id, a.content_hash`,
-		runIDs,
+		  AND a.status = 'ACTIVE'
+		  AND (
+		    ($2 = '' AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video')
+		    OR
+		    ($2 <> ''
+		     AND a.media_spec->>'kind' = 'final_video'
+		     AND a.media_spec->>'postProductionManifestHash' = $2)
+		  )
+		ORDER BY a.artifact_uri`,
+		runIDs, input.PostProductionManifestHash,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("assemble manifest outputs: %w", err)
@@ -913,21 +1498,31 @@ func (p *Postgres) BuildEpisodeManifest(
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate manifest outputs: %w", err)
 	}
+	if input.PostProductionManifestHash != "" && len(outputs) != 1 {
+		return nil, controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"G3 requires exactly one ACTIVE final video for the current post-production manifest",
+			"commit the exact current post-production revision before opening G3",
+		)
+	}
 	inputs := []string{"episode-revision:" + input.EpisodeRevisionID}
 	for _, runID := range input.RunIDs {
 		inputs = append(inputs, "generation-run:"+runID)
 	}
 	payload := map[string]any{
-		"schemaVersion":      "v1",
-		"scopeType":          "EPISODE",
-		"episodeRevisionId":  input.EpisodeRevisionID,
-		"workflowId":         step.WorkflowID,
-		"providerExecutions": executions,
-		"inputs":             inputs,
-		"outputs":            outputs,
+		"schemaVersion":              "v1",
+		"scopeType":                  "EPISODE",
+		"episodeRevisionId":          input.EpisodeRevisionID,
+		"workflowId":                 step.WorkflowID,
+		"postProductionManifestHash": input.PostProductionManifestHash,
+		"providerExecutions":         executions,
+		"inputs":                     inputs,
+		"outputs":                    outputs,
 		"costSummary": map[string]any{
-			"actualMicros": totalMicros,
-			"currency":     currency,
+			"actualMicros":      combinedMicros,
+			"currency":          combinedCurrency,
+			"currencyMismatch":  currencyMismatch,
+			"postProductionTTS": postProductionCost,
 		},
 		"gateHistory": json.RawMessage(approvals),
 	}
@@ -944,6 +1539,13 @@ func (p *Postgres) CommitEpisodeManifest(
 	if !json.Valid(payload) || artifact.URI != "cas://sha256/"+artifact.Digest {
 		return errors.New("manifest payload or CAS identity is invalid")
 	}
+	var binding generationManifestCommitBinding
+	if err := json.Unmarshal(payload, &binding); err != nil {
+		return fmt.Errorf("decode manifest artifact bindings: %w", err)
+	}
+	if binding.PostProductionManifestHash != input.PostProductionManifestHash {
+		return errors.New("manifest payload does not bind the requested post-production manifest")
+	}
 	episodeRevisionID, err := uuid.Parse(input.EpisodeRevisionID)
 	if err != nil {
 		return errors.New("episodeRevisionId must be a UUID")
@@ -952,7 +1554,59 @@ func (p *Postgres) CommitEpisodeManifest(
 	if err != nil {
 		return errors.New("manifest run IDs must be UUIDs")
 	}
+	payloadArtifactReferences, err := artifactReferencesFromPayload(
+		binding, runIDs,
+	)
+	if err != nil {
+		return err
+	}
+	payloadPostProductionReferences, err := postProductionReferencesFromPayload(
+		payloadArtifactReferences, binding.PostProductionManifestHash, runIDs,
+	)
+	if err != nil {
+		return err
+	}
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		if err := p.requireCurrentEpisodeAssetRights(
+			ctx,
+			tx,
+			episodeRevisionID,
+			runIDs,
+			input.GenerationPlanID,
+			input.BackgroundAudioAssetVersionID,
+		); err != nil {
+			return struct{}{}, err
+		}
+		if err := requireActiveManifestArtifacts(
+			ctx, tx, payloadArtifactReferences,
+		); err != nil {
+			return struct{}{}, err
+		}
+		currentPostProduction, err := requireActivePostProductionArtifacts(
+			ctx, tx, runIDs, input.PostProductionManifestHash,
+		)
+		if err != nil {
+			return struct{}{}, err
+		}
+		if input.PostProductionManifestHash != "" &&
+			(len(binding.Outputs) != 1 ||
+				binding.Outputs[0] != currentPostProduction.FinalVideoURI) {
+			return struct{}{}, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest outputs no longer match the ACTIVE current final video",
+				"rebuild the generation manifest from current post-production truth",
+			)
+		}
+		if !samePostProductionArtifactReferences(
+			payloadPostProductionReferences,
+			currentPostProduction.References,
+		) {
+			return struct{}{}, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest post-production references no longer match ACTIVE product truth",
+				"rebuild the generation manifest from the complete current post-production artifact set",
+			)
+		}
 		var seriesID, episodeID uuid.UUID
 		if err := tx.QueryRow(ctx, `
 			SELECT ep.series_id, ep.id
@@ -979,10 +1633,19 @@ func (p *Postgres) CommitEpisodeManifest(
 			return struct{}{}, fmt.Errorf("insert manifest artifact: %w", err)
 		}
 		if err := tx.QueryRow(ctx,
-			`SELECT id FROM video_pipeline.artifacts WHERE content_hash = $1`,
+			`SELECT id
+			 FROM video_pipeline.artifacts
+			 WHERE content_hash = $1 AND status = 'ACTIVE'
+			 FOR SHARE`,
 			artifact.Digest,
 		).Scan(&artifactID); err != nil {
-			return struct{}{}, fmt.Errorf("resolve manifest artifact: %w", err)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"generation manifest hash is bound to a non-ACTIVE CAS record",
+				)
+			}
+			return struct{}{}, fmt.Errorf("resolve ACTIVE manifest artifact: %w", err)
 		}
 		manifestID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("manifest:"+artifact.Digest))
 		tag, err := tx.Exec(ctx, `
@@ -1039,6 +1702,722 @@ func (p *Postgres) CommitEpisodeManifest(
 		return struct{}{}, nil
 	})
 	return err
+}
+
+type generationManifestCommitBinding struct {
+	PostProductionManifestHash string `json:"postProductionManifestHash"`
+	ProviderExecutions         []struct {
+		RunID     string `json:"runId"`
+		Artifacts []struct {
+			ID          string `json:"id"`
+			ContentHash string `json:"content_hash"`
+			ArtifactURI string `json:"artifact_uri"`
+			Role        string `json:"role"`
+			MediaSpec   struct {
+				Kind                       string `json:"kind"`
+				PostProductionManifestHash string `json:"postProductionManifestHash"`
+			} `json:"media_spec"`
+		} `json:"artifacts"`
+	} `json:"providerExecutions"`
+	Outputs []string `json:"outputs"`
+}
+
+type manifestArtifactReference struct {
+	RunID                      uuid.UUID
+	ArtifactID                 uuid.UUID
+	ContentHash                string
+	ArtifactURI                string
+	Kind                       string
+	Role                       string
+	PostProductionManifestHash string
+}
+
+type manifestArtifactReferenceKey struct {
+	RunID      uuid.UUID
+	ArtifactID uuid.UUID
+	Role       string
+}
+
+type postProductionArtifactReference struct {
+	RunID       uuid.UUID
+	ArtifactID  uuid.UUID
+	ContentHash string
+	ArtifactURI string
+	Kind        string
+	Role        string
+}
+
+type activePostProductionArtifacts struct {
+	FinalVideoURI string
+	References    []postProductionArtifactReference
+}
+
+func artifactReferencesFromPayload(
+	binding generationManifestCommitBinding,
+	runIDs []uuid.UUID,
+) ([]manifestArtifactReference, error) {
+	expectedRuns := make(map[uuid.UUID]struct{}, len(runIDs))
+	for _, runID := range runIDs {
+		expectedRuns[runID] = struct{}{}
+	}
+	seenRuns := make(map[uuid.UUID]struct{}, len(runIDs))
+	seenReferences := make(map[manifestArtifactReferenceKey]struct{})
+	references := make([]manifestArtifactReference, 0, len(runIDs)*6)
+	for _, execution := range binding.ProviderExecutions {
+		runID, err := uuid.Parse(execution.RunID)
+		if err != nil {
+			return nil, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest contains an invalid provider execution run",
+				"rebuild the manifest from the exact persisted runs",
+			)
+		}
+		if _, ok := expectedRuns[runID]; !ok {
+			return nil, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest contains a provider execution outside the exact run set",
+				"rebuild the manifest from the exact persisted runs",
+			)
+		}
+		if _, duplicate := seenRuns[runID]; duplicate {
+			return nil, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest contains duplicate provider executions",
+				"rebuild one provider execution projection per exact run",
+			)
+		}
+		seenRuns[runID] = struct{}{}
+		for _, artifact := range execution.Artifacts {
+			artifactID, err := uuid.Parse(artifact.ID)
+			if err != nil {
+				return nil, controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"generation manifest contains an invalid artifact identity",
+					"rebuild the manifest from current persisted artifact identities",
+				)
+			}
+			kind := artifact.MediaSpec.Kind
+			if kind == "" {
+				// Provider artifacts created before kind was explicitly frozen in
+				// the manifest use the repository's canonical default.
+				kind = "shot_video"
+			}
+			reference := manifestArtifactReference{
+				RunID:                      runID,
+				ArtifactID:                 artifactID,
+				ContentHash:                artifact.ContentHash,
+				ArtifactURI:                artifact.ArtifactURI,
+				Kind:                       kind,
+				Role:                       artifact.Role,
+				PostProductionManifestHash: artifact.MediaSpec.PostProductionManifestHash,
+			}
+			if reference.ContentHash == "" ||
+				reference.ArtifactURI == "" ||
+				reference.Kind == "" ||
+				reference.Role == "" {
+				return nil, controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"generation manifest contains an incomplete artifact reference",
+					"rebuild the manifest from complete persisted artifact identities",
+				)
+			}
+			key := manifestArtifactReferenceKey{
+				RunID: runID, ArtifactID: artifactID, Role: reference.Role,
+			}
+			if _, duplicate := seenReferences[key]; duplicate {
+				return nil, controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"generation manifest contains a duplicate artifact reference",
+					"rebuild the manifest from one frozen reference per persisted run link",
+				)
+			}
+			seenReferences[key] = struct{}{}
+			references = append(references, reference)
+		}
+	}
+	if len(seenRuns) != len(expectedRuns) {
+		return nil, controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"generation manifest omits provider executions for an exact run",
+			"rebuild the manifest from every exact persisted run",
+		)
+	}
+	return references, nil
+}
+
+func postProductionReferencesFromPayload(
+	artifacts []manifestArtifactReference,
+	manifestHash string,
+	runIDs []uuid.UUID,
+) ([]postProductionArtifactReference, error) {
+	references := make([]postProductionArtifactReference, 0, len(runIDs)*5)
+	for _, artifact := range artifacts {
+		if artifact.PostProductionManifestHash == "" {
+			continue
+		}
+		if manifestHash == "" ||
+			artifact.PostProductionManifestHash != manifestHash {
+			return nil, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest contains an artifact from a different post-production revision",
+				"rebuild the manifest from the exact current post-production manifest hash",
+			)
+		}
+		references = append(references, postProductionArtifactReference{
+			RunID:       artifact.RunID,
+			ArtifactID:  artifact.ArtifactID,
+			ContentHash: artifact.ContentHash,
+			ArtifactURI: artifact.ArtifactURI,
+			Kind:        artifact.Kind,
+			Role:        artifact.Role,
+		})
+	}
+	if manifestHash == "" {
+		return nil, nil
+	}
+	if _, err := validatePostProductionArtifactReferences(
+		references, runIDs, manifestHash,
+	); err != nil {
+		return nil, err
+	}
+	return references, nil
+}
+
+func requireActiveManifestArtifacts(
+	ctx context.Context,
+	tx pgx.Tx,
+	references []manifestArtifactReference,
+) error {
+	if len(references) == 0 {
+		return nil
+	}
+	runIDs := make([]uuid.UUID, 0, len(references))
+	artifactIDs := make([]uuid.UUID, 0, len(references))
+	roles := make([]string, 0, len(references))
+	for _, reference := range references {
+		runIDs = append(runIDs, reference.RunID)
+		artifactIDs = append(artifactIDs, reference.ArtifactID)
+		roles = append(roles, reference.Role)
+	}
+	rows, err := tx.Query(ctx, `
+		WITH requested AS (
+		  SELECT *
+		  FROM unnest($1::uuid[], $2::uuid[], $3::text[])
+		    WITH ORDINALITY AS requested(run_id, artifact_id, role, ordinal)
+		)
+		SELECT requested.ordinal,
+		       ra.generation_run_id,
+		       a.id,
+		       a.content_hash,
+		       a.artifact_uri,
+		       COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video'),
+		       ra.role,
+		       a.status
+		FROM requested
+		JOIN video_pipeline.run_artifacts ra
+		  ON ra.generation_run_id = requested.run_id
+		 AND ra.artifact_id = requested.artifact_id
+		 AND ra.role = requested.role
+		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+		ORDER BY requested.ordinal
+		FOR SHARE OF ra, a`,
+		runIDs, artifactIDs, roles,
+	)
+	if err != nil {
+		return fmt.Errorf("verify frozen manifest artifacts: %w", err)
+	}
+	verified := 0
+	for rows.Next() {
+		var (
+			ordinal int64
+			actual  manifestArtifactReference
+			status  string
+		)
+		if err := rows.Scan(
+			&ordinal,
+			&actual.RunID,
+			&actual.ArtifactID,
+			&actual.ContentHash,
+			&actual.ArtifactURI,
+			&actual.Kind,
+			&actual.Role,
+			&status,
+		); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan frozen manifest artifact: %w", err)
+		}
+		index := int(ordinal - 1)
+		if index < 0 || index >= len(references) {
+			rows.Close()
+			return fmt.Errorf("verify frozen manifest artifact: invalid reference ordinal %d", ordinal)
+		}
+		expected := references[index]
+		if status != "ACTIVE" ||
+			actual.RunID != expected.RunID ||
+			actual.ArtifactID != expected.ArtifactID ||
+			actual.ContentHash != expected.ContentHash ||
+			actual.ArtifactURI != expected.ArtifactURI ||
+			actual.Kind != expected.Kind ||
+			actual.Role != expected.Role {
+			rows.Close()
+			return controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"generation manifest artifact no longer matches its ACTIVE persisted run link",
+				"rebuild the manifest from the complete current artifact set",
+			)
+		}
+		verified++
+	}
+	iterationErr := rows.Err()
+	rows.Close()
+	if iterationErr != nil {
+		return fmt.Errorf("iterate frozen manifest artifacts: %w", iterationErr)
+	}
+	if verified != len(references) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"generation manifest artifact run link no longer exists",
+			"rebuild the manifest from the complete current artifact set",
+		)
+	}
+	return nil
+}
+
+func requireActivePostProductionArtifacts(
+	ctx context.Context,
+	tx pgx.Tx,
+	runIDs []uuid.UUID,
+	manifestHash string,
+) (activePostProductionArtifacts, error) {
+	if manifestHash == "" {
+		return activePostProductionArtifacts{}, nil
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT ra.generation_run_id, a.id, a.content_hash, a.artifact_uri,
+		       a.media_spec->>'kind', ra.role
+		FROM video_pipeline.run_artifacts ra
+		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+		WHERE ra.generation_run_id = ANY($1::uuid[])
+		  AND a.media_spec->>'postProductionManifestHash' = $2
+		  AND a.status = 'ACTIVE'
+		ORDER BY ra.generation_run_id, a.media_spec->>'kind', a.id
+		FOR SHARE OF ra, a`,
+		runIDs, manifestHash,
+	)
+	if err != nil {
+		return activePostProductionArtifacts{}, fmt.Errorf(
+			"verify ACTIVE current post-production artifacts: %w", err,
+		)
+	}
+	references := make([]postProductionArtifactReference, 0, len(runIDs)*5)
+	for rows.Next() {
+		var reference postProductionArtifactReference
+		if err := rows.Scan(
+			&reference.RunID,
+			&reference.ArtifactID,
+			&reference.ContentHash,
+			&reference.ArtifactURI,
+			&reference.Kind,
+			&reference.Role,
+		); err != nil {
+			rows.Close()
+			return activePostProductionArtifacts{}, fmt.Errorf(
+				"scan ACTIVE current post-production artifact: %w", err,
+			)
+		}
+		references = append(references, reference)
+	}
+	iterationErr := rows.Err()
+	rows.Close()
+	if iterationErr != nil {
+		return activePostProductionArtifacts{}, fmt.Errorf(
+			"iterate ACTIVE current post-production artifacts: %w", iterationErr,
+		)
+	}
+	finalVideoURI, err := validatePostProductionArtifactReferences(
+		references, runIDs, manifestHash,
+	)
+	if err != nil {
+		return activePostProductionArtifacts{}, err
+	}
+	return activePostProductionArtifacts{
+		FinalVideoURI: finalVideoURI,
+		References:    references,
+	}, nil
+}
+
+func validatePostProductionArtifactReferences(
+	references []postProductionArtifactReference,
+	runIDs []uuid.UUID,
+	manifestHash string,
+) (string, error) {
+	requiredRoles := map[string]string{
+		"final_video":             "OUTPUT",
+		"subtitle_srt":            "SUBTITLE",
+		"dialogue_audio":          "AUDIO",
+		"postproduction_manifest": "MANIFEST",
+		"service_bom":             "MANIFEST",
+	}
+	expectedRuns := make(map[uuid.UUID]struct{}, len(runIDs))
+	for _, runID := range runIDs {
+		expectedRuns[runID] = struct{}{}
+	}
+	artifactByKind := make(map[string]postProductionArtifactReference)
+	runsByKind := make(map[string]map[uuid.UUID]struct{})
+	seenRunKind := make(map[string]struct{}, len(references))
+	for _, reference := range references {
+		if _, ok := expectedRuns[reference.RunID]; !ok ||
+			reference.Kind == "" ||
+			reference.ContentHash == "" ||
+			reference.ArtifactURI == "" ||
+			reference.Role == "" {
+			return "", controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"post-production artifact reference is incomplete or outside the exact run set",
+				"rebuild the manifest from complete current post-production product truth",
+			)
+		}
+		if expectedRole, required := requiredRoles[reference.Kind]; required && reference.Role != expectedRole {
+			return "", controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"post-production artifact role differs from the required product contract",
+				"rebuild the exact final video, subtitle, dialogue, manifest, and Service BOM links",
+			)
+		}
+		if reference.Kind == "postproduction_manifest" &&
+			reference.ContentHash != manifestHash {
+			return "", controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"post-production manifest artifact differs from the current manifest hash",
+				"rebuild the manifest from the exact current post-production revision",
+			)
+		}
+		runKindKey := reference.RunID.String() + "\x00" + reference.Kind
+		if _, duplicate := seenRunKind[runKindKey]; duplicate {
+			return "", controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"post-production artifact kind is duplicated for a run",
+				"commit one immutable artifact of each post-production kind",
+			)
+		}
+		seenRunKind[runKindKey] = struct{}{}
+		if frozen, exists := artifactByKind[reference.Kind]; exists {
+			if frozen.ArtifactID != reference.ArtifactID ||
+				frozen.ContentHash != reference.ContentHash ||
+				frozen.ArtifactURI != reference.ArtifactURI ||
+				frozen.Role != reference.Role {
+				return "", controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"post-production kind resolves to different artifacts across runs",
+					"link one deterministic post-production artifact set to every exact run",
+				)
+			}
+		} else {
+			artifactByKind[reference.Kind] = reference
+		}
+		if runsByKind[reference.Kind] == nil {
+			runsByKind[reference.Kind] = make(map[uuid.UUID]struct{}, len(runIDs))
+		}
+		runsByKind[reference.Kind][reference.RunID] = struct{}{}
+	}
+	for kind := range artifactByKind {
+		if len(runsByKind[kind]) != len(expectedRuns) {
+			return "", controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"post-production artifact is not linked to every exact run",
+				"restore the complete current post-production run links before opening G3",
+			)
+		}
+	}
+	for kind := range requiredRoles {
+		if _, ok := artifactByKind[kind]; !ok {
+			return "", controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"current post-production artifact set is incomplete",
+				"commit final video, subtitle, dialogue, manifest, and Service BOM before opening G3",
+			)
+		}
+	}
+	finalVideo := artifactByKind["final_video"]
+	if finalVideo.ArtifactURI == "" {
+		return "", controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"current post-production manifest does not resolve to one ACTIVE final video",
+			"commit the exact current post-production revision before opening G3",
+		)
+	}
+	return finalVideo.ArtifactURI, nil
+}
+
+func samePostProductionArtifactReferences(
+	left []postProductionArtifactReference,
+	right []postProductionArtifactReference,
+) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	counts := make(map[postProductionArtifactReference]int, len(left))
+	for _, reference := range left {
+		counts[reference]++
+	}
+	for _, reference := range right {
+		if counts[reference] == 0 {
+			return false
+		}
+		counts[reference]--
+	}
+	return true
+}
+
+func (p *Postgres) requireCurrentEpisodeAssetRights(
+	ctx context.Context,
+	tx pgx.Tx,
+	episodeRevisionID uuid.UUID,
+	runIDs []uuid.UUID,
+	generationPlanID string,
+	backgroundAudioAssetVersionID string,
+) error {
+	plan, err := readPlan(ctx, tx, generationPlanID)
+	if err != nil {
+		return err
+	}
+	if plan.EpisodeRevisionID != episodeRevisionID.String() {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"post-production rights policy is not bound to the exact episode revision",
+			"restart from the immutable generation plan for this episode revision",
+		)
+	}
+
+	rows, err := tx.Query(ctx, `
+		SELECT gr.id, ssr.id, ssr.asset_version_refs, ep.series_id
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id = gr.shot_spec_revision_id
+		JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+		JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+		JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+		JOIN video_pipeline.episode_revisions er
+		  ON er.id = $2 AND er.episode_id = ep.id
+		WHERE gr.id = ANY($1::uuid[])
+		ORDER BY gr.id
+		FOR SHARE OF gr, ssr, er`,
+		runIDs, episodeRevisionID,
+	)
+	if err != nil {
+		return fmt.Errorf("lock post-production asset lineage: %w", err)
+	}
+	defer rows.Close()
+
+	assetSet := make(map[uuid.UUID]struct{})
+	seenRuns := make(map[uuid.UUID]struct{}, len(runIDs))
+	var seriesID uuid.UUID
+	for rows.Next() {
+		var runID, shotRevisionID, currentSeriesID uuid.UUID
+		var assetIDs []uuid.UUID
+		if err := rows.Scan(&runID, &shotRevisionID, &assetIDs, &currentSeriesID); err != nil {
+			return fmt.Errorf("scan post-production asset lineage: %w", err)
+		}
+		if seriesID == uuid.Nil {
+			seriesID = currentSeriesID
+		} else if seriesID != currentSeriesID {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"post-production runs span more than one series",
+				"use exact runs from one approved episode",
+			)
+		}
+		if plan.SeriesID != currentSeriesID.String() ||
+			!containsString(plan.ShotSpecRevisionIDs, shotRevisionID.String()) {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"post-production run lineage is outside the immutable rights plan",
+				"restart with the exact approved plan and shot revisions",
+			)
+		}
+		seenRuns[runID] = struct{}{}
+		for _, assetID := range assetIDs {
+			assetSet[assetID] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate post-production asset lineage: %w", err)
+	}
+	if len(seenRuns) != len(runIDs) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"one or more post-production runs have no current episode asset lineage",
+			"restart with exact successful runs from the approved episode",
+		)
+	}
+
+	var backgroundID uuid.UUID
+	if backgroundAudioAssetVersionID != "" {
+		backgroundID, err = uuid.Parse(backgroundAudioAssetVersionID)
+		if err != nil {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"background audio asset version identifier is invalid",
+				"select an immutable licensed MUSIC/AUDIO asset version",
+			)
+		}
+		assetSet[backgroundID] = struct{}{}
+	}
+	if len(assetSet) == 0 {
+		return nil
+	}
+	assetIDs := make([]uuid.UUID, 0, len(assetSet))
+	for assetID := range assetSet {
+		assetIDs = append(assetIDs, assetID)
+	}
+	sort.Slice(assetIDs, func(i, j int) bool {
+		return strings.Compare(assetIDs[i].String(), assetIDs[j].String()) < 0
+	})
+
+	if err := lockPostProductionRights(ctx, tx, assetIDs); err != nil {
+		return err
+	}
+	var seriesAssetCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.asset_versions av
+		JOIN video_pipeline.assets source_asset ON source_asset.id = av.asset_id
+		WHERE av.id = ANY($1::uuid[])
+		  AND source_asset.series_id = $2`,
+		assetIDs, seriesID,
+	).Scan(&seriesAssetCount); err != nil {
+		return fmt.Errorf("validate post-production asset series: %w", err)
+	}
+	if seriesAssetCount != len(assetIDs) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"one or more post-production assets are missing or outside the approved series",
+			"replace the asset with an approved revision from this series",
+		)
+	}
+	if backgroundID != uuid.Nil {
+		var compatible bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (
+			  SELECT 1
+			  FROM video_pipeline.asset_versions av
+			  JOIN video_pipeline.assets source_asset ON source_asset.id = av.asset_id
+			  WHERE av.id = $1
+			    AND source_asset.series_id = $2
+			    AND source_asset.asset_type IN ('MUSIC', 'AUDIO')
+			)`,
+			backgroundID, seriesID,
+		).Scan(&compatible); err != nil {
+			return fmt.Errorf("validate background audio type: %w", err)
+		}
+		if !compatible {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"background audio is not a compatible MUSIC/AUDIO asset",
+				"select an approved licensed MUSIC/AUDIO revision from this series",
+			)
+		}
+	}
+	return requireAssetLicenses(ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy)
+}
+
+func (p *Postgres) requireCurrentPostProductionBudget(
+	ctx context.Context,
+	tx pgx.Tx,
+	episodeRevisionID uuid.UUID,
+	generationPlanID string,
+	config orchestration.PostProductionConfig,
+) error {
+	plan, err := readPlan(ctx, tx, generationPlanID)
+	if err != nil {
+		return err
+	}
+	required := controlplane.BudgetLimit{
+		AmountMicros: config.SpeechBudgetMaximumMicros,
+		Currency:     config.SpeechBudgetCurrency,
+	}
+	if plan.EpisodeRevisionID != episodeRevisionID.String() ||
+		!sameBudgetLimit(plan.SpeechBudgetLimit, required) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"post-production speech budget is outside the immutable generation plan",
+			"create a current plan for the exact episode, TTS amount, and currency",
+		)
+	}
+	var seriesID, episodeID uuid.UUID
+	if err := tx.QueryRow(ctx, `
+		SELECT ep.series_id, ep.id
+		FROM video_pipeline.episode_revisions er
+		JOIN video_pipeline.episodes ep ON ep.id = er.episode_id
+		WHERE er.id = $1
+		FOR SHARE OF er, ep`,
+		episodeRevisionID,
+	).Scan(&seriesID, &episodeID); err != nil {
+		return fmt.Errorf("resolve post-production budget scope: %w", err)
+	}
+	return requireBudgetApproval(
+		ctx, tx, config.SpeechBudgetApprovalID, seriesID, episodeID,
+		generationPlanID, "SPEECH", required,
+	)
+}
+
+func lockPostProductionRights(
+	ctx context.Context,
+	tx pgx.Tx,
+	assetIDs []uuid.UUID,
+) error {
+	lockQueries := []struct {
+		name  string
+		query string
+	}{
+		{
+			name: "asset versions",
+			query: `
+				SELECT av.id
+				FROM video_pipeline.asset_versions av
+				WHERE av.id = ANY($1::uuid[])
+				ORDER BY av.id
+				FOR SHARE OF av`,
+		},
+		{
+			name: "license snapshots",
+			query: `
+				SELECT ls.id
+				FROM video_pipeline.asset_versions av
+				JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
+				WHERE av.id = ANY($1::uuid[])
+				ORDER BY ls.id
+				FOR SHARE OF ls`,
+		},
+		{
+			name: "consent assets",
+			query: `
+				SELECT ca.id
+				FROM video_pipeline.asset_versions av
+				JOIN video_pipeline.consent_assets ca ON ca.id = av.consent_asset_id
+				WHERE av.id = ANY($1::uuid[])
+				ORDER BY ca.id
+				FOR SHARE OF ca`,
+		},
+	}
+	for _, lock := range lockQueries {
+		rows, err := tx.Query(ctx, lock.query, assetIDs)
+		if err != nil {
+			return fmt.Errorf("lock post-production %s: %w", lock.name, err)
+		}
+		for rows.Next() {
+			var ignored uuid.UUID
+			if err := rows.Scan(&ignored); err != nil {
+				rows.Close()
+				return fmt.Errorf("scan locked post-production %s: %w", lock.name, err)
+			}
+		}
+		iterationErr := rows.Err()
+		rows.Close()
+		if iterationErr != nil {
+			return fmt.Errorf("iterate locked post-production %s: %w", lock.name, iterationErr)
+		}
+	}
+	return nil
 }
 
 func (p *Postgres) RecordProviderCancellation(
@@ -1347,6 +2726,311 @@ func (p *Postgres) FinalizeShotRun(
 		)
 	})
 	return err
+}
+
+func dialogueCues(
+	narrative []byte,
+	shotRevisionID string,
+	timelineOffset int64,
+	shotDuration int64,
+) ([]postproduction.Cue, error) {
+	type dialogueRow struct {
+		ID          string `json:"id"`
+		Speaker     string `json:"speaker"`
+		Text        string `json:"text"`
+		VoiceRef    string `json:"voiceRef"`
+		StartMillis int64  `json:"startMillis"`
+		EndMillis   int64  `json:"endMillis"`
+		StartMS     int64  `json:"startMs"`
+		EndMS       int64  `json:"endMs"`
+	}
+	var payload struct {
+		Dialogue  []dialogueRow `json:"dialogue"`
+		Dialogues []dialogueRow `json:"dialogues"`
+		Lines     []dialogueRow `json:"lines"`
+	}
+	if err := json.Unmarshal(narrative, &payload); err != nil {
+		return nil, fmt.Errorf("decode shot %s dialogue: %w", shotRevisionID, err)
+	}
+	rows := payload.Dialogue
+	if len(rows) == 0 {
+		rows = payload.Dialogues
+	}
+	if len(rows) == 0 {
+		rows = payload.Lines
+	}
+	cues := make([]postproduction.Cue, 0, len(rows))
+	for index, row := range rows {
+		start, end := row.StartMillis, row.EndMillis
+		if start == 0 && row.StartMS != 0 {
+			start = row.StartMS
+		}
+		if end == 0 && row.EndMS != 0 {
+			end = row.EndMS
+		}
+		if start < 0 || end <= start || end > shotDuration {
+			return nil, fmt.Errorf(
+				"shot %s dialogue %d has invalid local timing", shotRevisionID, index,
+			)
+		}
+		id := strings.TrimSpace(row.ID)
+		if id == "" {
+			id = uuid.NewSHA1(
+				uuid.NameSpaceOID,
+				[]byte(fmt.Sprintf("dialogue:%s:%d", shotRevisionID, index)),
+			).String()
+		}
+		cue := postproduction.Cue{
+			ID: id, Speaker: row.Speaker, Text: row.Text, VoiceRef: row.VoiceRef,
+			StartMillis: timelineOffset + start, EndMillis: timelineOffset + end,
+		}
+		if err := cue.Validate(); err != nil {
+			return nil, fmt.Errorf("shot %s dialogue %d: %w", shotRevisionID, index, err)
+		}
+		cues = append(cues, cue)
+	}
+	return cues, nil
+}
+
+func collectVoiceAssetBindings(
+	cues []postproduction.Cue,
+	shotAssetVersionIDs []uuid.UUID,
+	requireVoice bool,
+	result map[uuid.UUID]struct{},
+) error {
+	allowed := make(map[uuid.UUID]struct{}, len(shotAssetVersionIDs))
+	for _, assetVersionID := range shotAssetVersionIDs {
+		allowed[assetVersionID] = struct{}{}
+	}
+	for _, cue := range cues {
+		voiceRef := strings.TrimSpace(cue.VoiceRef)
+		if voiceRef == "" {
+			if requireVoice {
+				return controlplane.NewPolicyError(
+					controlplane.CodeConsentRequired,
+					"live speech cue has no approved voice asset binding",
+					"bind an approved VOICE/AUDIO asset version before live TTS",
+				)
+			}
+			continue
+		}
+		voiceAssetID, err := uuid.Parse(voiceRef)
+		if err != nil {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"voiceRef is not an immutable asset version identifier",
+				"use the approved VOICE/AUDIO asset version UUID",
+			)
+		}
+		if _, ok := allowed[voiceAssetID]; !ok {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"voiceRef is not included in the exact shot asset bindings",
+				"add the approved voice asset revision and reapprove the shot",
+			)
+		}
+		result[voiceAssetID] = struct{}{}
+	}
+	return nil
+}
+
+func (p *Postgres) validateVoiceAssets(
+	ctx context.Context,
+	episodeRevisionID uuid.UUID,
+	requested map[uuid.UUID]struct{},
+) error {
+	if len(requested) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(requested))
+	for id := range requested {
+		ids = append(ids, id)
+	}
+	var invalidLicense, invalidConsent int
+	if err := p.pool.QueryRow(ctx, `
+		SELECT
+		  COUNT(*) FILTER (WHERE
+		    av.id IS NULL
+		    OR source_asset.id IS NULL
+		    OR source_asset.series_id <> ep.series_id
+		    OR source_asset.asset_type NOT IN ('VOICE', 'AUDIO')
+		    OR av.status <> 'APPROVED'
+		    OR ls.id IS NULL
+		    OR ls.policy_status <> 'ALLOWED'
+		    OR (ls.expires_at IS NOT NULL AND ls.expires_at <= now())
+		  ),
+		  COUNT(*) FILTER (WHERE
+		    av.consent_asset_id IS NOT NULL
+		    AND (
+		      ca.id IS NULL
+		      OR ca.status <> 'ACTIVE'
+		      OR (ca.expires_at IS NOT NULL AND ca.expires_at <= now())
+		    )
+		  )
+		FROM video_pipeline.episode_revisions er
+		JOIN video_pipeline.episodes ep ON ep.id = er.episode_id
+		CROSS JOIN unnest($1::uuid[]) requested(id)
+		LEFT JOIN video_pipeline.asset_versions av ON av.id = requested.id
+		LEFT JOIN video_pipeline.assets source_asset ON source_asset.id = av.asset_id
+		LEFT JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
+		LEFT JOIN video_pipeline.consent_assets ca ON ca.id = av.consent_asset_id
+		WHERE er.id = $2`,
+		ids, episodeRevisionID,
+	).Scan(&invalidLicense, &invalidConsent); err != nil {
+		return fmt.Errorf("validate voice assets: %w", err)
+	}
+	if invalidLicense > 0 {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"one or more voice assets are missing, unapproved, unlicensed, or outside the series",
+			"select an active approved VOICE/AUDIO asset revision for every live cue",
+		)
+	}
+	if invalidConsent > 0 {
+		return controlplane.NewPolicyError(
+			controlplane.CodeConsentRequired,
+			"one or more bound voice consents are revoked or expired",
+			"renew or replace the voice consent before live TTS",
+		)
+	}
+	return nil
+}
+
+type speechCostEvidence struct {
+	AttemptCount    int    `json:"attemptCount"`
+	EstimatedMicros int64  `json:"estimatedMicros"`
+	ActualMicros    *int64 `json:"actualMicros"`
+	Currency        string `json:"currency"`
+	Verified        bool   `json:"verified"`
+}
+
+func summarizeSpeechCost(
+	attempts []postproduction.ProviderAttempt,
+) (speechCostEvidence, error) {
+	summary := speechCostEvidence{AttemptCount: len(attempts), Verified: len(attempts) > 0}
+	var actual int64
+	actualKnown := len(attempts) > 0
+	for index, attempt := range attempts {
+		if index == 0 {
+			summary.Currency = attempt.Cost.Currency
+		} else if summary.Currency != attempt.Cost.Currency {
+			return speechCostEvidence{}, errors.New("speech attempt currencies cannot be combined")
+		}
+		if attempt.Cost.EstimatedMicros > math.MaxInt64-summary.EstimatedMicros {
+			return speechCostEvidence{}, errors.New("speech estimate total overflows int64")
+		}
+		summary.EstimatedMicros += attempt.Cost.EstimatedMicros
+		if attempt.Cost.ActualMicros == nil {
+			actualKnown = false
+		} else {
+			if *attempt.Cost.ActualMicros > math.MaxInt64-actual {
+				return speechCostEvidence{}, errors.New("speech actual total overflows int64")
+			}
+			actual += *attempt.Cost.ActualMicros
+		}
+		summary.Verified = summary.Verified && attempt.Cost.Verified
+	}
+	if actualKnown {
+		summary.ActualMicros = &actual
+	} else {
+		summary.Verified = false
+	}
+	return summary, nil
+}
+
+func (p *Postgres) postProductionGateBindings(
+	ctx context.Context,
+	episodeRevisionID uuid.UUID,
+) ([]postproduction.GateBinding, error) {
+	rows, err := p.pool.Query(ctx, `
+		SELECT DISTINCT ON (ad.gate) ad.id, ad.gate, to_jsonb(ad)
+		FROM video_pipeline.approval_decisions ad
+		JOIN video_pipeline.episode_revisions er ON er.episode_id = ad.episode_id
+		WHERE er.id = $1
+		  AND ad.gate IN ('G1', 'G2')
+		  AND ad.decision = 'APPROVED'
+		ORDER BY ad.gate, ad.decided_at DESC`,
+		episodeRevisionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read post-production gate bindings: %w", err)
+	}
+	defer rows.Close()
+	bindings := make([]postproduction.GateBinding, 0, 2)
+	for rows.Next() {
+		var decisionID uuid.UUID
+		var gate string
+		var payload []byte
+		if err := rows.Scan(&decisionID, &gate, &payload); err != nil {
+			return nil, fmt.Errorf("scan post-production gate binding: %w", err)
+		}
+		hash, err := digestValue(json.RawMessage(payload))
+		if err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, postproduction.GateBinding{
+			Gate: gate, DecisionID: decisionID.String(), Decision: "APPROVED", ContentHash: hash,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate post-production gate bindings: %w", err)
+	}
+	return bindings, nil
+}
+
+func (p *Postgres) resolveBackgroundAudio(
+	ctx context.Context,
+	episodeRevisionID uuid.UUID,
+	assetVersionIDRaw string,
+) (postproduction.Artifact, error) {
+	assetVersionID, err := uuid.Parse(assetVersionIDRaw)
+	if err != nil {
+		return postproduction.Artifact{}, errors.New("backgroundAudioAssetVersionId must be a UUID")
+	}
+	var artifact postproduction.Artifact
+	artifact.Kind = "background_audio"
+	if err := p.pool.QueryRow(ctx, `
+		SELECT av.content_hash, av.artifact_uri, av.media_type,
+		       COALESCE(a.size_bytes, 0),
+		       COALESCE((a.media_spec->>'durationMillis')::bigint, 0)
+		FROM video_pipeline.asset_versions av
+		JOIN video_pipeline.assets source_asset ON source_asset.id = av.asset_id
+		JOIN video_pipeline.episode_revisions er ON er.id = $2
+		JOIN video_pipeline.episodes ep ON ep.id = er.episode_id
+		JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
+		LEFT JOIN video_pipeline.artifacts a ON a.content_hash = av.content_hash
+		WHERE av.id = $1
+		  AND source_asset.series_id = ep.series_id
+		  AND source_asset.asset_type IN ('MUSIC', 'AUDIO')
+		  AND av.status = 'APPROVED'
+		  AND ls.policy_status = 'ALLOWED'
+		  AND ls.commercial_use
+		  AND (ls.expires_at IS NULL OR ls.expires_at > now())
+		  AND (av.consent_asset_id IS NULL OR EXISTS (
+		    SELECT 1
+		    FROM video_pipeline.consent_assets ca
+		    WHERE ca.id = av.consent_asset_id
+		      AND ca.status = 'ACTIVE'
+		      AND (ca.expires_at IS NULL OR ca.expires_at > now())
+		  ))`,
+		assetVersionID, episodeRevisionID,
+	).Scan(
+		&artifact.Digest, &artifact.URI, &artifact.MediaType,
+		&artifact.SizeBytes, &artifact.DurationMillis,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return postproduction.Artifact{}, controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"background audio is not an approved compatible asset",
+				"select an active licensed audio revision for this series",
+			)
+		}
+		return postproduction.Artifact{}, fmt.Errorf("resolve background audio: %w", err)
+	}
+	if err := artifact.Validate(); err != nil {
+		return postproduction.Artifact{}, err
+	}
+	return artifact, nil
 }
 
 func uuidStrings(values []uuid.UUID) []string {

@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 )
@@ -56,6 +59,25 @@ type ProductionLedger interface {
 	FinalizeShotRun(context.Context, WorkflowStep, FinalizeShotRunInput) error
 }
 
+type PostProductionLedger interface {
+	PrepareEpisodePostProduction(
+		context.Context,
+		WorkflowStep,
+		FinalizeEpisodeInput,
+	) (postproduction.Request, error)
+	AuthorizeEpisodePostProduction(
+		context.Context,
+		WorkflowStep,
+		FinalizeEpisodeInput,
+	) error
+	CommitEpisodePostProduction(
+		context.Context,
+		WorkflowStep,
+		FinalizeEpisodeInput,
+		postproduction.Result,
+	) error
+}
+
 // Activities executes side effects at the Temporal Activity boundary. Temporal
 // persists orchestration history; Journal persists an independently queryable
 // input digest, result, audit record, and outbox event. Credentials never enter
@@ -66,6 +88,8 @@ type Activities struct {
 	Journal            WorkflowStepJournal
 	Production         ProductionLedger
 	Artifacts          *artifactstore.Store
+	PostProduction     postproduction.Executor
+	PostProductionData PostProductionLedger
 }
 
 // NewActivities creates bounded Activity clients.
@@ -79,6 +103,14 @@ func NewActivitiesWithJournal(providerAdapterURL string, journal WorkflowStepJou
 	activities := NewActivities(providerAdapterURL)
 	activities.Journal = journal
 	return activities
+}
+
+func (a *Activities) ConfigurePostProduction(
+	executor postproduction.Executor,
+	ledger PostProductionLedger,
+) {
+	a.PostProduction = executor
+	a.PostProductionData = ledger
 }
 
 // NewProductionActivities enables the normalized product projection and CAS
@@ -184,7 +216,7 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 				return ProviderResult{}, err
 			}
 			if err := a.Production.PrepareProviderJob(ctx, step, input); err != nil {
-				return ProviderResult{}, err
+				return ProviderResult{}, classifyPostProductionError(err)
 			}
 		}
 		result, err := a.executeProviderJob(ctx, input)
@@ -399,12 +431,104 @@ func (a *Activities) EscalateShot(ctx context.Context, input EscalateShotInput) 
 	return err
 }
 
+// FinalizeEpisode prepares immutable clip/context/prompt inputs from
+// PostgreSQL, performs idempotent speech calls, runs deterministic FFmpeg, and
+// commits the resulting evidence before G3 can open.
+func (a *Activities) FinalizeEpisode(
+	ctx context.Context,
+	input FinalizeEpisodeInput,
+) (postproduction.Result, error) {
+	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (postproduction.Result, error) {
+		if input.EpisodeRevisionID == "" || len(input.RunIDs) == 0 {
+			return postproduction.Result{}, errors.New("episode finalization requires episodeRevisionId and runIds")
+		}
+		if err := input.Config.Validate(); err != nil {
+			return postproduction.Result{}, err
+		}
+		if a.PostProduction == nil || a.PostProductionData == nil {
+			return postproduction.Result{}, errors.New("post-production executor and ledger are required")
+		}
+		step, err := currentWorkflowStep(ctx, input.TraceID)
+		if err != nil {
+			return postproduction.Result{}, err
+		}
+		request, err := a.PostProductionData.PrepareEpisodePostProduction(ctx, step, input)
+		if err != nil {
+			return postproduction.Result{}, classifyPostProductionError(err)
+		}
+		// Prepare resolves immutable inputs; this second transactional check is
+		// intentionally adjacent to the paid provider boundary so a rights
+		// revocation after Prepare fails closed before speech submission.
+		if err := a.PostProductionData.AuthorizeEpisodePostProduction(ctx, step, input); err != nil {
+			return postproduction.Result{}, classifyPostProductionError(err)
+		}
+		request.AuthorizePaidSubmit = func(submitCtx context.Context, _ postproduction.Cue) error {
+			return classifyPostProductionError(
+				a.PostProductionData.AuthorizeEpisodePostProduction(submitCtx, step, input),
+			)
+		}
+		result, err := finalizePostProductionWithHeartbeat(
+			ctx, a.PostProduction, request, input.EpisodeRevisionID,
+		)
+		if errors.Is(err, postproduction.ErrPendingKey) {
+			return postproduction.Result{}, temporal.NewNonRetryableApplicationError(
+				err.Error(), "PENDING_KEY", err,
+			)
+		}
+		if err != nil {
+			return postproduction.Result{}, classifyPostProductionError(err)
+		}
+		if err := a.PostProductionData.CommitEpisodePostProduction(ctx, step, input, result); err != nil {
+			return postproduction.Result{}, classifyPostProductionError(err)
+		}
+		return result, nil
+	})
+}
+
+func finalizePostProductionWithHeartbeat(
+	ctx context.Context,
+	executor postproduction.Executor,
+	request postproduction.Request,
+	episodeRevisionID string,
+) (postproduction.Result, error) {
+	stop := make(chan struct{})
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+		activity.RecordHeartbeat(ctx, map[string]any{
+			"phase": "post-production", "episodeRevisionId": episodeRevisionID,
+		})
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				activity.RecordHeartbeat(ctx, map[string]any{
+					"phase": "post-production", "episodeRevisionId": episodeRevisionID,
+				})
+			}
+		}
+	}()
+	result, err := executor.Finalize(ctx, request)
+	close(stop)
+	<-stopped
+	return result, err
+}
+
 // CreateGate3 creates the final review task after every shot has a reviewable
 // immutable artifact.
 func (a *Activities) CreateGate3(ctx context.Context, input CreateGate3Input) error {
 	_, err := journalActivity(ctx, a.Journal, input.TraceID, input, func() (struct{}, error) {
 		if input.EpisodeRevisionID == "" || len(input.RunIDs) == 0 {
 			return struct{}{}, errors.New("G3 review requires episodeRevisionId and runIds")
+		}
+		if input.PostProductionManifestHash != "" &&
+			!validPostProductionManifestHash(input.PostProductionManifestHash) {
+			return struct{}{}, errors.New("post-production manifest hash is invalid")
 		}
 		if input.PersistProductTruth {
 			if a.Production == nil || a.Artifacts == nil {
@@ -416,19 +540,29 @@ func (a *Activities) CreateGate3(ctx context.Context, input CreateGate3Input) er
 			}
 			manifest, err := a.Production.BuildEpisodeManifest(ctx, step, input)
 			if err != nil {
-				return struct{}{}, err
+				return struct{}{}, classifyPostProductionError(err)
 			}
 			artifact, err := a.Artifacts.Put(ctx, bytes.NewReader(manifest))
 			if err != nil {
 				return struct{}{}, fmt.Errorf("commit generation manifest to CAS: %w", err)
 			}
 			if err := a.Production.CommitEpisodeManifest(ctx, step, input, manifest, artifact); err != nil {
-				return struct{}{}, err
+				return struct{}{}, classifyPostProductionError(err)
 			}
 		}
 		return struct{}{}, nil
 	})
 	return err
+}
+
+func validPostProductionManifestHash(value string) bool {
+	if len(value) != sha256.Size*2 ||
+		value != strings.ToLower(value) ||
+		value == strings.Repeat("0", sha256.Size*2) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 // CancelProviderJob is an explicit compensation Activity. It uses the same
@@ -628,6 +762,30 @@ func classifyProviderError(err error) error {
 		string(providerErr.Code),
 		err,
 	)
+}
+
+func classifyPostProductionError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var applicationErr *temporal.ApplicationError
+	if errors.As(err, &applicationErr) {
+		return applicationErr
+	}
+	var domainErr *controlplane.DomainError
+	if errors.As(err, &domainErr) {
+		switch domainErr.Code {
+		case controlplane.CodeConsentRequired,
+			controlplane.CodeLicenseBlocked,
+			controlplane.CodeBudgetExceeded:
+			return temporal.NewNonRetryableApplicationError(
+				domainErr.Error(),
+				string(domainErr.Code),
+				err,
+			)
+		}
+	}
+	return classifyProviderError(err)
 }
 
 func sleepContext(ctx context.Context, delay time.Duration) error {

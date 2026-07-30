@@ -12,7 +12,7 @@ make video-down
 
 ```text
 PostgreSQL healthy
-  → migration v2 clean
+  → migration v5 clean
 Temporal healthy
 Mock Provider healthy
   → Orchestrator Worker registered
@@ -69,10 +69,10 @@ Mock Provider healthy
 三个 Go service 镜像：
 
 - multi-stage、`CGO_ENABLED=0`、`-trimpath`；
-- Alpine runtime，仅 ca-certs/wget；
+- Alpine runtime；基础服务仅 ca-certs/wget，Orchestrator 额外安装 FFmpeg 与 Noto CJK 字体；
 - non-root `10001:10001`；
 - read-only root FS；
-- `/tmp` tmpfs；
+- `/tmp` tmpfs；Orchestrator 为 45～60 秒后期处理单独限制为 1 GiB；
 - `no-new-privileges`；
 - drop all Linux capabilities；
 - CAS volume 只挂到需要的服务。
@@ -129,6 +129,7 @@ Metrics：
 - CAS bytes/disk headroom、Temporal backlog、outbox lag；
 - Activity journal incomplete age、input-hash conflict；
 - QC pass、Q1/Gate cycle time、3-shot episode completion。
+- post-production/TTS cue latency、FFmpeg duration、output bytes、manual timing required 与 G3 manifest binding。
 
 Alerts：
 
@@ -193,6 +194,10 @@ Key 到位后不改领域/Workflow：
 | Artifact | 临时 URL 过期后 CAS 可访问并 checksum 一致 |
 | Secret | 响应/日志/trace/PG backup/Manifest/export 0 命中 |
 | E2E | 1 集 ≥3 镜，TTS+SRT+VTT+CPU MP4+Manifest |
+
+FLO-104 的成片运行、证据分层和三次真实 Key 执行单见
+`docs/flo-104-postproduction.md`。真实 CER、字幕边界、音画起点、
+p50/p95、成功率与费用在 Key 到位前必须保持 `pending_key`。
 
 ## 9. 已知风险
 
