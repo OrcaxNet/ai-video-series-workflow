@@ -1315,13 +1315,6 @@ func testHTTPTemporalRecoveryAndPause(
 			t.Fatalf("decode cancel attempt %d: %v", attempt, err)
 		}
 	}
-	firstWorker.Stop()
-	firstWorkerStopped = true
-	replacementWorker := newWorker("reconciliation-worker-" + uuid.NewString())
-	if err := replacementWorker.Start(); err != nil {
-		t.Fatalf("start replacement Temporal worker: %v", err)
-	}
-	defer replacementWorker.Stop()
 	workflowRun := temporalClient.GetWorkflow(ctx, createOperation.TemporalWorkflowID, "")
 	if err := workflowRun.Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
 		t.Fatalf("workflow completion error = %v, want Canceled", err)
@@ -1334,6 +1327,16 @@ func testHTTPTemporalRecoveryAndPause(
 		unknownRun.FailureCode != "CANCEL_NOT_CONFIRMED" {
 		t.Fatalf("network cancellation run = %#v", unknownRun)
 	}
+	// Restart only after Temporal has durably closed the original execution.
+	// The replacement process owns the independently started reconciler and
+	// replays its Activity journal without depending on prior worker memory.
+	firstWorker.Stop()
+	firstWorkerStopped = true
+	replacementWorker := newWorker("reconciliation-worker-" + uuid.NewString())
+	if err := replacementWorker.Start(); err != nil {
+		t.Fatalf("start replacement Temporal worker: %v", err)
+	}
+	defer replacementWorker.Stop()
 	providerUp.Store(true)
 	reconcileBody := []byte(
 		`{"actor":{"actorId":"operator","role":"OPERATOR"},"recoveryMode":"RECONCILE_HISTORY"}`,
