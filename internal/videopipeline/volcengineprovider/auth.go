@@ -113,14 +113,18 @@ func (a *serviceAuthenticator) verify(request *http.Request, body []byte) error 
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	for knownNonce, expiresAt := range a.nonces {
-		if !expiresAt.After(now) {
+		// A timestamp exactly on either skew boundary remains valid. Retain
+		// nonces through that inclusive boundary so a future-dated request
+		// cannot be replayed after a cache entry derived from receipt time
+		// expires.
+		if expiresAt.Before(now) {
 			delete(a.nonces, knownNonce)
 		}
 	}
 	if _, replayed := a.nonces[nonce]; replayed {
 		return errors.New("replayed service authentication")
 	}
-	a.nonces[nonce] = now.Add(serviceAuthMaxSkew)
+	a.nonces[nonce] = signedAt.Add(serviceAuthMaxSkew)
 	return nil
 }
 

@@ -50,6 +50,7 @@ type Options struct {
 	DownloadClient *http.Client
 	Inspector      MediaInspector
 	Now            func() time.Time
+	AuthNow        func() time.Time
 }
 
 func New(
@@ -73,11 +74,15 @@ func New(
 	if now == nil {
 		now = time.Now
 	}
+	authNow := options.AuthNow
+	if authNow == nil {
+		authNow = time.Now
+	}
 	stateDir := filepath.Join(store.Root(), "provider-jobs")
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create live provider job registry: %w", err)
 	}
-	authenticator, err := newServiceAuthenticator(config.ServiceAuthSecret, time.Now)
+	authenticator, err := newServiceAuthenticator(config.ServiceAuthSecret, authNow)
 	if err != nil {
 		return nil, err
 	}

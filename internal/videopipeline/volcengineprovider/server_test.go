@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +28,29 @@ type fakeProvider struct {
 	cancelCount int
 	outputURL   string
 	submitErr   error
+}
+
+func (p *fakeProvider) counts() (submits, polls, cancels int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.submitCount, p.pollCount, p.cancelCount
+}
+
+type lockedClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *lockedClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *lockedClock) Set(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = now
 }
 
 func (p *fakeProvider) Discover(context.Context) ([]providercontract.Capability, error) {
@@ -232,6 +256,125 @@ func TestServer_RejectsAnonymousSubmitPollAndCancelBeforeUpstream(t *testing.T) 
 	}
 	if provider.pollCount != 0 || provider.cancelCount != 0 {
 		t.Fatalf("anonymous actions reached upstream: polls=%d cancels=%d", provider.pollCount, provider.cancelCount)
+	}
+}
+
+func TestServer_RejectsFutureDatedReplayAcrossFullSignatureWindowBeforeUpstream(t *testing.T) {
+	t.Parallel()
+	video := []byte("synthetic-mp4-fixture")
+	download := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write(video)
+	}))
+	defer download.Close()
+	start := time.Unix(1_800_000_000, 0).UTC()
+
+	tests := []struct {
+		name       string
+		method     string
+		path       func(providercontract.JobRequest) string
+		wantStatus int
+		count      func(*fakeProvider) int
+	}{
+		{
+			name: "submit", method: http.MethodPost,
+			path:       func(providercontract.JobRequest) string { return "/v1/jobs" },
+			wantStatus: http.StatusCreated,
+			count:      func(provider *fakeProvider) int { submits, _, _ := provider.counts(); return submits },
+		},
+		{
+			name: "poll", method: http.MethodGet,
+			path:       func(request providercontract.JobRequest) string { return "/v1/jobs/" + request.JobID },
+			wantStatus: http.StatusOK,
+			count:      func(provider *fakeProvider) int { _, polls, _ := provider.counts(); return polls },
+		},
+		{
+			name: "cancel", method: http.MethodPost,
+			path:       func(request providercontract.JobRequest) string { return "/v1/jobs/" + request.JobID + "/cancel" },
+			wantStatus: http.StatusAccepted,
+			count:      func(provider *fakeProvider) int { _, _, cancels := provider.counts(); return cancels },
+		},
+	}
+	for index, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clock := &lockedClock{now: start}
+			provider := &fakeProvider{outputURL: download.URL + "/result.mp4"}
+			store, err := artifactstore.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			adapter, err := New(testLiveConfig(), provider, store, Options{
+				DownloadClient: http.DefaultClient,
+				Inspector: fixedInspector{spec: MediaSpec{
+					Width: 1280, Height: 720, FPS: 24, DurationMillis: 5_062, Format: "mp4",
+				}},
+				Now: func() time.Time { return start }, AuthNow: clock.Now,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(adapter.Handler())
+			defer server.Close()
+			job := testJobRequest(t)
+			jobBody, err := json.Marshal(job)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if tt.name != "submit" {
+				setup := signedTestServiceRequestMethodWithBody(
+					t, http.MethodPost, server.URL+"/v1/jobs", jobBody, jobBody, start,
+					fmt.Sprintf("%032x", 0x10+index),
+				)
+				setup.Header.Set("Content-Type", "application/json")
+				setup.Header.Set("Idempotency-Key", job.JobID)
+				response, err := http.DefaultClient.Do(setup)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_ = response.Body.Close()
+				if response.StatusCode != http.StatusCreated {
+					t.Fatalf("setup HTTP status = %d, want 201", response.StatusCode)
+				}
+			}
+
+			var actionBody []byte
+			if tt.name == "submit" {
+				actionBody = jobBody
+			}
+			nonce := fmt.Sprintf("%032x", 0x20+index)
+			newAction := func() *http.Request {
+				request := signedTestServiceRequestMethodWithBody(
+					t, tt.method, server.URL+tt.path(job), actionBody, actionBody,
+					start.Add(119*time.Second), nonce,
+				)
+				if tt.name == "submit" {
+					request.Header.Set("Content-Type", "application/json")
+					request.Header.Set("Idempotency-Key", job.JobID)
+				}
+				return request
+			}
+
+			response, err := http.DefaultClient.Do(newAction())
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, readErr := io.ReadAll(response.Body)
+			_ = response.Body.Close()
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if response.StatusCode != tt.wantStatus {
+				t.Fatalf("first action HTTP %d, want %d: %s", response.StatusCode, tt.wantStatus, body)
+			}
+			beforeReplay := tt.count(provider)
+
+			clock.Set(start.Add(121 * time.Second))
+			assertUnauthenticated(t, newAction())
+			if afterReplay := tt.count(provider); afterReplay != beforeReplay {
+				t.Fatalf("replay reached upstream: before=%d after=%d", beforeReplay, afterReplay)
+			}
+		})
 	}
 }
 

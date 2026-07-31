@@ -146,6 +146,8 @@ Live Adapter 不发布宿主机端口，只在 Compose `video-backplane` 内通�
 body hash 与随机 nonce 绑定的 HMAC 服务签名；缺失、过期、篡改或重放请求会在任何
 Provider submit/poll/cancel 前返回 `401 unauthenticated`。该签名 Secret 与
 `ARK_API_KEY` 分离，Worker/单次探针只持有前者，只有 Adapter 持有后者。
+nonce 会保留到签名时间戳加完整允许偏差的闭区间末端；客户端时钟领先时也不存在
+按首次接收时间提前释放的重放窗口。
 
 `video-live-probe` 固定为一个 1280×720、24 fps、5 秒、无同步音频的原创抽象
 镜头，`maxAttempts=1`。输出目录带原子单次提交锁；即使任务失败，也不能在同一
