@@ -60,6 +60,8 @@ erDiagram
 | `context_revisions` | scope/type/revision/payload | 剧集→单集→场景→镜头四层 |
 | `effective_context_snapshots` | inputs/resolver/payload/hash | 每次 Prompt 使用不可变合并结果 |
 | `prompt_snapshots` | template/context/assets/final payload/hash | 最终 Prompt、分段来源与结构化请求可 diff |
+| `prompt_snapshot_inputs` / `prompt_snapshot_assets` | 精确 producer revision/hash/role | 付费前重建并验证 ShotSpec、Profile、四层 Context 与全部资产谱系 |
+| `content_compilation_runs` | source/stage/model/input/output/evidence/state | text.primary 内容编译的可恢复、可审计运行记录 |
 | `assets` / `asset_versions` | stable asset/type/version/CAS/source/rights | 新版本不覆盖被引用旧版 |
 | `revision_dependencies` / `freshness_impacts` | producer→consumer | 递归 stale 与影响分析 |
 
@@ -126,6 +128,7 @@ erDiagram
 | `review_tasks` | SHOT(Q1)、G1/G2/G3、LICENSE、BUDGET；预算审批精确绑定 Generation Plan、VIDEO/SPEECH scope、额度与币种 |
 | `approval_decisions` / `approval_bindings` | actor/reason + 精确 revision/hash |
 | `generation_manifests` | Shot/Episode 全谱系和锁定 hash |
+| `publication_locks` | succeeded Run + Manifest hash + passing QC hash + G3 | 发布资格的不可变最终绑定；一个 episode Manifest 可覆盖多个 Run |
 
 G1/G2/Q1/G3 都绑定具体 revision/hash；管理员不能绕过许可或 stale 检查。
 
@@ -140,9 +143,21 @@ PENDING_CONFIRMATION → RESERVED → SETTLED | RELEASED
 PENDING_CONFIRMATION → REJECTED
 ```
 
+VIDEO submit 在同一 serializable transaction 中锁定精确 BUDGET review 行，并按
+`budget_approval_id` 汇总所有 `RESERVED` 金额与 `SETTLED` 实际金额。每个 Run
+只预留按 Prompt 时长和冻结单价计算的单 Run estimate；取消/失败释放未结预留，
+成功按可信实际费用结算并记录未使用部分的 `RELEASE`。实际金额缺失、未验证、
+为负数，或 currency/pricing version 与 reservation 不一致时，不得用 estimate
+冒充实际费用，也不得释放差额；该 reservation 进入 `SETTLED`，但累计分配按完整
+预留金额保守占用，等待单独的人工调整流程。
+
 ### `cost_ledger`
 
-append-only 类型：`ESTIMATE`、`RESERVATION`、`ACTUAL`、`RELEASE`、`ADJUSTMENT`。金额未知时 `amount_micros/currency` 可空，但 units/unit/pricing version 必须保存；`verified=false` 防止把估值当实付。
+append-only 类型：`ESTIMATE`、`RESERVATION`、`ACTUAL`、`RELEASE`、`ADJUSTMENT`。
+金额未知时不创建伪造的 `ACTUAL`；Provider 返回但未通过 reservation 绑定核验的
+金额可作为 `verified=false` 的原始声明保留。只有 `verified=true` 且 currency/
+pricing version 与 reservation 完全一致的非负 `ACTUAL` 可降低累计预算占用并
+产生 `RELEASE`。
 
 成本可沿：
 

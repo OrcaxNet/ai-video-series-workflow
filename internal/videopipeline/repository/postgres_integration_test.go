@@ -271,17 +271,19 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	store := NewForPool(pool)
 
 	profileID, profileGroupID := uuid.New(), uuid.New()
+	sourceRevisionID := uuid.New()
 	seriesID, episodeID, episodeRevisionID := uuid.New(), uuid.New(), uuid.New()
 	sceneID, shotID := uuid.New(), uuid.New()
 	scriptID, storyboardID, shotRevisionID := uuid.New(), uuid.New(), uuid.New()
 	gate1ID, gate2ID, budgetID, speechBudgetID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
-	providerProfileID, capabilityID := uuid.New(), uuid.New()
+	providerProfileID, capabilityID, textCapabilityID := uuid.New(), uuid.New(), uuid.New()
 	safetyEvidenceArtifactID := uuid.New()
 	voiceLicenseID, musicLicenseID, consentID := uuid.New(), uuid.New(), uuid.New()
 	voiceAssetID, voiceAssetVersionID := uuid.New(), uuid.New()
 	musicAssetID, musicAssetVersionID := uuid.New(), uuid.New()
 	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 	episodeHash := strings.Repeat("1", 64)
+	sourceHash := strings.Repeat("0", 64)
 	shotHash := strings.Repeat("2", 64)
 	safetyEvidenceHash := strings.Repeat(
 		strings.ReplaceAll(safetyEvidenceArtifactID.String(), "-", ""),
@@ -290,6 +292,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	effectiveHash := strings.Repeat("3", 64)
 	profileHash := strings.Repeat("4", 64)
 	capabilityHash := strings.Repeat("5", 64)
+	textCapabilityHash := strings.Repeat("8", 64)
 
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.generation_profiles
@@ -307,6 +310,14 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			(id, title, status, default_profile_id, rights_declaration, created_by)
 		VALUES ($1, 'workflow projection fixture', 'ACTIVE', $2, '{}'::jsonb, 'integration')`,
 		seriesID, profileID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.source_revisions
+			(id, series_id, revision, status, content_hash, artifact_uri,
+			 language, rights_snapshot, created_by)
+		VALUES ($1, $2, 1, 'APPROVED', $3, $4, 'zh-CN',
+		        '{"basis":"integration"}'::jsonb, 'integration')`,
+		sourceRevisionID, seriesID, sourceHash, "cas://sha256/"+sourceHash,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.episodes (id, series_id, ordinal, title)
@@ -467,10 +478,15 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			(id, provider_profile_id, capability_alias, model_id, route_version,
 			 supported_inputs, limits, pricing_rule_version, capability_hash,
 			 status, effective_at)
-		VALUES ($1, $2, 'video.primary', 'fixture-video-v1', 'route-v1',
-		        ARRAY['text'], '{"unitPriceMicros":10,"remainingCalls":100,"allowedTerritories":["CN"],"productForms":["INTERNAL_PREVIEW","COMMERCIAL_RELEASE"],"contentSafetyPolicyVersions":["safety-v1"]}', 'pricing-v1', $3,
-		        'ACTIVE', now())`,
+		VALUES
+			($1, $2, 'video.primary', 'fixture-video-v1', 'route-v1',
+			 ARRAY['text'], '{"unitPriceMicros":10,"remainingCalls":100,"allowedTerritories":["CN"],"productForms":["INTERNAL_PREVIEW","COMMERCIAL_RELEASE"],"contentSafetyPolicyVersions":["safety-v1"]}', 'pricing-v1', $3,
+			 'ACTIVE', now()),
+			($4, $2, 'text.primary', 'fixture-text-v1', 'route-v1',
+			 ARRAY['text'], '{"unitPriceMicros":1,"remainingCalls":100,"allowedTerritories":["CN"],"productForms":["INTERNAL_PREVIEW"],"contentSafetyPolicyVersions":["safety-v1"]}', 'text-pricing-v1', $5,
+			 'ACTIVE', now())`,
 		capabilityID, providerProfileID, capabilityHash,
+		textCapabilityID, textCapabilityHash,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.artifacts
@@ -531,6 +547,59 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		CapabilityAlias: "video.primary", ProviderProfileID: providerProfileID.String(),
 		Provider: "MOCK", ModelID: "fixture-video-v1", RouteVersion: "route-v1",
 		CapabilityHash: capabilityHash,
+	}
+	textRoute := controlplane.ModelRouteSnapshot{
+		CapabilityAlias: "text.primary", ProviderProfileID: providerProfileID.String(),
+		Provider: "MOCK", ModelID: "fixture-text-v1", RouteVersion: "route-v1",
+		CapabilityHash: textCapabilityHash,
+	}
+	compilationCommand := controlplane.StartContentCompilationCommand{
+		SchemaVersion: "v1", SourceHash: sourceHash,
+		Stages:            []string{"STRUCTURE", "EPISODES", "SCENES", "SHOTS"},
+		TextRouteSnapshot: textRoute,
+		Actor:             controlplane.Actor{ActorID: "producer", Role: "PRODUCER"},
+	}
+	compilationDigest, err := digestValue(compilationCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	compilationIdempotency := controlplane.Idempotency{
+		Scope: "workflow-projection-compilation:" + sourceRevisionID.String(),
+		Key:   uuid.NewString(), RequestHash: compilationDigest,
+	}
+	compilation, err := store.StartContentCompilation(
+		ctx, sourceRevisionID.String(), compilationCommand,
+		compilationIdempotency, "workflow-projection-compilation",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedCompilation, err := store.StartContentCompilation(
+		ctx, sourceRevisionID.String(), compilationCommand,
+		compilationIdempotency, "workflow-projection-compilation",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if compilation.Value.State != "ACCEPTED" ||
+		!replayedCompilation.Replayed ||
+		replayedCompilation.Value.OperationID != compilation.Value.OperationID {
+		t.Fatalf(
+			"content compilation idempotency = first:%#v replay:%#v",
+			compilation, replayedCompilation,
+		)
+	}
+	var compilationRuns int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.content_compilation_runs
+		WHERE source_revision_id = $1 AND state = 'VALIDATED'`,
+		sourceRevisionID,
+	).Scan(&compilationRuns); err != nil {
+		t.Fatal(err)
+	}
+	if compilationRuns != 4 {
+		t.Fatalf("content compilation runs = %d, want 4", compilationRuns)
 	}
 	executionPolicy := controlplane.ExecutionPolicy{
 		TargetTerritory: "CN", ProductForm: "INTERNAL_PREVIEW",
@@ -715,6 +784,23 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var promptInputCount, promptAssetCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM video_pipeline.prompt_snapshot_inputs
+		   WHERE prompt_snapshot_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.prompt_snapshot_assets
+		   WHERE prompt_snapshot_id = $1)`,
+		prompt.ID,
+	).Scan(&promptInputCount, &promptAssetCount); err != nil {
+		t.Fatal(err)
+	}
+	if promptInputCount != 6 || promptAssetCount != 1 {
+		t.Fatalf(
+			"Prompt v6 lineage counts = inputs:%d assets:%d, want 6/1",
+			promptInputCount, promptAssetCount,
+		)
+	}
 	publicCommand := controlplane.CreateGenerationRunCommand{
 		SchemaVersion: "v1", ShotSpecRevisionID: shotRevisionID.String(),
 		PromptSnapshotID: prompt.ID, GenerationProfileRevisionID: profileID.String(),
@@ -757,6 +843,760 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		BudgetApprovalID: budgetID.String(), BudgetMaximumMicros: 1_000,
 		BudgetCurrency: "CNY", ProviderProfileID: providerProfileID.String(),
 		TraceID: step.TraceID, PersistProductTruth: true,
+	}
+	lineageShotID, lineageCommand := cloneIntegrationShotCommand(
+		t, ctx, pool, store, shotID.String(), publicCommand,
+	)
+	lineagePrompt, err := store.ResolvePromptSnapshot(
+		ctx, lineageCommand.PromptSnapshotID,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongPromptDispatch := dispatch
+	wrongPromptDispatch.Prompt = lineagePrompt
+	if _, err := store.PrepareProviderJob(ctx, step, wrongPromptDispatch); err == nil {
+		t.Fatal("Run A accepted Prompt B")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) ||
+			domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("Run A / Prompt B error = %#v", err)
+		}
+	}
+	wrongRouteDispatch := dispatch
+	wrongRouteDispatch.Route.Verification = "different-route-evidence"
+	if _, err := store.PrepareProviderJob(ctx, step, wrongRouteDispatch); err == nil {
+		t.Fatal("Run A accepted Route B")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) ||
+			domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("Run A / Route B error = %#v", err)
+		}
+	}
+	var rejectedBindingReservations, rejectedBindingJobs int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM video_pipeline.budget_reservations
+		   WHERE generation_run_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+		   JOIN video_pipeline.generation_attempts ga
+		     ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1)`,
+		run.RunID,
+	).Scan(&rejectedBindingReservations, &rejectedBindingJobs); err != nil {
+		t.Fatal(err)
+	}
+	if rejectedBindingReservations != 0 || rejectedBindingJobs != 0 {
+		t.Fatalf(
+			"Run binding rejection left paid side effects = reservations:%d jobs:%d",
+			rejectedBindingReservations, rejectedBindingJobs,
+		)
+	}
+
+	racePlanCommand := planCommand
+	racePlanCommand.ShotSpecRevisionIDs = []string{lineageCommand.ShotSpecRevisionID}
+	racePlanCommand.BudgetLimit = controlplane.BudgetLimit{
+		AmountMicros: 75, Currency: "CNY",
+	}
+	racePlanCommand.ExecutionPolicy = lineageCommand.ExecutionPolicy
+	racePlanDigest, err := digestValue(racePlanCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	racePlan, err := store.CreateGenerationPlan(
+		ctx, racePlanCommand,
+		controlplane.Idempotency{
+			Scope: "workflow-projection-race-plan:" + lineageShotID,
+			Key:   uuid.NewString(), RequestHash: racePlanDigest,
+		},
+		"workflow-projection-race-plan",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raceBudgetID := uuid.New()
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.review_tasks
+			(id, series_id, episode_id, review_type, state, assigned_role,
+			 decided_at, generation_plan_id, budget_scope,
+			 budget_limit_micros, budget_currency)
+		VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER',
+		        now(), $4, 'VIDEO', 75, 'CNY')`,
+		raceBudgetID, seriesID, episodeID, racePlan.Value.GenerationPlanID,
+	)
+	raceCommands := []controlplane.CreateGenerationRunCommand{
+		lineageCommand,
+		lineageCommand,
+	}
+	for index := range raceCommands {
+		raceCommands[index].GenerationPlanID = racePlan.Value.GenerationPlanID
+		raceCommands[index].BudgetApprovalID = raceBudgetID.String()
+		raceCommands[index].CreativeAttempt = index + 1
+	}
+	raceSteps := make([]orchestration.WorkflowStep, 2)
+	raceRuns := make([]orchestration.GenerationRunRef, 2)
+	raceDispatches := make([]orchestration.ExecuteProviderJobInput, 2)
+	for index := range raceCommands {
+		raceSteps[index], raceRuns[index], raceDispatches[index] =
+			createIntegrationWorkflowRun(
+				t, ctx, store, fmt.Sprintf("budget-race-%d", index+1),
+				raceCommands[index],
+			)
+	}
+	raceErrors := make([]error, 2)
+	var raceWait sync.WaitGroup
+	for index := range raceDispatches {
+		index := index
+		raceWait.Add(1)
+		go func() {
+			defer raceWait.Done()
+			_, raceErrors[index] = store.PrepareProviderJob(
+				ctx, raceSteps[index], raceDispatches[index],
+			)
+		}()
+	}
+	raceWait.Wait()
+	winner, loser := -1, -1
+	for index, raceErr := range raceErrors {
+		if raceErr == nil {
+			winner = index
+			continue
+		}
+		var domain *controlplane.DomainError
+		if !errors.As(raceErr, &domain) ||
+			domain.Code != controlplane.CodeBudgetExceeded {
+			t.Fatalf("concurrent cumulative reservation %d error = %#v", index, raceErr)
+		}
+		loser = index
+	}
+	if winner < 0 || loser < 0 || winner == loser {
+		t.Fatalf("cumulative reservation race = %#v, want one success/one budget rejection", raceErrors)
+	}
+	var raceReservations int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.budget_reservations br
+		JOIN video_pipeline.generation_runs gr ON gr.id = br.generation_run_id
+		WHERE gr.budget_approval_id = $1 AND br.status = 'RESERVED'`,
+		raceBudgetID.String(),
+	).Scan(&raceReservations); err != nil {
+		t.Fatal(err)
+	}
+	if raceReservations != 1 {
+		t.Fatalf("concurrent cumulative RESERVED rows = %d, want 1", raceReservations)
+	}
+	if err := store.RecordProviderCancellation(
+		ctx, raceSteps[winner],
+		orchestration.CancelProviderJobInput{
+			Dispatch:   raceDispatches[winner],
+			ReasonCode: "INTEGRATION_RELEASE",
+			TraceID:    raceSteps[winner].TraceID,
+		},
+		orchestration.CancelProviderResult{State: "CANCELLED"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.PrepareProviderJob(
+		ctx, raceSteps[loser], raceDispatches[loser],
+	); err != nil {
+		t.Fatalf("reservation after release: %v", err)
+	}
+	overBudgetDigest := strings.Repeat(
+		strings.ReplaceAll(uuid.NewString(), "-", ""),
+		2,
+	)
+	overBudgetActual := int64(51)
+	overBudgetResult := orchestration.ProviderResult{
+		UpstreamTaskID: "over-budget-task", RequestID: "over-budget-request",
+		ArtifactDigest: overBudgetDigest,
+		ArtifactURI:    "cas://sha256/" + overBudgetDigest,
+		MediaType:      "video/mp4", ArtifactSize: 1,
+		Width: 1280, Height: 720, DurationMillis: 5_000,
+		Model: raceDispatches[loser].Route,
+		Cost: providercontract.Cost{
+			EstimatedMicros: 50, ActualMicros: &overBudgetActual,
+			Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+		},
+	}
+	if err := store.CompleteProviderJob(
+		ctx, raceSteps[loser], raceDispatches[loser], overBudgetResult,
+	); err == nil {
+		t.Fatal("over-reservation Provider actual was accepted")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) ||
+			domain.Code != controlplane.CodeBudgetExceeded {
+			t.Fatalf("over-reservation completion error = %#v", err)
+		}
+	}
+	var overBudgetRunState, overBudgetAttemptState, overBudgetJobState string
+	var overBudgetArtifacts int
+	if err := pool.QueryRow(ctx, `
+		SELECT gr.state, ga.state, pj.state,
+		       (SELECT COUNT(*) FROM video_pipeline.run_artifacts
+		        WHERE generation_run_id = gr.id)
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+		JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+		WHERE gr.id = $1`,
+		raceRuns[loser].RunID,
+	).Scan(
+		&overBudgetRunState, &overBudgetAttemptState,
+		&overBudgetJobState, &overBudgetArtifacts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if overBudgetRunState != "FAILED" ||
+		overBudgetAttemptState != "FAILED" ||
+		overBudgetJobState != "FAILED" ||
+		overBudgetArtifacts != 0 {
+		t.Fatalf(
+			"over-budget terminal projection = run:%s attempt:%s job:%s artifacts:%d",
+			overBudgetRunState, overBudgetAttemptState,
+			overBudgetJobState, overBudgetArtifacts,
+		)
+	}
+
+	costPointer := func(value int64) *int64 {
+		return &value
+	}
+	billingDriftCases := []struct {
+		name               string
+		cost               providercontract.Cost
+		wantActual         bool
+		wantActualVerified bool
+		wantReleaseMicros  int64
+		wantSecondRejected bool
+	}{
+		{
+			name: "estimated exceeds reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 51, ActualMicros: costPointer(40),
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+			wantActual:         true,
+			wantActualVerified: true,
+			wantReleaseMicros:  10,
+		},
+		{
+			name: "actual exceeds reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(51),
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+			wantActual:         true,
+			wantActualVerified: true,
+			wantSecondRejected: true,
+		},
+		{
+			name: "actual is missing",
+			cost: providercontract.Cost{
+				EstimatedMicros: 40, ActualMicros: nil,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+			wantSecondRejected: true,
+		},
+		{
+			name: "cost is unverified",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(40),
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: false,
+			},
+			wantActual:         true,
+			wantSecondRejected: true,
+		},
+		{
+			name: "currency differs from reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(40),
+				Currency: "USD", PricingVersion: "pricing-v1", Verified: true,
+			},
+			wantActual:         true,
+			wantSecondRejected: true,
+		},
+		{
+			name: "pricing version differs from reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(40),
+				Currency: "CNY", PricingVersion: "pricing-v2", Verified: true,
+			},
+			wantActual:         true,
+			wantSecondRejected: true,
+		},
+	}
+	for _, drift := range billingDriftCases {
+		drift := drift
+		t.Run("provider completion billing drift "+drift.name, func(t *testing.T) {
+			_, driftCommand := cloneIntegrationShotCommand(
+				t, ctx, pool, store, shotID.String(), publicCommand,
+			)
+			driftPlanCommand := planCommand
+			driftPlanCommand.ShotSpecRevisionIDs = []string{
+				driftCommand.ShotSpecRevisionID,
+			}
+			driftPlanCommand.BudgetLimit = controlplane.BudgetLimit{
+				AmountMicros: 90, Currency: "CNY",
+			}
+			driftPlanCommand.ExecutionPolicy = driftCommand.ExecutionPolicy
+			driftPlanDigest, err := digestValue(driftPlanCommand)
+			if err != nil {
+				t.Fatal(err)
+			}
+			driftPlan, err := store.CreateGenerationPlan(
+				ctx, driftPlanCommand,
+				controlplane.Idempotency{
+					Scope: "completion-billing-drift-plan:" + uuid.NewString(),
+					Key:   uuid.NewString(), RequestHash: driftPlanDigest,
+				},
+				"completion-billing-drift-plan",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			driftBudgetID := uuid.New()
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.review_tasks
+					(id, series_id, episode_id, review_type, state, assigned_role,
+					 decided_at, generation_plan_id, budget_scope,
+					 budget_limit_micros, budget_currency)
+				VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER',
+				        now(), $4, 'VIDEO', 90, 'CNY')`,
+				driftBudgetID, seriesID, episodeID, driftPlan.Value.GenerationPlanID,
+			)
+			driftCommand.GenerationPlanID = driftPlan.Value.GenerationPlanID
+			driftCommand.BudgetApprovalID = driftBudgetID.String()
+			_, driftRun, driftDispatch := createIntegrationWorkflowRun(
+				t, ctx, store,
+				"completion-billing-drift-"+strings.ReplaceAll(drift.name, " ", "-"),
+				driftCommand,
+			)
+			driftCAS, err := artifactstore.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			driftArtifact, err := driftCAS.Put(
+				ctx,
+				bytes.NewReader([]byte("billing drift artifact: "+drift.name)),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var providerCalls atomic.Int32
+			driftProvider := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				request *http.Request,
+			) {
+				providerCalls.Add(1)
+				if request.Method != http.MethodPost ||
+					request.URL.Path != "/v1/jobs" {
+					http.NotFound(response, request)
+					return
+				}
+				var job providercontract.JobRequest
+				if err := json.NewDecoder(request.Body).Decode(&job); err != nil {
+					http.Error(response, "invalid fixture request", http.StatusBadRequest)
+					return
+				}
+				response.Header().Set("Content-Type", "application/json")
+				response.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(response).Encode(providercontract.JobResponse{
+					JobID: job.JobID, RunID: job.RunID,
+					UpstreamTaskID: "billing-drift-task-" + driftArtifact.Digest[:12],
+					RequestID:      "billing-drift-request-" + driftArtifact.Digest[:12],
+					State:          providercontract.StatusSucceeded,
+					Progress:       100,
+					Model:          job.Model,
+					Artifacts: []providercontract.AssetRef{{
+						ID:       "billing-drift-asset-" + driftArtifact.Digest[:12],
+						Revision: driftArtifact.Digest, Kind: providercontract.ModalityVideo,
+						Role: providercontract.AssetRoleOutput,
+						URI:  driftArtifact.URI, SHA256: driftArtifact.Digest,
+						LicenseReference: "integration-fixture-license",
+						MediaType:        "video/mp4", SizeBytes: driftArtifact.Size,
+						Width: 1280, Height: 720, DurationMillis: 5_000,
+					}},
+					Usage: providercontract.Usage{
+						InputUnits: 10, OutputUnits: 20, Unit: "mock-units",
+					},
+					Cost: drift.cost,
+				})
+			}))
+			defer driftProvider.Close()
+
+			activities := orchestration.NewProductionActivities(
+				driftProvider.URL, nil, store, driftCAS,
+			)
+			var activitySuite testsuite.WorkflowTestSuite
+			activityEnvironment := activitySuite.NewTestActivityEnvironment()
+			activityEnvironment.RegisterActivity(activities.ExecuteProviderJob)
+			_, activityErr := activityEnvironment.ExecuteActivity(
+				activities.ExecuteProviderJob, driftDispatch,
+			)
+			var applicationErr *temporal.ApplicationError
+			if !errors.As(activityErr, &applicationErr) ||
+				applicationErr.Type() != string(controlplane.CodeBudgetExceeded) ||
+				!applicationErr.NonRetryable() {
+				t.Fatalf(
+					"billing drift Activity error = %#v, want non-retryable %s",
+					activityErr, controlplane.CodeBudgetExceeded,
+				)
+			}
+			if providerCalls.Load() != 1 {
+				t.Fatalf("billing drift Provider calls = %d, want 1", providerCalls.Load())
+			}
+
+			var (
+				runState, runFailureClass, runFailureCode string
+				attemptState, attemptFailureCode          string
+				jobState, jobErrorCode                    string
+				reservationState                          string
+				reservedMicros                            int64
+				actualCount, releaseCount                 int
+				actualMicros, releaseMicros               int64
+				actualCurrency, actualPricing             string
+				actualVerified                            bool
+				artifactCount, runArtifactCount           int
+				qcCount, manifestCount, lockCount         int
+			)
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  gr.state, gr.failure_class, gr.failure_code,
+				  ga.state, ga.failure_code,
+				  pj.state, pj.error_code,
+				  br.status, br.amount_micros,
+				  COUNT(*) FILTER (WHERE cl.entry_type = 'ACTUAL'),
+				  COALESCE(SUM(cl.amount_micros)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), 0),
+				  COALESCE(MAX(cl.currency)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), ''),
+				  COALESCE(MAX(cl.pricing_rule_version)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), ''),
+				  COALESCE(BOOL_AND(cl.verified)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), false),
+				  COUNT(*) FILTER (WHERE cl.entry_type = 'RELEASE'),
+				  COALESCE(SUM(cl.amount_micros)
+				    FILTER (WHERE cl.entry_type = 'RELEASE'), 0),
+				  (SELECT COUNT(*) FROM video_pipeline.artifacts
+				   WHERE content_hash = $2),
+				  (SELECT COUNT(*) FROM video_pipeline.run_artifacts
+				   WHERE generation_run_id = gr.id),
+				  (SELECT COUNT(*) FROM video_pipeline.qc_reports
+				   WHERE generation_run_id = gr.id),
+				  (SELECT COUNT(*) FROM video_pipeline.generation_manifests
+				   WHERE scope_revision_id = gr.shot_spec_revision_id),
+				  (SELECT COUNT(*) FROM video_pipeline.publication_locks
+				   WHERE generation_run_id = gr.id)
+				FROM video_pipeline.generation_runs gr
+				JOIN video_pipeline.generation_attempts ga
+				  ON ga.generation_run_id = gr.id
+				JOIN video_pipeline.provider_jobs pj
+				  ON pj.generation_attempt_id = ga.id
+				JOIN video_pipeline.budget_reservations br
+				  ON br.id = pj.budget_reservation_id
+				LEFT JOIN video_pipeline.cost_ledger cl
+				  ON cl.budget_reservation_id = br.id
+				WHERE gr.id = $1
+				GROUP BY gr.id, ga.id, pj.id, br.id`,
+				driftRun.RunID, driftArtifact.Digest,
+			).Scan(
+				&runState, &runFailureClass, &runFailureCode,
+				&attemptState, &attemptFailureCode,
+				&jobState, &jobErrorCode,
+				&reservationState, &reservedMicros,
+				&actualCount, &actualMicros, &actualCurrency,
+				&actualPricing, &actualVerified,
+				&releaseCount, &releaseMicros,
+				&artifactCount, &runArtifactCount,
+				&qcCount, &manifestCount, &lockCount,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if runState != "FAILED" ||
+				runFailureClass != "BUDGET" ||
+				runFailureCode != "BUDGET_EXCEEDED" ||
+				attemptState != "FAILED" ||
+				attemptFailureCode != "BUDGET_EXCEEDED" ||
+				jobState != "FAILED" ||
+				jobErrorCode != "BUDGET_EXCEEDED" {
+				t.Fatalf(
+					"billing drift terminal projection = run:%s/%s/%s attempt:%s/%s job:%s/%s",
+					runState, runFailureClass, runFailureCode,
+					attemptState, attemptFailureCode, jobState, jobErrorCode,
+				)
+			}
+			if reservationState != "SETTLED" || reservedMicros != 50 {
+				t.Fatalf(
+					"billing drift reservation = %s/%d, want SETTLED/50",
+					reservationState, reservedMicros,
+				)
+			}
+			var wantActual int64
+			wantActualCount := 0
+			wantActualCurrency := ""
+			wantActualPricing := ""
+			wantActualVerified := false
+			if drift.wantActual {
+				wantActualCount = 1
+				wantActual = *drift.cost.ActualMicros
+				wantActualCurrency = drift.cost.Currency
+				wantActualPricing = drift.cost.PricingVersion
+				wantActualVerified = drift.wantActualVerified
+			}
+			wantReleaseCount := 0
+			if drift.wantReleaseMicros > 0 {
+				wantReleaseCount = 1
+			}
+			if actualCount != wantActualCount ||
+				actualMicros != wantActual ||
+				actualCurrency != wantActualCurrency ||
+				actualPricing != wantActualPricing ||
+				actualVerified != wantActualVerified ||
+				releaseCount != wantReleaseCount ||
+				releaseMicros != drift.wantReleaseMicros {
+				t.Fatalf(
+					"billing drift ledger = actual:%d/%d/%s/%s/%t release:%d/%d, want actual:%d/%d/%s/%s/%t release:%d/%d",
+					actualCount, actualMicros, actualCurrency, actualPricing,
+					actualVerified, releaseCount, releaseMicros,
+					wantActualCount, wantActual, wantActualCurrency,
+					wantActualPricing, wantActualVerified,
+					wantReleaseCount, drift.wantReleaseMicros,
+				)
+			}
+			if artifactCount != 0 || runArtifactCount != 0 ||
+				qcCount != 0 || manifestCount != 0 || lockCount != 0 {
+				t.Fatalf(
+					"billing drift downstream truth = artifact:%d run-artifact:%d qc:%d manifest:%d lock:%d",
+					artifactCount, runArtifactCount, qcCount, manifestCount, lockCount,
+				)
+			}
+
+			secondCommand := driftCommand
+			secondCommand.CreativeAttempt = 2
+			secondStep, secondRun, secondDispatch := createIntegrationWorkflowRun(
+				t, ctx, store,
+				"completion-billing-drift-second-"+
+					strings.ReplaceAll(drift.name, " ", "-"),
+				secondCommand,
+			)
+			_, secondErr := store.PrepareProviderJob(
+				ctx, secondStep, secondDispatch,
+			)
+			if drift.wantSecondRejected {
+				var domain *controlplane.DomainError
+				if !errors.As(secondErr, &domain) ||
+					domain.Code != controlplane.CodeBudgetExceeded {
+					t.Fatalf(
+						"secondary allocation after %s = %#v, want %s",
+						drift.name, secondErr, controlplane.CodeBudgetExceeded,
+					)
+				}
+				var secondReservations, secondJobs int
+				if err := pool.QueryRow(ctx, `
+					SELECT
+					  (SELECT COUNT(*)
+					   FROM video_pipeline.budget_reservations
+					   WHERE generation_run_id = $1),
+					  (SELECT COUNT(*)
+					   FROM video_pipeline.provider_jobs pj
+					   JOIN video_pipeline.generation_attempts ga
+					     ON ga.id = pj.generation_attempt_id
+					   WHERE ga.generation_run_id = $1)`,
+					secondRun.RunID,
+				).Scan(&secondReservations, &secondJobs); err != nil {
+					t.Fatal(err)
+				}
+				if secondReservations != 0 || secondJobs != 0 {
+					t.Fatalf(
+						"rejected secondary allocation side effects = reservations:%d jobs:%d",
+						secondReservations, secondJobs,
+					)
+				}
+			} else {
+				if secondErr != nil {
+					t.Fatalf(
+						"trusted secondary allocation after %s: %v",
+						drift.name, secondErr,
+					)
+				}
+				if err := store.RecordProviderCancellation(
+					ctx, secondStep,
+					orchestration.CancelProviderJobInput{
+						Dispatch:   secondDispatch,
+						ReasonCode: "INTEGRATION_DRIFT_SECONDARY_CLEANUP",
+						TraceID:    secondStep.TraceID,
+					},
+					orchestration.CancelProviderResult{State: "CANCELLED"},
+				); err != nil {
+					t.Fatal(err)
+				}
+			}
+		})
+	}
+
+	_, cancelRaceCommand := cloneIntegrationShotCommand(
+		t, ctx, pool, store, shotID.String(), publicCommand,
+	)
+	cancelRaceStep, cancelRaceRun, cancelRaceDispatch :=
+		createIntegrationWorkflowRun(
+			t, ctx, store, "cancel-first", cancelRaceCommand,
+		)
+	if _, err := store.PrepareProviderJob(
+		ctx, cancelRaceStep, cancelRaceDispatch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderCancellation(
+		ctx, cancelRaceStep,
+		orchestration.CancelProviderJobInput{
+			Dispatch:   cancelRaceDispatch,
+			ReasonCode: "INTEGRATION_CANCEL_FIRST",
+			TraceID:    cancelRaceStep.TraceID,
+		},
+		orchestration.CancelProviderResult{State: "CANCELLED"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	cancelRaceDigest := strings.Repeat(
+		strings.ReplaceAll(uuid.NewString(), "-", ""),
+		2,
+	)
+	cancelRaceActual := int64(40)
+	cancelRaceResult := orchestration.ProviderResult{
+		UpstreamTaskID: "cancel-race-task", RequestID: "cancel-race-request",
+		ArtifactDigest: cancelRaceDigest,
+		ArtifactURI:    "cas://sha256/" + cancelRaceDigest,
+		MediaType:      "video/mp4", ArtifactSize: 1,
+		Width: 1280, Height: 720, DurationMillis: 5_000,
+		Model: cancelRaceDispatch.Route,
+		Cost: providercontract.Cost{
+			EstimatedMicros: 50, ActualMicros: &cancelRaceActual,
+			Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+		},
+	}
+	if err := store.CompleteProviderJob(
+		ctx, cancelRaceStep, cancelRaceDispatch, cancelRaceResult,
+	); err == nil {
+		t.Fatal("cancel-first run accepted a late Provider success")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeConflict {
+			t.Fatalf("cancel-first late success error = %#v", err)
+		}
+	}
+	var cancelRunState, cancelAttemptState, cancelJobState, cancelReservationState string
+	var cancelArtifacts int
+	if err := pool.QueryRow(ctx, `
+		SELECT gr.state, ga.state, pj.state, br.status,
+		       (SELECT COUNT(*) FROM video_pipeline.run_artifacts
+		        WHERE generation_run_id = gr.id)
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+		JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+		JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+		WHERE gr.id = $1`,
+		cancelRaceRun.RunID,
+	).Scan(
+		&cancelRunState, &cancelAttemptState, &cancelJobState,
+		&cancelReservationState, &cancelArtifacts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if cancelRunState != "CANCELLED" ||
+		cancelAttemptState != "CANCELLED" ||
+		cancelJobState != "CANCELLED" ||
+		cancelReservationState != "RELEASED" ||
+		cancelArtifacts != 0 {
+		t.Fatalf(
+			"cancel-first terminal projection = run:%s attempt:%s job:%s reservation:%s artifacts:%d",
+			cancelRunState, cancelAttemptState, cancelJobState,
+			cancelReservationState, cancelArtifacts,
+		)
+	}
+
+	_, artifactConflictCommand := cloneIntegrationShotCommand(
+		t, ctx, pool, store, shotID.String(), publicCommand,
+	)
+	artifactConflictStep, artifactConflictRun, artifactConflictDispatch :=
+		createIntegrationWorkflowRun(
+			t, ctx, store, "artifact-conflict", artifactConflictCommand,
+		)
+	if _, err := store.PrepareProviderJob(
+		ctx, artifactConflictStep, artifactConflictDispatch,
+	); err != nil {
+		t.Fatal(err)
+	}
+	artifactConflictDigest := strings.Repeat(
+		strings.ReplaceAll(uuid.NewString(), "-", ""),
+		2,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES ($1, $2, $3, 'application/octet-stream', 99, '{}', 'ACTIVE')`,
+		uuid.New(), artifactConflictDigest,
+		"cas://sha256/"+artifactConflictDigest,
+	)
+	artifactConflictActual := int64(40)
+	artifactConflictResult := orchestration.ProviderResult{
+		UpstreamTaskID: "artifact-conflict-task",
+		RequestID:      "artifact-conflict-request",
+		ArtifactDigest: artifactConflictDigest,
+		ArtifactURI:    "cas://sha256/" + artifactConflictDigest,
+		MediaType:      "video/mp4", ArtifactSize: 1,
+		Width: 1280, Height: 720, DurationMillis: 5_000,
+		Model: artifactConflictDispatch.Route,
+		Cost: providercontract.Cost{
+			EstimatedMicros: 50, ActualMicros: &artifactConflictActual,
+			Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+		},
+	}
+	if err := store.CompleteProviderJob(
+		ctx, artifactConflictStep, artifactConflictDispatch, artifactConflictResult,
+	); err == nil {
+		t.Fatal("incompatible artifact metadata was reused")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeConflict {
+			t.Fatalf("artifact metadata conflict error = %#v", err)
+		}
+	}
+	var conflictRunState, conflictReservationState string
+	var conflictRunArtifacts int
+	if err := pool.QueryRow(ctx, `
+		SELECT gr.state, br.status,
+		       (SELECT COUNT(*) FROM video_pipeline.run_artifacts
+		        WHERE generation_run_id = gr.id)
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+		JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+		JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+		WHERE gr.id = $1`,
+		artifactConflictRun.RunID,
+	).Scan(
+		&conflictRunState, &conflictReservationState, &conflictRunArtifacts,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if conflictRunState != "QUEUED" ||
+		conflictReservationState != "RESERVED" ||
+		conflictRunArtifacts != 0 {
+		t.Fatalf(
+			"artifact conflict projection = run:%s reservation:%s artifacts:%d",
+			conflictRunState, conflictReservationState, conflictRunArtifacts,
+		)
+	}
+	if err := store.RecordProviderCancellation(
+		ctx, artifactConflictStep,
+		orchestration.CancelProviderJobInput{
+			Dispatch:   artifactConflictDispatch,
+			ReasonCode: "INTEGRATION_CONFLICT_CLEANUP",
+			TraceID:    artifactConflictStep.TraceID,
+		},
+		orchestration.CancelProviderResult{State: "CANCELLED"},
+	); err != nil {
+		t.Fatal(err)
 	}
 	var videoProviderCalls atomic.Int32
 	blockedProvider := httptest.NewServer(http.HandlerFunc(func(
@@ -946,9 +1786,85 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		})
 	}
 	restoreVideoApproval()
-	step.ActivityID, step.ActivityType = "provider", orchestration.ActivityExecuteProviderJob
-	if err := store.PrepareProviderJob(ctx, step, dispatch); err != nil {
+	mustExec(t, ctx, pool, `
+		DELETE FROM video_pipeline.prompt_snapshot_inputs
+		WHERE prompt_snapshot_id = $1
+		  AND dependency_role = 'context:shot'`,
+		prompt.ID,
+	)
+	if err := store.ValidateWorkerUpgradeReadiness(ctx); err == nil {
+		t.Fatal("v6 worker accepted an active run with incomplete Prompt lineage")
+	}
+	if _, err := store.CompilePromptSnapshot(
+		ctx,
+		orchestration.WorkflowStep{
+			WorkflowID: "workflow-upgrade-recompile-" + uuid.NewString(),
+			ActivityID: "compile", ActivityType: orchestration.ActivityCompilePrompt,
+			TraceID: "workflow-upgrade-recompile",
+		},
+		orchestration.CompilePromptInput{
+			ShotSpecRevisionID:   shotRevisionID.String(),
+			GenerationProfileRef: profileID.String(),
+			TraceID:              "workflow-upgrade-recompile", PersistProductTruth: true,
+		},
+	); err != nil {
 		t.Fatal(err)
+	}
+	if err := store.ValidateWorkerUpgradeReadiness(ctx); err != nil {
+		t.Fatalf("v6 worker rejected restored Prompt lineage: %v", err)
+	}
+	step.ActivityID, step.ActivityType = "provider", orchestration.ActivityExecuteProviderJob
+	preparedProvider, err := store.PrepareProviderJob(ctx, step, dispatch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preparedProvider.Budget.MaxCostMicros != 50 ||
+		preparedProvider.Budget.EstimatedCostMicros != 50 ||
+		preparedProvider.BudgetReservation.AmountMicros != 50 ||
+		preparedProvider.BudgetReservation.Currency != "CNY" ||
+		preparedProvider.BudgetReservation.PricingVersion != "pricing-v1" {
+		t.Fatalf("per-run durable Provider allocation = %#v", preparedProvider)
+	}
+	var preparedRequestSnapshot []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT pj.request_snapshot
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+		WHERE ga.generation_run_id = $1`,
+		run.RunID,
+	).Scan(&preparedRequestSnapshot); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.provider_jobs pj
+		SET request_snapshot = '{"legacy":"v5"}'::jsonb
+		FROM video_pipeline.generation_attempts ga
+		WHERE pj.generation_attempt_id = ga.id
+		  AND ga.generation_run_id = $1`,
+		run.RunID,
+	)
+	if err := store.ValidateWorkerUpgradeReadiness(ctx); err == nil {
+		t.Fatal("v6 worker accepted an active v5 Provider request snapshot")
+	}
+	if _, err := store.PrepareProviderJob(ctx, step, dispatch); err == nil {
+		t.Fatal("Provider retry accepted a drifted prepared request snapshot")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) ||
+			domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("drifted prepared request retry error = %#v", err)
+		}
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.provider_jobs pj
+		SET request_snapshot = $2
+		FROM video_pipeline.generation_attempts ga
+		WHERE pj.generation_attempt_id = ga.id
+		  AND ga.generation_run_id = $1`,
+		run.RunID, preparedRequestSnapshot,
+	)
+	if err := store.ValidateWorkerUpgradeReadiness(ctx); err != nil {
+		t.Fatalf("v6 worker rejected restored Provider reservation lineage: %v", err)
 	}
 	qaPauseActor := controlplane.Actor{ActorID: "qa-operator", Role: "OPERATOR"}
 	qaPauseDigest, _ := digestValue(map[string]any{"runId": run.RunID, "reason": "QA_PAUSE"})
@@ -996,7 +1912,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	actualCost := int64(750)
+	actualCost := int64(40)
 	providerResult := orchestration.ProviderResult{
 		UpstreamTaskID: "task-1", RequestID: "request-1",
 		ArtifactDigest: videoArtifact.Digest, ArtifactURI: videoArtifact.URI,
@@ -1005,11 +1921,22 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		Model: model,
 		Usage: providercontract.Usage{InputUnits: 10, OutputUnits: 20, Unit: "mock-units"},
 		Cost: providercontract.Cost{
-			EstimatedMicros: 800, ActualMicros: &actualCost, Currency: "CNY",
+			EstimatedMicros: 50, ActualMicros: &actualCost, Currency: "CNY",
 			PricingVersion: "pricing-v1", Verified: true,
 		},
 	}
 	if err := store.CompleteProviderJob(ctx, step, dispatch, providerResult); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderCancellation(
+		ctx, step,
+		orchestration.CancelProviderJobInput{
+			Dispatch:   dispatch,
+			ReasonCode: "INTEGRATION_SUCCESS_FIRST",
+			TraceID:    step.TraceID,
+		},
+		orchestration.CancelProviderResult{State: "CANCELLED"},
+	); err != nil {
 		t.Fatal(err)
 	}
 	completedAfterPause, err := store.GetGenerationRun(ctx, run.RunID)
@@ -1018,7 +1945,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	if completedAfterPause.State != "SUCCEEDED" ||
 		completedAfterPause.FailureClass != "" || completedAfterPause.FailureCode != "" {
-		t.Fatalf("provider success retained pause failure = %#v", completedAfterPause)
+		t.Fatalf("success-first cancellation race projection = %#v", completedAfterPause)
 	}
 	step.ActivityID, step.ActivityType = "qc", orchestration.ActivityRunAutomaticQC
 	qcInput := orchestration.RunQCInput{
@@ -1886,10 +2813,11 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.CreateApprovalDecision(ctx, g3Command, controlplane.Idempotency{
+	g3Decision, err := store.CreateApprovalDecision(ctx, g3Command, controlplane.Idempotency{
 		Scope: "workflow-projection-g3:" + episodeID.String(),
 		Key:   uuid.NewString(), RequestHash: g3Digest,
-	}, step.TraceID); err != nil {
+	}, step.TraceID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	locked, err := store.GetManifest(ctx, "EPISODE", episodeRevisionID.String())
@@ -1910,6 +2838,75 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	if g3State != "APPROVED" {
 		t.Fatalf("G3 review state = %q, want APPROVED", g3State)
+	}
+	var qcReportID, qcReportHash string
+	if err := pool.QueryRow(ctx, `
+		SELECT id, report_hash
+		FROM video_pipeline.qc_reports
+		WHERE generation_run_id = $1 AND state = 'PASSED'`,
+		run.RunID,
+	).Scan(&qcReportID, &qcReportHash); err != nil {
+		t.Fatal(err)
+	}
+	publicationCommand := controlplane.LockPublicationCommand{
+		SchemaVersion: "v1",
+		ManifestID:    manifest.ManifestID, ManifestHash: manifest.ManifestHash,
+		QCReportID: qcReportID, QCReportHash: qcReportHash,
+		Gate3DecisionID: g3Decision.Value.DecisionID,
+		Actor:           controlplane.Actor{ActorID: "director", Role: "DIRECTOR"},
+	}
+	publicationDigest, err := digestValue(publicationCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicationIdempotency := controlplane.Idempotency{
+		Scope: "workflow-projection-publication:" + run.RunID,
+		Key:   uuid.NewString(), RequestHash: publicationDigest,
+	}
+	publication, err := store.LockPublication(
+		ctx, run.RunID, publicationCommand,
+		publicationIdempotency, "workflow-projection-publication",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayedPublication, err := store.LockPublication(
+		ctx, run.RunID, publicationCommand,
+		publicationIdempotency, "workflow-projection-publication",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if publication.Value.RunID != run.RunID ||
+		publication.Value.ManifestID != manifest.ManifestID ||
+		publication.Value.QCReportID != qcReportID ||
+		publication.Value.Gate3DecisionID != g3Decision.Value.DecisionID ||
+		!replayedPublication.Replayed ||
+		replayedPublication.Value.PublicationLockID !=
+			publication.Value.PublicationLockID {
+		t.Fatalf(
+			"publication lock = first:%#v replay:%#v",
+			publication, replayedPublication,
+		)
+	}
+	stalePublicationCommand := publicationCommand
+	stalePublicationCommand.QCReportHash = strings.Repeat("f", 64)
+	stalePublicationDigest, _ := digestValue(stalePublicationCommand)
+	if _, err := store.LockPublication(
+		ctx, run.RunID, stalePublicationCommand,
+		controlplane.Idempotency{
+			Scope: "workflow-projection-publication-stale:" + run.RunID,
+			Key:   uuid.NewString(), RequestHash: stalePublicationDigest,
+		},
+		"workflow-projection-publication-stale",
+	); err == nil {
+		t.Fatal("publication lock accepted a stale QC hash")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) ||
+			domain.Code != controlplane.CodeGateRequired {
+			t.Fatalf("stale publication lock error = %#v", err)
+		}
 	}
 
 	publicDigest, err := digestValue(publicCommand)
@@ -2816,21 +3813,7 @@ func cloneIntegrationShotCommand(
 	t.Helper()
 	newShotID := uuid.New()
 	newShotRevisionID := uuid.New()
-	newContextID := uuid.New()
-	newPromptID := uuid.New()
 	newShotHash := strings.Repeat(
-		strings.ReplaceAll(uuid.NewString(), "-", ""),
-		2,
-	)
-	newContextHash := strings.Repeat(
-		strings.ReplaceAll(uuid.NewString(), "-", ""),
-		2,
-	)
-	newPromptInputHash := strings.Repeat(
-		strings.ReplaceAll(uuid.NewString(), "-", ""),
-		2,
-	)
-	newPromptHash := strings.Repeat(
 		strings.ReplaceAll(uuid.NewString(), "-", ""),
 		2,
 	)
@@ -2862,36 +3845,23 @@ func cloneIntegrationShotCommand(
 	); err != nil {
 		t.Fatalf("clone integration shot revision: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO video_pipeline.effective_context_snapshots
-		  (id, shot_spec_revision_id, schema_version, resolver_version,
-		   context_revision_ids, normalized_payload, content_hash)
-		SELECT $2, $3, ecs.schema_version, ecs.resolver_version,
-		       ecs.context_revision_ids, ecs.normalized_payload, $4
-		FROM video_pipeline.prompt_snapshots ps
-		JOIN video_pipeline.effective_context_snapshots ecs
-		  ON ecs.id = ps.effective_context_snapshot_id
-		WHERE ps.id = $1`,
-		source.PromptSnapshotID, newContextID, newShotRevisionID, newContextHash,
-	); err != nil {
-		t.Fatalf("clone integration effective context: %v", err)
-	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO video_pipeline.prompt_snapshots
-		  (id, shot_spec_revision_id, schema_version, compiler_version,
-		   prompt_template_ref, effective_context_snapshot_id, asset_version_refs,
-		   predecessor_summary, tail_frame_hash, positive_prompt, negative_prompt,
-		   model_payload, evidence_ids, normalized_input_hash, content_hash)
-		SELECT $2, $3, schema_version, compiler_version,
-		       prompt_template_ref, $4, asset_version_refs,
-		       predecessor_summary, tail_frame_hash, positive_prompt, negative_prompt,
-		       model_payload, evidence_ids, $5, $6
-		FROM video_pipeline.prompt_snapshots
-		WHERE id = $1`,
-		source.PromptSnapshotID, newPromptID, newShotRevisionID, newContextID,
-		newPromptInputHash, newPromptHash,
-	); err != nil {
-		t.Fatalf("clone integration prompt: %v", err)
+	clonedPrompt, err := store.CompilePromptSnapshot(
+		ctx,
+		orchestration.WorkflowStep{
+			WorkflowID:   "integration-clone-" + newShotID.String(),
+			ActivityID:   "compile-prompt",
+			ActivityType: orchestration.ActivityCompilePrompt,
+			TraceID:      "integration-clone-" + newShotID.String(),
+		},
+		orchestration.CompilePromptInput{
+			ShotSpecRevisionID:   newShotRevisionID.String(),
+			GenerationProfileRef: source.GenerationProfileRevisionID,
+			TraceID:              "integration-clone-" + newShotID.String(),
+			PersistProductTruth:  true,
+		},
+	)
+	if err != nil {
+		t.Fatalf("compile cloned integration prompt: %v", err)
 	}
 
 	planRecord, err := store.GetGenerationPlan(ctx, source.GenerationPlanID)
@@ -3034,12 +4004,76 @@ func cloneIntegrationShotCommand(
 	}
 	cloned := source
 	cloned.ShotSpecRevisionID = newShotRevisionID.String()
-	cloned.PromptSnapshotID = newPromptID.String()
+	cloned.PromptSnapshotID = clonedPrompt.ID
 	cloned.GenerationPlanID = plan.Value.GenerationPlanID
 	cloned.BudgetApprovalID = clonedBudgetID.String()
 	cloned.ExecutionPolicy = executionPolicy
 	cloned.CreativeAttempt = 1
 	return newShotID.String(), cloned
+}
+
+func createIntegrationWorkflowRun(
+	t *testing.T,
+	ctx context.Context,
+	store *Postgres,
+	label string,
+	command controlplane.CreateGenerationRunCommand,
+) (
+	orchestration.WorkflowStep,
+	orchestration.GenerationRunRef,
+	orchestration.ExecuteProviderJobInput,
+) {
+	t.Helper()
+	prompt, err := store.ResolvePromptSnapshot(ctx, command.PromptSnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := store.GetGenerationPlan(ctx, command.GenerationPlanID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	model := providercontract.ModelSnapshot{
+		CapabilityAlias: command.RouteSnapshot.CapabilityAlias,
+		Provider:        command.RouteSnapshot.Provider,
+		ModelID:         command.RouteSnapshot.ModelID,
+		EndpointID:      command.RouteSnapshot.EndpointID,
+		RouteVersion:    command.RouteSnapshot.RouteVersion,
+		CapabilityHash:  command.RouteSnapshot.CapabilityHash,
+		Verification:    "integration",
+	}
+	step := orchestration.WorkflowStep{
+		WorkflowID:   "integration-workflow-" + label + "-" + uuid.NewString(),
+		ActivityID:   "create-run",
+		ActivityType: orchestration.ActivityCreateRun,
+		TraceID:      "integration-" + label,
+	}
+	run, err := store.CreateWorkflowRun(ctx, step, orchestration.CreateRunInput{
+		ShotSpecRevisionID:   command.ShotSpecRevisionID,
+		PromptSnapshot:       prompt,
+		GenerationProfileRef: command.GenerationProfileRevisionID,
+		Route:                model,
+		GenerationPlanID:     command.GenerationPlanID,
+		BudgetApprovalID:     command.BudgetApprovalID,
+		ProviderProfileID:    command.RouteSnapshot.ProviderProfileID,
+		CreativeAttempt:      command.CreativeAttempt,
+		TraceID:              step.TraceID,
+		PersistProductTruth:  true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	step.ActivityID = "provider"
+	step.ActivityType = orchestration.ActivityExecuteProviderJob
+	dispatch := orchestration.ExecuteProviderJobInput{
+		Run: run, Prompt: prompt, Route: model,
+		BudgetApprovalID:    command.BudgetApprovalID,
+		BudgetMaximumMicros: plan.BudgetLimit.AmountMicros,
+		BudgetCurrency:      plan.BudgetLimit.Currency,
+		ProviderProfileID:   command.RouteSnapshot.ProviderProfileID,
+		TraceID:             step.TraceID,
+		PersistProductTruth: true,
+	}
+	return step, run, dispatch
 }
 
 type integrationHTTPResponse struct {

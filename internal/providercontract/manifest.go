@@ -44,40 +44,63 @@ type AttemptEvidence struct {
 	LatencyMillis int64     `json:"latency_millis"`
 }
 
+type GateEvidence struct {
+	Gate        string `json:"gate"`
+	DecisionID  string `json:"decision_id"`
+	BindingID   string `json:"binding_id"`
+	BindingHash string `json:"binding_hash"`
+	ActorID     string `json:"actor_id"`
+}
+
+func (g GateEvidence) Validate() error {
+	if (g.Gate != "G1" && g.Gate != "G2" && g.Gate != "G3") ||
+		!nonEmptyManifest(g.DecisionID, g.BindingID, g.BindingHash, g.ActorID) ||
+		!validSHA256(g.BindingHash) {
+		return errors.New("manifest gate evidence is incomplete")
+	}
+	return nil
+}
+
 // GenerationManifest is the immutable provider-neutral audit record for one
 // provider attempt. It contains snapshot and content hashes, never prompt text
 // or signed transport URLs.
 type GenerationManifest struct {
-	SchemaVersion  string           `json:"schema_version"`
-	ManifestID     string           `json:"manifest_id"`
-	Evidence       string           `json:"evidence"`
-	ShotID         string           `json:"shot_id"`
-	RequestID      string           `json:"request_id"`
-	IdempotencyKey string           `json:"idempotency_key"`
-	Modality       Modality         `json:"modality"`
-	PromptSnapshot string           `json:"prompt_snapshot_id"`
-	Context        ContextRefs      `json:"context"`
-	InputAssets    []AssetEvidence  `json:"input_assets"`
-	Requested      OutputSpec       `json:"requested_output"`
-	Provider       ProviderEvidence `json:"provider"`
-	Attempt        AttemptEvidence  `json:"attempt"`
-	Status         JobStatus        `json:"status"`
-	Actual         *OutputSpec      `json:"actual_output,omitempty"`
-	OutputAssets   []AssetEvidence  `json:"output_assets,omitempty"`
-	Usage          Usage            `json:"usage"`
-	Budget         BudgetEnvelope   `json:"budget"`
-	Error          *Error           `json:"error,omitempty"`
+	SchemaVersion  string            `json:"schema_version"`
+	ManifestID     string            `json:"manifest_id"`
+	Evidence       string            `json:"evidence"`
+	ShotID         string            `json:"shot_id"`
+	RequestID      string            `json:"request_id"`
+	IdempotencyKey string            `json:"idempotency_key"`
+	Modality       Modality          `json:"modality"`
+	PromptSnapshot string            `json:"prompt_snapshot_id"`
+	Context        ContextRefs       `json:"context"`
+	InputRevisions map[string]string `json:"input_revision_hashes,omitempty"`
+	InputAssets    []AssetEvidence   `json:"input_assets"`
+	Requested      OutputSpec        `json:"requested_output"`
+	ModelSnapshot  *ModelSnapshot    `json:"model_snapshot,omitempty"`
+	Gates          []GateEvidence    `json:"gates,omitempty"`
+	Provider       ProviderEvidence  `json:"provider"`
+	Attempt        AttemptEvidence   `json:"attempt"`
+	Status         JobStatus         `json:"status"`
+	Actual         *OutputSpec       `json:"actual_output,omitempty"`
+	OutputAssets   []AssetEvidence   `json:"output_assets,omitempty"`
+	Usage          Usage             `json:"usage"`
+	Budget         BudgetEnvelope    `json:"budget"`
+	Error          *Error            `json:"error,omitempty"`
 }
 
 type ManifestBuildInput struct {
-	ManifestID  string
-	ShotID      string
-	Evidence    string
-	Request     GenerationRequest
-	Job         Job
-	Attempt     int
-	StartedAt   time.Time
-	CompletedAt time.Time
+	ManifestID          string
+	ShotID              string
+	Evidence            string
+	Request             GenerationRequest
+	Job                 Job
+	Attempt             int
+	StartedAt           time.Time
+	CompletedAt         time.Time
+	InputRevisionHashes map[string]string
+	ModelSnapshot       *ModelSnapshot
+	Gates               []GateEvidence
 }
 
 func NewGenerationManifest(input ManifestBuildInput) (GenerationManifest, error) {
@@ -94,7 +117,10 @@ func NewGenerationManifest(input ManifestBuildInput) (GenerationManifest, error)
 		Modality:       input.Request.Modality,
 		PromptSnapshot: input.Request.PromptSnapshotID,
 		Context:        input.Request.Context,
+		InputRevisions: cloneStringMap(input.InputRevisionHashes),
 		Requested:      input.Request.Output,
+		ModelSnapshot:  cloneModelSnapshot(input.ModelSnapshot),
+		Gates:          append([]GateEvidence(nil), input.Gates...),
 		Provider: ProviderEvidence{
 			Name:      input.Job.Provider,
 			Model:     input.Job.ProviderModel,
@@ -163,6 +189,22 @@ func (m GenerationManifest) Validate() error {
 			return err
 		}
 	}
+	for name, digest := range m.InputRevisions {
+		if strings.TrimSpace(name) == "" || !validSHA256(digest) {
+			return errors.New("manifest input revision hashes are invalid")
+		}
+	}
+	for _, gate := range m.Gates {
+		if err := gate.Validate(); err != nil {
+			return err
+		}
+	}
+	if m.ModelSnapshot != nil {
+		alias := CapabilityAlias(m.ModelSnapshot.CapabilityAlias)
+		if err := m.ModelSnapshot.Validate(alias); err != nil {
+			return fmt.Errorf("manifest model snapshot: %w", err)
+		}
+	}
 	if m.Status == StatusSucceeded {
 		if m.Actual == nil || len(m.OutputAssets) == 0 {
 			return errors.New("succeeded manifest requires actual output and output assets")
@@ -174,6 +216,34 @@ func (m GenerationManifest) Validate() error {
 		}
 	}
 	return nil
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneModelSnapshot(snapshot *ModelSnapshot) *ModelSnapshot {
+	if snapshot == nil {
+		return nil
+	}
+	cloned := *snapshot
+	return &cloned
+}
+
+func nonEmptyManifest(values ...string) bool {
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return false
+		}
+	}
+	return true
 }
 
 func (a AssetEvidence) Validate() error {

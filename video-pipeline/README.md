@@ -9,6 +9,9 @@
 - 事务内幂等记录、业务写、审计与版本化 outbox；写冲突采用 serializable transaction 重试；
 - 四类能力别名：`text.primary`、`image.primary`、`video.primary`、`speech.primary`；
 - 无密钥状态发现、确定性估算/任务、幂等 replay、polling、取消竞态与回调去重；
+- Episode Workflow：G2 输入校验、逐镜头远程任务、结构 QC、人工复核、G3 signal；
+- FLO-102 主链路：授权内容结构化、不可变 revision、四层上下文/资产解析、
+  PromptSnapshot、Provider 执行、CAS、Manifest 与 QC/G3 publication lock；
 - Episode/Shot Workflow：G2 精确绑定、逐镜头远程任务、结构 QC、Q1/G3 人工复核、pause/resume/cancel 与 Provider 取消补偿；
 - 单集后期：独立 `speech.primary` 预算/路由、不可变 UTF-8 SRT、CPU FFmpeg 响度/同步/烧录、外挂字幕、独立对白轨、成片 Manifest/Service BOM，并在 G3 前 fail closed；
 - 入队前 fail-closed：冻结目标地区、产品形态、内容安全策略和 Provider 剩余配额；阻断路径不会启动 Workflow/Provider；
@@ -70,7 +73,7 @@ go vet ./...
 1. 无 Key 时四类 live capability 均为 `liveConfigured=false`，Dry-run/Mock 可用；
 2. 相同 JobID/输入只得到一个上游任务；
 3. Mock 任务经 polling 归档到 `cas://sha256/...`；
-4. PostgreSQL migration v5 clean、42 张控制面表、不可变 trigger、CAS retention guard 与预算审批精确绑定字段存在；
+4. PostgreSQL migration v7 clean、46 张控制面表、不可变 trigger、CAS retention guard、预算审批精确绑定与 FLO-102 Prompt 谱系表存在；
 5. 并发相同幂等键只提交一份 Series/audit/outbox，不同请求冲突，策略失败整体回滚；
 6. Activity journal 结果可重放且输入漂移被拒绝；
 7. 工作流投影可从 Prompt 一直查询到冻结路由、实际媒体规格、成本、审核与锁定 Manifest；
@@ -89,6 +92,7 @@ internal/videopipeline/
   controlplane/                 REST handler、policy、RFC7807
   mockprovider/                 场景注入、异步任务、callback/cancel
   orchestration/                持久流程、预算确认、provider reconciliation
+  production/                   内容/上下文/Prompt/生成/Manifest 主链路与 30 镜金标
   postproduction/               Provider-neutral TTS、字幕 revision、确定性 FFmpeg
   repository/                   pgx 数据层、幂等/audit/outbox/谱系
   runtimeconfig/                仅显式环境变量配置

@@ -82,38 +82,50 @@ func (p *HTTPSpeechProvider) Synthesize(
 			input.SubtitleRevision.ContentHash + "\x00" + input.Cue.ID,
 	))
 	jobID := "speech-" + hex.EncodeToString(jobDigest[:16])
-	jobRequest := providercontract.JobRequest{
-		SchemaVersion: "v1",
-		JobID:         jobID,
-		RunID:         "episode-" + input.EpisodeRevisionID,
-		Capability:    providercontract.CapabilitySpeech,
-		InputHash:     inputHash,
-		Model:         input.Config.Route,
-		Request: providercontract.GenerationRequest{
-			RequestID:        jobID,
-			IdempotencyKey:   jobID,
-			Modality:         providercontract.ModalityAudio,
-			Prompt:           input.Cue.Text,
-			PromptSnapshotID: input.SubtitleRevision.ID + ":" + input.Cue.ID,
-			ModelHint:        input.Cue.VoiceRef,
-			Output: providercontract.OutputSpec{
-				DurationMillis: int(input.Cue.EndMillis - input.Cue.StartMillis),
-				Format:         "wav",
-			},
-			Budget: providercontract.BudgetEnvelope{
-				EstimatedCostMicros: input.BudgetMicros,
-				MaxCostMicros:       input.BudgetMicros,
-				MaxAttempts:         2,
-			},
+	runID := "episode-" + input.EpisodeRevisionID
+	generationRequest := providercontract.GenerationRequest{
+		RequestID:        jobID,
+		IdempotencyKey:   jobID,
+		Modality:         providercontract.ModalityAudio,
+		Prompt:           input.Cue.Text,
+		PromptSnapshotID: input.SubtitleRevision.ID + ":" + input.Cue.ID,
+		ModelHint:        input.Cue.VoiceRef,
+		Output: providercontract.OutputSpec{
+			DurationMillis: int(input.Cue.EndMillis - input.Cue.StartMillis),
+			Format:         "wav",
 		},
-		BudgetReservation: providercontract.BudgetReservation{
+		Budget: providercontract.BudgetEnvelope{
+			EstimatedCostMicros: input.BudgetMicros,
+			MaxCostMicros:       input.BudgetMicros,
+			MaxAttempts:         2,
+		},
+	}
+	reservation, err := providercontract.BindBudgetReservation(
+		providercontract.BudgetReservation{
 			ReservationID:  input.Config.BudgetApprovalID + ":" + input.Cue.ID,
 			Currency:       input.Config.BudgetCurrency,
 			AmountMicros:   input.BudgetMicros,
 			PricingVersion: "post-production-approved-v1",
 			ConfirmedBy:    input.Config.BudgetApprovalID,
 		},
-		TraceID: input.TraceID,
+		providercontract.BudgetBindingInput{
+			RunID: runID, InputHash: inputHash, Model: input.Config.Route,
+			Budget: generationRequest.Budget,
+		},
+	)
+	if err != nil {
+		return ProviderAttempt{}, fmt.Errorf("bind speech budget reservation: %w", err)
+	}
+	jobRequest := providercontract.JobRequest{
+		SchemaVersion:     "v1",
+		JobID:             jobID,
+		RunID:             runID,
+		Capability:        providercontract.CapabilitySpeech,
+		InputHash:         inputHash,
+		Model:             input.Config.Route,
+		Request:           generationRequest,
+		BudgetReservation: reservation,
+		TraceID:           input.TraceID,
 	}
 	response, err := mockprovider.Submit(ctx, p.Client, p.Endpoint, jobRequest)
 	if err != nil {

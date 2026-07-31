@@ -174,6 +174,9 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	}
 	sum := sha256.Sum256([]byte(request.JobID + "\x00" + request.InputHash))
 	actual := int64(125)
+	if request.BudgetReservation.AmountMicros < actual {
+		actual = request.BudgetReservation.AmountMicros
+	}
 	response := providercontract.JobResponse{
 		JobID:          request.JobID,
 		RunID:          request.RunID,

@@ -164,6 +164,10 @@ type Output struct {
 	Assets []AssetRef `json:"assets"`
 	Actual OutputSpec `json:"actual"`
 	Usage  Usage      `json:"usage"`
+	// Text is transient structured provider output. Callers validate and
+	// persist it as immutable domain revisions; Generation Manifests never
+	// embed it.
+	Text string `json:"text,omitempty"`
 }
 
 // Job contains provider provenance needed by a Generation Manifest. It does

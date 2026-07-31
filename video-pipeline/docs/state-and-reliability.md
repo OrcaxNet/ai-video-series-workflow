@@ -165,7 +165,10 @@ stateDiagram-v2
 - 先生成 plan，展示模型、镜头、候选、调用量、金额区间、预算余额；
 - 价格未知时显示“金额未知”，强制人工确认，不伪造 0；
 - 提交前预占估算上界；终态按实际结算并释放差额；
-- provider 不返实际金额则保留 units、金额 `NULL`、`verified=false`；
+- provider 不返实际金额时不写伪造 `ACTUAL`；未验证或 currency/pricing
+  漂移的声明记录为 `verified=false`，不产生 `RELEASE`；
+- 累计分配仅采用与 reservation 完全匹配的 verified actual；其余完成结果按
+  完整 reservation 保守占用，直到经独立人工调整；
 - 批量默认并发 1，先跑一个 probe shot 再放量。
 
 ## 9. 补偿矩阵

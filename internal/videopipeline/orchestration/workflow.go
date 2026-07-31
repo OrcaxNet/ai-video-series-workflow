@@ -110,8 +110,14 @@ type WorkflowControl struct {
 
 // PromptSnapshotRef identifies an immutable compiled prompt.
 type PromptSnapshotRef struct {
-	ID     string `json:"id"`
-	Digest string `json:"digest"`
+	ID                  string                       `json:"id"`
+	Digest              string                       `json:"digest"`
+	PositivePrompt      string                       `json:"positivePrompt"`
+	NegativePrompt      string                       `json:"negativePrompt,omitempty"`
+	Context             providercontract.ContextRefs `json:"context"`
+	Assets              []providercontract.AssetRef  `json:"assets,omitempty"`
+	Output              providercontract.OutputSpec  `json:"output"`
+	InputRevisionHashes map[string]string            `json:"inputRevisionHashes"`
 }
 
 // GenerationRunRef identifies one creative generation attempt.
@@ -557,6 +563,13 @@ type ExecuteProviderJobInput struct {
 	ProviderProfileID   string                         `json:"providerProfileId,omitempty"`
 	TraceID             string                         `json:"traceId"`
 	PersistProductTruth bool                           `json:"persistProductTruth,omitempty"`
+}
+
+// PreparedProviderJob is the durable per-run budget allocation returned by the
+// product-truth transaction before any paid Provider request is assembled.
+type PreparedProviderJob struct {
+	Budget            providercontract.BudgetEnvelope    `json:"budget"`
+	BudgetReservation providercontract.BudgetReservation `json:"budgetReservation"`
 }
 
 type RunQCInput struct {

@@ -110,6 +110,45 @@ func (s *Server) createSourceRevision(w http.ResponseWriter, r *http.Request) {
 	writeOperation(w, http.StatusAccepted, stored.Value)
 }
 
+func (s *Server) startContentCompilation(w http.ResponseWriter, r *http.Request) {
+	if !s.requireStore(w, r) {
+		return
+	}
+	var command StartContentCompilationCommand
+	if !decodeCommand(w, r, &command) {
+		return
+	}
+	traceID := traceID(r)
+	sourceID := r.PathValue("sourceRevisionId")
+	err := validateUUID("sourceRevisionId", sourceID)
+	if err == nil {
+		err = s.authorizeCommandActor(r, command.Actor)
+	}
+	if err == nil {
+		err = validateStartContentCompilation(command)
+	}
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	command.Actor = normalizedActor(command.Actor)
+	idempotency, err := commandIdempotency(
+		r, "source:"+sourceID+":compilation", command,
+	)
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	stored, err := s.store.StartContentCompilation(
+		r.Context(), sourceID, command, idempotency, traceID,
+	)
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	writeOperation(w, http.StatusAccepted, stored.Value)
+}
+
 func (s *Server) createGenerationPlan(w http.ResponseWriter, r *http.Request) {
 	if !s.requireStore(w, r) {
 		return
@@ -539,6 +578,45 @@ func (s *Server) createApprovalDecision(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusCreated, stored.Value)
 }
 
+func (s *Server) lockRunForPublication(w http.ResponseWriter, r *http.Request) {
+	if !s.requireStore(w, r) {
+		return
+	}
+	var command LockPublicationCommand
+	if !decodeCommand(w, r, &command) {
+		return
+	}
+	traceID := traceID(r)
+	runID := r.PathValue("runId")
+	err := validateUUID("runId", runID)
+	if err == nil {
+		err = s.authorizeCommandActor(r, command.Actor)
+	}
+	if err == nil {
+		err = validateLockPublication(command)
+	}
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	command.Actor = normalizedActor(command.Actor)
+	idempotency, err := commandIdempotency(
+		r, "run:"+runID+":publication-lock", command,
+	)
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	stored, err := s.store.LockPublication(
+		r.Context(), runID, command, idempotency, traceID,
+	)
+	if err != nil {
+		writeProblem(w, traceID, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, stored.Value)
+}
+
 func (s *Server) listRevisionImpacts(w http.ResponseWriter, r *http.Request) {
 	if !s.requireStore(w, r) {
 		return
@@ -606,6 +684,65 @@ func validateCreateSeries(command CreateSeriesCommand) error {
 		return err
 	}
 	return authorize(ActionCreateSeries, command.Actor)
+}
+
+func validateStartContentCompilation(command StartContentCompilationCommand) error {
+	if command.SchemaVersion != "v1" {
+		return validationError("schemaVersion must be v1")
+	}
+	if err := validateSHA256("sourceHash", command.SourceHash); err != nil {
+		return err
+	}
+	if len(command.Stages) == 0 {
+		return validationError("stages must contain at least one compilation stage")
+	}
+	allowed := map[string]struct{}{
+		"STRUCTURE": {}, "EPISODES": {}, "SCENES": {}, "SHOTS": {},
+	}
+	seen := make(map[string]struct{}, len(command.Stages))
+	for index, stage := range command.Stages {
+		stage = strings.ToUpper(strings.TrimSpace(stage))
+		if _, ok := allowed[stage]; !ok {
+			return validationError("stages contains an unsupported compilation stage")
+		}
+		if _, ok := seen[stage]; ok {
+			return validationError("stages must not contain duplicates")
+		}
+		seen[stage] = struct{}{}
+		command.Stages[index] = stage
+	}
+	if err := validateRoute(command.TextRouteSnapshot); err != nil {
+		return err
+	}
+	if command.TextRouteSnapshot.CapabilityAlias != "text.primary" {
+		return validationError("textRouteSnapshot.capabilityAlias must be text.primary")
+	}
+	return authorize(ActionCompileContent, command.Actor)
+}
+
+func validateLockPublication(command LockPublicationCommand) error {
+	if command.SchemaVersion != "v1" {
+		return validationError("schemaVersion must be v1")
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"manifestId", command.ManifestID},
+		{"qcReportId", command.QCReportID},
+		{"gate3DecisionId", command.Gate3DecisionID},
+	} {
+		if err := validateUUID(field.name, field.value); err != nil {
+			return err
+		}
+	}
+	if err := validateSHA256("manifestHash", command.ManifestHash); err != nil {
+		return err
+	}
+	if err := validateSHA256("qcReportHash", command.QCReportHash); err != nil {
+		return err
+	}
+	return authorize(ActionLockPublication, command.Actor)
 }
 
 func validateCreateSource(command CreateSourceRevisionCommand) error {

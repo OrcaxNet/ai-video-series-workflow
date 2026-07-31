@@ -176,6 +176,32 @@ paths:
           $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/PolicyBlocked"
+  /api/v1/sources/{sourceRevisionId}/compilations:
+    post:
+      tags: [Series]
+      operationId: startContentCompilation
+      x-fr: [FR-P0-02, FR-P0-03, FR-P0-04]
+      description: |
+        Starts provider-neutral structured extraction and dramatization from one
+        authorized immutable source revision. Every returned world, character,
+        relationship, location, prop, episode, scene, and shot revision remains
+        editable only by appending a child revision.
+      parameters:
+        - $ref: "#/components/parameters/SourceRevisionID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartContentCompilationRequest"
+      responses:
+        "202":
+          $ref: "#/components/responses/OperationAccepted"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/PolicyBlocked"
   /api/v1/series/{seriesId}/impacts:
     get:
       tags: [Lineage]
@@ -252,6 +278,37 @@ paths:
               schema:
                 type: string
                 format: uri-reference
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/PolicyBlocked"
+  /api/v1/shots/{shotId}/prompt-snapshots:
+    post:
+      tags: [Production]
+      operationId: compilePromptSnapshot
+      x-fr: [FR-P0-06, FR-P0-07, FR-P0-09, FR-P0-11]
+      description: |
+        Resolves exactly one series, episode, scene, and shot context revision;
+        applies scope allowlists; resolves exact approved asset revisions and
+        predecessor prompt/tail-frame references; then stores an immutable
+        provider-neutral PromptSnapshot.
+      parameters:
+        - $ref: "#/components/parameters/ShotID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/ExpectedRevision"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompilePromptSnapshotRequest"
+      responses:
+        "201":
+          description: Immutable prompt snapshot and effective-context hash
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PromptSnapshot"
         "409":
           $ref: "#/components/responses/Conflict"
         "422":
@@ -353,6 +410,34 @@ paths:
       responses:
         "202":
           $ref: "#/components/responses/OperationAccepted"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/PolicyBlocked"
+  /api/v1/runs/{runId}/publication-lock:
+    post:
+      tags: [Approvals, Lineage]
+      operationId: lockRunForPublication
+      x-fr: [FR-P0-20, FR-P0-22, FR-P0-23]
+      description: |
+        Creates one immutable publication lock only when the run succeeded, the
+        QC report passed and matches, and G3 approved that exact manifest.
+      parameters:
+        - $ref: "#/components/parameters/RunID"
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LockPublicationRequest"
+      responses:
+        "201":
+          description: QC- and G3-bound immutable publication lock
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PublicationLock"
         "409":
           $ref: "#/components/responses/Conflict"
         "422":
@@ -460,6 +545,13 @@ components:
         pattern: '^"[1-9][0-9]*"$'
     SeriesID:
       name: seriesId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    SourceRevisionID:
+      name: sourceRevisionId
       in: path
       required: true
       schema:
@@ -787,6 +879,139 @@ components:
           format: uuid
         actor:
           $ref: "#/components/schemas/Actor"
+    StartContentCompilationRequest:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, sourceHash, stages, textRouteSnapshot, actor]
+      properties:
+        schemaVersion:
+          const: v1
+        sourceHash:
+          $ref: "#/components/schemas/SHA256"
+        stages:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum: [STRUCTURE, EPISODES, SCENES, SHOTS]
+        textRouteSnapshot:
+          $ref: "#/components/schemas/ModelRouteSnapshot"
+        actor:
+          $ref: "#/components/schemas/Actor"
+    CompilePromptSnapshotRequest:
+      type: object
+      additionalProperties: false
+      required:
+        [schemaVersion, shotSpecRevisionId, contextRevisionIds, assetVersionRefs, promptTemplateRef, generationProfileRevisionId, output, actor]
+      properties:
+        schemaVersion:
+          const: v1
+        shotSpecRevisionId:
+          type: string
+          format: uuid
+        contextRevisionIds:
+          type: object
+          additionalProperties: false
+          required: [series, episode, scene, shot]
+          properties:
+            series:
+              type: string
+              format: uuid
+            episode:
+              type: string
+              format: uuid
+            scene:
+              type: string
+              format: uuid
+            shot:
+              type: string
+              format: uuid
+        assetVersionRefs:
+          type: array
+          uniqueItems: true
+          items:
+            type: object
+            additionalProperties: false
+            required: [alias, assetVersionId, role]
+            properties:
+              alias:
+                type: string
+              assetVersionId:
+                type: string
+                format: uuid
+              role:
+                enum: [reference_image, reference_video, reference_audio, first_frame, last_frame]
+        previousPromptSnapshotId:
+          type: string
+          format: uuid
+        tailFrameAssetVersionId:
+          type: string
+          format: uuid
+        promptTemplateRef:
+          type: string
+        generationProfileRevisionId:
+          type: string
+          format: uuid
+        output:
+          $ref: "#/components/schemas/VideoOutputSpec"
+        actor:
+          $ref: "#/components/schemas/Actor"
+    PromptSnapshot:
+      type: object
+      additionalProperties: false
+      required:
+        [promptSnapshotId, shotSpecRevisionId, effectiveContextSnapshotId, compilerVersion, normalizedInputHash, contentHash, inputRevisionHashes, output]
+      properties:
+        promptSnapshotId:
+          type: string
+          format: uuid
+        shotSpecRevisionId:
+          type: string
+          format: uuid
+        effectiveContextSnapshotId:
+          type: string
+          format: uuid
+        compilerVersion:
+          type: string
+        normalizedInputHash:
+          $ref: "#/components/schemas/SHA256"
+        contentHash:
+          $ref: "#/components/schemas/SHA256"
+        inputRevisionHashes:
+          type: object
+          additionalProperties:
+            $ref: "#/components/schemas/SHA256"
+        previousPromptSnapshotId:
+          type: string
+          format: uuid
+        tailFrameHash:
+          $ref: "#/components/schemas/SHA256"
+        output:
+          $ref: "#/components/schemas/VideoOutputSpec"
+    VideoOutputSpec:
+      type: object
+      additionalProperties: false
+      required: [width, height, resolution, aspectRatio, fps, durationMillis, format]
+      properties:
+        width:
+          type: integer
+          minimum: 1
+        height:
+          type: integer
+          minimum: 1
+        resolution:
+          type: string
+        aspectRatio:
+          type: string
+        fps:
+          type: integer
+          minimum: 1
+        durationMillis:
+          type: integer
+          minimum: 1000
+        format:
+          type: string
     StartProductionRequest:
       type: object
       additionalProperties: false
@@ -943,6 +1168,55 @@ components:
                 $ref: "#/components/schemas/SHA256"
         actor:
           $ref: "#/components/schemas/Actor"
+    LockPublicationRequest:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, manifestId, manifestHash, qcReportId, qcReportHash, gate3DecisionId, actor]
+      properties:
+        schemaVersion:
+          const: v1
+        manifestId:
+          type: string
+          format: uuid
+        manifestHash:
+          $ref: "#/components/schemas/SHA256"
+        qcReportId:
+          type: string
+          format: uuid
+        qcReportHash:
+          $ref: "#/components/schemas/SHA256"
+        gate3DecisionId:
+          type: string
+          format: uuid
+        actor:
+          $ref: "#/components/schemas/Actor"
+    PublicationLock:
+      type: object
+      additionalProperties: false
+      required: [publicationLockId, runId, manifestId, manifestHash, qcReportId, qcReportHash, gate3DecisionId, lockedAt]
+      properties:
+        publicationLockId:
+          type: string
+          format: uuid
+        runId:
+          type: string
+          format: uuid
+        manifestId:
+          type: string
+          format: uuid
+        manifestHash:
+          $ref: "#/components/schemas/SHA256"
+        qcReportId:
+          type: string
+          format: uuid
+        qcReportHash:
+          $ref: "#/components/schemas/SHA256"
+        gate3DecisionId:
+          type: string
+          format: uuid
+        lockedAt:
+          type: string
+          format: date-time
     ApprovalDecision:
       allOf:
         - $ref: "#/components/schemas/CreateApprovalDecisionRequest"

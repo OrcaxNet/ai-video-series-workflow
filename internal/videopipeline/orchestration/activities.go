@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/production"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 )
@@ -46,8 +48,9 @@ type WorkflowStepJournal interface {
 // and manifest independently queryable and approvable.
 type ProductionLedger interface {
 	CompilePromptSnapshot(context.Context, WorkflowStep, CompilePromptInput) (PromptSnapshotRef, error)
+	ResolvePromptSnapshot(context.Context, string) (PromptSnapshotRef, error)
 	CreateWorkflowRun(context.Context, WorkflowStep, CreateRunInput) (GenerationRunRef, error)
-	PrepareProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput) error
+	PrepareProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput) (PreparedProviderJob, error)
 	CompleteProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput, ProviderResult) error
 	RecordAutomaticQC(context.Context, WorkflowStep, RunQCInput, QCResult) error
 	OpenShotReview(context.Context, WorkflowStep, CreateReviewInput) error
@@ -85,11 +88,20 @@ type PostProductionLedger interface {
 type Activities struct {
 	ProviderAdapterURL string
 	HTTPClient         *http.Client
+	PromptSource       PromptSource
 	Journal            WorkflowStepJournal
 	Production         ProductionLedger
 	Artifacts          *artifactstore.Store
 	PostProduction     postproduction.Executor
 	PostProductionData PostProductionLedger
+}
+
+// PromptSource loads and compiles exact persisted shot/context/asset
+// revisions. It is used by isolated compiler integrations; persisted workflow
+// executions use ProductionLedger so the full product projection remains
+// transactional and queryable.
+type PromptSource interface {
+	CompilePrompt(context.Context, string, string) (production.PromptSnapshot, error)
 }
 
 // NewActivities creates bounded Activity clients.
@@ -136,10 +148,13 @@ func (a *Activities) ValidateBatch(ctx context.Context, input EpisodeProductionI
 }
 
 // CompilePrompt persists the full effective-context and evidence chain in
-// production. The deterministic fallback is retained for isolated workflow
-// replay tests that intentionally run without the product repository.
+// production. The deterministic fallback is explicitly mock-only and retained
+// for isolated workflow replay tests without the product repository.
 func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput) (PromptSnapshotRef, error) {
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (PromptSnapshotRef, error) {
+		if input.ShotSpecRevisionID == "" || input.GenerationProfileRef == "" {
+			return PromptSnapshotRef{}, errors.New("shotSpecRevisionId and generationProfileRef are required")
+		}
 		if input.PersistProductTruth {
 			if a.Production == nil {
 				return PromptSnapshotRef{}, errors.New("production ledger is required")
@@ -150,12 +165,47 @@ func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput
 			}
 			return a.Production.CompilePromptSnapshot(ctx, step, input)
 		}
-		if input.ShotSpecRevisionID == "" || input.GenerationProfileRef == "" {
-			return PromptSnapshotRef{}, errors.New("shotSpecRevisionId and generationProfileRef are required")
+		if a.PromptSource != nil {
+			snapshot, err := a.PromptSource.CompilePrompt(
+				ctx,
+				input.ShotSpecRevisionID,
+				input.GenerationProfileRef,
+			)
+			if err != nil {
+				return PromptSnapshotRef{}, fmt.Errorf("compile production prompt: %w", err)
+			}
+			if err := snapshot.ValidateIntegrity(); err != nil {
+				return PromptSnapshotRef{}, fmt.Errorf("verify production prompt snapshot: %w", err)
+			}
+			if snapshot.ID == "" || snapshot.ContentHash == "" ||
+				snapshot.ShotRevision.ID != input.ShotSpecRevisionID ||
+				snapshot.GenerationProfileRef != input.GenerationProfileRef {
+				return PromptSnapshotRef{}, errors.New("prompt source returned an unpinned snapshot")
+			}
+			return toPromptSnapshotRef(snapshot), nil
 		}
 		sum := sha256.Sum256([]byte(input.ShotSpecRevisionID + "\x00" + input.GenerationProfileRef))
 		digest := hex.EncodeToString(sum[:])
-		return PromptSnapshotRef{ID: "prompt-" + digest[:16], Digest: digest}, nil
+		contextID := func(scope string) string {
+			value := sha256.Sum256([]byte(scope + "\x00" + input.ShotSpecRevisionID))
+			return "mock-context-" + scope + "-" + hex.EncodeToString(value[:8])
+		}
+		return PromptSnapshotRef{
+			ID:             "mock-prompt-" + digest[:16],
+			Digest:         digest,
+			PositivePrompt: "deterministic mock-only shot " + input.ShotSpecRevisionID,
+			Context: providercontract.ContextRefs{
+				SeriesSnapshotID:  contextID("series"),
+				EpisodeSnapshotID: contextID("episode"),
+				SceneSnapshotID:   contextID("scene"),
+				ShotSnapshotID:    contextID("shot"),
+			},
+			Output: providercontract.OutputSpec{
+				Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+				FPS: 24, DurationMillis: 5_000, Format: "mp4",
+			},
+			InputRevisionHashes: map[string]string{"shot_spec": digest},
+		}, nil
 	})
 }
 
@@ -206,6 +256,7 @@ func (a *Activities) CreateRun(ctx context.Context, input CreateRunInput) (Gener
 func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (ProviderResult, error) {
 		var step WorkflowStep
+		var prepared PreparedProviderJob
 		if input.PersistProductTruth {
 			if a.Production == nil {
 				return ProviderResult{}, errors.New("production ledger is required")
@@ -215,11 +266,32 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 			if err != nil {
 				return ProviderResult{}, err
 			}
-			if err := a.Production.PrepareProviderJob(ctx, step, input); err != nil {
+			exactPrompt, err := a.Production.ResolvePromptSnapshot(ctx, input.Prompt.ID)
+			if err != nil {
+				return ProviderResult{}, classifyPostProductionError(err)
+			}
+			if input.Prompt.ID != exactPrompt.ID || input.Prompt.Digest != exactPrompt.Digest {
+				return ProviderResult{}, temporal.NewNonRetryableApplicationError(
+					"prompt snapshot identity differs from the persisted immutable record",
+					string(controlplane.CodeRevisionConflict),
+					nil,
+				)
+			}
+			if promptSnapshotCarriesExecutionFields(input.Prompt) &&
+				!reflect.DeepEqual(input.Prompt, exactPrompt) {
+				return ProviderResult{}, temporal.NewNonRetryableApplicationError(
+					"prompt snapshot content differs from the persisted immutable record",
+					string(controlplane.CodeRevisionConflict),
+					nil,
+				)
+			}
+			input.Prompt = exactPrompt
+			prepared, err = a.Production.PrepareProviderJob(ctx, step, input)
+			if err != nil {
 				return ProviderResult{}, classifyPostProductionError(err)
 			}
 		}
-		result, err := a.executeProviderJob(ctx, input)
+		result, err := a.executeProviderJob(ctx, input, prepared)
 		if err != nil {
 			return ProviderResult{}, err
 		}
@@ -235,54 +307,99 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 				return ProviderResult{}, errors.New("provider result was not committed to CAS")
 			}
 			if err := a.Production.CompleteProviderJob(ctx, step, input, result); err != nil {
-				return ProviderResult{}, err
+				return ProviderResult{}, classifyPostProductionError(err)
 			}
 		}
 		return result, nil
 	})
 }
 
-func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
+func promptSnapshotCarriesExecutionFields(prompt PromptSnapshotRef) bool {
+	return prompt.PositivePrompt != "" ||
+		prompt.NegativePrompt != "" ||
+		prompt.Context != (providercontract.ContextRefs{}) ||
+		len(prompt.Assets) != 0 ||
+		prompt.Output != (providercontract.OutputSpec{}) ||
+		len(prompt.InputRevisionHashes) != 0
+}
+
+func (a *Activities) executeProviderJob(
+	ctx context.Context,
+	input ExecuteProviderJobInput,
+	prepared PreparedProviderJob,
+) (ProviderResult, error) {
 	if a.HTTPClient == nil {
 		return ProviderResult{}, errors.New("provider HTTP client is required")
 	}
 	activity.RecordHeartbeat(ctx, map[string]any{"phase": "submitting", "runId": input.Run.RunID})
 	jobID := "provider-job-" + input.Run.RunID
+	promptText := input.Prompt.PositivePrompt
+	if input.Prompt.NegativePrompt != "" {
+		promptText += "\nNEGATIVE CONSTRAINTS: " + input.Prompt.NegativePrompt
+	}
+	if promptText == "" {
+		return ProviderResult{}, errors.New("immutable compiled prompt text is required")
+	}
+	outputSpec := input.Prompt.Output
+	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
+		return ProviderResult{}, errors.New("immutable compiled output specification is required")
+	}
+	budget := prepared.Budget
+	budgetReservation := prepared.BudgetReservation
+	if !input.PersistProductTruth {
+		budget = providercontract.BudgetEnvelope{
+			EstimatedCostMicros: input.BudgetMaximumMicros,
+			MaxCostMicros:       input.BudgetMaximumMicros,
+			MaxAttempts:         2,
+		}
+		var err error
+		budgetReservation, err = providercontract.BindBudgetReservation(
+			providercontract.BudgetReservation{
+				ReservationID:  input.BudgetApprovalID,
+				Currency:       input.BudgetCurrency,
+				AmountMicros:   input.BudgetMaximumMicros,
+				PricingVersion: "workflow-approved-v1",
+				ConfirmedBy:    input.BudgetApprovalID,
+			},
+			providercontract.BudgetBindingInput{
+				RunID:     input.Run.RunID,
+				InputHash: input.Run.RunSpecDigest,
+				Model:     input.Route,
+				Budget:    budget,
+			},
+		)
+		if err != nil {
+			return ProviderResult{}, fmt.Errorf("bind budget approval: %w", err)
+		}
+	}
+	if err := budgetReservation.ValidateFor(providercontract.BudgetBindingInput{
+		RunID: input.Run.RunID, InputHash: input.Run.RunSpecDigest,
+		Model: input.Route, Budget: budget,
+	}); err != nil {
+		return ProviderResult{}, fmt.Errorf("validate prepared budget allocation: %w", err)
+	}
+	generationRequest := providercontract.GenerationRequest{
+		RequestID:        jobID,
+		IdempotencyKey:   jobID,
+		Modality:         providercontract.ModalityVideo,
+		Prompt:           promptText,
+		PromptSnapshotID: input.Prompt.ID,
+		Context:          input.Prompt.Context,
+		Assets:           input.Prompt.Assets,
+		Output:           outputSpec,
+		ModelHint:        input.Route.ModelID,
+		Budget:           budget,
+	}
 	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, providercontract.JobRequest{
-		SchemaVersion: "v1",
-		JobID:         jobID,
-		RunID:         input.Run.RunID,
-		Capability:    providercontract.CapabilityVideo,
-		InputHash:     input.Run.RunSpecDigest,
-		Model:         input.Route,
-		Request: providercontract.GenerationRequest{
-			RequestID:        jobID,
-			IdempotencyKey:   jobID,
-			Modality:         providercontract.ModalityVideo,
-			Prompt:           "immutable prompt snapshot " + input.Prompt.Digest,
-			PromptSnapshotID: input.Prompt.ID,
-			Output: providercontract.OutputSpec{
-				Width:          1280,
-				Height:         720,
-				AspectRatio:    "16:9",
-				FPS:            24,
-				DurationMillis: 5_000,
-				Format:         "mp4",
-			},
-			Budget: providercontract.BudgetEnvelope{
-				EstimatedCostMicros: input.BudgetMaximumMicros,
-				MaxCostMicros:       input.BudgetMaximumMicros,
-				MaxAttempts:         2,
-			},
-		},
-		BudgetReservation: providercontract.BudgetReservation{
-			ReservationID:  input.BudgetApprovalID,
-			Currency:       input.BudgetCurrency,
-			AmountMicros:   input.BudgetMaximumMicros,
-			PricingVersion: "workflow-approved-v1",
-			ConfirmedBy:    input.BudgetApprovalID,
-		},
-		TraceID: input.TraceID,
+		SchemaVersion:     "v1",
+		JobID:             jobID,
+		RunID:             input.Run.RunID,
+		Capability:        providercontract.CapabilityVideo,
+		InputHash:         input.Run.RunSpecDigest,
+		Model:             input.Route,
+		Request:           generationRequest,
+		BudgetReservation: budgetReservation,
+		TraceID:           input.TraceID,
 	})
 	if err != nil {
 		return ProviderResult{}, classifyProviderError(err)
@@ -350,6 +467,19 @@ func (a *Activities) executeProviderJob(ctx context.Context, input ExecuteProvid
 		Usage:          result.Usage,
 		Cost:           result.Cost,
 	}, nil
+}
+
+func toPromptSnapshotRef(snapshot production.PromptSnapshot) PromptSnapshotRef {
+	return PromptSnapshotRef{
+		ID:                  snapshot.ID,
+		Digest:              snapshot.ContentHash,
+		PositivePrompt:      snapshot.PositivePrompt,
+		NegativePrompt:      snapshot.NegativePrompt,
+		Context:             snapshot.EffectiveContext.RevisionRefs,
+		Assets:              snapshot.Assets,
+		Output:              snapshot.Output,
+		InputRevisionHashes: snapshot.InputRevisionHashes,
+	}
 }
 
 // RunAutomaticQC is deliberately conservative: a committed, correctly
@@ -623,6 +753,22 @@ func (a *Activities) CancelProviderJob(
 					return CancelProviderResult{}, errors.New("artifact store is required")
 				}
 				providerResult := providerResultFromResponse(response)
+				completionDispatch := input.Dispatch
+				exactPrompt, err := a.Production.ResolvePromptSnapshot(
+					ctx, input.Dispatch.Prompt.ID,
+				)
+				if err != nil {
+					return CancelProviderResult{}, err
+				}
+				if input.Dispatch.Prompt.ID != exactPrompt.ID ||
+					input.Dispatch.Prompt.Digest != exactPrompt.Digest {
+					return CancelProviderResult{},
+						controlplane.NewConflictError(
+							controlplane.CodeRevisionConflict,
+							"cancellation race Prompt differs from the persisted immutable record",
+						)
+				}
+				completionDispatch.Prompt = exactPrompt
 				exists, err := a.Artifacts.Exists(providerResult.ArtifactDigest)
 				if err != nil {
 					return CancelProviderResult{}, fmt.Errorf("verify raced provider artifact in CAS: %w", err)
@@ -630,7 +776,9 @@ func (a *Activities) CancelProviderJob(
 				if !exists {
 					return CancelProviderResult{}, errors.New("raced provider result was not committed to CAS")
 				}
-				if err := a.Production.CompleteProviderJob(ctx, step, input.Dispatch, providerResult); err != nil {
+				if err := a.Production.CompleteProviderJob(
+					ctx, step, completionDispatch, providerResult,
+				); err != nil {
 					return CancelProviderResult{}, err
 				}
 			}
@@ -777,7 +925,10 @@ func classifyPostProductionError(err error) error {
 		switch domainErr.Code {
 		case controlplane.CodeConsentRequired,
 			controlplane.CodeLicenseBlocked,
-			controlplane.CodeBudgetExceeded:
+			controlplane.CodeBudgetExceeded,
+			controlplane.CodeRevisionConflict,
+			controlplane.CodeStaleDependency,
+			controlplane.CodeCapability:
 			return temporal.NewNonRetryableApplicationError(
 				domainErr.Error(),
 				string(domainErr.Code),

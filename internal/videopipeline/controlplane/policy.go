@@ -21,6 +21,7 @@ type Action string
 const (
 	ActionCreateSeries    Action = "series.create"
 	ActionCreateRevision  Action = "revision.create"
+	ActionCompileContent  Action = "content.compile"
 	ActionCreatePlan      Action = "generation_plan.create"
 	ActionStartProduction Action = "production.start"
 	ActionCreateRun       Action = "run.create"
@@ -32,11 +33,13 @@ const (
 	ActionApproveQ1       Action = "approval.q1"
 	ActionApproveG3       Action = "approval.g3"
 	ActionApproveSafety   Action = "approval.safety"
+	ActionLockPublication Action = "publication.lock"
 )
 
 var allowedRoles = map[Action]map[string]struct{}{
 	ActionCreateSeries:    roles("CREATOR", "PRODUCER", "ADMIN"),
 	ActionCreateRevision:  roles("CREATOR", "ARTIST", "PRODUCER", "ADMIN"),
+	ActionCompileContent:  roles("CREATOR", "PRODUCER", "OPERATOR", "ADMIN"),
 	ActionCreatePlan:      roles("PRODUCER", "OPERATOR", "ADMIN"),
 	ActionStartProduction: roles("PRODUCER", "OPERATOR", "ADMIN"),
 	ActionCreateRun:       roles("ARTIST", "PRODUCER", "OPERATOR", "ADMIN"),
@@ -48,6 +51,7 @@ var allowedRoles = map[Action]map[string]struct{}{
 	ActionApproveQ1:       roles("REVIEWER", "DIRECTOR"),
 	ActionApproveG3:       roles("DIRECTOR", "PRODUCER"),
 	ActionApproveSafety:   roles("SAFETY_REVIEWER", "ADMIN"),
+	ActionLockPublication: roles("DIRECTOR", "PRODUCER"),
 }
 
 func roles(values ...string) map[string]struct{} {

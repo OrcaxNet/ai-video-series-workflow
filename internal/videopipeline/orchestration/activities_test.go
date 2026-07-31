@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -36,17 +37,28 @@ type cancellationLedgerFixture struct {
 
 type providerPreparationLedgerFixture struct {
 	ProductionLedger
-	prepareErr   error
-	prepareCalls int
+	resolvedPrompt PromptSnapshotRef
+	resolveErr     error
+	resolveCalls   int
+	prepareErr     error
+	prepareCalls   int
+}
+
+func (l *providerPreparationLedgerFixture) ResolvePromptSnapshot(
+	context.Context,
+	string,
+) (PromptSnapshotRef, error) {
+	l.resolveCalls++
+	return l.resolvedPrompt, l.resolveErr
 }
 
 func (l *providerPreparationLedgerFixture) PrepareProviderJob(
 	context.Context,
 	WorkflowStep,
 	ExecuteProviderJobInput,
-) error {
+) (PreparedProviderJob, error) {
 	l.prepareCalls++
-	return l.prepareErr
+	return PreparedProviderJob{}, l.prepareErr
 }
 
 type postProductionLedgerFixture struct {
@@ -256,7 +268,7 @@ func TestActivities_CompilePromptReplaysWithoutRevalidation(t *testing.T) {
 	if err := encoded.Get(&result); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if result != expected {
+	if !reflect.DeepEqual(result, expected) {
 		t.Fatalf("result = %#v, want %#v", result, expected)
 	}
 	if len(journal.output) != 0 {
@@ -694,6 +706,65 @@ func TestActivities_ExecuteProviderJobPreservesVideoBudgetErrorBeforeProvider(
 	if ledger.prepareCalls != 1 || providerCalls.Load() != 0 {
 		t.Fatalf(
 			"VIDEO budget boundary side effects = prepare:%d provider:%d, want 1/0",
+			ledger.prepareCalls,
+			providerCalls.Load(),
+		)
+	}
+}
+
+func TestActivities_ExecuteProviderJobRejectsTamperedPersistedPromptBeforeProvider(
+	t *testing.T,
+) {
+	t.Parallel()
+	var providerCalls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(
+		response http.ResponseWriter,
+		_ *http.Request,
+	) {
+		providerCalls.Add(1)
+		http.Error(response, "provider must not be called", http.StatusInternalServerError)
+	}))
+	defer provider.Close()
+
+	exact := PromptSnapshotRef{
+		ID:             "prompt-immutable",
+		Digest:         strings.Repeat("a", 64),
+		PositivePrompt: "approved immutable prompt",
+		Context: providercontract.ContextRefs{
+			SeriesSnapshotID: "series-context", EpisodeSnapshotID: "episode-context",
+			SceneSnapshotID: "scene-context", ShotSnapshotID: "shot-context",
+		},
+		Output: providercontract.OutputSpec{
+			Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+			FPS: 24, DurationMillis: 5_000, Format: "mp4",
+		},
+		InputRevisionHashes: map[string]string{"shot_spec": strings.Repeat("b", 64)},
+	}
+	tampered := exact
+	tampered.PositivePrompt = "unapproved tampered prompt"
+	ledger := &providerPreparationLedgerFixture{resolvedPrompt: exact}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.ExecuteProviderJob)
+	_, err := env.ExecuteActivity(activities.ExecuteProviderJob, ExecuteProviderJobInput{
+		Run:                 GenerationRunRef{RunID: "run-prompt-tamper"},
+		Prompt:              tampered,
+		BudgetApprovalID:    "approval-prompt-tamper",
+		BudgetMaximumMicros: 100,
+		BudgetCurrency:      "CNY",
+		TraceID:             "trace-prompt-tamper",
+		PersistProductTruth: true,
+	})
+	assertNonRetryableApplicationError(
+		t,
+		err,
+		string(controlplane.CodeRevisionConflict),
+	)
+	if ledger.resolveCalls != 1 || ledger.prepareCalls != 0 || providerCalls.Load() != 0 {
+		t.Fatalf(
+			"tampered Prompt side effects = resolve:%d prepare:%d provider:%d, want 1/0/0",
+			ledger.resolveCalls,
 			ledger.prepareCalls,
 			providerCalls.Load(),
 		)

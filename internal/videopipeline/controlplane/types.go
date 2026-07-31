@@ -37,6 +37,14 @@ type CreateSourceRevisionCommand struct {
 	Actor            Actor  `json:"actor"`
 }
 
+type StartContentCompilationCommand struct {
+	SchemaVersion     string             `json:"schemaVersion"`
+	SourceHash        string             `json:"sourceHash"`
+	Stages            []string           `json:"stages"`
+	TextRouteSnapshot ModelRouteSnapshot `json:"textRouteSnapshot"`
+	Actor             Actor              `json:"actor"`
+}
+
 type ModelRouteSnapshot struct {
 	CapabilityAlias   string `json:"capabilityAlias"`
 	ProviderProfileID string `json:"providerProfileId"`
@@ -180,6 +188,27 @@ type ApprovalDecision struct {
 	TraceID    string    `json:"traceId"`
 }
 
+type LockPublicationCommand struct {
+	SchemaVersion   string `json:"schemaVersion"`
+	ManifestID      string `json:"manifestId"`
+	ManifestHash    string `json:"manifestHash"`
+	QCReportID      string `json:"qcReportId"`
+	QCReportHash    string `json:"qcReportHash"`
+	Gate3DecisionID string `json:"gate3DecisionId"`
+	Actor           Actor  `json:"actor"`
+}
+
+type PublicationLock struct {
+	PublicationLockID string    `json:"publicationLockId"`
+	RunID             string    `json:"runId"`
+	ManifestID        string    `json:"manifestId"`
+	ManifestHash      string    `json:"manifestHash"`
+	QCReportID        string    `json:"qcReportId"`
+	QCReportHash      string    `json:"qcReportHash"`
+	Gate3DecisionID   string    `json:"gate3DecisionId"`
+	LockedAt          time.Time `json:"lockedAt"`
+}
+
 type Operation struct {
 	OperationID        string    `json:"operationId"`
 	OperationType      string    `json:"operationType"`
@@ -257,6 +286,7 @@ type Store interface {
 	Ping(context.Context) error
 	CreateSeries(context.Context, CreateSeriesCommand, Idempotency, string) (Stored[Operation], error)
 	CreateSourceRevision(context.Context, string, int, CreateSourceRevisionCommand, Idempotency, string) (Stored[Operation], error)
+	StartContentCompilation(context.Context, string, StartContentCompilationCommand, Idempotency, string) (Stored[Operation], error)
 	CreateGenerationPlan(context.Context, CreateGenerationPlanCommand, Idempotency, string) (Stored[GenerationPlan], error)
 	GetGenerationPlan(context.Context, string) (GenerationPlanRecord, error)
 	PrepareProduction(context.Context, string, int, StartProductionCommand, Idempotency, string) (Stored[Operation], error)
@@ -267,6 +297,7 @@ type Store interface {
 	RequestRunCancellation(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
 	RequestRunResume(context.Context, string, int, Actor, string, Idempotency, string) (Stored[Operation], error)
 	CreateApprovalDecision(context.Context, CreateApprovalDecisionCommand, Idempotency, string) (Stored[ApprovalDecision], error)
+	LockPublication(context.Context, string, LockPublicationCommand, Idempotency, string) (Stored[PublicationLock], error)
 	ListRevisionImpacts(context.Context, string, string) ([]FreshnessImpact, error)
 	GetManifest(context.Context, string, string) (GenerationManifest, error)
 	GetOperation(context.Context, string) (Operation, error)
