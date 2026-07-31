@@ -1059,6 +1059,262 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		)
 	}
 
+	costPointer := func(value int64) *int64 {
+		return &value
+	}
+	billingDriftCases := []struct {
+		name string
+		cost providercontract.Cost
+	}{
+		{
+			name: "estimated exceeds reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 51, ActualMicros: costPointer(40),
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		},
+		{
+			name: "actual exceeds reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(51),
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		},
+		{
+			name: "actual is missing",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: nil,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		},
+		{
+			name: "cost is unverified",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(40),
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: false,
+			},
+		},
+		{
+			name: "currency differs from reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(40),
+				Currency: "USD", PricingVersion: "pricing-v1", Verified: true,
+			},
+		},
+		{
+			name: "pricing version differs from reservation",
+			cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: costPointer(40),
+				Currency: "CNY", PricingVersion: "pricing-v2", Verified: true,
+			},
+		},
+	}
+	for _, drift := range billingDriftCases {
+		drift := drift
+		t.Run("provider completion billing drift "+drift.name, func(t *testing.T) {
+			_, driftCommand := cloneIntegrationShotCommand(
+				t, ctx, pool, store, shotID.String(), publicCommand,
+			)
+			_, driftRun, driftDispatch := createIntegrationWorkflowRun(
+				t, ctx, store,
+				"completion-billing-drift-"+strings.ReplaceAll(drift.name, " ", "-"),
+				driftCommand,
+			)
+			driftCAS, err := artifactstore.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			driftArtifact, err := driftCAS.Put(
+				ctx,
+				bytes.NewReader([]byte("billing drift artifact: "+drift.name)),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var providerCalls atomic.Int32
+			driftProvider := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				request *http.Request,
+			) {
+				providerCalls.Add(1)
+				if request.Method != http.MethodPost ||
+					request.URL.Path != "/v1/jobs" {
+					http.NotFound(response, request)
+					return
+				}
+				var job providercontract.JobRequest
+				if err := json.NewDecoder(request.Body).Decode(&job); err != nil {
+					http.Error(response, "invalid fixture request", http.StatusBadRequest)
+					return
+				}
+				response.Header().Set("Content-Type", "application/json")
+				response.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(response).Encode(providercontract.JobResponse{
+					JobID: job.JobID, RunID: job.RunID,
+					UpstreamTaskID: "billing-drift-task-" + driftArtifact.Digest[:12],
+					RequestID:      "billing-drift-request-" + driftArtifact.Digest[:12],
+					State:          providercontract.StatusSucceeded,
+					Progress:       100,
+					Model:          job.Model,
+					Artifacts: []providercontract.AssetRef{{
+						ID:       "billing-drift-asset-" + driftArtifact.Digest[:12],
+						Revision: driftArtifact.Digest, Kind: providercontract.ModalityVideo,
+						Role: providercontract.AssetRoleOutput,
+						URI:  driftArtifact.URI, SHA256: driftArtifact.Digest,
+						LicenseReference: "integration-fixture-license",
+						MediaType:        "video/mp4", SizeBytes: driftArtifact.Size,
+						Width: 1280, Height: 720, DurationMillis: 5_000,
+					}},
+					Usage: providercontract.Usage{
+						InputUnits: 10, OutputUnits: 20, Unit: "mock-units",
+					},
+					Cost: drift.cost,
+				})
+			}))
+			defer driftProvider.Close()
+
+			activities := orchestration.NewProductionActivities(
+				driftProvider.URL, nil, store, driftCAS,
+			)
+			var activitySuite testsuite.WorkflowTestSuite
+			activityEnvironment := activitySuite.NewTestActivityEnvironment()
+			activityEnvironment.RegisterActivity(activities.ExecuteProviderJob)
+			_, activityErr := activityEnvironment.ExecuteActivity(
+				activities.ExecuteProviderJob, driftDispatch,
+			)
+			var applicationErr *temporal.ApplicationError
+			if !errors.As(activityErr, &applicationErr) ||
+				applicationErr.Type() != string(controlplane.CodeBudgetExceeded) ||
+				!applicationErr.NonRetryable() {
+				t.Fatalf(
+					"billing drift Activity error = %#v, want non-retryable %s",
+					activityErr, controlplane.CodeBudgetExceeded,
+				)
+			}
+			if providerCalls.Load() != 1 {
+				t.Fatalf("billing drift Provider calls = %d, want 1", providerCalls.Load())
+			}
+
+			var (
+				runState, runFailureClass, runFailureCode string
+				attemptState, attemptFailureCode          string
+				jobState, jobErrorCode                    string
+				reservationState                          string
+				reservedMicros                            int64
+				actualCount, releaseCount                 int
+				actualMicros, releaseMicros               int64
+				actualCurrency, actualPricing             string
+				actualVerified                            bool
+				artifactCount, runArtifactCount           int
+				qcCount, manifestCount, lockCount         int
+			)
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  gr.state, gr.failure_class, gr.failure_code,
+				  ga.state, ga.failure_code,
+				  pj.state, pj.error_code,
+				  br.status, br.amount_micros,
+				  COUNT(*) FILTER (WHERE cl.entry_type = 'ACTUAL'),
+				  COALESCE(SUM(cl.amount_micros)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), 0),
+				  COALESCE(MAX(cl.currency)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), ''),
+				  COALESCE(MAX(cl.pricing_rule_version)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), ''),
+				  COALESCE(BOOL_AND(cl.verified)
+				    FILTER (WHERE cl.entry_type = 'ACTUAL'), false),
+				  COUNT(*) FILTER (WHERE cl.entry_type = 'RELEASE'),
+				  COALESCE(SUM(cl.amount_micros)
+				    FILTER (WHERE cl.entry_type = 'RELEASE'), 0),
+				  (SELECT COUNT(*) FROM video_pipeline.artifacts
+				   WHERE content_hash = $2),
+				  (SELECT COUNT(*) FROM video_pipeline.run_artifacts
+				   WHERE generation_run_id = gr.id),
+				  (SELECT COUNT(*) FROM video_pipeline.qc_reports
+				   WHERE generation_run_id = gr.id),
+				  (SELECT COUNT(*) FROM video_pipeline.generation_manifests
+				   WHERE scope_revision_id = gr.shot_spec_revision_id),
+				  (SELECT COUNT(*) FROM video_pipeline.publication_locks
+				   WHERE generation_run_id = gr.id)
+				FROM video_pipeline.generation_runs gr
+				JOIN video_pipeline.generation_attempts ga
+				  ON ga.generation_run_id = gr.id
+				JOIN video_pipeline.provider_jobs pj
+				  ON pj.generation_attempt_id = ga.id
+				JOIN video_pipeline.budget_reservations br
+				  ON br.id = pj.budget_reservation_id
+				LEFT JOIN video_pipeline.cost_ledger cl
+				  ON cl.budget_reservation_id = br.id
+				WHERE gr.id = $1
+				GROUP BY gr.id, ga.id, pj.id, br.id`,
+				driftRun.RunID, driftArtifact.Digest,
+			).Scan(
+				&runState, &runFailureClass, &runFailureCode,
+				&attemptState, &attemptFailureCode,
+				&jobState, &jobErrorCode,
+				&reservationState, &reservedMicros,
+				&actualCount, &actualMicros, &actualCurrency,
+				&actualPricing, &actualVerified,
+				&releaseCount, &releaseMicros,
+				&artifactCount, &runArtifactCount,
+				&qcCount, &manifestCount, &lockCount,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if runState != "FAILED" ||
+				runFailureClass != "BUDGET" ||
+				runFailureCode != "BUDGET_EXCEEDED" ||
+				attemptState != "FAILED" ||
+				attemptFailureCode != "BUDGET_EXCEEDED" ||
+				jobState != "FAILED" ||
+				jobErrorCode != "BUDGET_EXCEEDED" {
+				t.Fatalf(
+					"billing drift terminal projection = run:%s/%s/%s attempt:%s/%s job:%s/%s",
+					runState, runFailureClass, runFailureCode,
+					attemptState, attemptFailureCode, jobState, jobErrorCode,
+				)
+			}
+			if reservationState != "SETTLED" || reservedMicros != 50 {
+				t.Fatalf(
+					"billing drift reservation = %s/%d, want SETTLED/50",
+					reservationState, reservedMicros,
+				)
+			}
+			wantActual := drift.cost.EstimatedMicros
+			if drift.cost.ActualMicros != nil {
+				wantActual = *drift.cost.ActualMicros
+			}
+			wantReleaseCount := 0
+			var wantRelease int64
+			if wantActual >= 0 && wantActual < reservedMicros {
+				wantReleaseCount = 1
+				wantRelease = reservedMicros - wantActual
+			}
+			if actualCount != 1 ||
+				actualMicros != wantActual ||
+				actualCurrency != drift.cost.Currency ||
+				actualPricing != drift.cost.PricingVersion ||
+				actualVerified != drift.cost.Verified ||
+				releaseCount != wantReleaseCount ||
+				releaseMicros != wantRelease {
+				t.Fatalf(
+					"billing drift ledger = actual:%d/%d/%s/%s/%t release:%d/%d, want actual:1/%d/%s/%s/%t release:%d/%d",
+					actualCount, actualMicros, actualCurrency, actualPricing,
+					actualVerified, releaseCount, releaseMicros,
+					wantActual, drift.cost.Currency, drift.cost.PricingVersion,
+					drift.cost.Verified, wantReleaseCount, wantRelease,
+				)
+			}
+			if artifactCount != 0 || runArtifactCount != 0 ||
+				qcCount != 0 || manifestCount != 0 || lockCount != 0 {
+				t.Fatalf(
+					"billing drift downstream truth = artifact:%d run-artifact:%d qc:%d manifest:%d lock:%d",
+					artifactCount, runArtifactCount, qcCount, manifestCount, lockCount,
+				)
+			}
+		})
+	}
+
 	_, cancelRaceCommand := cloneIntegrationShotCommand(
 		t, ctx, pool, store, shotID.String(), publicCommand,
 	)

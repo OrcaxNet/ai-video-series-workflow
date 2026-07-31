@@ -307,7 +307,7 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 				return ProviderResult{}, errors.New("provider result was not committed to CAS")
 			}
 			if err := a.Production.CompleteProviderJob(ctx, step, input, result); err != nil {
-				return ProviderResult{}, err
+				return ProviderResult{}, classifyPostProductionError(err)
 			}
 		}
 		return result, nil

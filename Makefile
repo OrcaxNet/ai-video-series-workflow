@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-flo104-mock-evidence video-secret-scan video-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-secret-scan video-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -33,6 +33,9 @@ video-integration-test:
 
 video-postproduction-integration-test:
 	go test -tags=integration ./internal/videopipeline/postproduction
+
+video-migration-v7-rollback-guard-test:
+	./video-pipeline/scripts/test-migration-v7-rollback-guard.sh
 
 video-flo104-mock-evidence:
 	./video-pipeline/scripts/flo104-mock-evidence.sh artifacts/flo104-mock

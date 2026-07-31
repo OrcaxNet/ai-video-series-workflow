@@ -89,4 +89,6 @@ docker exec "${temporal_container}" tctl --address "${temporal_address}" workflo
 workflow_result="$(docker exec "${temporal_container}" tctl --address "${temporal_address}" workflow observe --workflow_id "${workflow_id}")"
 printf '%s' "${workflow_result}" | grep -Fq '"state":"LOCKED"'
 
+./video-pipeline/scripts/test-migration-v7-rollback-guard.sh
+
 echo "video-pipeline smoke passed"

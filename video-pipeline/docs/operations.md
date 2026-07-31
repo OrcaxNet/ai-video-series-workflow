@@ -39,6 +39,57 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 保留数据库证据并以前向修复恢复。`000007` down 只用于没有这些数据的可丢弃测试
 环境，并会在不安全时主动失败。
 
+`golang-migrate` 会在执行 down SQL 前先把目标版本写为 dirty。因此，如果上述安全
+闸门拒绝 `000007 down`，即使第一条保护检查已在任何 DDL 前失败，迁移状态也会显示
+为 `6/dirty`，后续 migration 会被阻断。误触后的恢复流程如下：
+
+1. 继续停止控制面写入和新旧 worker，不重试 down；保留失败日志与数据库备份。
+2. 使用由 Secret 注入、不会打印到日志的 `VIDEO_POSTGRES_DSN` 检查状态：
+
+   ```bash
+   migrate -path ./video-pipeline/db/migrations \
+     -database "$VIDEO_POSTGRES_DSN" version
+   psql "$VIDEO_POSTGRES_DSN" -Atc \
+     "SELECT version, dirty FROM public.schema_migrations;"
+   ```
+
+3. 只有当错误明确是
+   `cannot roll back generation mainline upgrade while GENERATION_PROFILE lineage exists`
+   且以下两项仍保持 v7 形态时，才能判定没有执行部分 down DDL：
+
+   ```sql
+   SELECT pg_get_constraintdef(oid)
+   FROM pg_constraint
+   WHERE conrelid = 'video_pipeline.prompt_snapshot_inputs'::regclass
+     AND conname = 'prompt_snapshot_inputs_input_type_check';
+   -- 结果必须仍包含 GENERATION_PROFILE
+
+   SELECT COUNT(*)
+   FROM pg_constraint
+   WHERE conrelid = 'video_pipeline.publication_locks'::regclass
+     AND conname = 'publication_locks_manifest_id_key';
+   -- v7 结果必须为 0
+   ```
+
+   同时确认触发保护的 lineage/lock 数据仍存在，且表、列和约束与操作前快照一致。
+4. 满足上述全部核验后，只清理迁移工具的 dirty 标记并重新验证：
+
+   ```bash
+   migrate -path ./video-pipeline/db/migrations \
+     -database "$VIDEO_POSTGRES_DSN" force 7
+   migrate -path ./video-pipeline/db/migrations \
+     -database "$VIDEO_POSTGRES_DSN" up
+   psql "$VIDEO_POSTGRES_DSN" -Atc \
+     "SELECT version, dirty FROM public.schema_migrations;"
+   # 必须为 7|f
+   ```
+
+若错误来自创建 `publication_locks_manifest_id_key`，或任一 v7 约束/数据快照发生
+变化，说明 down 可能已部分执行：**不得 `force 7`**。保持停写，从备份恢复或使用
+经审核的前向修复迁移恢复完整 v7 schema。可丢弃环境的自动化证据由
+`make video-migration-v7-rollback-guard-test` 提供；它会断言保护失败产生
+`6/dirty`、相关 DDL/数据未变，再执行 `force 7 → up` 并验证 `7/clean`。
+
 ## 2. 配置
 
 | 环境变量 | 默认 | 说明 |
