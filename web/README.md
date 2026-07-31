@@ -35,9 +35,10 @@ VITE_STUDIO_MODE=live npm run dev
 publication lock 等公开端点，但这些写操作必须绑定 PostgreSQL 中真实存在的
 shot/context/asset/Prompt、冻结 route、预算审批、内容安全、Consent/License 与
 artifact commit。PoC 尚未从真实投影加载这些 UUID，因此 live client 只启用无 Secret
-的 provider discovery；涉及 Mock 投影的 mutation 会 fail closed，不会把 contract-only
-操作显示为已经由真实控制面完成，也不会调用已经移除的直接 Provider Job submit
-路由。
+的 provider discovery；项目创建、G1/G2/G3、Job attempt、Mock 完成、revision
+重生成和并发注入全部在 `fetch` 前 fail closed。客户端不会发送硬编码/Mock UUID、
+全零权利证据、缺失 episode 或非不可变 binding，也不会把 contract-only 操作显示为
+已由真实控制面完成。
 
 ## 页面
 
@@ -72,6 +73,10 @@ artifact commit。PoC 尚未从真实投影加载这些 UUID，因此 live clien
   `(sourceJobId, nextAttempt)` 唯一约束拒绝陈旧 source 重放。
 - `SUCCEEDED`、`FAILED`、`CANCELLED` 是单调终态；晚到 callback、异常注入和批次
   完成均不得覆盖；批次完成和 G3 只计算每个镜头标记为当前的 attempt。
+- Mock G3 不信任 React 按钮状态：Mock control plane 自持 current-attempt 状态，并在
+  批准前再次要求全部 `SUCCEEDED`，以及精确匹配 episode revision、QC report、
+  Manifest 与 artifact 四类不可变 binding。任一任务未完成/失败/取消、binding
+  缺失或 revision/hash 漂移都会返回 409/422。
 - Prompt“回滚”只切换下一次使用的 revision，不删除历史产物、费用或 Manifest。
 - G3 只批准精确 Manifest/QC 绑定；真实发布还必须通过
   `POST /api/v1/runs/{runId}/publication-lock` 生成不可变 publication lock。PoC 的

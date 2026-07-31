@@ -12,11 +12,16 @@ projection 是业务真相，Temporal history 与 Provider SDK 不是 UI 查询�
 |---|---|---|---|
 | 内容与资产 | G1 | 内容结构、资产、许可/同意快照齐全 | world/character/asset revision + content hash |
 | 剧本与分镜 | G2 | G1 APPROVED，脚本、分镜、Prompt/context snapshot 无 stale | episode script/storyboard/prompt revision + content hash |
-| 成片锁版 | G3 | G2 APPROVED，镜头与 QC 完成，字幕/音轨/标识/Manifest 就绪 | episode cut/subtitle/Manifest revision + content hash |
+| 成片锁版 | G3 | G2 APPROVED，当前 attempts 全部成功，QC/Manifest/artifact 就绪 | episode revision/QC/Manifest/artifact + content hash |
 
 后端的 Q1 是逐镜头质量复核，UI 在任务/QC 视图中显示，但不替代三道剧集级闸门。任何角色都不能绕过许可、stale 或预算策略。
 
 审批按钮只在前置完成时可用；这只是即时反馈，控制面仍必须再次执行 RBAC、Gate、freshness、license、budget 和 ETag 校验。409/422 显示稳定 `errorCode`、建议动作与 `traceId`，不回显上游错误体。`REVISION_CONFLICT` 的对账 revision 只读取冻结 Error schema 的 `affectedObjects[].currentRevision`；前端不得自行发明 Gate 查询路由。
+
+Mock control plane 同样执行 G3 真相校验，不依赖 React disabled：它自持每个 shot 的
+current Job 与状态，仅在全部 current attempts 为 `SUCCEEDED`，且请求精确匹配当前
+episode revision、QC report、Manifest、artifact 的 revision/hash 时接受批准。缺失、
+重复或漂移 binding，以及未完成、FAILED、CANCELLED attempt 均在 API 边界拒绝。
 
 ## 2. Provider 与运行状态
 
@@ -51,6 +56,10 @@ Idempotency-Key 与严格递增校验。真实控制面不公开直接 Provider 
 `shotSpecRevisionId`、`promptSnapshotId`、generation profile/plan、冻结
 `routeSnapshot`、`budgetApprovalId` 与 `executionPolicy`。PoC 未加载这些真实绑定时
 必须 fail closed，不能把 Mock 行转换为 live 请求。
+
+这一 live 门禁适用于所有从 Mock state 派生的 mutation，不只 Job attempt：Series
+创建、G1/G2/G3、Mock 完成、revision 重生成和并发注入都在 `fetch` 前返回
+`LIVE_PROJECTION_BINDINGS_REQUIRED`。只有 provider discovery GET 保持启用。
 
 ### 2.1 新 attempt 创作意图幂等
 

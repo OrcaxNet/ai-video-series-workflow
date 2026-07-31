@@ -363,6 +363,7 @@ function reducer(state: StudioState, action: Action): StudioState {
       return toast(
         {
           ...state,
+          busy: false,
           jobs,
           jobsViewState: "READY",
           gates: nextGates,
@@ -717,7 +718,7 @@ interface StudioActions {
   regenerateGate(gateId: GateId): Promise<void>;
   simulateConcurrentUpdate(gateId: GateId): Promise<void>;
   synchronizeGate(gateId: GateId): void;
-  completeMockRun(): void;
+  completeMockRun(): Promise<void>;
   injectScenario(scenario: FailureScenario): void;
   cancelJob(jobId: string): void;
   confirmCancelJob(jobId: string): void;
@@ -887,6 +888,16 @@ export function StudioProvider({
     [handleProblem, state.gates.G1.etag],
   );
 
+  const completeMockRun = useCallback(async () => {
+    dispatch({ type: "BUSY", busy: true });
+    try {
+      await apiRef.current.completeMockRun();
+      dispatch({ type: "COMPLETE_MOCK_RUN" });
+    } catch (error) {
+      handleProblem(error);
+    }
+  }, [handleProblem]);
+
   const createJobAttempt = useCallback(
     async (jobId: string) => {
       const sourceJob = state.jobs.find((job) => job.id === jobId);
@@ -973,7 +984,7 @@ export function StudioProvider({
       regenerateGate,
       simulateConcurrentUpdate,
       synchronizeGate,
-      completeMockRun: () => dispatch({ type: "COMPLETE_MOCK_RUN" }),
+      completeMockRun,
       injectScenario: (scenario) => dispatch({ type: "INJECT_SCENARIO", scenario }),
       cancelJob: (jobId) => dispatch({ type: "CANCEL_JOB", jobId }),
       confirmCancelJob: (jobId) => dispatch({ type: "CONFIRM_CANCEL_JOB", jobId }),
@@ -986,6 +997,7 @@ export function StudioProvider({
       dismissToast: (id) => dispatch({ type: "DISMISS_TOAST", id }),
     }),
     [
+      completeMockRun,
       createJobAttempt,
       createProject,
       decideGate,

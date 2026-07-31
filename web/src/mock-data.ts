@@ -74,9 +74,12 @@ const g2Bindings = [
   binding("PROMPT_SET", "prompts-e03-r3", "Prompt 快照 · r3"),
 ];
 const g3Bindings = [
+  binding("EPISODE_REVISION", "episode-e03-r2", "第 03 集 · revision r2"),
   binding("EPISODE_CUT", "cut-e03-r2", "第 03 集成片 · r2"),
   binding("SUBTITLE", "sub-e03-r3", "中文字幕 · r3"),
+  binding("QC_REPORT", "qc-e03-r2", "画面 / 字幕 / 音轨 QC · passed"),
   binding("MANIFEST", "manifest-e03-r1", "谱系清单 · r1"),
+  binding("ARTIFACT", "artifact-cut-e03-r2", "成片 artifact commit · r2"),
 ];
 
 export const gates: Record<"G1" | "G2" | "G3", Gate> = {

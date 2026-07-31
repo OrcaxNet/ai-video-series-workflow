@@ -27,21 +27,25 @@ const jobAttemptInput = (
   idempotencyKey,
 });
 
+const projectInput = {
+  title: "潮汐失语者 PoC",
+  sourceText: "一段有权改编的原作内容",
+  aspectRatio: "16:9",
+  targetDuration: "03:20",
+  targetAudience: "悬疑剧观众",
+  visualStyle: "沿海现实主义",
+};
+
+const approveUpstreamGates = async (api: MockControlPlaneApi) => {
+  await api.createApproval(input("G1", 7, "g1-before-g3"));
+  await api.createApproval(input("G2", 9, "g2-before-g3"));
+};
+
 describe("MockControlPlaneApi", () => {
   it("creates a project operation from creator inputs without requiring a provider key", async () => {
     const api = new MockControlPlaneApi();
     await expect(
-      api.createSeries(
-        {
-          title: "潮汐失语者 PoC",
-          sourceText: "一段有权改编的原作内容",
-          aspectRatio: "16:9",
-          targetDuration: "03:20",
-          targetAudience: "悬疑剧观众",
-          visualStyle: "沿海现实主义",
-        },
-        "22222222-2222-4222-8222-222222222222",
-      ),
+      api.createSeries(projectInput, "22222222-2222-4222-8222-222222222222"),
     ).resolves.toMatchObject({ state: "ACCEPTED" });
   });
 
@@ -152,6 +156,79 @@ describe("MockControlPlaneApi", () => {
     });
   });
 
+  it("rejects direct G3 approval while current attempts are incomplete", async () => {
+    const api = new MockControlPlaneApi();
+    await approveUpstreamGates(api);
+
+    await expect(api.createApproval(input("G3", 2, "g3-incomplete"))).rejects.toMatchObject({
+      status: 422,
+      errorCode: "G3_RUNS_INCOMPLETE",
+    });
+  });
+
+  it.each(["FAILED", "CANCELLED"] as const)(
+    "rejects direct G3 approval while a current attempt is %s",
+    async (state) => {
+      const jobSeed = jobs.map((job) => ({
+        ...job,
+        state: (job.id === "job-v-032" ? state : "SUCCEEDED") as typeof job.state,
+      }));
+      const api = new MockControlPlaneApi(gates, jobSeed);
+      await approveUpstreamGates(api);
+
+      await expect(
+        api.createApproval(input("G3", 2, `g3-${state.toLowerCase()}`)),
+      ).rejects.toMatchObject({
+        status: 422,
+        errorCode: "G3_TERMINAL_ATTEMPT_BLOCKED",
+      });
+    },
+  );
+
+  it.each(["EPISODE_REVISION", "QC_REPORT", "MANIFEST", "ARTIFACT"] as const)(
+    "rejects direct G3 approval without the exact %s binding",
+    async (missingType) => {
+      const jobSeed = jobs.map((job) => ({ ...job, state: "SUCCEEDED" as const }));
+      const api = new MockControlPlaneApi(gates, jobSeed);
+      await approveUpstreamGates(api);
+      const g3Input = input("G3", 2, `g3-missing-${missingType.toLowerCase()}`);
+      g3Input.bindings = g3Input.bindings.filter((binding) => binding.objectType !== missingType);
+
+      await expect(api.createApproval(g3Input)).rejects.toMatchObject({
+        status: 422,
+        errorCode: "G3_BINDING_REQUIRED",
+      });
+    },
+  );
+
+  it("rejects G3 when an immutable evidence revision differs from control-plane truth", async () => {
+    const jobSeed = jobs.map((job) => ({ ...job, state: "SUCCEEDED" as const }));
+    const api = new MockControlPlaneApi(gates, jobSeed);
+    await approveUpstreamGates(api);
+    const g3Input = input("G3", 2, "g3-evidence-conflict");
+    g3Input.bindings = g3Input.bindings.map((binding) =>
+      binding.objectType === "MANIFEST"
+        ? { ...binding, revisionId: "manifest-e03-stale" }
+        : binding,
+    );
+
+    await expect(api.createApproval(g3Input)).rejects.toMatchObject({
+      status: 409,
+      errorCode: "G3_BINDING_CONFLICT",
+    });
+  });
+
+  it("approves G3 only after the Mock control plane records successful attempts and exact evidence", async () => {
+    const api = new MockControlPlaneApi();
+    await approveUpstreamGates(api);
+    await api.completeMockRun();
+
+    await expect(api.createApproval(input("G3", 2, "g3-complete"))).resolves.toMatchObject({
+      gate: "G3",
+      decision: "APPROVED",
+    });
+  });
+
   it.each(["FAILED", "CANCELLED"] as const)(
     "creates a distinct current Job for a %s creative redo without mutating the source",
     async (state) => {
@@ -256,42 +333,62 @@ describe("HttpControlPlaneApi", () => {
     vi.unstubAllGlobals();
   });
 
-  it("uses the frozen conflict payload and never calls an invented gate read route", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          type: "https://errors.example/revision-conflict",
-          title: "Revision conflict",
-          status: 409,
-          detail: "G1 changed",
-          errorCode: "REVISION_CONFLICT",
-          retryable: false,
-          traceId: "trc-live-conflict",
-          suggestedAction: "Reconcile from affected objects",
-          affectedObjects: [{ objectType: "GATE", objectId: "G1", currentRevision: 12 }],
-        }),
-        { status: 409, headers: { "Content-Type": "application/problem+json" } },
-      ),
-    );
-    vi.stubGlobal("fetch", fetchMock);
-    const api = new HttpControlPlaneApi("/api/v1");
-
-    const conflict = await api.createApproval(input("G1", 7, "live-stale")).catch((error: unknown) => error);
-
-    expect(conflict).toBeInstanceOf(ApiProblem);
-    expect((conflict as ApiProblem).affectedObjects[0]?.currentRevision).toBe(12);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/approvals");
-  });
-
-  it("fails closed instead of submitting a mock projection to the removed provider-jobs route", async () => {
+  it("fails closed before fetch when a Mock-derived project is submitted in live mode", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     const api = new HttpControlPlaneApi("/api/v1");
 
-    await expect(api.createJobAttempt(jobAttemptInput("FAILED", "live-attempt"))).rejects.toMatchObject({
+    await expect(api.createSeries(projectInput, "live-project")).rejects.toMatchObject({
       status: 501,
-      errorCode: "LIVE_RUN_BINDINGS_REQUIRED",
+      errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["G1", "G2", "G3"] as const)(
+    "fails closed before fetch when Mock-derived %s approval is submitted in live mode",
+    async (gateId) => {
+      const fetchMock = vi.fn();
+      vi.stubGlobal("fetch", fetchMock);
+      const api = new HttpControlPlaneApi("/api/v1");
+
+      await expect(
+        api.createApproval(input(gateId, gates[gateId].etag, `live-${gateId}`)),
+      ).rejects.toMatchObject({
+        status: 501,
+        errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
+      });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("fails closed before fetch when a Mock-derived Job attempt is submitted in live mode", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("/api/v1");
+
+    await expect(
+      api.createJobAttempt(jobAttemptInput("FAILED", "live-attempt")),
+    ).rejects.toMatchObject({
+      status: 501,
+      errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("fails closed before fetch for every remaining Mock-only control mutation", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("/api/v1");
+
+    await expect(api.completeMockRun()).rejects.toMatchObject({
+      errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
+    });
+    await expect(api.regenerateGate("G1", 7)).rejects.toMatchObject({
+      errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
+    });
+    await expect(api.simulateConcurrentUpdate("G1")).rejects.toMatchObject({
+      errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
     });
     expect(fetchMock).not.toHaveBeenCalled();
   });

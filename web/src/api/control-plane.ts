@@ -9,6 +9,7 @@ import {
   type Gate,
   type GateId,
   type ProviderCapability,
+  type ProviderJob,
   type RegenerationResult,
 } from "../domain";
 import {
@@ -22,6 +23,7 @@ export interface ControlPlaneApi {
   createSeries(input: CreateProjectInput, idempotencyKey: string): Promise<CreateProjectResult>;
   createApproval(input: ApprovalInput): Promise<ApprovalResult>;
   createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult>;
+  completeMockRun(): Promise<void>;
   regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult>;
   simulateConcurrentUpdate(gateId: GateId): Promise<number>;
 }
@@ -64,6 +66,26 @@ const jobAttemptFingerprint = (input: CreateJobAttemptInput) =>
     model: input.sourceJob.model,
   });
 
+const requiredG3BindingTypes = [
+  "EPISODE_REVISION",
+  "QC_REPORT",
+  "MANIFEST",
+  "ARTIFACT",
+] as const;
+
+const bindingFingerprint = (bindings: ApprovalInput["bindings"]) =>
+  bindings
+    .map((binding) => [binding.objectType, binding.revisionId, binding.contentHash].join(":"))
+    .sort();
+
+const liveMutationBlocked = (operation: string) =>
+  problem(
+    501,
+    "LIVE_PROJECTION_BINDINGS_REQUIRED",
+    `${operation} 仍绑定 Mock projection，真实写操作已在网络请求前阻断。`,
+    "先从控制面加载并校验真实 series/episode、rights/profile、immutable revision、route、budget 与 policy 绑定，再开放对应 mutation。",
+  );
+
 export class MockControlPlaneApi implements ControlPlaneApi {
   private gates: Record<GateId, Gate>;
   private idempotency = new Map<string, { fingerprint: string; result: ApprovalResult }>();
@@ -74,14 +96,19 @@ export class MockControlPlaneApi implements ControlPlaneApi {
   >();
   private currentJobByShot = new Map<string, string>();
   private attemptByJobId = new Map<string, number>();
+  private jobStateById = new Map<string, ProviderJob["state"]>();
   private generationAttemptOwners = new Map<string, string>();
   private staleGates = new Set<GateId>();
 
-  constructor(seed: Record<GateId, Gate> = fixtureGates) {
+  constructor(
+    seed: Record<GateId, Gate> = fixtureGates,
+    jobSeed: ProviderJob[] = fixtureJobs,
+  ) {
     this.gates = structuredClone(seed);
-    fixtureJobs.forEach((job) => {
+    jobSeed.forEach((job) => {
       if (job.isCurrentAttempt) this.currentJobByShot.set(job.shotId, job.id);
       this.attemptByJobId.set(job.id, job.attempt);
+      this.jobStateById.set(job.id, job.state);
     });
   }
 
@@ -139,6 +166,9 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     ) {
       throw problem(422, "GATE_REQUIRED", "上游审核尚未完成，不能锁定成片。", "先完成 G1 和 G2。");
     }
+    if (input.gateId === "G3" && input.decision === "APPROVED") {
+      this.assertG3ApprovalTruth(input);
+    }
     if (gate.state === "BLOCKED") {
       throw problem(422, "GATE_REQUIRED", `${input.gateId} 仍被上游条件阻断。`, "检查审核链与任务终态。");
     }
@@ -167,7 +197,7 @@ export class MockControlPlaneApi implements ControlPlaneApi {
       this.gates.G2.state = "PENDING";
     }
     if (input.decision === "APPROVED" && input.gateId === "G2") {
-      this.gates.G3.state = "PENDING";
+      this.gates.G3.state = this.isG3TruthReady() ? "PENDING" : "BLOCKED";
     }
     if (input.decision === "RETURNED" && input.gateId === "G1") {
       this.gates.G2.state = "BLOCKED";
@@ -265,8 +295,22 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     });
     this.currentJobByShot.set(input.sourceJob.shotId, result.providerJobId);
     this.attemptByJobId.set(result.providerJobId, input.nextAttempt);
+    this.jobStateById.set(input.sourceJob.id, input.sourceJob.state);
+    this.jobStateById.set(result.providerJobId, result.state);
     this.generationAttemptOwners.set(input.generationAttemptId, intentKey);
     return structuredClone(result);
+  }
+
+  async completeMockRun(): Promise<void> {
+    await Promise.resolve();
+    for (const jobId of this.currentJobByShot.values()) {
+      const state = this.jobStateById.get(jobId);
+      if (state !== "FAILED" && state !== "CANCELLED") {
+        this.jobStateById.set(jobId, "SUCCEEDED");
+      }
+    }
+    this.gates.G3.state =
+      this.gates.G2.state === "APPROVED" && this.isG3TruthReady() ? "PENDING" : "BLOCKED";
   }
 
   async regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult> {
@@ -313,6 +357,72 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     return this.gates[gateId].etag;
   }
 
+  private currentJobStates() {
+    return Array.from(this.currentJobByShot.values(), (jobId) => ({
+      jobId,
+      state: this.jobStateById.get(jobId),
+    }));
+  }
+
+  private hasCompleteG3Bindings(bindings: ApprovalInput["bindings"]) {
+    return requiredG3BindingTypes.every(
+      (objectType) => bindings.filter((binding) => binding.objectType === objectType).length === 1,
+    );
+  }
+
+  private isG3TruthReady() {
+    const currentJobs = this.currentJobStates();
+    return (
+      currentJobs.length > 0 &&
+      currentJobs.every((job) => job.state === "SUCCEEDED") &&
+      this.hasCompleteG3Bindings(this.gates.G3.bindings)
+    );
+  }
+
+  private assertG3ApprovalTruth(input: ApprovalInput) {
+    const currentJobs = this.currentJobStates();
+    const terminalBlockers = currentJobs.filter(
+      (job) => job.state === "FAILED" || job.state === "CANCELLED",
+    );
+    if (terminalBlockers.length > 0) {
+      throw problem(
+        422,
+        "G3_TERMINAL_ATTEMPT_BLOCKED",
+        `当前批次仍有 ${terminalBlockers.length} 个 FAILED/CANCELLED attempt。`,
+        "为每个失败或取消的当前任务创建并完成新 attempt；历史终态保持只读。",
+      );
+    }
+    if (currentJobs.length === 0 || currentJobs.some((job) => job.state !== "SUCCEEDED")) {
+      throw problem(
+        422,
+        "G3_RUNS_INCOMPLETE",
+        "当前批次的全部 current attempts 尚未成功，不能批准 G3。",
+        "等待所有当前 GenerationRun/ProviderJob 达到 SUCCEEDED 后重新审核。",
+      );
+    }
+    if (
+      !this.hasCompleteG3Bindings(this.gates.G3.bindings) ||
+      !this.hasCompleteG3Bindings(input.bindings)
+    ) {
+      throw problem(
+        422,
+        "G3_BINDING_REQUIRED",
+        "G3 必须精确绑定 episode revision、QC report、Manifest 与 artifact。",
+        "重新加载当前成片投影，并提交四类不可变 binding。",
+      );
+    }
+    if (
+      bindingFingerprint(input.bindings).join("|") !==
+      bindingFingerprint(this.gates.G3.bindings).join("|")
+    ) {
+      throw problem(
+        409,
+        "G3_BINDING_CONFLICT",
+        "G3 请求绑定与控制面当前 episode/QC/Manifest/artifact 真相不一致。",
+        "刷新成片谱系，核对精确 revision 与 content hash 后重新提交。",
+      );
+    }
+  }
 }
 
 interface ProviderStatusResponse {
@@ -336,89 +446,34 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
   }
 
   async createSeries(input: CreateProjectInput, idempotencyKey: string): Promise<CreateProjectResult> {
-    const response = await fetch(`${this.baseUrl}/series`, {
-      method: "POST",
-      credentials: "omit",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "Idempotency-Key": idempotencyKey,
-      },
-      body: JSON.stringify({
-        schemaVersion: "v1",
-        title: input.title,
-        generationProfileRevisionId: "00000000-0000-4000-8000-000000000101",
-        rightsDeclaration: {
-          basis: "creator_declared",
-          evidenceArtifactHash: "0".repeat(64),
-        },
-        actor: { actorId: "local-creator", role: "CREATOR" },
-      }),
-    });
-    if (!response.ok) {
-      throw await this.readProblem(response);
-    }
-    const operation = (await response.json()) as {
-      operationId: string;
-      aggregateId: string;
-      state: "ACCEPTED";
-      traceId: string;
-    };
-    return {
-      operationId: operation.operationId,
-      seriesId: operation.aggregateId,
-      state: operation.state,
-      traceId: operation.traceId,
-    };
+    void input;
+    void idempotencyKey;
+    throw liveMutationBlocked("创建 Series");
   }
 
   async createApproval(input: ApprovalInput): Promise<ApprovalResult> {
-    const response = await fetch(`${this.baseUrl}/approvals`, {
-      method: "POST",
-      credentials: "omit",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "Idempotency-Key": input.idempotencyKey,
-      },
-      body: JSON.stringify({
-        schemaVersion: "v1",
-        seriesId: "series-tide-001",
-        gate: input.gateId,
-        decision: input.decision,
-        reasonCode: input.decision === "APPROVED" ? "creator_approved" : "creator_returned",
-        explanation: input.explanation,
-        bindings: input.bindings,
-        actor: { actorId: "local-creator", role: "DIRECTOR" },
-      }),
-    });
-    if (!response.ok) {
-      throw await this.readProblem(response);
-    }
-    return (await response.json()) as ApprovalResult;
+    void input;
+    throw liveMutationBlocked("提交 Gate 审核");
   }
 
   async createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult> {
     void input;
-    throw problem(
-      501,
-      "LIVE_RUN_BINDINGS_REQUIRED",
-      "真实控制面已收口为 GenerationRun 命令，不能从 Mock Provider Job 投影直接创建新 attempt。",
-      "先持久化 shotSpec、PromptSnapshot、route、budget、safety/consent/license 绑定，再通过 POST /shots/{shotId}/runs 提交；当前操作仅支持 Mock 排练。",
-    );
+    throw liveMutationBlocked("创建 GenerationRun attempt");
   }
 
-  async regenerateGate(): Promise<RegenerationResult> {
-    throw problem(
-      501,
-      "CAPABILITY_UNAVAILABLE",
-      "当前冻结 OpenAPI 尚未提供通用 Gate 重生成端点。",
-      "由对应内容 revision API 创建新版本后重新绑定 Gate。",
-    );
+  async completeMockRun(): Promise<void> {
+    throw liveMutationBlocked("完成 Mock 排练");
   }
 
-  async simulateConcurrentUpdate(): Promise<number> {
-    throw problem(501, "CAPABILITY_UNAVAILABLE", "真实控制面不提供测试注入。", "仅在 Mock 场景中使用此操作。");
+  async regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult> {
+    void gateId;
+    void expectedRevision;
+    throw liveMutationBlocked("重生成 Gate revision");
+  }
+
+  async simulateConcurrentUpdate(gateId: GateId): Promise<number> {
+    void gateId;
+    throw liveMutationBlocked("注入并发更新");
   }
 
   private async readProblem(response: Response) {
