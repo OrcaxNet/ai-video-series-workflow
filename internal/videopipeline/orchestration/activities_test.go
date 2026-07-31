@@ -727,6 +727,7 @@ func TestActivities_CreateGate3PreservesRightsErrorContract(t *testing.T) {
 
 func TestActivities_ExecuteProviderJobUsesLiveAdapterAndReturnsMeasuredCASArtifact(t *testing.T) {
 	t.Parallel()
+	const serviceAuthSecret = "test-service-auth-secret-32-bytes-long"
 	download := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "video/mp4")
 		_, _ = w.Write([]byte("synthetic-live-activity-video"))
@@ -742,6 +743,7 @@ func TestActivities_ExecuteProviderJobUsesLiveAdapterAndReturnsMeasuredCASArtifa
 		VideoModel: "doubao-seedance-2.0", PlanName: "agent-plan-large",
 		PricingVersion: "agent-plan-large-included-v1", Currency: "CNY",
 		MaxDownloadBytes: 1 << 20, DownloadTimeout: 5 * time.Second,
+		ServiceAuthSecret: serviceAuthSecret,
 	}, provider, store, volcengineprovider.Options{
 		DownloadClient: download.Client(), Inspector: activityLiveInspector{},
 	})
@@ -753,6 +755,10 @@ func TestActivities_ExecuteProviderJobUsesLiveAdapterAndReturnsMeasuredCASArtifa
 	capability := sha256.Sum256([]byte("volcengine-agent-plan-large\x00doubao-seedance-2.0"))
 	inputDigest := sha256.Sum256([]byte("immutable activity live input"))
 	activities := NewActivities(server.URL)
+	activities.HTTPClient, err = volcengineprovider.AuthenticatedHTTPClient(activities.HTTPClient, serviceAuthSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
 	input := ExecuteProviderJobInput{
 		Run: GenerationRunRef{
 			RunID: "live-activity-run", RunSpecDigest: hex.EncodeToString(inputDigest[:]), Attempt: 1,

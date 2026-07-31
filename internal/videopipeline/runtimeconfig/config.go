@@ -37,13 +37,14 @@ type ControlPlane struct {
 
 // OrchestratorWorker configures the Temporal workflow worker.
 type OrchestratorWorker struct {
-	TemporalAddress          string
-	Namespace                string
-	TaskQueue                string
-	ProviderAdapterURL       string
-	SpeechProviderAdapterURL string
-	PostgresDSN              string
-	ArtifactRoot             string
+	TemporalAddress           string
+	Namespace                 string
+	TaskQueue                 string
+	ProviderAdapterURL        string
+	ProviderServiceAuthSecret string
+	SpeechProviderAdapterURL  string
+	PostgresDSN               string
+	ArtifactRoot              string
 }
 
 // MockProvider configures the deterministic, no-key provider fixture.
@@ -57,19 +58,20 @@ type MockProvider struct {
 // VolcengineProvider configures the credential-isolated Agent Plan adapter.
 // APIKey is retained only in memory and must never be logged or serialized.
 type VolcengineProvider struct {
-	HTTPAddress      string
-	ArtifactRoot     string
-	ProviderID       string
-	BaseURL          string
-	APIKey           string
-	Region           string
-	VideoModel       string
-	PlanName         string
-	PricingVersion   string
-	Currency         string
-	MaxDownloadBytes int64
-	RequestTimeout   time.Duration
-	DownloadTimeout  time.Duration
+	HTTPAddress       string
+	ArtifactRoot      string
+	ProviderID        string
+	BaseURL           string
+	APIKey            string
+	ServiceAuthSecret string
+	Region            string
+	VideoModel        string
+	PlanName          string
+	PricingVersion    string
+	Currency          string
+	MaxDownloadBytes  int64
+	RequestTimeout    time.Duration
+	DownloadTimeout   time.Duration
 }
 
 // LoadControlPlane reads namespaced settings with safe local defaults.
@@ -143,12 +145,13 @@ func loadControlPlane(lookup LookupEnv) (ControlPlane, error) {
 // LoadOrchestratorWorker reads Temporal worker settings.
 func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 	cfg := OrchestratorWorker{
-		TemporalAddress:          value(os.LookupEnv, "VIDEO_TEMPORAL_ADDRESS", "temporal:7233"),
-		Namespace:                value(os.LookupEnv, "VIDEO_TEMPORAL_NAMESPACE", "default"),
-		TaskQueue:                value(os.LookupEnv, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
-		ProviderAdapterURL:       value(os.LookupEnv, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
-		SpeechProviderAdapterURL: value(os.LookupEnv, "VIDEO_SPEECH_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
-		ArtifactRoot:             value(os.LookupEnv, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
+		TemporalAddress:           value(os.LookupEnv, "VIDEO_TEMPORAL_ADDRESS", "temporal:7233"),
+		Namespace:                 value(os.LookupEnv, "VIDEO_TEMPORAL_NAMESPACE", "default"),
+		TaskQueue:                 value(os.LookupEnv, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
+		ProviderAdapterURL:        value(os.LookupEnv, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
+		ProviderServiceAuthSecret: value(os.LookupEnv, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
+		SpeechProviderAdapterURL:  value(os.LookupEnv, "VIDEO_SPEECH_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
+		ArtifactRoot:              value(os.LookupEnv, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
 	}
 	if err := validateDialAddress(cfg.TemporalAddress); err != nil {
 		return OrchestratorWorker{}, fmt.Errorf("VIDEO_TEMPORAL_ADDRESS: %w", err)
@@ -205,19 +208,20 @@ func LoadVolcengineProvider() (VolcengineProvider, error) {
 
 func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	cfg := VolcengineProvider{
-		HTTPAddress:      value(lookup, "VIDEO_VOLCENGINE_PROVIDER_HTTP_ADDRESS", ":8091"),
-		ArtifactRoot:     value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
-		ProviderID:       value(lookup, "VIDEO_VOLCENGINE_PROVIDER_ID", "volcengine-agent-plan-large"),
-		BaseURL:          value(lookup, "VIDEO_VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3"),
-		APIKey:           value(lookup, "ARK_API_KEY", ""),
-		Region:           value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
-		VideoModel:       value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
-		PlanName:         value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),
-		PricingVersion:   value(lookup, "VIDEO_VOLCENGINE_PRICING_VERSION", "agent-plan-large-included-v1"),
-		Currency:         value(lookup, "VIDEO_VOLCENGINE_CURRENCY", "CNY"),
-		MaxDownloadBytes: 256 << 20,
-		RequestTimeout:   2 * time.Minute,
-		DownloadTimeout:  2 * time.Minute,
+		HTTPAddress:       value(lookup, "VIDEO_VOLCENGINE_PROVIDER_HTTP_ADDRESS", ":8091"),
+		ArtifactRoot:      value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
+		ProviderID:        value(lookup, "VIDEO_VOLCENGINE_PROVIDER_ID", "volcengine-agent-plan-large"),
+		BaseURL:           value(lookup, "VIDEO_VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+		APIKey:            value(lookup, "ARK_API_KEY", ""),
+		ServiceAuthSecret: value(lookup, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
+		Region:            value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
+		VideoModel:        value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
+		PlanName:          value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),
+		PricingVersion:    value(lookup, "VIDEO_VOLCENGINE_PRICING_VERSION", "agent-plan-large-included-v1"),
+		Currency:          value(lookup, "VIDEO_VOLCENGINE_CURRENCY", "CNY"),
+		MaxDownloadBytes:  256 << 20,
+		RequestTimeout:    2 * time.Minute,
+		DownloadTimeout:   2 * time.Minute,
 	}
 	var err error
 	if cfg.MaxDownloadBytes, err = positiveInt64(lookup, "VIDEO_VOLCENGINE_MAX_DOWNLOAD_BYTES", cfg.MaxDownloadBytes); err != nil {
@@ -237,6 +241,9 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	}
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return VolcengineProvider{}, errors.New("ARK_API_KEY is required for the live provider adapter")
+	}
+	if len(cfg.ServiceAuthSecret) < 32 {
+		return VolcengineProvider{}, errors.New("VIDEO_PROVIDER_SERVICE_AUTH_SECRET must contain at least 32 bytes")
 	}
 	if strings.TrimSpace(cfg.ArtifactRoot) == "" || strings.TrimSpace(cfg.ProviderID) == "" ||
 		strings.TrimSpace(cfg.Region) == "" || strings.TrimSpace(cfg.VideoModel) == "" ||

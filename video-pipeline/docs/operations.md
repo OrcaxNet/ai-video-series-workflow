@@ -106,6 +106,7 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 | `VIDEO_SPEECH_PROVIDER_ADAPTER_URL` | `http://mock-provider:8090` | 可与真实视频 Adapter 分离的语音 Adapter |
 | `VIDEO_ARTIFACT_ROOT` | `/var/lib/video-pipeline/artifacts` | 本地 CAS |
 | `ARK_API_KEY` | 未设置 | 火山方舟；只显式注入 |
+| `VIDEO_PROVIDER_SERVICE_AUTH_SECRET` | 未设置 | Live Adapter 内部 HMAC 服务认证；至少 32 bytes，只通过 Secret manager 注入 |
 | `VIDEO_VOLCENGINE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | Agent Plan 数据面；不得写入 Manifest/BOM |
 | `VIDEO_VOLCENGINE_VIDEO_MODEL` | `doubao-seedance-2.0` | 冻结真实视频模型 |
 | `VIDEO_VOLCENGINE_PLAN` | `agent-plan-large` | 套餐计费模式标识 |
@@ -134,14 +135,23 @@ Mock，Mock/Live 证据边界不变。Adapter 同时兼容 Agent Plan 顶层
 下载；成功响应仅返回 `cas://sha256/...`。
 
 ```bash
-# ARK_API_KEY 由运行环境注入，不写入 .env.video 或命令输出。
+# ARK_API_KEY 与 VIDEO_PROVIDER_SERVICE_AUTH_SECRET 均由运行环境注入，
+# 不写入 .env.video、命令输出、Manifest 或日志。
 make video-live-provider-up
 VIDEO_BUILD_VERSION=<fixed-sha> make video-live-probe
 ```
 
+Live Adapter 不发布宿主机端口，只在 Compose `video-backplane` 内通过服务名访问。
+除 `/health/live` 与 `/health/ready` 外，所有 `/v1/*` 请求必须携带 2 分钟有效、
+body hash 与随机 nonce 绑定的 HMAC 服务签名；缺失、过期、篡改或重放请求会在任何
+Provider submit/poll/cancel 前返回 `401 unauthenticated`。该签名 Secret 与
+`ARK_API_KEY` 分离，Worker/单次探针只持有前者，只有 Adapter 持有后者。
+
 `video-live-probe` 固定为一个 1280×720、24 fps、5 秒、无同步音频的原创抽象
 镜头，`maxAttempts=1`。输出目录带原子单次提交锁；即使任务失败，也不能在同一
-目录重提。成功后产出 MP4、Generation Manifest、Service BOM 与脱敏结果 JSON。
+目录重提。成功后会把 Manifest 声明的每个 CAS output 都复制到证据目录；当前包括
+MP4 与 `last-frame.jpg`，并在 probe result 的 `files`/`artifacts` 和 Service BOM 的
+`artifacts` 中记录文件名、角色、媒体类型、字节数与 SHA-256。
 Adapter 在返回成功前使用 ffprobe 实测分辨率/FPS/时长并提交 CAS；任务 ID、
 请求 ID、token 用量和套餐成本语义进入证据。Agent Plan 未返回逐任务货币价格时，
 成本记录为 `subscription_included`、实际增量 `0 CNY`、

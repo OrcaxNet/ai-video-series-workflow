@@ -38,6 +38,7 @@ type Server struct {
 	store          *artifactstore.Store
 	downloadClient *http.Client
 	inspector      MediaInspector
+	authenticator  *serviceAuthenticator
 	now            func() time.Time
 	stateDir       string
 
@@ -76,9 +77,13 @@ func New(
 	if err := os.MkdirAll(stateDir, 0o750); err != nil {
 		return nil, fmt.Errorf("create live provider job registry: %w", err)
 	}
+	authenticator, err := newServiceAuthenticator(config.ServiceAuthSecret, time.Now)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		config: config, provider: provider, store: store,
-		downloadClient: client, inspector: inspector, now: now,
+		downloadClient: client, inspector: inspector, authenticator: authenticator, now: now,
 		stateDir: stateDir, jobs: make(map[string]*jobRecord),
 	}, nil
 }
@@ -87,11 +92,11 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health/live", s.health)
 	mux.HandleFunc("GET /health/ready", s.health)
-	mux.HandleFunc("GET /v1/capabilities", s.capabilities)
-	mux.HandleFunc("POST /v1/estimates", s.estimate)
-	mux.HandleFunc("POST /v1/jobs", s.createJob)
-	mux.HandleFunc("GET /v1/jobs/{jobID}", s.getJob)
-	mux.HandleFunc("POST /v1/jobs/{jobID}/cancel", s.cancelJob)
+	mux.Handle("GET /v1/capabilities", s.authenticator.middleware(http.HandlerFunc(s.capabilities)))
+	mux.Handle("POST /v1/estimates", s.authenticator.middleware(http.HandlerFunc(s.estimate)))
+	mux.Handle("POST /v1/jobs", s.authenticator.middleware(http.HandlerFunc(s.createJob)))
+	mux.Handle("GET /v1/jobs/{jobID}", s.authenticator.middleware(http.HandlerFunc(s.getJob)))
+	mux.Handle("POST /v1/jobs/{jobID}/cancel", s.authenticator.middleware(http.HandlerFunc(s.cancelJob)))
 	return http.MaxBytesHandler(mux, 1<<20)
 }
 

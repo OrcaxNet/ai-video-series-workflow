@@ -24,6 +24,7 @@ type fakeProvider struct {
 	mu          sync.Mutex
 	submitCount int
 	pollCount   int
+	cancelCount int
 	outputURL   string
 	submitErr   error
 }
@@ -77,8 +78,13 @@ func (p *fakeProvider) Poll(context.Context, string) (providercontract.Job, erro
 }
 
 func (p *fakeProvider) Cancel(context.Context, string) (providercontract.Job, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.cancelCount++
 	return providercontract.Job{ID: "cgt-live-1", Status: providercontract.StatusCancelled}, nil
 }
+
+const testServiceAuthSecret = "test-service-auth-secret-32-bytes-long"
 
 type fixedInspector struct {
 	spec MediaSpec
@@ -119,7 +125,7 @@ func TestServer_SubmitPollDownloadAndCASWithoutTransportLeak(t *testing.T) {
 		t.Fatalf("idempotent replay = %#v, submit count = %d", replayed, provider.submitCount)
 	}
 
-	response, err := http.Get(server.URL + "/v1/jobs/" + request.JobID)
+	response, err := authenticatedTestClient(t).Get(server.URL + "/v1/jobs/" + request.JobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,6 +185,75 @@ func TestServer_SubmitPollDownloadAndCASWithoutTransportLeak(t *testing.T) {
 	}
 }
 
+func TestServer_RejectsAnonymousSubmitPollAndCancelBeforeUpstream(t *testing.T) {
+	t.Parallel()
+	provider := &fakeProvider{}
+	adapter, _ := testAdapter(t, provider, fixedInspector{})
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+
+	request := testJobRequest(t)
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthenticatedSubmit, err := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unauthenticatedSubmit.Header.Set("Content-Type", "application/json")
+	unauthenticatedSubmit.Header.Set("Idempotency-Key", request.JobID)
+	assertUnauthenticated(t, unauthenticatedSubmit)
+	if provider.submitCount != 0 {
+		t.Fatalf("anonymous submit reached upstream %d times", provider.submitCount)
+	}
+
+	created := postJob(t, server.URL, request)
+	if created.State != providercontract.StatusQueued || provider.submitCount != 1 {
+		t.Fatalf("authenticated setup = %#v, submits = %d", created, provider.submitCount)
+	}
+
+	tests := []struct {
+		name   string
+		method string
+		path   string
+	}{
+		{name: "poll", method: http.MethodGet, path: "/v1/jobs/" + request.JobID},
+		{name: "cancel", method: http.MethodPost, path: "/v1/jobs/" + request.JobID + "/cancel"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			httpRequest, err := http.NewRequest(tt.method, server.URL+tt.path, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertUnauthenticated(t, httpRequest)
+		})
+	}
+	if provider.pollCount != 0 || provider.cancelCount != 0 {
+		t.Fatalf("anonymous actions reached upstream: polls=%d cancels=%d", provider.pollCount, provider.cancelCount)
+	}
+}
+
+func assertUnauthenticated(t *testing.T, request *http.Request) {
+	t.Helper()
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var envelope struct {
+		Error *providercontract.Error `json:"error"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&envelope); err != nil {
+		t.Fatalf("decode unauthenticated response: %v", err)
+	}
+	if response.StatusCode != http.StatusUnauthorized || envelope.Error == nil ||
+		envelope.Error.Code != providercontract.CodeUnauthenticated || envelope.Error.Retryable {
+		t.Fatalf("anonymous response HTTP %d: %#v", response.StatusCode, envelope.Error)
+	}
+}
+
 func TestServer_RejectsSimulationAndWrongFrozenModelBeforeSubmit(t *testing.T) {
 	t.Parallel()
 	provider := &fakeProvider{}
@@ -205,7 +280,7 @@ func TestServer_RejectsSimulationAndWrongFrozenModelBeforeSubmit(t *testing.T) {
 			httpRequest, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewReader(body))
 			httpRequest.Header.Set("Content-Type", "application/json")
 			httpRequest.Header.Set("Idempotency-Key", request.JobID)
-			response, err := http.DefaultClient.Do(httpRequest)
+			response, err := authenticatedTestClient(t).Do(httpRequest)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -233,7 +308,7 @@ func TestServer_UnexpectedProviderErrorIsSanitized(t *testing.T) {
 	httpRequest, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewReader(body))
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Idempotency-Key", request.JobID)
-	response, err := http.DefaultClient.Do(httpRequest)
+	response, err := authenticatedTestClient(t).Do(httpRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,6 +346,7 @@ func testLiveConfig() runtimeconfig.VolcengineProvider {
 		VideoModel: "doubao-seedance-2.0", PlanName: "agent-plan-large",
 		PricingVersion: "agent-plan-large-included-v1", Currency: "CNY",
 		MaxDownloadBytes: 1 << 20, DownloadTimeout: 5 * time.Second,
+		ServiceAuthSecret: testServiceAuthSecret,
 	}
 }
 
@@ -338,7 +414,7 @@ func postJob(t *testing.T, endpoint string, request providercontract.JobRequest)
 	}
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Idempotency-Key", request.JobID)
-	response, err := http.DefaultClient.Do(httpRequest)
+	response, err := authenticatedTestClient(t).Do(httpRequest)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,4 +428,13 @@ func postJob(t *testing.T, endpoint string, request providercontract.JobRequest)
 		t.Fatal(err)
 	}
 	return result
+}
+
+func authenticatedTestClient(t *testing.T) *http.Client {
+	t.Helper()
+	client, err := AuthenticatedHTTPClient(http.DefaultClient, testServiceAuthSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }

@@ -127,12 +127,13 @@ services:
       VIDEO_VOLCENGINE_PLAN: agent-plan-large
       VIDEO_VOLCENGINE_PRICING_VERSION: agent-plan-large-included-v1
       VIDEO_VOLCENGINE_CURRENCY: CNY
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
       ARK_API_KEY: ${ARK_API_KEY:-}
     volumes:
       - video-artifacts:/var/lib/video-pipeline/artifacts
-    ports:
-      - "${VIDEO_VOLCENGINE_PROVIDER_PORT:-8091}:8091"
+    expose:
+      - "8091"
     healthcheck:
       test:
         - CMD
@@ -163,6 +164,7 @@ services:
     image: ai-video-series-live-probe:${VIDEO_BUILD_VERSION:-dev}
     environment:
       VIDEO_PROVIDER_ADAPTER_URL: http://volcengine-provider:8091
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
       VIDEO_LIVE_PROBE_OUTPUT_DIR: /var/lib/video-pipeline/evidence/flo104-live-probe
       VIDEO_BUILD_VERSION: ${VIDEO_BUILD_VERSION:-dev}
@@ -195,6 +197,7 @@ services:
       VIDEO_TEMPORAL_NAMESPACE: default
       VIDEO_TEMPORAL_TASK_QUEUE: video-production-v1
       VIDEO_PROVIDER_ADAPTER_URL: ${VIDEO_PROVIDER_ADAPTER_URL:-http://mock-provider:8090}
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
       VIDEO_SPEECH_PROVIDER_ADAPTER_URL: ${VIDEO_SPEECH_PROVIDER_ADAPTER_URL:-http://mock-provider:8090}
       VIDEO_POSTGRES_ADDRESS: postgres:5432
       VIDEO_POSTGRES_USER: ${VIDEO_POSTGRES_USER:-video}

@@ -12,6 +12,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
@@ -58,6 +59,16 @@ func main() {
 		workflow.RegisterOptions{Name: orchestration.ShotReconciliationWorkflowName},
 	)
 	activities := orchestration.NewProductionActivities(cfg.ProviderAdapterURL, store, store, artifacts)
+	if cfg.ProviderServiceAuthSecret != "" {
+		authenticatedClient, err := volcengineprovider.AuthenticatedHTTPClient(
+			mockprovider.DefaultHTTPClient(),
+			cfg.ProviderServiceAuthSecret,
+		)
+		if err != nil {
+			log.Fatalf("configure video provider service authentication: %v", err)
+		}
+		activities.HTTPClient = authenticatedClient
+	}
 	speech, err := postproduction.NewHTTPSpeechProvider(
 		cfg.SpeechProviderAdapterURL,
 		mockprovider.DefaultHTTPClient(),

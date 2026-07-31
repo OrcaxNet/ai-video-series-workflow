@@ -40,13 +40,15 @@ video-migration-v7-rollback-guard-test:
 video-flo104-mock-evidence:
 	./video-pipeline/scripts/flo104-mock-evidence.sh artifacts/flo104-mock
 
-# The live profile reads ARK_API_KEY only from the invoking environment. The
-# probe output directory is single-use, preventing accidental paid re-submit.
+# The live profile reads provider and internal service-auth secrets only from
+# the invoking environment. The probe output directory is single-use.
 video-live-provider-up: video-bootstrap
 	@test -n "$${ARK_API_KEY:-}" || (echo "ARK_API_KEY must be injected at runtime" && exit 1)
+	@test "$${#VIDEO_PROVIDER_SERVICE_AUTH_SECRET}" -ge 32 || (echo "VIDEO_PROVIDER_SERVICE_AUTH_SECRET must contain at least 32 bytes" && exit 1)
 	$(VIDEO_COMPOSE) --profile live up --build --wait volcengine-provider
 
 video-live-probe: video-bootstrap
+	@test "$${#VIDEO_PROVIDER_SERVICE_AUTH_SECRET}" -ge 32 || (echo "VIDEO_PROVIDER_SERVICE_AUTH_SECRET must contain at least 32 bytes" && exit 1)
 	$(VIDEO_COMPOSE) --profile live run --build --rm live-probe
 
 video-secret-scan:

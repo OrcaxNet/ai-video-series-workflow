@@ -21,6 +21,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
 )
 
 const (
@@ -29,17 +30,18 @@ const (
 )
 
 type Config struct {
-	AdapterURL   string
-	ArtifactRoot string
-	OutputDir    string
-	BuildVersion string
-	Region       string
-	PlanName     string
-	Prompt       string
-	PollInterval time.Duration
-	Timeout      time.Duration
-	HTTPClient   *http.Client
-	Now          func() time.Time
+	AdapterURL        string
+	ServiceAuthSecret string
+	ArtifactRoot      string
+	OutputDir         string
+	BuildVersion      string
+	Region            string
+	PlanName          string
+	Prompt            string
+	PollInterval      time.Duration
+	Timeout           time.Duration
+	HTTPClient        *http.Client
+	Now               func() time.Time
 }
 
 type MeasuredOutput struct {
@@ -68,12 +70,24 @@ type Result struct {
 	ArtifactSHA256 string                 `json:"artifact_sha256"`
 	ArtifactBytes  int64                  `json:"artifact_bytes"`
 	Output         MeasuredOutput         `json:"actual_output"`
+	Artifacts      []EvidenceArtifact     `json:"artifacts"`
 	Usage          providercontract.Usage `json:"usage"`
 	Cost           providercontract.Cost  `json:"cost"`
 	ManifestSHA256 string                 `json:"manifest_sha256"`
 	ServiceBOMHash string                 `json:"service_bom_sha256"`
 	Files          map[string]string      `json:"files"`
 	Redaction      RedactionEvidence      `json:"redaction"`
+}
+
+type EvidenceArtifact struct {
+	ID        string          `json:"id"`
+	Kind      string          `json:"kind"`
+	Role      string          `json:"role"`
+	File      string          `json:"file"`
+	SHA256    string          `json:"sha256"`
+	Bytes     int64           `json:"bytes"`
+	MediaType string          `json:"media_type"`
+	Output    *MeasuredOutput `json:"actual_output,omitempty"`
 }
 
 type RedactionEvidence struct {
@@ -102,10 +116,11 @@ type ServiceBOM struct {
 		Bytes  int64          `json:"bytes"`
 		Output MeasuredOutput `json:"actual_output"`
 	} `json:"artifact"`
-	Usage    providercontract.Usage `json:"usage"`
-	Cost     providercontract.Cost  `json:"cost"`
-	CostNote string                 `json:"cost_note"`
-	Manifest struct {
+	Artifacts []EvidenceArtifact     `json:"artifacts"`
+	Usage     providercontract.Usage `json:"usage"`
+	Cost      providercontract.Cost  `json:"cost"`
+	CostNote  string                 `json:"cost_note"`
+	Manifest  struct {
 		SHA256 string `json:"sha256"`
 	} `json:"generation_manifest"`
 	Security struct {
@@ -137,7 +152,11 @@ func Run(ctx context.Context, config Config) (Result, error) {
 	startedAt := config.Now().UTC()
 	runCtx, cancel := context.WithTimeout(ctx, config.Timeout)
 	defer cancel()
-	response, err := mockprovider.Submit(runCtx, config.HTTPClient, config.AdapterURL, request)
+	authenticatedClient, err := volcengineprovider.AuthenticatedHTTPClient(config.HTTPClient, config.ServiceAuthSecret)
+	if err != nil {
+		return Result{}, fmt.Errorf("configure live adapter service authentication: %w", err)
+	}
+	response, err := mockprovider.Submit(runCtx, authenticatedClient, config.AdapterURL, request)
 	if err != nil {
 		return Result{}, fmt.Errorf("submit single live provider job: %w", err)
 	}
@@ -151,7 +170,7 @@ func Run(ctx context.Context, config Config) (Result, error) {
 		if err := sleep(runCtx, config.PollInterval); err != nil {
 			return Result{}, fmt.Errorf("wait for single live provider job: %w", err)
 		}
-		response, err = mockprovider.Get(runCtx, config.HTTPClient, config.AdapterURL, jobID)
+		response, err = mockprovider.Get(runCtx, authenticatedClient, config.AdapterURL, jobID)
 		if err != nil {
 			return Result{}, fmt.Errorf("poll single live provider job: %w", err)
 		}
@@ -207,15 +226,15 @@ func Run(ctx context.Context, config Config) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	videoPath := filepath.Join(config.OutputDir, "probe.mp4")
-	if err := copyArtifact(store, video.SHA256, videoPath); err != nil {
-		return Result{}, err
-	}
 	output := MeasuredOutput{
 		Width: video.Width, Height: video.Height, FPS: video.FPS,
 		DurationMillis: video.DurationMillis, Format: "mp4", MediaType: video.MediaType,
 	}
-	bom := buildBOM(config, response, video, output, manifestHash, completedAt)
+	evidenceArtifacts, artifactFiles, err := exportArtifacts(store, config.OutputDir, response.Artifacts, video, output)
+	if err != nil {
+		return Result{}, err
+	}
+	bom := buildBOM(config, response, video, output, evidenceArtifacts, manifestHash, completedAt)
 	bomPath := filepath.Join(config.OutputDir, "service-bom.json")
 	bomBytes, err := canonicalJSON(bom)
 	if err != nil {
@@ -235,14 +254,14 @@ func Run(ctx context.Context, config Config) (Result, error) {
 		StartedAt: startedAt, CompletedAt: completedAt,
 		LatencyMillis:  completedAt.Sub(startedAt).Milliseconds(),
 		ArtifactSHA256: video.SHA256, ArtifactBytes: video.SizeBytes,
-		Output: output, Usage: response.Usage, Cost: response.Cost,
+		Output: output, Artifacts: evidenceArtifacts, Usage: response.Usage, Cost: response.Cost,
 		ManifestSHA256: manifestHash, ServiceBOMHash: bomHash,
-		Files: map[string]string{
-			"video": "probe.mp4", "generation_manifest": "generation-manifest.json",
-			"service_bom": "service-bom.json", "result": "probe-result.json",
-		},
+		Files:     artifactFiles,
 		Redaction: RedactionEvidence{},
 	}
+	result.Files["generation_manifest"] = "generation-manifest.json"
+	result.Files["service_bom"] = "service-bom.json"
+	result.Files["result"] = "probe-result.json"
 	resultPath := filepath.Join(config.OutputDir, "probe-result.json")
 	resultBytes, err := canonicalJSON(result)
 	if err != nil {
@@ -261,6 +280,9 @@ func validateConfig(config *Config) error {
 	if strings.TrimSpace(config.AdapterURL) == "" || strings.TrimSpace(config.ArtifactRoot) == "" ||
 		strings.TrimSpace(config.OutputDir) == "" {
 		return errors.New("adapter URL, artifact root, and output directory are required")
+	}
+	if len(config.ServiceAuthSecret) < 32 {
+		return errors.New("provider service authentication secret must contain at least 32 bytes")
 	}
 	if config.Region == "" {
 		config.Region = "cn-beijing"
@@ -343,6 +365,7 @@ func buildBOM(
 	response providercontract.JobResponse,
 	video providercontract.AssetRef,
 	output MeasuredOutput,
+	artifacts []EvidenceArtifact,
 	manifestHash string,
 	completedAt time.Time,
 ) ServiceBOM {
@@ -360,12 +383,74 @@ func buildBOM(
 	bom.Artifact.SHA256 = video.SHA256
 	bom.Artifact.Bytes = video.SizeBytes
 	bom.Artifact.Output = output
+	bom.Artifacts = artifacts
 	bom.Usage = response.Usage
 	bom.Cost = response.Cost
 	bom.CostNote = "request included in Agent Plan subscription; provider returned usage units but no per-task monetary amount"
 	bom.Manifest.SHA256 = manifestHash
 	bom.GeneratedAt = completedAt
 	return bom
+}
+
+func exportArtifacts(
+	store *artifactstore.Store,
+	outputDir string,
+	artifacts []providercontract.AssetRef,
+	video providercontract.AssetRef,
+	videoOutput MeasuredOutput,
+) ([]EvidenceArtifact, map[string]string, error) {
+	evidence := make([]EvidenceArtifact, 0, len(artifacts))
+	files := make(map[string]string, len(artifacts)+3)
+	for index, artifact := range artifacts {
+		if !strings.HasPrefix(artifact.URI, "cas://sha256/") || artifact.SHA256 == "" || artifact.SizeBytes < 1 {
+			return nil, nil, fmt.Errorf("provider artifact %d is not an immutable CAS output", index+1)
+		}
+		key, filename := evidenceArtifactLocation(artifact, index)
+		if _, exists := files[key]; exists {
+			key = fmt.Sprintf("artifact_%02d", index+1)
+			filename = fmt.Sprintf("artifact-%02d%s", index+1, mediaExtension(artifact.MediaType))
+		}
+		if err := copyArtifact(store, artifact.SHA256, artifact.SizeBytes, filepath.Join(outputDir, filename)); err != nil {
+			return nil, nil, fmt.Errorf("export provider artifact %d: %w", index+1, err)
+		}
+		item := EvidenceArtifact{
+			ID: artifact.ID, Kind: string(artifact.Kind), Role: string(artifact.Role),
+			File: filename, SHA256: artifact.SHA256, Bytes: artifact.SizeBytes,
+			MediaType: artifact.MediaType,
+		}
+		if artifact.SHA256 == video.SHA256 && artifact.Role == providercontract.AssetRoleOutput {
+			measured := videoOutput
+			item.Output = &measured
+		}
+		evidence = append(evidence, item)
+		files[key] = filename
+	}
+	return evidence, files, nil
+}
+
+func evidenceArtifactLocation(artifact providercontract.AssetRef, index int) (string, string) {
+	if artifact.Kind == providercontract.ModalityVideo && artifact.Role == providercontract.AssetRoleOutput {
+		return "video", "probe.mp4"
+	}
+	if artifact.Role == providercontract.AssetRoleLastFrame {
+		return "last_frame", "last-frame" + mediaExtension(artifact.MediaType)
+	}
+	return fmt.Sprintf("artifact_%02d", index+1), fmt.Sprintf("artifact-%02d%s", index+1, mediaExtension(artifact.MediaType))
+}
+
+func mediaExtension(mediaType string) string {
+	switch strings.ToLower(strings.TrimSpace(strings.Split(mediaType, ";")[0])) {
+	case "video/mp4":
+		return ".mp4"
+	case "image/jpeg":
+		return ".jpg"
+	case "image/png":
+		return ".png"
+	case "image/webp":
+		return ".webp"
+	default:
+		return ".bin"
+	}
 }
 
 func selectVideo(artifacts []providercontract.AssetRef) (providercontract.AssetRef, error) {
@@ -379,7 +464,7 @@ func selectVideo(artifacts []providercontract.AssetRef) (providercontract.AssetR
 	return providercontract.AssetRef{}, errors.New("live provider response lacks a measured CAS video artifact")
 }
 
-func copyArtifact(store *artifactstore.Store, digest, destination string) error {
+func copyArtifact(store *artifactstore.Store, digest string, expectedSize int64, destination string) error {
 	source, err := store.Open(digest)
 	if err != nil {
 		return err
@@ -387,19 +472,32 @@ func copyArtifact(store *artifactstore.Store, digest, destination string) error 
 	defer source.Close()
 	file, err := os.OpenFile(destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return fmt.Errorf("create probe video: %w", err)
+		return fmt.Errorf("create evidence artifact: %w", err)
 	}
-	if _, err := io.Copy(file, source); err != nil {
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(destination)
+		}
+	}()
+	hash := sha256.New()
+	written, err := io.Copy(io.MultiWriter(file, hash), source)
+	if err != nil {
 		_ = file.Close()
-		return fmt.Errorf("copy probe video: %w", err)
+		return fmt.Errorf("copy evidence artifact: %w", err)
+	}
+	if written != expectedSize || hex.EncodeToString(hash.Sum(nil)) != digest {
+		_ = file.Close()
+		return errors.New("exported evidence artifact does not match its declared size and SHA-256")
 	}
 	if err := file.Sync(); err != nil {
 		_ = file.Close()
-		return fmt.Errorf("sync probe video: %w", err)
+		return fmt.Errorf("sync evidence artifact: %w", err)
 	}
 	if err := file.Close(); err != nil {
-		return fmt.Errorf("close probe video: %w", err)
+		return fmt.Errorf("close evidence artifact: %w", err)
 	}
+	committed = true
 	return nil
 }
 

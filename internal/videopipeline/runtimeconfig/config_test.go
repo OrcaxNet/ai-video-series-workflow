@@ -125,13 +125,18 @@ func TestLoadVolcengineProviderRequiresExplicitKeyAndUsesAgentPlanDefaults(t *te
 		t.Fatal("loadVolcengineProvider() error = nil without ARK_API_KEY")
 	}
 	base["ARK_API_KEY"] = "test-runtime-credential"
+	if _, err := loadVolcengineProvider(lookup); err == nil {
+		t.Fatal("loadVolcengineProvider() error = nil without service authentication secret")
+	}
+	base["VIDEO_PROVIDER_SERVICE_AUTH_SECRET"] = "test-service-auth-secret-32-bytes-long"
 	cfg, err := loadVolcengineProvider(lookup)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cfg.BaseURL != "https://ark.cn-beijing.volces.com/api/plan/v3" ||
 		cfg.VideoModel != "doubao-seedance-2.0" || cfg.PlanName != "agent-plan-large" ||
-		cfg.APIKey != "test-runtime-credential" || cfg.MaxDownloadBytes != 256<<20 {
+		cfg.APIKey != "test-runtime-credential" || cfg.ServiceAuthSecret != "test-service-auth-secret-32-bytes-long" ||
+		cfg.MaxDownloadBytes != 256<<20 {
 		t.Fatalf("unexpected live defaults: %#v", cfg)
 	}
 }
