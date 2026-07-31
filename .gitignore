@@ -10,6 +10,12 @@ coverage.out
 video-pipeline/.env.video
 artifacts/
 provider-preflight-manifest*.json
+web/dist/
+web/node_modules/
+web/playwright-report/
+web/test-results/
+web/coverage/
+web/*.tsbuildinfo
 
 # Editor and OS
 .DS_Store

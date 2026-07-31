@@ -20,7 +20,7 @@
 - OpenAPI、AsyncAPI、数据模型、状态机、ADR、FR-P0-01～24 追踪；
 - 无 GPU/无模型 Key 的 Compose、smoke 与 CI。
 
-当前不声称已实现真实火山调用、前端页面或生成质量。`mock-provider` 只生成确定性 fixture 产物；真实 Key 到位后，由火山 Provider Adapter 实现相同领域契约并完成文末实测清单。
+当前不声称已实现真实火山调用或生成质量。FLO-101 的前端 PoC 位于 `../web/`，默认使用 `mock_only` 投影验证交互与异常；`mock-provider` 只生成确定性 fixture 产物。真实 Key 到位后，由火山 Provider Adapter 实现相同领域契约并完成文末实测清单。
 
 公开 OpenAPI 只包含由本控制面实际提供的产品接口。Provider capability 管理、connection-test、直接 job/callback HTTP 接口不在本服务伪占路由；它们属于 Provider Adapter 的独立增量。当前 Temporal Activity 通过内部 `providercontract` 执行 submit/poll/cancel，并把 ProviderJob、重试、费用和恢复状态投影到 PostgreSQL。
 
@@ -105,6 +105,7 @@ video-pipeline/
   docs/                         架构、状态、ER、ADR、追踪和运维
   docs/flo-104-postproduction.md 音频/字幕/成片证据与真实 Key 执行单
   scripts/smoke.sh              无 GPU/无 Key E2E
+web/                            React/TypeScript 创作操作台、Mock API、组件/Playwright 测试
 ```
 
 ## Secret 边界

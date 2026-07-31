@@ -5,6 +5,7 @@
 当前 M0 基线：
 
 - `internal/providercontract` 是唯一 Provider-neutral 契约，覆盖文本、图像、视频和音频，保留 FLO-110 的预算、错误、Secret 和 `pending_key` 边界；
+- `web/` 提供面向创作者的 React/TypeScript PoC 操作台，覆盖内容/资产、剧本/分镜、Provider 任务、三道人工闸门、四级上下文、revision diff/回滚与 Manifest 谱系；
 - 火山引擎优先；Claude 文本备用目前只保留显式配置的路由契约，尚未启用 live adapter；本地 GPU、模型权重和 ComfyUI 均不是运行前置；
 - PostgreSQL 保存产品真相，Temporal 保存持久编排 history，SHA-256 CAS 保存不可变媒体；
 - FLO-102 已实现授权内容结构化、不可变 revision、四层上下文/资产解析、
@@ -29,6 +30,7 @@ make video-down
 
 真实调用必须由 Secret manager 在进程启动时显式注入，并按 `video-pipeline/docs/operations.md` 完成连接、模型权限、能力/价格快照和账单对账；检测到密钥本身不会自动开启真实调用。
 
+- FLO-101 前端运行：`web/README.md`
 - FLO-110 Provider 调研与实测计划：`docs/flo-110/README.md`
 - FLO-108 架构入口：`video-pipeline/README.md`
 - FLO-102 生成主链路：`video-pipeline/docs/flo-102-generation-mainline.md`
