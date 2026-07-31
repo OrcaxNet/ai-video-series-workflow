@@ -17,7 +17,7 @@ import (
 func TestServer_IdempotentReplayAndConflict(t *testing.T) {
 	t.Parallel()
 	server := newTestServer(t)
-	request := validRequest("success")
+	request := validRequest(t, "success")
 
 	first := submit(t, server, request, http.StatusCreated)
 	second := submit(t, server, request, http.StatusOK)
@@ -53,7 +53,7 @@ func TestServer_DiscoversFourCapabilitiesAndEstimates(t *testing.T) {
 
 	estimateBody, err := json.Marshal(providercontract.EstimateRequest{
 		Capability: providercontract.CapabilityVideo,
-		Model:      validRequest("success").Model,
+		Model:      validRequest(t, "success").Model,
 		Parameters: map[string]any{"durationSeconds": 5},
 		Candidates: 2,
 	})
@@ -98,7 +98,7 @@ func TestServer_FailureMatrix(t *testing.T) {
 		t.Run(tt.scenario, func(t *testing.T) {
 			t.Parallel()
 			server := newTestServer(t)
-			recorder := submitRecorder(t, server, validRequest(tt.scenario))
+			recorder := submitRecorder(t, server, validRequest(t, tt.scenario))
 			if recorder.Code != tt.status {
 				t.Fatalf("status = %d, want %d; body=%s", recorder.Code, tt.status, recorder.Body.String())
 			}
@@ -118,7 +118,7 @@ func TestServer_FailureMatrix(t *testing.T) {
 func TestServer_UnknownRecoveryAndImmutableArtifact(t *testing.T) {
 	t.Parallel()
 	server := newTestServer(t)
-	request := validRequest("recovery")
+	request := validRequest(t, "recovery")
 	created := submit(t, server, request, http.StatusCreated)
 	if created.State != providercontract.StatusQueued || created.UpstreamTaskID == "" {
 		t.Fatalf("created = %#v", created)
@@ -135,7 +135,7 @@ func TestServer_UnknownRecoveryAndImmutableArtifact(t *testing.T) {
 		t.Fatalf("artifact is not content addressed: %#v", completed.Artifacts[0])
 	}
 
-	timeout := validRequest("timeout")
+	timeout := validRequest(t, "timeout")
 	timeout.JobID = "job-timeout"
 	timeout.Request.IdempotencyKey = timeout.JobID
 	unknown := submit(t, server, timeout, http.StatusCreated)
@@ -150,7 +150,7 @@ func TestServer_UnknownRecoveryAndImmutableArtifact(t *testing.T) {
 func TestServer_DeduplicatesAndOrdersCallbacks(t *testing.T) {
 	t.Parallel()
 	server := newTestServer(t)
-	request := validRequest("duplicate_callback")
+	request := validRequest(t, "duplicate_callback")
 	submit(t, server, request, http.StatusCreated)
 
 	callback := callbackRequest{CallbackID: "callback-1", Sequence: 2, State: providercontract.StatusRunning}
@@ -175,7 +175,7 @@ func TestServer_DeduplicatesAndOrdersCallbacks(t *testing.T) {
 func TestServer_RejectsInvalidCallbackState(t *testing.T) {
 	t.Parallel()
 	server := newTestServer(t)
-	request := validRequest("duplicate_callback")
+	request := validRequest(t, "duplicate_callback")
 	submit(t, server, request, http.StatusCreated)
 
 	recorder := callbackRecorder(t, server, request.JobID, callbackRequest{
@@ -191,7 +191,7 @@ func TestServer_RejectsInvalidCallbackState(t *testing.T) {
 func TestServer_CancellationRacePreservesSuccess(t *testing.T) {
 	t.Parallel()
 	server := newTestServer(t)
-	request := validRequest("cancel_race")
+	request := validRequest(t, "cancel_race")
 	submit(t, server, request, http.StatusCreated)
 	recorder := httptest.NewRecorder()
 	httpRequest := httptest.NewRequest(http.MethodPost, "/v1/jobs/"+request.JobID+"/cancel", nil)
@@ -220,10 +220,11 @@ func newTestServer(t *testing.T) *Server {
 	}, store)
 }
 
-func validRequest(simulation string) providercontract.JobRequest {
+func validRequest(t *testing.T, simulation string) providercontract.JobRequest {
+	t.Helper()
 	input := sha256.Sum256([]byte("input"))
 	capability := sha256.Sum256([]byte("capability"))
-	return providercontract.JobRequest{
+	request := providercontract.JobRequest{
 		SchemaVersion: "v1",
 		JobID:         "job-1",
 		RunID:         "run-1",
@@ -267,6 +268,20 @@ func validRequest(simulation string) providercontract.JobRequest {
 		TraceID:    "trace-1",
 		Simulation: simulation,
 	}
+	var err error
+	request.BudgetReservation, err = providercontract.BindBudgetReservation(
+		request.BudgetReservation,
+		providercontract.BudgetBindingInput{
+			RunID:     request.RunID,
+			InputHash: request.InputHash,
+			Model:     request.Model,
+			Budget:    request.Request.Budget,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return request
 }
 
 func submit(t *testing.T, server *Server, request providercontract.JobRequest, wantStatus int) providercontract.JobResponse {

@@ -31,7 +31,13 @@ npm run test:e2e
 VITE_STUDIO_MODE=live npm run dev
 ```
 
-当前后端只运行 system/provider discovery 子集；其余 mutation 仍按冻结 OpenAPI 作为增量实施边界。界面不会把 contract-only 操作显示为已经由真实控制面完成。
+最新控制面已经提供 Series、PromptSnapshot、GenerationRun、Approval、Manifest 与
+publication lock 等公开端点，但这些写操作必须绑定 PostgreSQL 中真实存在的
+shot/context/asset/Prompt、冻结 route、预算审批、内容安全、Consent/License 与
+artifact commit。PoC 尚未从真实投影加载这些 UUID，因此 live client 只启用无 Secret
+的 provider discovery；涉及 Mock 投影的 mutation 会 fail closed，不会把 contract-only
+操作显示为已经由真实控制面完成，也不会调用已经移除的直接 Provider Job submit
+路由。
 
 ## 页面
 
@@ -53,9 +59,13 @@ VITE_STUDIO_MODE=live npm run dev
   `affectedObjects[].currentRevision` 对账，不调用未定义的 Gate 查询路由。
 - 资产引用切换会创建新的不可变 G1/asset-set snapshot，使 G1 重新待审并阻断
   G2/G3；同一 G2 revision 不能批准 stale 镜头。
-- 基础设施重试沿用同一 Provider Job；`FAILED` / `CANCELLED` 的创作重做通过
-  `POST /api/v1/provider-jobs` 创建递增 attempt 和全新 Job ID。旧终态行、时间、错误与
-  费用证据只读保留，并显示新旧替代关系。
+- 基础设施重试沿用同一 Provider Job；Mock 中 `FAILED` / `CANCELLED` 的创作重做
+  创建递增 attempt 和全新 Job ID。旧终态行、时间、错误与费用证据只读保留，并显示
+  新旧替代关系。
+- 真实提交以当前 OpenAPI 的 `POST /api/v1/shots/{shotId}/runs` 为唯一入口，必须携带
+  精确 `shotSpecRevisionId`、`promptSnapshotId`、generation profile/plan、冻结
+  `routeSnapshot`、`budgetApprovalId`、execution policy 与安全/权利前置。UI 在这些
+  真实绑定未加载前拒绝把 Mock Job 行转换成 live run。
 - 新 attempt 以 `project + sourceJobId + nextAttempt` 作为稳定创作意图：同步 in-flight
   guard 阻止同一渲染周期重复提交，响应丢失后的重试复用确定性的
   `generationAttemptId` / `Idempotency-Key`。Mock 另以服务端 current Job 和
@@ -63,6 +73,9 @@ VITE_STUDIO_MODE=live npm run dev
 - `SUCCEEDED`、`FAILED`、`CANCELLED` 是单调终态；晚到 callback、异常注入和批次
   完成均不得覆盖；批次完成和 G3 只计算每个镜头标记为当前的 attempt。
 - Prompt“回滚”只切换下一次使用的 revision，不删除历史产物、费用或 Manifest。
+- G3 只批准精确 Manifest/QC 绑定；真实发布还必须通过
+  `POST /api/v1/runs/{runId}/publication-lock` 生成不可变 publication lock。PoC 的
+  Mock 锁版不会伪装成真实 artifact commit 或已发布成片。
 
 ## Secret 与权限边界
 

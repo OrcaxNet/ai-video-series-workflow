@@ -8,6 +8,9 @@
 - `web/` 提供面向创作者的 React/TypeScript PoC 操作台，覆盖内容/资产、剧本/分镜、Provider 任务、三道人工闸门、四级上下文、revision diff/回滚与 Manifest 谱系；
 - 火山引擎优先；Claude 文本备用目前只保留显式配置的路由契约，尚未启用 live adapter；本地 GPU、模型权重和 ComfyUI 均不是运行前置；
 - PostgreSQL 保存产品真相，Temporal 保存持久编排 history，SHA-256 CAS 保存不可变媒体；
+- FLO-102 已实现授权内容结构化、不可变 revision、四层上下文/资产解析、
+  PromptSnapshot、Provider/CAS/Manifest 主链路与 30 镜确定性金标；
+- G1/G2 和逐镜 Q1 之后可执行 Provider-neutral TTS、不可变 UTF-8 SRT 与确定性 CPU FFmpeg，成片 Manifest 作为 G3 的必需绑定；
 - 无 Key Fake/Mock 覆盖成功、超时、401/403、429、5xx、配额、预算、内容阻断、地区/模型不可用、重复回调、取消竞态和恢复；
 - OpenAPI、AsyncAPI、ER/数据字典、状态机、ADR、24 条 P0 追踪及迁移/回滚说明均已冻结。
 
@@ -30,4 +33,6 @@ make video-down
 - FLO-101 前端运行：`web/README.md`
 - FLO-110 Provider 调研与实测计划：`docs/flo-110/README.md`
 - FLO-108 架构入口：`video-pipeline/README.md`
+- FLO-102 生成主链路：`video-pipeline/docs/flo-102-generation-mainline.md`
+- FLO-104 音频字幕与成片：`video-pipeline/docs/flo-104-postproduction.md`
 - 旧跨项目 PR #26 迁移结论：`video-pipeline/docs/migration-from-vibe-forge-pr26.md`

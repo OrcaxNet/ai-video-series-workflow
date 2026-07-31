@@ -93,6 +93,14 @@ stateDiagram-v2
 
 Temporal Activity retry 策略：initial 1s、coefficient 2、max 30s、max 3。Provider `Retry-After` 优先于本地退避。Activity heartbeat 保存 phase、ProviderJob ID、upstream task ID、state、progress；不保存 Prompt 或 Secret。
 
+每个 Activity 还以稳定的 `workflowId + activityId` 在 PostgreSQL 预留 journal：只保存输入 SHA-256；成功结果、审计与版本化 outbox 在一个 serializable transaction 中提交。重试先读取已提交结果；若 submit 后进程崩溃但 journal 尚未完成，则使用相同 provider JobID 对账，禁止创建第二个付费任务。相同 ActivityID 出现不同输入 hash 会以冲突终止，避免代码或历史漂移被静默覆盖。
+
+生产 worker 同时将每一步投影到规范化产品表：Prompt 编译冻结四级上下文，Run 校验 G2 计划、冻结路由和预算，ProviderJob 在网络调用前落库，完成后记录 CAS 产物的实际媒体规格、用量和成本。Q1/G3 的 review task 与决策同步闭环；G3 前生成无凭据的 Episode Manifest，并以内容哈希写入 CAS 后锁定。
+
+公开 shot-run 请求先提交 PostgreSQL，再以 `shot-generation-{runId}` 启动或恢复唯一 Temporal Workflow；只有 Temporal 确认后才返回 `202`。pause 会持久化 `PAUSED` 并取消当前 polling Activity，resume 使用相同 Provider JobID 继续 reconcile。cancel 使用 disconnected compensation Activity：若 ProviderJob 从未准备则不发外部请求并直接收敛 `CANCELLED`；否则调用 Provider cancel，取消胜出时收敛 `CANCELLED`，成功竞态不回退 `SUCCEEDED`，无法确认时进入 `UNKNOWN + CANCEL_NOT_CONFIRMED`，由同一 JobID 后续对账。
+
+GenerationPlan 还冻结 `ExecutionPolicy`。入队前必须同时满足 capability snapshot 的 `allowedTerritories`、`productForms`、`contentSafetyPolicyVersions` 和 `remainingCalls`，并引用一个由 `SAFETY_REVIEWER` 或 `ADMIN` 作出的不可变 `SAFETY` 决策。该决策必须未过期，策略版本一致，并以内容哈希绑定精确的 EpisodeRevision、全部 ShotSpecRevision 与 ACTIVE 证据 Artifact；缺失、越权、过期或版本/绑定不匹配均 fail-closed，且不会启动 Temporal 或产生 ProviderJob。所有 License/Consent 仍须与目标地区及商业形态兼容。
+
 ## 5. UNKNOWN reconciliation
 
 发生以下任一情况必须进入 `UNKNOWN`：
@@ -111,7 +119,7 @@ Temporal Activity retry 策略：initial 1s、coefficient 2、max 30s、max 3。
 5. 仍未知则保留 `UNKNOWN`、安排下一次对账并展示人工动作；
 6. 禁止重新调用 create task，除非人工证明未创建并新建 attempt。
 
-进程重启后 Temporal history 与 ProviderJob 表共同恢复；成功产物重复调用率目标为 0。
+进程重启后 Temporal history、PostgreSQL Activity journal 与 ProviderJob 映射共同恢复；成功产物重复调用率目标为 0。
 
 ## 6. Callback 与 polling 并存
 
@@ -157,7 +165,10 @@ stateDiagram-v2
 - 先生成 plan，展示模型、镜头、候选、调用量、金额区间、预算余额；
 - 价格未知时显示“金额未知”，强制人工确认，不伪造 0；
 - 提交前预占估算上界；终态按实际结算并释放差额；
-- provider 不返实际金额则保留 units、金额 `NULL`、`verified=false`；
+- provider 不返实际金额时不写伪造 `ACTUAL`；未验证或 currency/pricing
+  漂移的声明记录为 `verified=false`，不产生 `RELEASE`；
+- 累计分配仅采用与 reservation 完全匹配的 verified actual；其余完成结果按
+  完整 reservation 保守占用，直到经独立人工调整；
 - 批量默认并发 1，先跑一个 probe shot 再放量。
 
 ## 9. 补偿矩阵

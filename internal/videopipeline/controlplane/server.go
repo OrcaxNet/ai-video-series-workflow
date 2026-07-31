@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -41,7 +42,16 @@ type Dependency struct {
 type Server struct {
 	config       runtimeconfig.ControlPlane
 	dependencies []Dependency
+	store        Store
+	workflows    WorkflowController
+	artifacts    ArtifactVerifier
 	now          func() time.Time
+}
+
+// ArtifactVerifier proves that a CAS object exists before its immutable
+// reference is committed to PostgreSQL.
+type ArtifactVerifier interface {
+	Open(string) (io.ReadCloser, error)
 }
 
 // New creates a control-plane server with runtime dependency probes.
@@ -59,6 +69,24 @@ func NewWithDependencies(config runtimeconfig.ControlPlane, dependencies []Depen
 	return &Server{config: config, dependencies: dependencies, now: time.Now}
 }
 
+// NewWithRuntime injects product truth and external orchestration boundaries.
+func NewWithRuntime(
+	config runtimeconfig.ControlPlane,
+	dependencies []Dependency,
+	store Store,
+	workflows WorkflowController,
+	artifacts ArtifactVerifier,
+) *Server {
+	return &Server{
+		config:       config,
+		dependencies: dependencies,
+		store:        store,
+		workflows:    workflows,
+		artifacts:    artifacts,
+		now:          time.Now,
+	}
+}
+
 // Handler returns the namespaced HTTP routes.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
@@ -67,7 +95,22 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+APIBase+"/system/health", s.readiness)
 	mux.HandleFunc("GET "+APIBase+"/system/info", s.systemInfo)
 	mux.HandleFunc("GET "+APIBase+"/providers/status", s.providerStatus)
-	return securityHeaders(mux)
+	mux.HandleFunc("POST "+APIBase+"/series", s.createSeries)
+	mux.HandleFunc("POST "+APIBase+"/series/{seriesId}/sources", s.createSourceRevision)
+	mux.HandleFunc("POST "+APIBase+"/sources/{sourceRevisionId}/compilations", s.startContentCompilation)
+	mux.HandleFunc("GET "+APIBase+"/series/{seriesId}/impacts", s.listRevisionImpacts)
+	mux.HandleFunc("POST "+APIBase+"/generation-plans", s.createGenerationPlan)
+	mux.HandleFunc("POST "+APIBase+"/episodes/{episodeId}/production-batches", s.startEpisodeProduction)
+	mux.HandleFunc("POST "+APIBase+"/shots/{shotId}/runs", s.createGenerationRun)
+	mux.HandleFunc("GET "+APIBase+"/runs/{runId}", s.getGenerationRun)
+	mux.HandleFunc("POST "+APIBase+"/runs/{runId}/pause", s.pauseGenerationRun)
+	mux.HandleFunc("POST "+APIBase+"/runs/{runId}/cancel", s.cancelGenerationRun)
+	mux.HandleFunc("POST "+APIBase+"/runs/{runId}/resume", s.resumeGenerationRun)
+	mux.HandleFunc("POST "+APIBase+"/runs/{runId}/publication-lock", s.lockRunForPublication)
+	mux.HandleFunc("POST "+APIBase+"/approvals", s.createApprovalDecision)
+	mux.HandleFunc("GET "+APIBase+"/manifests/{scopeType}/{revisionId}", s.getGenerationManifest)
+	mux.HandleFunc("GET "+APIBase+"/operations/{operationId}", s.getOperation)
+	return securityHeaders(s.authentication(mux))
 }
 
 type healthResponse struct {
@@ -287,7 +330,9 @@ func HTTPProbe(endpoint string) Probe {
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
-	w.Header().Set("Content-Type", "application/json")
+	if w.Header().Get("Content-Type") == "" {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }

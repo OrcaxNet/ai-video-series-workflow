@@ -1,0 +1,364 @@
+{
+  "schema_version": "v1",
+  "groups": [
+    {
+      "category": "single_character",
+      "episode_id": "episode-single",
+      "shots": [
+        {
+          "id": "single-01",
+          "ordinal": 1,
+          "narrative": "Lin enters the observatory and studies the silent star map.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "walks to the star map and stops", "primary": true}],
+          "expressions": {"char-lin": "alert curiosity"},
+          "camera": {"shot_size": "medium", "angle": "eye-level", "movement": "slow dolly in", "lens": "50mm"},
+          "continuity": {"entry_state": "door opening behind Lin", "exit_state": "Lin facing the star map"}
+        },
+        {
+          "id": "single-02",
+          "ordinal": 2,
+          "narrative": "Lin brushes dust from a glowing constellation.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "brushes dust from one glowing symbol", "primary": true}],
+          "expressions": {"char-lin": "careful concentration"},
+          "camera": {"shot_size": "close-up", "angle": "high three-quarter", "movement": "locked", "lens": "65mm"},
+          "continuity": {"entry_state": "right hand above dusty map", "exit_state": "constellation fully visible"}
+        },
+        {
+          "id": "single-03",
+          "ordinal": 3,
+          "narrative": "Lin hears a distant bell and turns toward the western arch.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "turns once toward the western arch", "primary": true}],
+          "expressions": {"char-lin": "sudden concern"},
+          "camera": {"shot_size": "medium close-up", "angle": "eye-level", "movement": "subtle pan right", "lens": "50mm"},
+          "continuity": {"entry_state": "hand resting on map", "exit_state": "gaze fixed on western arch"}
+        },
+        {
+          "id": "single-04",
+          "ordinal": 4,
+          "narrative": "Lin opens the narrow archway and peers into blue fog.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "opens the archway halfway", "primary": true}],
+          "expressions": {"char-lin": "cautious resolve"},
+          "camera": {"shot_size": "medium", "angle": "rear three-quarter", "movement": "slow push", "lens": "40mm"},
+          "continuity": {"entry_state": "left hand on closed archway", "exit_state": "archway half open"}
+        },
+        {
+          "id": "single-05",
+          "ordinal": 5,
+          "narrative": "Lin raises a lantern against the fog.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "raises the lantern to shoulder height", "primary": true}],
+          "expressions": {"char-lin": "steady focus"},
+          "camera": {"shot_size": "close-up", "angle": "low three-quarter", "movement": "locked", "lens": "58mm"},
+          "continuity": {"entry_state": "lantern beside left hip", "exit_state": "lantern held at left shoulder"}
+        },
+        {
+          "id": "single-06",
+          "ordinal": 6,
+          "narrative": "Lin finds a silver feather on the stone floor.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "kneels and picks up the feather", "primary": true}],
+          "expressions": {"char-lin": "quiet surprise"},
+          "camera": {"shot_size": "medium", "angle": "high angle", "movement": "gentle tilt down", "lens": "45mm"},
+          "continuity": {"entry_state": "standing with lantern raised", "exit_state": "kneeling with feather in right hand"}
+        },
+        {
+          "id": "single-07",
+          "ordinal": 7,
+          "narrative": "Lin compares the feather with an emblem on the wall.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "holds the feather beside the wall emblem", "primary": true}],
+          "expressions": {"char-lin": "recognition"},
+          "camera": {"shot_size": "over-shoulder", "angle": "eye-level", "movement": "locked", "lens": "60mm"},
+          "continuity": {"entry_state": "feather held at chest", "exit_state": "feather aligned with emblem"}
+        },
+        {
+          "id": "single-08",
+          "ordinal": 8,
+          "narrative": "Lin traces the emblem and reveals a hidden seam.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "traces the emblem clockwise once", "primary": true}],
+          "expressions": {"char-lin": "measured anticipation"},
+          "camera": {"shot_size": "insert close-up", "angle": "profile", "movement": "micro dolly", "lens": "85mm"},
+          "continuity": {"entry_state": "finger at top of emblem", "exit_state": "hidden seam illuminated"}
+        },
+        {
+          "id": "single-09",
+          "ordinal": 9,
+          "narrative": "Lin steps back as the wall panel unlocks.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "takes one deliberate step backward", "primary": true}],
+          "expressions": {"char-lin": "guarded wonder"},
+          "camera": {"shot_size": "full", "angle": "eye-level", "movement": "dolly back", "lens": "35mm"},
+          "continuity": {"entry_state": "right hand near emblem", "exit_state": "one step clear of opening panel"}
+        },
+        {
+          "id": "single-10",
+          "ordinal": 10,
+          "narrative": "Lin faces the revealed stairway and makes a decision.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "nods once toward the revealed stairway", "primary": true}],
+          "expressions": {"char-lin": "resolved calm"},
+          "dialogue": [{"character_id": "char-lin", "text": "I am ready.", "start_ms": 1800, "end_ms": 3300}],
+          "camera": {"shot_size": "medium close-up", "angle": "low eye-level", "movement": "slow dolly in", "lens": "55mm"},
+          "continuity": {"entry_state": "standing before dark stairway", "exit_state": "chin raised toward stairway"}
+        }
+      ]
+    },
+    {
+      "category": "two_character_prop",
+      "episode_id": "episode-duo",
+      "shots": [
+        {
+          "id": "duo-01",
+          "ordinal": 1,
+          "narrative": "Lin offers the brass compass to Mara across the archive table.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-lin", "description": "slides the compass to Mara", "primary": true}],
+          "expressions": {"char-lin": "earnest", "char-mara": "skeptical"},
+          "prop_ids": ["prop-compass"],
+          "camera": {"shot_size": "two-shot", "angle": "table height", "movement": "slow lateral slide", "lens": "45mm"},
+          "continuity": {"entry_state": "compass beside Lin", "exit_state": "compass centered between them"}
+        },
+        {
+          "id": "duo-02",
+          "ordinal": 2,
+          "narrative": "Mara rotates the compass while Lin watches the needle.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-mara", "description": "rotates the compass one quarter turn", "primary": true}],
+          "expressions": {"char-lin": "focused", "char-mara": "testing"},
+          "prop_ids": ["prop-compass"],
+          "camera": {"shot_size": "over-shoulder", "angle": "high three-quarter", "movement": "locked", "lens": "65mm"},
+          "continuity": {"entry_state": "compass between both hands", "exit_state": "needle pointing north-west"}
+        },
+        {
+          "id": "duo-03",
+          "ordinal": 3,
+          "narrative": "The compass needle flares and both friends lean closer.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-lin", "description": "leans closer to the flaring needle", "primary": true}, {"character_id": "char-mara", "description": "steadies the compass", "primary": false}],
+          "expressions": {"char-lin": "astonished", "char-mara": "controlled concern"},
+          "prop_ids": ["prop-compass"],
+          "camera": {"shot_size": "tight two-shot", "angle": "eye-level", "movement": "subtle push", "lens": "70mm"},
+          "continuity": {"entry_state": "both seated upright", "exit_state": "both leaning over compass"}
+        },
+        {
+          "id": "duo-04",
+          "ordinal": 4,
+          "narrative": "Mara points to the matching route on a paper chart.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-mara", "description": "points once to the route on the chart", "primary": true}],
+          "expressions": {"char-lin": "hopeful", "char-mara": "certain"},
+          "prop_ids": ["prop-compass", "prop-chart"],
+          "camera": {"shot_size": "medium two-shot", "angle": "overhead three-quarter", "movement": "tilt down", "lens": "50mm"},
+          "continuity": {"entry_state": "chart rolled at table edge", "exit_state": "chart open beneath compass"}
+        },
+        {
+          "id": "duo-05",
+          "ordinal": 5,
+          "narrative": "Lin marks the route with a charcoal line.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-lin", "description": "draws one charcoal line along the route", "primary": true}],
+          "expressions": {"char-lin": "careful", "char-mara": "watchful"},
+          "prop_ids": ["prop-compass", "prop-chart"],
+          "camera": {"shot_size": "insert", "angle": "overhead", "movement": "locked", "lens": "75mm"},
+          "continuity": {"entry_state": "charcoal at route origin", "exit_state": "route fully marked"}
+        },
+        {
+          "id": "duo-06",
+          "ordinal": 6,
+          "narrative": "Mara closes the compass and returns it to Lin.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-mara", "description": "closes and hands the compass to Lin", "primary": true}],
+          "expressions": {"char-lin": "grateful", "char-mara": "serious"},
+          "prop_ids": ["prop-compass"],
+          "camera": {"shot_size": "medium", "angle": "side profile", "movement": "short track", "lens": "50mm"},
+          "continuity": {"entry_state": "compass in Mara's hands", "exit_state": "compass in Lin's right hand"}
+        },
+        {
+          "id": "duo-07",
+          "ordinal": 7,
+          "narrative": "Lin fastens the compass to a belt while Mara folds the chart.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-lin", "description": "fastens the compass to the belt", "primary": true}, {"character_id": "char-mara", "description": "folds the chart once", "primary": false}],
+          "expressions": {"char-lin": "prepared", "char-mara": "efficient"},
+          "prop_ids": ["prop-compass", "prop-chart"],
+          "camera": {"shot_size": "medium two-shot", "angle": "eye-level", "movement": "locked", "lens": "40mm"},
+          "continuity": {"entry_state": "both standing at table", "exit_state": "compass secured and chart folded"}
+        },
+        {
+          "id": "duo-08",
+          "ordinal": 8,
+          "narrative": "Mara gives Lin the folded chart.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-mara", "description": "places the folded chart in Lin's open hand", "primary": true}],
+          "expressions": {"char-lin": "trusting", "char-mara": "protective"},
+          "prop_ids": ["prop-chart"],
+          "camera": {"shot_size": "close two-shot", "angle": "eye-level", "movement": "slow push", "lens": "60mm"},
+          "continuity": {"entry_state": "chart in Mara's left hand", "exit_state": "chart in Lin's left hand"}
+        },
+        {
+          "id": "duo-09",
+          "ordinal": 9,
+          "narrative": "Lin and Mara seal their plan with a forearm clasp.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-lin", "description": "clasps Mara's forearm once", "primary": true}, {"character_id": "char-mara", "description": "returns the clasp", "primary": false}],
+          "expressions": {"char-lin": "confident", "char-mara": "warm resolve"},
+          "camera": {"shot_size": "medium two-shot", "angle": "slightly low", "movement": "arc ten degrees", "lens": "45mm"},
+          "continuity": {"entry_state": "both facing each other", "exit_state": "forearms clasped"}
+        },
+        {
+          "id": "duo-10",
+          "ordinal": 10,
+          "narrative": "They turn together toward the archive exit.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin", "char-mara"],
+          "actions": [{"character_id": "char-mara", "description": "turns with Lin toward the exit", "primary": true}],
+          "expressions": {"char-lin": "determined", "char-mara": "determined"},
+          "dialogue": [{"character_id": "char-mara", "text": "We leave before dawn.", "start_ms": 1200, "end_ms": 3300}],
+          "prop_ids": ["prop-compass", "prop-chart"],
+          "camera": {"shot_size": "wide two-shot", "angle": "rear three-quarter", "movement": "dolly back", "lens": "32mm"},
+          "continuity": {"entry_state": "forearms separating", "exit_state": "both facing exit"}
+        }
+      ]
+    },
+    {
+      "category": "motion_camera",
+      "episode_id": "episode-motion",
+      "shots": [
+        {
+          "id": "motion-01",
+          "ordinal": 1,
+          "narrative": "Lin runs across the rain bridge as signal lights ignite behind.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "runs straight across the bridge", "primary": true}],
+          "expressions": {"char-lin": "urgent focus"},
+          "camera": {"shot_size": "wide", "angle": "low side", "movement": "fast parallel tracking", "lens": "28mm"},
+          "continuity": {"entry_state": "Lin entering bridge at full stride", "exit_state": "Lin at bridge midpoint"}
+        },
+        {
+          "id": "motion-02",
+          "ordinal": 2,
+          "narrative": "Lin vaults one fallen beam without breaking stride.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "vaults the fallen beam once", "primary": true}],
+          "expressions": {"char-lin": "strained determination"},
+          "camera": {"shot_size": "full", "angle": "low front three-quarter", "movement": "handheld retreat", "lens": "30mm"},
+          "continuity": {"entry_state": "right foot before beam", "exit_state": "both feet beyond beam"}
+        },
+        {
+          "id": "motion-03",
+          "ordinal": 3,
+          "narrative": "The bridge tilts and Lin grabs a cable.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "grabs the hanging cable with both hands", "primary": true}],
+          "expressions": {"char-lin": "shocked effort"},
+          "camera": {"shot_size": "medium full", "angle": "dutch angle", "movement": "rapid tilt and settle", "lens": "35mm"},
+          "continuity": {"entry_state": "bridge deck beginning to tilt", "exit_state": "Lin hanging from cable"}
+        },
+        {
+          "id": "motion-04",
+          "ordinal": 4,
+          "narrative": "Lin swings from the cable toward the upper platform.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "swings in one arc toward the platform", "primary": true}],
+          "expressions": {"char-lin": "committed effort"},
+          "camera": {"shot_size": "wide", "angle": "high side", "movement": "crane arc", "lens": "24mm"},
+          "continuity": {"entry_state": "cable vertical above tilted bridge", "exit_state": "Lin near platform edge"}
+        },
+        {
+          "id": "motion-05",
+          "ordinal": 5,
+          "narrative": "Lin lands and slides across the wet platform.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "lands and slides to one knee", "primary": true}],
+          "expressions": {"char-lin": "braced concentration"},
+          "camera": {"shot_size": "full", "angle": "ground level", "movement": "whip pan then track", "lens": "28mm"},
+          "continuity": {"entry_state": "boots above platform edge", "exit_state": "right knee on wet platform"}
+        },
+        {
+          "id": "motion-06",
+          "ordinal": 6,
+          "narrative": "A searchlight sweeps past as Lin rolls behind a vent.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "rolls once behind the vent", "primary": true}],
+          "expressions": {"char-lin": "controlled alarm"},
+          "camera": {"shot_size": "medium wide", "angle": "overhead", "movement": "searchlight-matched pan", "lens": "32mm"},
+          "continuity": {"entry_state": "Lin exposed beside vent", "exit_state": "Lin concealed behind vent"}
+        },
+        {
+          "id": "motion-07",
+          "ordinal": 7,
+          "narrative": "Lin sprints up a spiral service stair.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "runs upward around one stair turn", "primary": true}],
+          "expressions": {"char-lin": "breathless resolve"},
+          "camera": {"shot_size": "wide", "angle": "top-down", "movement": "descending spiral crane", "lens": "22mm"},
+          "continuity": {"entry_state": "Lin at bottom stair", "exit_state": "Lin one level higher"}
+        },
+        {
+          "id": "motion-08",
+          "ordinal": 8,
+          "narrative": "Lin pushes through a rotating turbine door.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "pushes one turbine blade and slips through", "primary": true}],
+          "expressions": {"char-lin": "timed precision"},
+          "camera": {"shot_size": "medium full", "angle": "front", "movement": "rotational follow", "lens": "30mm"},
+          "continuity": {"entry_state": "turbine gap approaching", "exit_state": "Lin beyond turbine door"}
+        },
+        {
+          "id": "motion-09",
+          "ordinal": 9,
+          "narrative": "Lin races down the final corridor toward sunrise.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "sprints toward the bright corridor exit", "primary": true}],
+          "expressions": {"char-lin": "exhausted hope"},
+          "camera": {"shot_size": "long shot", "angle": "centered rear", "movement": "accelerating dolly", "lens": "35mm"},
+          "continuity": {"entry_state": "Lin entering dark corridor", "exit_state": "Lin near bright exit"}
+        },
+        {
+          "id": "motion-10",
+          "ordinal": 10,
+          "narrative": "Lin bursts onto the roof and stops before the rising sun.",
+          "duration_millis": 5000,
+          "character_ids": ["char-lin"],
+          "actions": [{"character_id": "char-lin", "description": "crosses the threshold and stops", "primary": true}],
+          "expressions": {"char-lin": "relieved awe"},
+          "camera": {"shot_size": "extreme wide", "angle": "low rear", "movement": "rapid pullback to reveal skyline", "lens": "20mm"},
+          "continuity": {"entry_state": "Lin crossing roof threshold", "exit_state": "Lin silhouetted before sunrise"}
+        }
+      ]
+    }
+  ]
+}

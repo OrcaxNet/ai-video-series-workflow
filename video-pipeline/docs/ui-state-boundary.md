@@ -1,6 +1,8 @@
 # UI 状态、权限与回滚边界
 
-本文定义 FLO-101 操作台如何读取 FLO-108 OpenAPI/AsyncAPI。PostgreSQL/control-plane projection 是业务真相，Temporal history 与 Provider SDK 不是 UI 查询源。
+本文定义 FLO-101 操作台如何读取当前 OpenAPI/AsyncAPI。PostgreSQL/control-plane
+projection 是业务真相，Temporal history 与 Provider SDK 不是 UI 查询源。前端 Mock
+用于演练交互，不构成可提交给真实控制面的 revision、route、预算、权利或产物绑定。
 
 ## 1. 人工闸门
 
@@ -38,14 +40,17 @@
 
 | 操作 | 旧 Job | 新 Job / attempt | G3 计算 |
 |---|---|---|---|
-| FAILED / CANCELLED → 创建新 attempt | 保持原 ID、终态、时间、错误/费用并转为历史只读行 | `POST /api/v1/provider-jobs`；新 Job ID，attempt + 1，初始 QUEUED | 新 Job 成为该镜头当前 attempt；未成功前持续阻断 |
+| FAILED / CANCELLED → 创建新 attempt | 保持原 ID、终态、时间、错误/费用并转为历史只读行 | Mock 新建 Provider Job；live 必须以精确 Prompt/route/budget/policy 绑定创建 GenerationRun | 新 attempt 成为该镜头当前运行；未成功前持续阻断 |
 | 429 / 5xx 基础设施 retry | 原 Job ID 上递增 retryCount | 不创建新 attempt | 仍由同一当前 Job 决定 |
 | 当前批次完成 | 历史行 no-op | 只推进各镜头当前的非终态 Job | 所有当前 attempt SUCCEEDED 且 G2 APPROVED 才解锁 |
 
 前端投影用 `isCurrentAttempt` 标识每个镜头参与当前批次判定的唯一行，并用
 `supersedesJobId` / `supersededByJobId` 呈现替代关系。Mock API 对新 attempt 同样执行
-Idempotency-Key 与严格递增校验；切换 live 后复用冻结 OpenAPI 已定义的
-`POST /api/v1/provider-jobs`，不增加专用私有路由。
+Idempotency-Key 与严格递增校验。真实控制面不公开直接 Provider Job submit；唯一写
+入口是 `POST /api/v1/shots/{shotId}/runs`，且必须提交 PostgreSQL 中存在的
+`shotSpecRevisionId`、`promptSnapshotId`、generation profile/plan、冻结
+`routeSnapshot`、`budgetApprovalId` 与 `executionPolicy`。PoC 未加载这些真实绑定时
+必须 fail closed，不能把 Mock 行转换为 live 请求。
 
 ### 2.1 新 attempt 创作意图幂等
 
@@ -53,8 +58,10 @@ Idempotency-Key 与严格递增校验；切换 live 后复用冻结 OpenAPI 已�
   in-flight set，因此同一事件循环内的重复激活只会进入一次 API。
 - `generationAttemptId` 和 `Idempotency-Key` 由意图键稳定派生并缓存在内存 command
   ledger；请求已受理但响应丢失时，再次操作会复用同一请求身份，由控制面返回原 Job。
-- 请求快照携带非敏感 `creativeIntentKey = sourceJobId:nextAttempt`，用于审计与唯一性
-  对账；不包含 Secret。该字段位于 OpenAPI 允许扩展的 `requestSnapshot`，无需契约迁移。
+- Mock 请求快照携带非敏感 `creativeIntentKey = sourceJobId:nextAttempt`，用于演练
+  审计与唯一性对账；不包含 Secret。live GenerationRun 的幂等身份由公开 Run 命令及
+  服务端事务、稳定 Workflow ID 和不可变输入绑定共同保证，不向当前 OpenAPI 注入
+  `requestSnapshot` 扩展字段。
 - Mock 服务端维护每个 shot 的 current Job、每个 Job 的 attempt，以及唯一
   `(sourceJobId, nextAttempt)`。同键同 payload replay 原结果；不同键重放已落库意图返回
   `ATTEMPT_ALREADY_EXISTS`；历史 source 返回 `ATTEMPT_SOURCE_SUPERSEDED`。客户端传入的
@@ -94,6 +101,11 @@ Mock 任务即使 SUCCEEDED 也保持 `mock_only`，不会升级为真实质量�
 6. 回滚选择历史 revision，不删除较新 revision、CAS artifact、cost ledger、audit 或 Manifest。
 7. 已提交 ProviderJob 不随应用回滚而撤销；reconciliation 继续使用原 task ID。
 8. G3 锁版后的修改产生新的 episode cut/Manifest revision，旧导出仍可验证。
+9. 真实 G3 决策必须绑定精确 Manifest/QC；只有
+   `POST /api/v1/runs/{runId}/publication-lock` 成功后才形成不可变发布锁。Mock G3
+   不代表 artifact 已提交或作品已发布。
+10. 生成和后期付费提交前，控制面必须重新验证 Consent/License、预算保守预占、
+    Prompt/route 绑定与 artifact commit；UI 的 enabled 状态不替代服务端 fail-closed。
 
 ## 6. 浏览器安全边界
 

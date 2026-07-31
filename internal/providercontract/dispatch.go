@@ -3,6 +3,8 @@ package providercontract
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -124,6 +126,7 @@ type BudgetReservation struct {
 	AmountMicros   int64  `json:"amount_micros"`
 	PricingVersion string `json:"pricing_version"`
 	ConfirmedBy    string `json:"confirmed_by"`
+	BindingHash    string `json:"binding_hash"`
 }
 
 func (b BudgetReservation) Validate() error {
@@ -131,10 +134,125 @@ func (b BudgetReservation) Validate() error {
 		strings.TrimSpace(b.Currency) == "" ||
 		b.AmountMicros < 0 ||
 		strings.TrimSpace(b.PricingVersion) == "" ||
-		strings.TrimSpace(b.ConfirmedBy) == "" {
+		strings.TrimSpace(b.ConfirmedBy) == "" ||
+		!validSHA256(b.BindingHash) {
 		return errors.New("an approved budget reservation is required")
 	}
 	return nil
+}
+
+// BudgetBindingInput pins an approval to one run, immutable generation input,
+// model route, and estimate envelope. InputHash is the control-plane run-spec
+// digest or, for the production domain runner, the PromptSnapshot content hash.
+type BudgetBindingInput struct {
+	RunID     string
+	InputHash string
+	Model     ModelSnapshot
+	Budget    BudgetEnvelope
+}
+
+// BindBudgetReservation returns a copy carrying the deterministic approval
+// binding. The caller persists this value as the immutable approval evidence.
+func BindBudgetReservation(reservation BudgetReservation, input BudgetBindingInput) (BudgetReservation, error) {
+	if err := validateBudgetBindingInput(input); err != nil {
+		return BudgetReservation{}, err
+	}
+	if strings.TrimSpace(reservation.ReservationID) == "" ||
+		strings.TrimSpace(reservation.Currency) == "" ||
+		reservation.AmountMicros < 0 ||
+		strings.TrimSpace(reservation.PricingVersion) == "" ||
+		strings.TrimSpace(reservation.ConfirmedBy) == "" {
+		return BudgetReservation{}, errors.New("complete budget approval fields are required before binding")
+	}
+	digest, err := budgetReservationBindingHash(reservation, input)
+	if err != nil {
+		return BudgetReservation{}, err
+	}
+	reservation.BindingHash = digest
+	return reservation, nil
+}
+
+// ValidateFor fails closed unless the reservation covers the current estimate
+// and its persisted binding matches this exact run/input/route/budget tuple.
+func (b BudgetReservation) ValidateFor(input BudgetBindingInput) error {
+	if err := b.Validate(); err != nil {
+		return err
+	}
+	if err := validateBudgetBindingInput(input); err != nil {
+		return err
+	}
+	if b.AmountMicros < input.Budget.EstimatedCostMicros {
+		return &Error{
+			Code:        CodeBudgetExceeded,
+			SafeMessage: "budget reservation does not cover the current estimate",
+		}
+	}
+	if b.AmountMicros > input.Budget.MaxCostMicros {
+		return &Error{
+			Code:        CodeBudgetExceeded,
+			SafeMessage: "budget reservation exceeds the request maximum",
+		}
+	}
+	expected, err := budgetReservationBindingHash(b, input)
+	if err != nil {
+		return err
+	}
+	if b.BindingHash != expected {
+		return &Error{
+			Code:        CodeInvalidRequest,
+			SafeMessage: "budget reservation is bound to different immutable generation input",
+		}
+	}
+	return nil
+}
+
+func validateBudgetBindingInput(input BudgetBindingInput) error {
+	if strings.TrimSpace(input.RunID) == "" || !validSHA256(input.InputHash) {
+		return errors.New("budget binding requires a run ID and immutable input hash")
+	}
+	alias := CapabilityAlias(input.Model.CapabilityAlias)
+	if err := input.Model.Validate(alias); err != nil {
+		return fmt.Errorf("budget binding model: %w", err)
+	}
+	if input.Budget.EstimatedCostMicros < 0 ||
+		input.Budget.MaxCostMicros <= 0 ||
+		input.Budget.EstimatedCostMicros > input.Budget.MaxCostMicros ||
+		input.Budget.MaxAttempts < 1 {
+		return errors.New("budget binding requires a valid estimate envelope")
+	}
+	return nil
+}
+
+func budgetReservationBindingHash(reservation BudgetReservation, input BudgetBindingInput) (string, error) {
+	material := struct {
+		SchemaVersion  string         `json:"schema_version"`
+		RunID          string         `json:"run_id"`
+		InputHash      string         `json:"input_hash"`
+		Model          ModelSnapshot  `json:"model"`
+		Budget         BudgetEnvelope `json:"budget"`
+		ReservationID  string         `json:"reservation_id"`
+		Currency       string         `json:"currency"`
+		AmountMicros   int64          `json:"amount_micros"`
+		PricingVersion string         `json:"pricing_version"`
+		ConfirmedBy    string         `json:"confirmed_by"`
+	}{
+		SchemaVersion:  "budget-reservation-binding-v1",
+		RunID:          input.RunID,
+		InputHash:      input.InputHash,
+		Model:          input.Model,
+		Budget:         input.Budget,
+		ReservationID:  reservation.ReservationID,
+		Currency:       reservation.Currency,
+		AmountMicros:   reservation.AmountMicros,
+		PricingVersion: reservation.PricingVersion,
+		ConfirmedBy:    reservation.ConfirmedBy,
+	}
+	data, err := json.Marshal(material)
+	if err != nil {
+		return "", fmt.Errorf("encode budget reservation binding: %w", err)
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 type Cost struct {
@@ -182,11 +300,13 @@ func (r JobRequest) Validate() error {
 	if r.Request.IdempotencyKey != r.JobID {
 		return errors.New("generation request idempotency_key must equal job_id")
 	}
-	if err := r.BudgetReservation.Validate(); err != nil {
+	if err := r.BudgetReservation.ValidateFor(BudgetBindingInput{
+		RunID:     r.RunID,
+		InputHash: r.InputHash,
+		Model:     r.Model,
+		Budget:    r.Request.Budget,
+	}); err != nil {
 		return err
-	}
-	if r.BudgetReservation.AmountMicros > r.Request.Budget.MaxCostMicros {
-		return errors.New("budget reservation exceeds the request maximum")
 	}
 	return nil
 }

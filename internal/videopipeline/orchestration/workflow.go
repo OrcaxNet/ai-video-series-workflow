@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -17,6 +18,8 @@ const (
 	WorkflowName        = "video.production.episode.v1"
 	DefaultTaskQueue    = "video-production-v1"
 	Gate3DecisionSignal = "video.production.gate3-decision.v1"
+	ShotDecisionSignal  = "video.production.shot-decision.v1"
+	ControlSignal       = "video.production.control.v1"
 	StatusQuery         = "video.production.status.v1"
 
 	ActivityValidateBatch      = "video.activity.validate-batch.v1"
@@ -26,6 +29,7 @@ const (
 	ActivityRunAutomaticQC     = "video.activity.run-automatic-qc.v1"
 	ActivityCreateShotReview   = "video.activity.create-shot-review.v1"
 	ActivityEscalateShot       = "video.activity.escalate-shot.v1"
+	ActivityFinalizeEpisode    = "video.activity.finalize-episode.v1"
 	ActivityCreateGate3        = "video.activity.create-gate3-review.v1"
 )
 
@@ -37,20 +41,26 @@ type EpisodeProductionInput struct {
 	ShotSpecRevisionIDs  []string                       `json:"shotSpecRevisionIds"`
 	GenerationProfileRef string                         `json:"generationProfileRef"`
 	Gate2DecisionID      string                         `json:"gate2DecisionId"`
+	GenerationPlanID     string                         `json:"generationPlanId,omitempty"`
+	ProviderProfileID    string                         `json:"providerProfileId,omitempty"`
 	ProviderRoute        providercontract.ModelSnapshot `json:"providerRoute"`
 	BudgetApprovalID     string                         `json:"budgetApprovalId"`
 	BudgetMaximumMicros  int64                          `json:"budgetMaximumMicros"`
 	BudgetCurrency       string                         `json:"budgetCurrency"`
 	TraceID              string                         `json:"traceId"`
+	RequireShotApproval  bool                           `json:"requireShotApproval,omitempty"`
+	PersistProductTruth  bool                           `json:"persistProductTruth,omitempty"`
+	PostProduction       *PostProductionConfig          `json:"postProduction,omitempty"`
 }
 
 // EpisodeProductionResult is the durable terminal or intervention state.
 type EpisodeProductionResult struct {
-	State         string               `json:"state"`
-	LockedRunIDs  []string             `json:"lockedRunIds"`
-	FailedShotID  string               `json:"failedShotId,omitempty"`
-	Gate3Decision *Gate3Decision       `json:"gate3Decision,omitempty"`
-	Shots         map[string]ShotState `json:"shots"`
+	State          string                 `json:"state"`
+	LockedRunIDs   []string               `json:"lockedRunIds"`
+	FailedShotID   string                 `json:"failedShotId,omitempty"`
+	PostProduction *postproduction.Result `json:"postProduction,omitempty"`
+	Gate3Decision  *Gate3Decision         `json:"gate3Decision,omitempty"`
+	Shots          map[string]ShotState   `json:"shots"`
 }
 
 // ShotState is exposed through the workflow query handler.
@@ -64,8 +74,9 @@ type ShotState struct {
 
 // WorkflowStatus is safe for UI polling and operational diagnostics.
 type WorkflowStatus struct {
-	State string               `json:"state"`
-	Shots map[string]ShotState `json:"shots"`
+	State  string               `json:"state"`
+	Paused bool                 `json:"paused"`
+	Shots  map[string]ShotState `json:"shots"`
 }
 
 // Gate3Decision is sent by the control plane after the exact cut, manifest,
@@ -77,10 +88,36 @@ type Gate3Decision struct {
 	ActorID    string `json:"actorId"`
 }
 
+// ShotDecision is an immutable Q1 decision for one exact run and artifact.
+type ShotDecision struct {
+	DecisionID         string `json:"decisionId"`
+	ShotSpecRevisionID string `json:"shotSpecRevisionId"`
+	RunID              string `json:"runId"`
+	Approved           bool   `json:"approved"`
+	ReasonCode         string `json:"reasonCode,omitempty"`
+	ActorID            string `json:"actorId"`
+}
+
+// WorkflowControl pauses or resumes at deterministic Activity boundaries.
+// Cancellation continues to use Temporal cancellation so in-flight Activities
+// receive context cancellation and their heartbeat details remain recoverable.
+type WorkflowControl struct {
+	CommandID  string `json:"commandId"`
+	Action     string `json:"action"`
+	ActorID    string `json:"actorId"`
+	ReasonCode string `json:"reasonCode,omitempty"`
+}
+
 // PromptSnapshotRef identifies an immutable compiled prompt.
 type PromptSnapshotRef struct {
-	ID     string `json:"id"`
-	Digest string `json:"digest"`
+	ID                  string                       `json:"id"`
+	Digest              string                       `json:"digest"`
+	PositivePrompt      string                       `json:"positivePrompt"`
+	NegativePrompt      string                       `json:"negativePrompt,omitempty"`
+	Context             providercontract.ContextRefs `json:"context"`
+	Assets              []providercontract.AssetRef  `json:"assets,omitempty"`
+	Output              providercontract.OutputSpec  `json:"output"`
+	InputRevisionHashes map[string]string            `json:"inputRevisionHashes"`
 }
 
 // GenerationRunRef identifies one creative generation attempt.
@@ -97,6 +134,11 @@ type ProviderResult struct {
 	RequestID      string                         `json:"requestId"`
 	ArtifactDigest string                         `json:"artifactDigest"`
 	ArtifactURI    string                         `json:"artifactUri"`
+	MediaType      string                         `json:"mediaType,omitempty"`
+	ArtifactSize   int64                          `json:"artifactSizeBytes,omitempty"`
+	Width          int                            `json:"width,omitempty"`
+	Height         int                            `json:"height,omitempty"`
+	DurationMillis int64                          `json:"durationMillis,omitempty"`
 	Model          providercontract.ModelSnapshot `json:"modelSnapshot"`
 	Usage          providercontract.Usage         `json:"usage"`
 	Cost           providercontract.Cost          `json:"cost"`
@@ -106,6 +148,44 @@ type ProviderResult struct {
 type QCResult struct {
 	Passed      bool   `json:"passed"`
 	FailureCode string `json:"failureCode,omitempty"`
+}
+
+// PostProductionConfig freezes the independent speech route, budget, subtitle
+// behavior, and optional licensed background asset before Temporal starts.
+type PostProductionConfig struct {
+	Enabled                       bool                           `json:"enabled"`
+	Evidence                      string                         `json:"evidence"`
+	SpeechRoute                   providercontract.ModelSnapshot `json:"speechRoute"`
+	SpeechProviderProfileID       string                         `json:"speechProviderProfileId"`
+	SpeechBudgetApprovalID        string                         `json:"speechBudgetApprovalId"`
+	SpeechBudgetMaximumMicros     int64                          `json:"speechBudgetMaximumMicros"`
+	SpeechBudgetCurrency          string                         `json:"speechBudgetCurrency"`
+	SubtitleLanguage              string                         `json:"subtitleLanguage"`
+	BurnSubtitles                 bool                           `json:"burnSubtitles"`
+	BackgroundAudioAssetVersionID string                         `json:"backgroundAudioAssetVersionId,omitempty"`
+	EnforcePoCDuration            bool                           `json:"enforcePoCDuration"`
+}
+
+func (c PostProductionConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if err := c.SpeechRoute.Validate(providercontract.CapabilitySpeech); err != nil {
+		return errors.New("a frozen speech.primary route is required")
+	}
+	if c.Evidence != postproduction.EvidenceMockOnly &&
+		c.Evidence != postproduction.EvidenceLive &&
+		c.Evidence != postproduction.EvidencePendingKey {
+		return errors.New("post-production evidence is invalid")
+	}
+	if c.SpeechProviderProfileID == "" || c.SpeechBudgetApprovalID == "" ||
+		c.SpeechBudgetMaximumMicros <= 0 || len(c.SpeechBudgetCurrency) != 3 {
+		return errors.New("post-production speech profile and approved budget are required")
+	}
+	if c.SubtitleLanguage == "" {
+		return errors.New("post-production subtitle language is required")
+	}
+	return nil
 }
 
 // EpisodeProductionWorkflow runs a G2-approved production batch.
@@ -123,6 +203,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	}); err != nil {
 		return EpisodeProductionResult{}, fmt.Errorf("register status query: %w", err)
 	}
+	controlChannel := workflow.GetSignalChannel(ctx, ControlSignal)
 
 	baseOptions := workflow.ActivityOptions{
 		StartToCloseTimeout: 2 * time.Minute,
@@ -136,6 +217,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			NonRetryableErrorTypes: []string{
 				"VALIDATION_ERROR",
 				"LICENSE_BLOCKED",
+				"CONSENT_REQUIRED",
 				string(providercontract.CodeBudgetExceeded),
 				string(providercontract.CodeUnauthenticated),
 				string(providercontract.CodeForbidden),
@@ -149,6 +231,7 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityValidateBatch, input).Get(ctx, nil); err != nil {
 		return EpisodeProductionResult{}, err
 	}
+	waitForResume(ctx, &status, controlChannel)
 
 	status.State = "PRODUCING"
 	lockedRunIDs := make([]string, 0, len(input.ShotSpecRevisionIDs))
@@ -158,10 +241,12 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 			ShotSpecRevisionID:   shotID,
 			GenerationProfileRef: input.GenerationProfileRef,
 			TraceID:              input.TraceID,
+			PersistProductTruth:  input.PersistProductTruth,
 		}
 		if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCompilePrompt, compileInput).Get(ctx, &prompt); err != nil {
 			return EpisodeProductionResult{}, err
 		}
+		waitForResume(ctx, &status, controlChannel)
 
 		var accepted bool
 		for creativeAttempt := 1; creativeAttempt <= 2; creativeAttempt++ {
@@ -174,12 +259,17 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 				PromptSnapshot:       prompt,
 				GenerationProfileRef: input.GenerationProfileRef,
 				Route:                input.ProviderRoute,
+				GenerationPlanID:     input.GenerationPlanID,
+				BudgetApprovalID:     input.BudgetApprovalID,
+				ProviderProfileID:    input.ProviderProfileID,
 				CreativeAttempt:      creativeAttempt,
 				TraceID:              input.TraceID,
+				PersistProductTruth:  input.PersistProductTruth,
 			}
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateRun, createInput).Get(ctx, &run); err != nil {
 				return EpisodeProductionResult{}, err
 			}
+			waitForResume(ctx, &status, controlChannel)
 			shotStatus.State = "RUNNING"
 			shotStatus.RunID = run.RunID
 			status.Shots[shotID] = shotStatus
@@ -194,31 +284,47 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 				BudgetApprovalID:    input.BudgetApprovalID,
 				BudgetMaximumMicros: input.BudgetMaximumMicros,
 				BudgetCurrency:      input.BudgetCurrency,
+				ProviderProfileID:   input.ProviderProfileID,
 				TraceID:             input.TraceID,
+				PersistProductTruth: input.PersistProductTruth,
 			}
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, providerOptions), ActivityExecuteProviderJob, dispatchInput).Get(ctx, &generated); err != nil {
 				return EpisodeProductionResult{}, err
 			}
+			waitForResume(ctx, &status, controlChannel)
 
 			shotStatus.State = "QC_PENDING"
 			shotStatus.ArtifactDigest = generated.ArtifactDigest
 			status.Shots[shotID] = shotStatus
 			var qc QCResult
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityRunAutomaticQC, RunQCInput{
-				Run: run, Provider: generated, TraceID: input.TraceID,
+				Run: run, Provider: generated, TraceID: input.TraceID, PersistProductTruth: input.PersistProductTruth,
 			}).Get(ctx, &qc); err != nil {
 				return EpisodeProductionResult{}, err
 			}
+			waitForResume(ctx, &status, controlChannel)
 			if qc.Passed {
 				if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateShotReview, CreateReviewInput{
-					ShotSpecRevisionID: shotID,
-					RunID:              run.RunID,
-					ArtifactDigest:     generated.ArtifactDigest,
-					TraceID:            input.TraceID,
+					ShotSpecRevisionID:  shotID,
+					RunID:               run.RunID,
+					ArtifactDigest:      generated.ArtifactDigest,
+					TraceID:             input.TraceID,
+					PersistProductTruth: input.PersistProductTruth,
 				}).Get(ctx, nil); err != nil {
 					return EpisodeProductionResult{}, err
 				}
-				shotStatus.State = "REVIEW"
+				shotStatus.State = "WAITING_Q1"
+				status.Shots[shotID] = shotStatus
+				if input.RequireShotApproval {
+					decision := waitForShotDecision(ctx, &status, controlChannel, shotID, run.RunID)
+					if !decision.Approved {
+						shotStatus.State = "Q1_REJECTED"
+						shotStatus.FailureCode = decision.ReasonCode
+						status.Shots[shotID] = shotStatus
+						continue
+					}
+				}
+				shotStatus.State = "APPROVED"
 				status.Shots[shotID] = shotStatus
 				lockedRunIDs = append(lockedRunIDs, run.RunID)
 				accepted = true
@@ -231,9 +337,10 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 
 		if !accepted {
 			if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityEscalateShot, EscalateShotInput{
-				ShotSpecRevisionID: shotID,
-				FailureCode:        status.Shots[shotID].FailureCode,
-				TraceID:            input.TraceID,
+				ShotSpecRevisionID:  shotID,
+				FailureCode:         status.Shots[shotID].FailureCode,
+				TraceID:             input.TraceID,
+				PersistProductTruth: input.PersistProductTruth,
 			}).Get(ctx, nil); err != nil {
 				return EpisodeProductionResult{}, err
 			}
@@ -247,17 +354,55 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 		}
 	}
 
+	var delivery *postproduction.Result
+	if input.PostProduction != nil && input.PostProduction.Enabled {
+		status.State = "POST_PRODUCTION"
+		postOptions := baseOptions
+		postOptions.StartToCloseTimeout = 45 * time.Minute
+		postOptions.HeartbeatTimeout = 30 * time.Second
+		var finalized postproduction.Result
+		if err := workflow.ExecuteActivity(
+			workflow.WithActivityOptions(ctx, postOptions),
+			ActivityFinalizeEpisode,
+			FinalizeEpisodeInput{
+				EpisodeRevisionID:   input.EpisodeRevisionID,
+				RunIDs:              lockedRunIDs,
+				GenerationPlanID:    input.GenerationPlanID,
+				Config:              *input.PostProduction,
+				TraceID:             input.TraceID,
+				PersistProductTruth: input.PersistProductTruth,
+			},
+		).Get(ctx, &finalized); err != nil {
+			return EpisodeProductionResult{
+				State: "POST_PRODUCTION_FAILED", LockedRunIDs: lockedRunIDs, Shots: status.Shots,
+			}, err
+		}
+		delivery = &finalized
+	}
+
 	status.State = "WAITING_G3"
+	postProductionManifestHash := ""
+	if delivery != nil {
+		postProductionManifestHash = delivery.ManifestHash
+	}
 	if err := workflow.ExecuteActivity(workflow.WithActivityOptions(ctx, baseOptions), ActivityCreateGate3, CreateGate3Input{
-		EpisodeRevisionID: input.EpisodeRevisionID,
-		RunIDs:            lockedRunIDs,
-		TraceID:           input.TraceID,
+		EpisodeRevisionID:          input.EpisodeRevisionID,
+		RunIDs:                     lockedRunIDs,
+		GenerationPlanID:           input.GenerationPlanID,
+		PostProductionManifestHash: postProductionManifestHash,
+		BackgroundAudioAssetVersionID: func() string {
+			if input.PostProduction == nil {
+				return ""
+			}
+			return input.PostProduction.BackgroundAudioAssetVersionID
+		}(),
+		TraceID:             input.TraceID,
+		PersistProductTruth: input.PersistProductTruth,
 	}).Get(ctx, nil); err != nil {
 		return EpisodeProductionResult{}, err
 	}
 
-	var gate3 Gate3Decision
-	workflow.GetSignalChannel(ctx, Gate3DecisionSignal).Receive(ctx, &gate3)
+	gate3 := waitForGate3Decision(ctx, &status, controlChannel)
 	if gate3.DecisionID == "" || gate3.ActorID == "" {
 		return EpisodeProductionResult{}, temporal.NewNonRetryableApplicationError(
 			"invalid G3 decision signal", "VALIDATION_ERROR", errors.New("decisionId and actorId are required"),
@@ -266,20 +411,125 @@ func EpisodeProductionWorkflow(ctx workflow.Context, input EpisodeProductionInpu
 	if !gate3.Approved {
 		status.State = "G3_REJECTED"
 		return EpisodeProductionResult{
-			State:         status.State,
-			LockedRunIDs:  lockedRunIDs,
-			Gate3Decision: &gate3,
-			Shots:         status.Shots,
+			State:          status.State,
+			LockedRunIDs:   lockedRunIDs,
+			PostProduction: delivery,
+			Gate3Decision:  &gate3,
+			Shots:          status.Shots,
 		}, nil
 	}
 
 	status.State = "LOCKED"
 	return EpisodeProductionResult{
-		State:         status.State,
-		LockedRunIDs:  lockedRunIDs,
-		Gate3Decision: &gate3,
-		Shots:         status.Shots,
+		State:          status.State,
+		LockedRunIDs:   lockedRunIDs,
+		PostProduction: delivery,
+		Gate3Decision:  &gate3,
+		Shots:          status.Shots,
 	}, nil
+}
+
+func waitForResume(ctx workflow.Context, status *WorkflowStatus, controls workflow.ReceiveChannel) bool {
+	var command WorkflowControl
+	pauseObserved := status.Paused
+	for controls.ReceiveAsync(&command) {
+		applyControl(status, command)
+		if command.Action == "PAUSE" {
+			pauseObserved = true
+		}
+	}
+	if !status.Paused {
+		return pauseObserved
+	}
+	previous := status.State
+	status.State = "PAUSED"
+	for status.Paused {
+		selector := workflow.NewSelector(ctx)
+		selector.AddReceive(controls, func(channel workflow.ReceiveChannel, _ bool) {
+			channel.Receive(ctx, &command)
+			applyControl(status, command)
+		})
+		selector.AddReceive(ctx.Done(), func(workflow.ReceiveChannel, bool) {})
+		selector.Select(ctx)
+		if ctx.Err() != nil {
+			return true
+		}
+	}
+	status.State = previous
+	return true
+}
+
+func applyControl(status *WorkflowStatus, command WorkflowControl) {
+	if command.CommandID == "" || command.ActorID == "" {
+		return
+	}
+	switch command.Action {
+	case "PAUSE":
+		status.Paused = true
+	case "RESUME":
+		status.Paused = false
+	}
+}
+
+func waitForShotDecision(
+	ctx workflow.Context,
+	status *WorkflowStatus,
+	controls workflow.ReceiveChannel,
+	shotID string,
+	runID string,
+) ShotDecision {
+	decisions := workflow.GetSignalChannel(ctx, ShotDecisionSignal)
+	for {
+		waitForResume(ctx, status, controls)
+		var decision ShotDecision
+		selector := workflow.NewSelector(ctx)
+		selector.AddReceive(decisions, func(channel workflow.ReceiveChannel, _ bool) {
+			channel.Receive(ctx, &decision)
+		})
+		selector.AddReceive(controls, func(channel workflow.ReceiveChannel, _ bool) {
+			var command WorkflowControl
+			channel.Receive(ctx, &command)
+			applyControl(status, command)
+		})
+		selector.Select(ctx)
+		if status.Paused {
+			continue
+		}
+		if decision.DecisionID != "" &&
+			decision.ActorID != "" &&
+			decision.ShotSpecRevisionID == shotID &&
+			decision.RunID == runID {
+			return decision
+		}
+	}
+}
+
+func waitForGate3Decision(
+	ctx workflow.Context,
+	status *WorkflowStatus,
+	controls workflow.ReceiveChannel,
+) Gate3Decision {
+	decisions := workflow.GetSignalChannel(ctx, Gate3DecisionSignal)
+	for {
+		waitForResume(ctx, status, controls)
+		var decision Gate3Decision
+		selector := workflow.NewSelector(ctx)
+		selector.AddReceive(decisions, func(channel workflow.ReceiveChannel, _ bool) {
+			channel.Receive(ctx, &decision)
+		})
+		selector.AddReceive(controls, func(channel workflow.ReceiveChannel, _ bool) {
+			var command WorkflowControl
+			channel.Receive(ctx, &command)
+			applyControl(status, command)
+		})
+		selector.Select(ctx)
+		if status.Paused {
+			continue
+		}
+		if decision.DecisionID != "" && decision.ActorID != "" {
+			return decision
+		}
+	}
 }
 
 // Activity inputs are explicit and version-independent product contracts.
@@ -287,6 +537,7 @@ type CompilePromptInput struct {
 	ShotSpecRevisionID   string `json:"shotSpecRevisionId"`
 	GenerationProfileRef string `json:"generationProfileRef"`
 	TraceID              string `json:"traceId"`
+	PersistProductTruth  bool   `json:"persistProductTruth,omitempty"`
 }
 
 type CreateRunInput struct {
@@ -294,8 +545,12 @@ type CreateRunInput struct {
 	PromptSnapshot       PromptSnapshotRef              `json:"promptSnapshot"`
 	GenerationProfileRef string                         `json:"generationProfileRef"`
 	Route                providercontract.ModelSnapshot `json:"route"`
+	GenerationPlanID     string                         `json:"generationPlanId,omitempty"`
+	BudgetApprovalID     string                         `json:"budgetApprovalId,omitempty"`
+	ProviderProfileID    string                         `json:"providerProfileId,omitempty"`
 	CreativeAttempt      int                            `json:"creativeAttempt"`
 	TraceID              string                         `json:"traceId"`
+	PersistProductTruth  bool                           `json:"persistProductTruth,omitempty"`
 }
 
 type ExecuteProviderJobInput struct {
@@ -305,32 +560,57 @@ type ExecuteProviderJobInput struct {
 	BudgetApprovalID    string                         `json:"budgetApprovalId"`
 	BudgetMaximumMicros int64                          `json:"budgetMaximumMicros"`
 	BudgetCurrency      string                         `json:"budgetCurrency"`
+	ProviderProfileID   string                         `json:"providerProfileId,omitempty"`
 	TraceID             string                         `json:"traceId"`
+	PersistProductTruth bool                           `json:"persistProductTruth,omitempty"`
+}
+
+// PreparedProviderJob is the durable per-run budget allocation returned by the
+// product-truth transaction before any paid Provider request is assembled.
+type PreparedProviderJob struct {
+	Budget            providercontract.BudgetEnvelope    `json:"budget"`
+	BudgetReservation providercontract.BudgetReservation `json:"budgetReservation"`
 }
 
 type RunQCInput struct {
-	Run      GenerationRunRef `json:"run"`
-	Provider ProviderResult   `json:"provider"`
-	TraceID  string           `json:"traceId"`
+	Run                 GenerationRunRef `json:"run"`
+	Provider            ProviderResult   `json:"provider"`
+	TraceID             string           `json:"traceId"`
+	PersistProductTruth bool             `json:"persistProductTruth,omitempty"`
 }
 
 type CreateReviewInput struct {
-	ShotSpecRevisionID string `json:"shotSpecRevisionId"`
-	RunID              string `json:"runId"`
-	ArtifactDigest     string `json:"artifactDigest"`
-	TraceID            string `json:"traceId"`
+	ShotSpecRevisionID  string `json:"shotSpecRevisionId"`
+	RunID               string `json:"runId"`
+	ArtifactDigest      string `json:"artifactDigest"`
+	TraceID             string `json:"traceId"`
+	PersistProductTruth bool   `json:"persistProductTruth,omitempty"`
 }
 
 type EscalateShotInput struct {
-	ShotSpecRevisionID string `json:"shotSpecRevisionId"`
-	FailureCode        string `json:"failureCode"`
-	TraceID            string `json:"traceId"`
+	ShotSpecRevisionID  string `json:"shotSpecRevisionId"`
+	FailureCode         string `json:"failureCode"`
+	TraceID             string `json:"traceId"`
+	PersistProductTruth bool   `json:"persistProductTruth,omitempty"`
 }
 
 type CreateGate3Input struct {
-	EpisodeRevisionID string   `json:"episodeRevisionId"`
-	RunIDs            []string `json:"runIds"`
-	TraceID           string   `json:"traceId"`
+	EpisodeRevisionID             string   `json:"episodeRevisionId"`
+	RunIDs                        []string `json:"runIds"`
+	GenerationPlanID              string   `json:"generationPlanId,omitempty"`
+	PostProductionManifestHash    string   `json:"postProductionManifestHash,omitempty"`
+	BackgroundAudioAssetVersionID string   `json:"backgroundAudioAssetVersionId,omitempty"`
+	TraceID                       string   `json:"traceId"`
+	PersistProductTruth           bool     `json:"persistProductTruth,omitempty"`
+}
+
+type FinalizeEpisodeInput struct {
+	EpisodeRevisionID   string               `json:"episodeRevisionId"`
+	RunIDs              []string             `json:"runIds"`
+	GenerationPlanID    string               `json:"generationPlanId,omitempty"`
+	Config              PostProductionConfig `json:"config"`
+	TraceID             string               `json:"traceId"`
+	PersistProductTruth bool                 `json:"persistProductTruth,omitempty"`
 }
 
 func validateWorkflowInput(input EpisodeProductionInput) error {
@@ -339,6 +619,10 @@ func validateWorkflowInput(input EpisodeProductionInput) error {
 	}
 	if input.SeriesID == "" || input.EpisodeRevisionID == "" || input.GenerationProfileRef == "" || input.Gate2DecisionID == "" {
 		return errors.New("seriesId, episodeRevisionId, generationProfileRef, and gate2DecisionId are required")
+	}
+	if input.PersistProductTruth &&
+		(input.GenerationPlanID == "" || input.ProviderProfileID == "") {
+		return errors.New("generationPlanId and providerProfileId are required for product persistence")
 	}
 	if err := input.ProviderRoute.Validate(providercontract.CapabilityVideo); err != nil {
 		return errors.New("a frozen video.primary providerRoute is required")
@@ -358,6 +642,11 @@ func validateWorkflowInput(input EpisodeProductionInput) error {
 			return fmt.Errorf("duplicate shotSpecRevisionId %q", shotID)
 		}
 		seen[shotID] = struct{}{}
+	}
+	if input.PostProduction != nil {
+		if err := input.PostProduction.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

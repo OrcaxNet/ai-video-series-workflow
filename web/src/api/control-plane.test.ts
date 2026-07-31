@@ -284,40 +284,15 @@ describe("HttpControlPlaneApi", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/approvals");
   });
 
-  it("submits a new creative attempt through the frozen provider-jobs route", async () => {
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
-        JSON.stringify({
-          providerJobId: "33333333-3333-4333-8333-333333333303",
-          generationAttemptId: "22222222-2222-4222-8222-222222222202",
-          state: "QUEUED",
-          traceId: "trc-live-attempt-2",
-          createdAt: "2026-07-30T06:10:00Z",
-        }),
-        { status: 202, headers: { "Content-Type": "application/json" } },
-      ),
-    );
+  it("fails closed instead of submitting a mock projection to the removed provider-jobs route", async () => {
+    const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
     const api = new HttpControlPlaneApi("/api/v1");
 
-    await expect(api.createJobAttempt(jobAttemptInput("FAILED", "live-attempt"))).resolves.toMatchObject({
-      providerJobId: "33333333-3333-4333-8333-333333333303",
-      state: "QUEUED",
+    await expect(api.createJobAttempt(jobAttemptInput("FAILED", "live-attempt"))).rejects.toMatchObject({
+      status: 501,
+      errorCode: "LIVE_RUN_BINDINGS_REQUIRED",
     });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/provider-jobs");
-    const request = fetchMock.mock.calls[0]?.[1] as RequestInit;
-    const body = JSON.parse(String(request.body)) as Record<string, unknown>;
-    expect(body).toMatchObject({
-      schemaVersion: "v1",
-      generationAttemptId: "22222222-2222-4222-8222-222222222202",
-      capability: "video.primary",
-    });
-    expect(body.requestSnapshot).toMatchObject({
-      creativeAttempt: 2,
-      creativeIntentKey: "job-v-032:2",
-      supersedesProviderJobId: "job-v-032",
-    });
-    expect((request.headers as Record<string, string>)["Idempotency-Key"]).toBe("live-attempt");
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

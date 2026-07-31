@@ -64,11 +64,6 @@ const jobAttemptFingerprint = (input: CreateJobAttemptInput) =>
     model: input.sourceJob.model,
   });
 
-const sha256 = async (seed: string) => {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(seed));
-  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-};
-
 export class MockControlPlaneApi implements ControlPlaneApi {
   private gates: Record<GateId, Gate>;
   private idempotency = new Map<string, { fingerprint: string; result: ApprovalResult }>();
@@ -404,69 +399,13 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
   }
 
   async createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult> {
-    const [inputHash, capabilityHash] = await Promise.all([
-      sha256(`${input.sourceJob.shotId}:${input.nextAttempt}:${input.generationAttemptId}`),
-      sha256(`${input.sourceJob.capability}:${input.sourceJob.model}`),
-    ]);
-    const response = await fetch(`${this.baseUrl}/provider-jobs`, {
-      method: "POST",
-      credentials: "omit",
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-        "Idempotency-Key": input.idempotencyKey,
-      },
-      body: JSON.stringify({
-        schemaVersion: "v1",
-        generationAttemptId: input.generationAttemptId,
-        generationPlanId: "00000000-0000-4000-8000-000000000301",
-        capability: input.sourceJob.capability,
-        inputHash,
-        routeSnapshot: {
-          capabilityAlias: input.sourceJob.capability,
-          providerProfileId: "00000000-0000-4000-8000-000000000401",
-          provider: input.sourceJob.provider,
-          modelId: input.sourceJob.model,
-          routeVersion: "route-v4",
-          capabilityHash,
-        },
-        requestSnapshot: {
-          shotId: input.sourceJob.shotId,
-          creativeAttempt: input.nextAttempt,
-          creativeIntentKey: `${input.sourceJob.id}:${input.nextAttempt}`,
-          supersedesProviderJobId: input.sourceJob.id,
-          evidence: input.sourceJob.evidence,
-        },
-        actor: { actorId: "local-creator", role: "CREATOR" },
-      }),
-    });
-    if (!response.ok) {
-      throw await this.readProblem(response);
-    }
-    const job = (await response.json()) as {
-      providerJobId: string;
-      generationAttemptId: string;
-      state: string;
-      traceId: string;
-      createdAt: string;
-      upstreamTaskId?: string;
-    };
-    if (job.state !== "QUEUED") {
-      throw problem(
-        502,
-        "PROJECTION_STATE_UNSUPPORTED",
-        `新 Provider Job 返回了未就绪状态 ${job.state}。`,
-        "重新加载任务投影，确认控制面已完成持久化与提交。",
-      );
-    }
-    return {
-      providerJobId: job.providerJobId,
-      generationAttemptId: job.generationAttemptId,
-      state: "QUEUED",
-      traceId: job.traceId,
-      createdAt: job.createdAt,
-      taskId: job.upstreamTaskId,
-    };
+    void input;
+    throw problem(
+      501,
+      "LIVE_RUN_BINDINGS_REQUIRED",
+      "真实控制面已收口为 GenerationRun 命令，不能从 Mock Provider Job 投影直接创建新 attempt。",
+      "先持久化 shotSpec、PromptSnapshot、route、budget、safety/consent/license 绑定，再通过 POST /shots/{shotId}/runs 提交；当前操作仅支持 Mock 排练。",
+    );
   }
 
   async regenerateGate(): Promise<RegenerationResult> {

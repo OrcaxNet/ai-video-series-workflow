@@ -21,7 +21,12 @@ type ControlPlane struct {
 	Environment        string
 	HTTPAddress        string
 	PostgresAddress    string
+	PostgresDSN        string
 	TemporalAddress    string
+	TemporalNamespace  string
+	TemporalTaskQueue  string
+	AuthHMACSecret     string
+	AuthAudience       string
 	ArtifactRoot       string
 	ProviderAdapterURL string
 	DependencyTimeout  time.Duration
@@ -36,6 +41,8 @@ type OrchestratorWorker struct {
 	Namespace          string
 	TaskQueue          string
 	ProviderAdapterURL string
+	PostgresDSN        string
+	ArtifactRoot       string
 }
 
 // MockProvider configures the deterministic, no-key provider fixture.
@@ -57,6 +64,9 @@ func loadControlPlane(lookup LookupEnv) (ControlPlane, error) {
 		HTTPAddress:        value(lookup, "VIDEO_CONTROL_PLANE_HTTP_ADDRESS", ":8080"),
 		PostgresAddress:    value(lookup, "VIDEO_POSTGRES_ADDRESS", "postgres:5432"),
 		TemporalAddress:    value(lookup, "VIDEO_TEMPORAL_ADDRESS", "temporal:7233"),
+		TemporalNamespace:  value(lookup, "VIDEO_TEMPORAL_NAMESPACE", "default"),
+		TemporalTaskQueue:  value(lookup, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
+		AuthAudience:       value(lookup, "VIDEO_AUTH_AUDIENCE", "video-control-plane"),
 		ArtifactRoot:       value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
 		ProviderAdapterURL: value(lookup, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
 		Version:            value(lookup, "VIDEO_BUILD_VERSION", "development"),
@@ -89,8 +99,24 @@ func loadControlPlane(lookup LookupEnv) (ControlPlane, error) {
 	if strings.TrimSpace(cfg.ArtifactRoot) == "" {
 		return ControlPlane{}, errors.New("VIDEO_ARTIFACT_ROOT is required")
 	}
+	if strings.TrimSpace(cfg.TemporalNamespace) == "" || strings.TrimSpace(cfg.TemporalTaskQueue) == "" {
+		return ControlPlane{}, errors.New("Temporal namespace and task queue are required")
+	}
+	cfg.AuthHMACSecret = value(lookup, "VIDEO_AUTH_HMAC_SECRET", "")
+	if cfg.AuthHMACSecret != "" && len(cfg.AuthHMACSecret) < 32 {
+		return ControlPlane{}, errors.New("VIDEO_AUTH_HMAC_SECRET must contain at least 32 bytes")
+	}
+	if strings.TrimSpace(cfg.AuthAudience) == "" {
+		return ControlPlane{}, errors.New("VIDEO_AUTH_AUDIENCE is required")
+	}
+	if strings.EqualFold(cfg.Environment, "production") && cfg.AuthHMACSecret == "" {
+		return ControlPlane{}, errors.New("VIDEO_AUTH_HMAC_SECRET is required in production")
+	}
 	if err := validateHTTPURL(cfg.ProviderAdapterURL); err != nil {
 		return ControlPlane{}, fmt.Errorf("VIDEO_PROVIDER_ADAPTER_URL: %w", err)
+	}
+	if cfg.PostgresDSN, err = postgresDSN(lookup, cfg.PostgresAddress); err != nil {
+		return ControlPlane{}, err
 	}
 	return cfg, nil
 }
@@ -102,6 +128,7 @@ func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 		Namespace:          value(os.LookupEnv, "VIDEO_TEMPORAL_NAMESPACE", "default"),
 		TaskQueue:          value(os.LookupEnv, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
 		ProviderAdapterURL: value(os.LookupEnv, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
+		ArtifactRoot:       value(os.LookupEnv, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
 	}
 	if err := validateDialAddress(cfg.TemporalAddress); err != nil {
 		return OrchestratorWorker{}, fmt.Errorf("VIDEO_TEMPORAL_ADDRESS: %w", err)
@@ -111,6 +138,17 @@ func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 	}
 	if err := validateHTTPURL(cfg.ProviderAdapterURL); err != nil {
 		return OrchestratorWorker{}, fmt.Errorf("VIDEO_PROVIDER_ADAPTER_URL: %w", err)
+	}
+	var err error
+	postgresAddress := value(os.LookupEnv, "VIDEO_POSTGRES_ADDRESS", "postgres:5432")
+	if err := validateDialAddress(postgresAddress); err != nil {
+		return OrchestratorWorker{}, fmt.Errorf("VIDEO_POSTGRES_ADDRESS: %w", err)
+	}
+	if cfg.PostgresDSN, err = postgresDSN(os.LookupEnv, postgresAddress); err != nil {
+		return OrchestratorWorker{}, err
+	}
+	if strings.TrimSpace(cfg.ArtifactRoot) == "" {
+		return OrchestratorWorker{}, errors.New("VIDEO_ARTIFACT_ROOT is required")
 	}
 	return cfg, nil
 }
@@ -209,4 +247,28 @@ func splitCSV(raw string) []string {
 		values = append(values, item)
 	}
 	return values
+}
+
+func postgresDSN(lookup LookupEnv, address string) (string, error) {
+	if raw, ok := lookup("VIDEO_POSTGRES_DSN"); ok && strings.TrimSpace(raw) != "" {
+		parsed, err := url.Parse(strings.TrimSpace(raw))
+		if err != nil || (parsed.Scheme != "postgres" && parsed.Scheme != "postgresql") || parsed.Host == "" || parsed.Path == "" {
+			return "", errors.New("VIDEO_POSTGRES_DSN must be a PostgreSQL URL")
+		}
+		return parsed.String(), nil
+	}
+	user := value(lookup, "VIDEO_POSTGRES_USER", "video")
+	password := value(lookup, "VIDEO_POSTGRES_PASSWORD", "video-local-only")
+	database := value(lookup, "VIDEO_POSTGRES_DATABASE", "video_pipeline")
+	if user == "" || password == "" || database == "" {
+		return "", errors.New("PostgreSQL user, password, and database must be non-empty")
+	}
+	dsn := &url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword(user, password),
+		Host:     address,
+		Path:     "/" + database,
+		RawQuery: "sslmode=disable",
+	}
+	return dsn.String(), nil
 }

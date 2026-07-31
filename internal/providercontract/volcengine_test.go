@@ -30,6 +30,7 @@ func TestVolcengineProvider_SubmitTextMapping(t *testing.T) {
 			"id":"response-test-1",
 			"model":"configured-text-model",
 			"status":"completed",
+			"output":[{"type":"message","content":[{"type":"output_text","text":"{\"episodes\":[]}"}]}],
 			"usage":{"input_tokens":12,"output_tokens":2}
 		}`)
 	}))
@@ -55,7 +56,8 @@ func TestVolcengineProvider_SubmitTextMapping(t *testing.T) {
 	}
 	if job.Status != StatusSucceeded || job.ProviderModel != "configured-text-model" ||
 		job.ProviderRequestID != "text-request-1" || job.Output == nil ||
-		job.Output.Usage.InputTokens != 12 || job.Output.Usage.OutputTokens != 2 {
+		job.Output.Usage.InputTokens != 12 || job.Output.Usage.OutputTokens != 2 ||
+		job.Output.Text != `{"episodes":[]}` {
 		t.Fatalf("Submit() job = %#v", job)
 	}
 }
