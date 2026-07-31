@@ -53,9 +53,15 @@ type MeasuredOutput struct {
 	MediaType      string `json:"media_type"`
 }
 
+type ComponentEvidence struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+}
+
 type Result struct {
 	SchemaVersion  string                 `json:"schema_version"`
 	Evidence       string                 `json:"evidence"`
+	Component      ComponentEvidence      `json:"component"`
 	RunID          string                 `json:"run_id"`
 	JobID          string                 `json:"job_id"`
 	TaskID         string                 `json:"provider_task_id"`
@@ -97,13 +103,10 @@ type RedactionEvidence struct {
 }
 
 type ServiceBOM struct {
-	SchemaVersion string `json:"schema_version"`
-	Evidence      string `json:"evidence"`
-	Component     struct {
-		Name    string `json:"name"`
-		Version string `json:"version"`
-	} `json:"component"`
-	Provider struct {
+	SchemaVersion string            `json:"schema_version"`
+	Evidence      string            `json:"evidence"`
+	Component     ComponentEvidence `json:"component"`
+	Provider      struct {
 		Name      string `json:"name"`
 		Model     string `json:"model"`
 		Region    string `json:"region"`
@@ -248,6 +251,9 @@ func Run(ctx context.Context, config Config) (Result, error) {
 
 	result := Result{
 		SchemaVersion: "1", Evidence: providercontract.EvidenceLiveProvider,
+		Component: ComponentEvidence{
+			Name: "video-live-probe", Version: firstNonEmpty(config.BuildVersion, "development"),
+		},
 		RunID: runID, JobID: jobID, TaskID: response.UpstreamTaskID, RequestID: response.RequestID,
 		Provider: "volcengine_ark", Model: response.Model.ModelID,
 		Region: config.Region, Plan: config.PlanName,

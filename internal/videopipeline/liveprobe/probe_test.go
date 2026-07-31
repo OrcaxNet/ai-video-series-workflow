@@ -111,6 +111,7 @@ func TestRunProducesSingleSanitizedLiveEvidenceBundle(t *testing.T) {
 	}
 	if submits.Load() != 1 || result.TaskID != "cgt-live-probe" ||
 		result.RequestID != "request-live-probe" || result.ArtifactSHA256 != artifact.Digest ||
+		result.Component.Name != "video-live-probe" || result.Component.Version != "fixed-sha" ||
 		result.Output.Width != 1280 || result.Output.Height != 720 || result.Output.FPS != 24 ||
 		result.Output.DurationMillis != 5_062 || result.Usage.VideoTokens != 250_000 ||
 		len(result.Artifacts) != 2 || result.Files["last_frame"] != "last-frame.jpg" {
@@ -151,7 +152,8 @@ func TestRunProducesSingleSanitizedLiveEvidenceBundle(t *testing.T) {
 	if err := json.Unmarshal(bomBytes, &bom); err != nil {
 		t.Fatal(err)
 	}
-	if len(bom.Artifacts) != 2 || bom.Artifacts[1].SHA256 != lastFrame.Digest ||
+	if bom.Component.Name != "video-volcengine-provider" || bom.Component.Version != "fixed-sha" ||
+		len(bom.Artifacts) != 2 || bom.Artifacts[1].SHA256 != lastFrame.Digest ||
 		bom.Artifacts[1].File != "last-frame.jpg" {
 		t.Fatalf("Service BOM artifacts = %#v", bom.Artifacts)
 	}
