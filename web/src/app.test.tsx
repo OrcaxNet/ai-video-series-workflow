@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { MockControlPlaneApi, type ControlPlaneApi } from "./api/control-plane";
 import { App } from "./app";
 import type { CreateJobAttemptInput, CreateJobAttemptResult } from "./domain";
-import { createInitialState } from "./mock-data";
+import { createInitialState, gates, jobs } from "./mock-data";
 import { StudioProvider, useStudio } from "./studio-store";
 
 const renderStudio = (api: ControlPlaneApi = new MockControlPlaneApi()) =>
@@ -19,6 +19,9 @@ const failedJobsState = () => {
   state.jobs[1] = { ...state.jobs[1], state: "FAILED" };
   return state;
 };
+
+const failedJobSeed = () =>
+  jobs.map((job) => (job.id === "job-v-032" ? { ...job, state: "FAILED" as const } : job));
 
 class DeferredAttemptApi extends MockControlPlaneApi {
   readonly attemptInputs: CreateJobAttemptInput[] = [];
@@ -40,6 +43,13 @@ class DeferredAttemptApi extends MockControlPlaneApi {
       state: "QUEUED",
       traceId: "trc-deferred-attempt-2",
       createdAt: "2026-07-30T06:50:00Z",
+      g3Revision: {
+        revision: 3,
+        revisionId: "gate-g3-r3",
+        etag: 3,
+        state: "BLOCKED",
+        bindings: gates.G3.bindings,
+      },
     });
   }
 }
@@ -47,6 +57,10 @@ class DeferredAttemptApi extends MockControlPlaneApi {
 class LostFirstResponseApi extends MockControlPlaneApi {
   readonly attemptInputs: CreateJobAttemptInput[] = [];
   private loseResponse = true;
+
+  constructor() {
+    super(gates, failedJobSeed());
+  }
 
   override async createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult> {
     this.attemptInputs.push(structuredClone(input));

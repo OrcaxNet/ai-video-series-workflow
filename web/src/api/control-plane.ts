@@ -23,6 +23,7 @@ export interface ControlPlaneApi {
   createSeries(input: CreateProjectInput, idempotencyKey: string): Promise<CreateProjectResult>;
   createApproval(input: ApprovalInput): Promise<ApprovalResult>;
   createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult>;
+  transitionJobState(jobId: string, state: ProviderJob["state"]): Promise<void>;
   completeMockRun(): Promise<void>;
   regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult>;
   simulateConcurrentUpdate(gateId: GateId): Promise<number>;
@@ -77,6 +78,13 @@ const bindingFingerprint = (bindings: ApprovalInput["bindings"]) =>
   bindings
     .map((binding) => [binding.objectType, binding.revisionId, binding.contentHash].join(":"))
     .sort();
+
+const terminalJobStates = new Set<ProviderJob["state"]>(["SUCCEEDED", "FAILED", "CANCELLED"]);
+
+const stableHash = (seed: string) =>
+  Array.from({ length: 64 }, (_, index) =>
+    ((seed.charCodeAt(index % seed.length) + index) % 16).toString(16),
+  ).join("");
 
 const liveMutationBlocked = (operation: string) =>
   problem(
@@ -252,15 +260,16 @@ export class MockControlPlaneApi implements ControlPlaneApi {
         `刷新任务投影并使用当前 Job ${currentJobId ?? "unknown"}；不得从历史 source 重放。`,
       );
     }
-    if (input.sourceJob.state !== "FAILED" && input.sourceJob.state !== "CANCELLED") {
+    const currentJobState = this.jobStateById.get(currentJobId);
+    if (currentJobState !== "FAILED" && currentJobState !== "CANCELLED") {
       throw problem(
         422,
         "RUN_TERMINAL_REQUIRED",
-        "只有当前 FAILED 或 CANCELLED Job 可以创建替代 attempt。",
-        "选择当前终态任务，或对可重试故障沿用原 Job ID。",
+        `控制面当前 Job ${currentJobId} 为 ${currentJobState ?? "UNKNOWN"}，不能创建替代 attempt。`,
+        "刷新任务投影；只有控制面确认的当前 FAILED 或 CANCELLED Job 才能创建新 attempt。",
       );
     }
-    const currentAttempt = this.attemptByJobId.get(input.sourceJob.id);
+    const currentAttempt = this.attemptByJobId.get(currentJobId);
     if (currentAttempt === undefined || input.nextAttempt !== currentAttempt + 1) {
       throw problem(
         409,
@@ -280,12 +289,14 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     }
 
     const suffix = input.sourceJob.shotId.replace(/^shot-/, "");
+    const g3Revision = this.invalidateG3ForNewAttempt(input);
     const result: CreateJobAttemptResult = {
       providerJobId: `job-v-${suffix}-a${input.nextAttempt}`,
       generationAttemptId: input.generationAttemptId,
       state: "QUEUED",
       traceId: `trc_attempt_${suffix}_a${input.nextAttempt}`,
       createdAt: new Date().toISOString(),
+      g3Revision,
     };
     this.jobAttempts.set(input.idempotencyKey, { fingerprint, result });
     this.jobAttemptIntents.set(intentKey, {
@@ -295,10 +306,33 @@ export class MockControlPlaneApi implements ControlPlaneApi {
     });
     this.currentJobByShot.set(input.sourceJob.shotId, result.providerJobId);
     this.attemptByJobId.set(result.providerJobId, input.nextAttempt);
-    this.jobStateById.set(input.sourceJob.id, input.sourceJob.state);
     this.jobStateById.set(result.providerJobId, result.state);
     this.generationAttemptOwners.set(input.generationAttemptId, intentKey);
     return structuredClone(result);
+  }
+
+  async transitionJobState(jobId: string, state: ProviderJob["state"]): Promise<void> {
+    await Promise.resolve();
+    if (!Array.from(this.currentJobByShot.values()).includes(jobId)) {
+      throw problem(
+        409,
+        "ATTEMPT_SOURCE_SUPERSEDED",
+        `${jobId} 不是控制面当前 Job，不能接受状态事件。`,
+        "刷新任务投影并将事件关联到 currentJobByShot 指向的 Job。",
+      );
+    }
+    const currentState = this.jobStateById.get(jobId);
+    if (!currentState) {
+      throw problem(404, "JOB_NOT_FOUND", `控制面中不存在 Job ${jobId}。`, "重新加载任务投影后重试。");
+    }
+    if (terminalJobStates.has(currentState)) {
+      return;
+    }
+    this.jobStateById.set(jobId, state);
+    if (this.gates.G3.state !== "APPROVED") {
+      this.gates.G3.state =
+        this.gates.G2.state === "APPROVED" && this.isG3TruthReady() ? "PENDING" : "BLOCKED";
+    }
   }
 
   async completeMockRun(): Promise<void> {
@@ -423,6 +457,58 @@ export class MockControlPlaneApi implements ControlPlaneApi {
       );
     }
   }
+
+  private invalidateG3ForNewAttempt(input: CreateJobAttemptInput) {
+    const gate = this.gates.G3;
+    gate.history = [
+      ...gate.history.map((record) =>
+        record.revision === gate.revision && record.state === "CURRENT"
+          ? { ...record, state: "SUPERSEDED" as const }
+          : record,
+      ),
+      {
+        revision: gate.revision + 1,
+        revisionId: `gate-g3-r${gate.revision + 1}`,
+        state: "CURRENT",
+        author: "创作编排",
+        createdAt: new Date().toISOString(),
+        note: `${input.sourceJob.shot} attempt ${input.nextAttempt} 产生新的 episode/QC/Manifest/artifact 谱系`,
+      },
+    ];
+    gate.revision += 1;
+    gate.etag += 1;
+    gate.revisionId = `gate-g3-r${gate.revision}`;
+    gate.state = "BLOCKED";
+    gate.decidedAt = undefined;
+    gate.decidedBy = undefined;
+    gate.explanation = undefined;
+    const bindingRevision = `r${gate.revision}-a${input.nextAttempt}`;
+    gate.bindings = gate.bindings.map((binding) => {
+      const revisionIdByType: Record<string, string> = {
+        EPISODE_REVISION: `episode-e03-${bindingRevision}`,
+        EPISODE_CUT: `cut-e03-${bindingRevision}`,
+        SUBTITLE: `sub-e03-${bindingRevision}`,
+        QC_REPORT: `qc-e03-${bindingRevision}`,
+        MANIFEST: `manifest-e03-${bindingRevision}`,
+        ARTIFACT: `artifact-cut-e03-${bindingRevision}`,
+      };
+      const revisionId = revisionIdByType[binding.objectType] ?? binding.revisionId;
+      return {
+        ...binding,
+        revisionId,
+        contentHash: stableHash(`${revisionId}:${input.generationAttemptId}`),
+        label: `${binding.objectType} · G3 ${bindingRevision}`,
+      };
+    });
+    this.staleGates.delete("G3");
+    return {
+      revision: gate.revision,
+      revisionId: gate.revisionId,
+      etag: gate.etag,
+      state: "BLOCKED" as const,
+      bindings: structuredClone(gate.bindings),
+    };
+  }
 }
 
 interface ProviderStatusResponse {
@@ -459,6 +545,12 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
   async createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult> {
     void input;
     throw liveMutationBlocked("创建 GenerationRun attempt");
+  }
+
+  async transitionJobState(jobId: string, state: ProviderJob["state"]): Promise<void> {
+    void jobId;
+    void state;
+    throw liveMutationBlocked("更新 Mock Job 状态");
   }
 
   async completeMockRun(): Promise<void> {

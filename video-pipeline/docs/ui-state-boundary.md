@@ -22,6 +22,10 @@ Mock control plane 同样执行 G3 真相校验，不依赖 React disabled：它
 current Job 与状态，仅在全部 current attempts 为 `SUCCEEDED`，且请求精确匹配当前
 episode revision、QC report、Manifest、artifact 的 revision/hash 时接受批准。缺失、
 重复或漂移 binding，以及未完成、FAILED、CANCELLED attempt 均在 API 边界拒绝。
+创建替代 attempt 时，终态只从 `currentJobByShot` 指向的内部 Job 和
+`jobStateById` 读取；客户端 projection 的 state 不可信且不得回写。合法的新 attempt
+会原子推进 G3 revision/ETag，重建 episode/QC/Manifest/artifact bindings，并把旧批准
+降为历史证据；新 current attempt 完成前，新的 G3 revision 保持阻断。
 
 ## 2. Provider 与运行状态
 

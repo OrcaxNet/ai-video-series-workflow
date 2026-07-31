@@ -73,6 +73,10 @@ artifact commit。PoC 尚未从真实投影加载这些 UUID，因此 live clien
   `(sourceJobId, nextAttempt)` 唯一约束拒绝陈旧 source 重放。
 - `SUCCEEDED`、`FAILED`、`CANCELLED` 是单调终态；晚到 callback、异常注入和批次
   完成均不得覆盖；批次完成和 G3 只计算每个镜头标记为当前的 attempt。
+- 新 attempt 只读取 control plane 的 `currentJobByShot` / `jobStateById` 真相；客户端
+  传入的 Job state 既不参与终态判定，也不会回写内部状态。每次合法的新 attempt
+  都原子创建新的 G3 revision/ETag 与 episode/QC/Manifest/artifact bindings，旧 G3
+  批准仅保留为历史，当前 revision 重新进入阻断/待审。
 - Mock G3 不信任 React 按钮状态：Mock control plane 自持 current-attempt 状态，并在
   批准前再次要求全部 `SUCCEEDED`，以及精确匹配 episode revision、QC report、
   Manifest 与 artifact 四类不可变 binding。任一任务未完成/失败/取消、binding

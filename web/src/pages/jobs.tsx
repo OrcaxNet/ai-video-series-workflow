@@ -114,7 +114,7 @@ export function JobsPage() {
           {scenarios.map((scenario) => {
             const Icon = scenario.icon;
             return (
-              <button type="button" key={scenario.id} onClick={() => actions.injectScenario(scenario.id)}>
+              <button type="button" key={scenario.id} onClick={() => void actions.injectScenario(scenario.id)}>
                 <Icon size={16} aria-hidden="true" />
                 <span>
                   <strong>{scenario.label}</strong>
@@ -264,7 +264,7 @@ export function JobsPage() {
                         <button
                           className="text-button"
                           type="button"
-                          onClick={() => actions.retryJob(job.id)}
+                          onClick={() => void actions.retryJob(job.id)}
                           disabled={state.busy}
                         >
                           重试
@@ -275,7 +275,7 @@ export function JobsPage() {
                         <button
                           className="text-button muted"
                           type="button"
-                          onClick={() => actions.cancelJob(job.id)}
+                          onClick={() => void actions.cancelJob(job.id)}
                           disabled={state.busy}
                         >
                           取消
@@ -285,7 +285,7 @@ export function JobsPage() {
                         <button
                           className="text-button"
                           type="button"
-                          onClick={() => actions.confirmCancelJob(job.id)}
+                          onClick={() => void actions.confirmCancelJob(job.id)}
                           disabled={state.busy}
                         >
                           确认取消终态

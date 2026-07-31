@@ -41,6 +41,12 @@ const approveUpstreamGates = async (api: MockControlPlaneApi) => {
   await api.createApproval(input("G2", 9, "g2-before-g3"));
 };
 
+const jobsWithSourceState = (state: (typeof jobs)[number]["state"]) =>
+  jobs.map((job) => (job.id === "job-v-032" ? { ...job, state } : job));
+
+const apiWithSourceState = (state: "FAILED" | "CANCELLED") =>
+  new MockControlPlaneApi(gates, jobsWithSourceState(state));
+
 describe("MockControlPlaneApi", () => {
   it("creates a project operation from creator inputs without requiring a provider key", async () => {
     const api = new MockControlPlaneApi();
@@ -229,10 +235,81 @@ describe("MockControlPlaneApi", () => {
     });
   });
 
+  it.each([
+    ["RUNNING", "FAILED"],
+    ["RUNNING", "CANCELLED"],
+    ["SUCCEEDED", "FAILED"],
+    ["SUCCEEDED", "CANCELLED"],
+  ] as const)(
+    "rejects internal %s when the client reports %s",
+    async (internalState, reportedState) => {
+      const api = new MockControlPlaneApi(gates, jobsWithSourceState(internalState));
+
+      await expect(
+        api.createJobAttempt(jobAttemptInput(reportedState, `${internalState}-${reportedState}`)),
+      ).rejects.toMatchObject({
+        status: 422,
+        errorCode: "RUN_TERMINAL_REQUIRED",
+      });
+    },
+  );
+
+  it("creates a new blocked G3 revision and exact evidence after an approved cut gets a legal new attempt", async () => {
+    const approvedGates = structuredClone(gates);
+    approvedGates.G1.state = "APPROVED";
+    approvedGates.G2.state = "APPROVED";
+    approvedGates.G3.state = "APPROVED";
+    approvedGates.G3.etag = 3;
+    approvedGates.G3.history = approvedGates.G3.history.map((record) =>
+      record.revision === approvedGates.G3.revision
+        ? { ...record, state: "APPROVED" as const }
+        : record,
+    );
+    const api = new MockControlPlaneApi(approvedGates, jobsWithSourceState("FAILED"));
+    const attempt = await api.createJobAttempt(jobAttemptInput("FAILED", "post-lock-redo"));
+
+    expect(attempt.g3Revision).toMatchObject({
+      revision: 3,
+      revisionId: "gate-g3-r3",
+      etag: 4,
+      state: "BLOCKED",
+    });
+    expect(attempt.g3Revision.bindings).not.toEqual(gates.G3.bindings);
+    await expect(
+      api.createApproval({
+        ...input("G3", attempt.g3Revision.etag, "g3-before-new-attempt-finishes"),
+        bindings: attempt.g3Revision.bindings,
+      }),
+    ).rejects.toMatchObject({
+      status: 422,
+      errorCode: "G3_RUNS_INCOMPLETE",
+    });
+
+    await api.completeMockRun();
+    await expect(
+      api.createApproval({
+        ...input("G3", attempt.g3Revision.etag, "g3-old-evidence"),
+        bindings: gates.G3.bindings,
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      errorCode: "G3_BINDING_CONFLICT",
+    });
+    await expect(
+      api.createApproval({
+        ...input("G3", attempt.g3Revision.etag, "g3-new-evidence"),
+        bindings: attempt.g3Revision.bindings,
+      }),
+    ).resolves.toMatchObject({
+      gate: "G3",
+      decision: "APPROVED",
+    });
+  });
+
   it.each(["FAILED", "CANCELLED"] as const)(
     "creates a distinct current Job for a %s creative redo without mutating the source",
     async (state) => {
-      const api = new MockControlPlaneApi();
+      const api = apiWithSourceState(state);
       const input = jobAttemptInput(state, `new-${state.toLowerCase()}-attempt`);
       const result = await api.createJobAttempt(input);
 
@@ -252,7 +329,7 @@ describe("MockControlPlaneApi", () => {
   );
 
   it("keeps creative-attempt submission idempotent and rejects a changed payload", async () => {
-    const api = new MockControlPlaneApi();
+    const api = apiWithSourceState("FAILED");
     const firstInput = jobAttemptInput("FAILED", "same-attempt-key");
     const first = await api.createJobAttempt(firstInput);
 
@@ -266,7 +343,7 @@ describe("MockControlPlaneApi", () => {
   });
 
   it("rejects a different-key replay of an already persisted source attempt", async () => {
-    const api = new MockControlPlaneApi();
+    const api = apiWithSourceState("FAILED");
     const firstInput = jobAttemptInput("FAILED", "original-attempt-key");
     const first = await api.createJobAttempt(firstInput);
 
@@ -284,9 +361,10 @@ describe("MockControlPlaneApi", () => {
   });
 
   it("advances server-side current attempt truth from attempt 2 to attempt 3", async () => {
-    const api = new MockControlPlaneApi();
+    const api = apiWithSourceState("FAILED");
     const firstInput = jobAttemptInput("FAILED", "attempt-2-key");
     const attempt2 = await api.createJobAttempt(firstInput);
+    await api.transitionJobState(attempt2.providerJobId, "FAILED");
     const attempt3 = await api.createJobAttempt({
       sourceJob: {
         ...firstInput.sourceJob,
@@ -388,6 +466,9 @@ describe("HttpControlPlaneApi", () => {
       errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
     });
     await expect(api.simulateConcurrentUpdate("G1")).rejects.toMatchObject({
+      errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
+    });
+    await expect(api.transitionJobState("job-v-032", "FAILED")).rejects.toMatchObject({
       errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
     });
     expect(fetchMock).not.toHaveBeenCalled();

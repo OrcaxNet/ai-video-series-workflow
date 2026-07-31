@@ -126,6 +126,24 @@ const scenarioFailure: Partial<Record<FailureScenario, ProviderJob["failure"]>> 
 
 const terminalJobStates = new Set<ProviderJob["state"]>(["SUCCEEDED", "FAILED", "CANCELLED"]);
 
+const scenarioStateByType: Partial<Record<FailureScenario, ProviderJob["state"]>> = {
+  unauthorized: "REQUIRES_ACTION",
+  forbidden: "REQUIRES_ACTION",
+  rate_limited: "RETRYING",
+  quota_exceeded: "REQUIRES_ACTION",
+  budget_exceeded: "REQUIRES_ACTION",
+  provider_unavailable: "RETRYING",
+  timeout: "UNKNOWN",
+  terminal_failure: "FAILED",
+  cancelled: "CANCELLED",
+  cancel_race: "SUCCEEDED",
+};
+
+const scenarioJobState = (current: ProviderJob, scenario: FailureScenario) =>
+  terminalJobStates.has(current.state)
+    ? current.state
+    : (scenarioStateByType[scenario] ?? current.state);
+
 const stableHash = (seed: string) =>
   Array.from({ length: 64 }, (_, index) => ((seed.charCodeAt(index % seed.length) + index) % 16).toString(16)).join("");
 
@@ -435,19 +453,9 @@ function reducer(state: StudioState, action: Action): StudioState {
           };
         }
         const failure = scenarioFailure[action.scenario];
-        const stateByScenario: Partial<Record<FailureScenario, ProviderJob["state"]>> = {
-          unauthorized: "REQUIRES_ACTION",
-          forbidden: "REQUIRES_ACTION",
-          rate_limited: "RETRYING",
-          quota_exceeded: "REQUIRES_ACTION",
-          budget_exceeded: "REQUIRES_ACTION",
-          provider_unavailable: "RETRYING",
-          timeout: "UNKNOWN",
-          terminal_failure: "FAILED",
-        };
         return {
           ...job,
-          state: stateByScenario[action.scenario] ?? "FAILED",
+          state: scenarioJobState(job, action.scenario),
           failure,
           retryCount:
             action.scenario === "rate_limited" || action.scenario === "provider_unavailable"
@@ -592,7 +600,32 @@ function reducer(state: StudioState, action: Action): StudioState {
           jobs,
           gates: {
             ...state.gates,
-            G3: { ...state.gates.G3, state: "BLOCKED" },
+            G3: {
+              ...state.gates.G3,
+              revision: action.result.g3Revision.revision,
+              revisionId: action.result.g3Revision.revisionId,
+              etag: action.result.g3Revision.etag,
+              state: action.result.g3Revision.state,
+              bindings: action.result.g3Revision.bindings,
+              decidedAt: undefined,
+              decidedBy: undefined,
+              explanation: undefined,
+              history: [
+                ...state.gates.G3.history.map((record) =>
+                  record.revision === state.gates.G3.revision && record.state === "CURRENT"
+                    ? { ...record, state: "SUPERSEDED" as const }
+                    : record,
+                ),
+                {
+                  revision: action.result.g3Revision.revision,
+                  revisionId: action.result.g3Revision.revisionId,
+                  state: "CURRENT" as const,
+                  author: "创作编排",
+                  createdAt: nowLabel(),
+                  note: `${source.shot} attempt ${nextJob.attempt} 产生新的成片谱系`,
+                },
+              ],
+            },
           },
           activity: [
             {
@@ -719,10 +752,10 @@ interface StudioActions {
   simulateConcurrentUpdate(gateId: GateId): Promise<void>;
   synchronizeGate(gateId: GateId): void;
   completeMockRun(): Promise<void>;
-  injectScenario(scenario: FailureScenario): void;
-  cancelJob(jobId: string): void;
-  confirmCancelJob(jobId: string): void;
-  retryJob(jobId: string): void;
+  injectScenario(scenario: FailureScenario): Promise<void>;
+  cancelJob(jobId: string): Promise<void>;
+  confirmCancelJob(jobId: string): Promise<void>;
+  retryJob(jobId: string): Promise<void>;
   createJobAttempt(jobId: string): Promise<void>;
   setJobsViewState(viewState: JobsViewState): void;
   selectPrompt(version: number): void;
@@ -898,6 +931,63 @@ export function StudioProvider({
     }
   }, [handleProblem]);
 
+  const injectScenario = useCallback(
+    async (scenario: FailureScenario) => {
+      const current = state.jobs.find((job) => job.shotId === "shot-032" && job.isCurrentAttempt);
+      if (
+        !current ||
+        terminalJobStates.has(current.state) ||
+        scenarioJobState(current, scenario) === current.state
+      ) {
+        dispatch({ type: "INJECT_SCENARIO", scenario });
+        return;
+      }
+      try {
+        await apiRef.current.transitionJobState(current.id, scenarioJobState(current, scenario));
+        dispatch({ type: "INJECT_SCENARIO", scenario });
+      } catch (error) {
+        handleProblem(error);
+      }
+    },
+    [handleProblem, state.jobs],
+  );
+
+  const cancelJob = useCallback(
+    async (jobId: string) => {
+      try {
+        await apiRef.current.transitionJobState(jobId, "CANCEL_REQUESTED");
+        dispatch({ type: "CANCEL_JOB", jobId });
+      } catch (error) {
+        handleProblem(error);
+      }
+    },
+    [handleProblem],
+  );
+
+  const confirmCancelJob = useCallback(
+    async (jobId: string) => {
+      try {
+        await apiRef.current.transitionJobState(jobId, "CANCELLED");
+        dispatch({ type: "CONFIRM_CANCEL_JOB", jobId });
+      } catch (error) {
+        handleProblem(error);
+      }
+    },
+    [handleProblem],
+  );
+
+  const retryJob = useCallback(
+    async (jobId: string) => {
+      try {
+        await apiRef.current.transitionJobState(jobId, "RETRYING");
+        dispatch({ type: "RETRY_JOB", jobId });
+      } catch (error) {
+        handleProblem(error);
+      }
+    },
+    [handleProblem],
+  );
+
   const createJobAttempt = useCallback(
     async (jobId: string) => {
       const sourceJob = state.jobs.find((job) => job.id === jobId);
@@ -985,10 +1075,10 @@ export function StudioProvider({
       simulateConcurrentUpdate,
       synchronizeGate,
       completeMockRun,
-      injectScenario: (scenario) => dispatch({ type: "INJECT_SCENARIO", scenario }),
-      cancelJob: (jobId) => dispatch({ type: "CANCEL_JOB", jobId }),
-      confirmCancelJob: (jobId) => dispatch({ type: "CONFIRM_CANCEL_JOB", jobId }),
-      retryJob: (jobId) => dispatch({ type: "RETRY_JOB", jobId }),
+      injectScenario,
+      cancelJob,
+      confirmCancelJob,
+      retryJob,
       createJobAttempt,
       setJobsViewState: (viewState) => dispatch({ type: "SET_JOBS_VIEW_STATE", viewState }),
       selectPrompt: (version) => dispatch({ type: "SELECT_PROMPT", version }),
@@ -998,13 +1088,17 @@ export function StudioProvider({
     }),
     [
       completeMockRun,
+      confirmCancelJob,
       createJobAttempt,
       createProject,
       decideGate,
+      injectScenario,
       lockAssetRevision,
       regenerateGate,
+      retryJob,
       simulateConcurrentUpdate,
       synchronizeGate,
+      cancelJob,
     ],
   );
 

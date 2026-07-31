@@ -112,6 +112,13 @@ export interface CreateJobAttemptResult {
   traceId: string;
   createdAt: string;
   taskId?: string;
+  g3Revision: {
+    revision: number;
+    revisionId: string;
+    etag: number;
+    state: "BLOCKED";
+    bindings: RevisionBinding[];
+  };
 }
 
 export interface AssetRevision {
