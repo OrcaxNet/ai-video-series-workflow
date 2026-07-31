@@ -146,11 +146,18 @@ PENDING_CONFIRMATION → REJECTED
 VIDEO submit 在同一 serializable transaction 中锁定精确 BUDGET review 行，并按
 `budget_approval_id` 汇总所有 `RESERVED` 金额与 `SETTLED` 实际金额。每个 Run
 只预留按 Prompt 时长和冻结单价计算的单 Run estimate；取消/失败释放未结预留，
-成功按实际费用结算并记录未使用部分的 `RELEASE`。
+成功按可信实际费用结算并记录未使用部分的 `RELEASE`。实际金额缺失、未验证、
+为负数，或 currency/pricing version 与 reservation 不一致时，不得用 estimate
+冒充实际费用，也不得释放差额；该 reservation 进入 `SETTLED`，但累计分配按完整
+预留金额保守占用，等待单独的人工调整流程。
 
 ### `cost_ledger`
 
-append-only 类型：`ESTIMATE`、`RESERVATION`、`ACTUAL`、`RELEASE`、`ADJUSTMENT`。金额未知时 `amount_micros/currency` 可空，但 units/unit/pricing version 必须保存；`verified=false` 防止把估值当实付。
+append-only 类型：`ESTIMATE`、`RESERVATION`、`ACTUAL`、`RELEASE`、`ADJUSTMENT`。
+金额未知时不创建伪造的 `ACTUAL`；Provider 返回但未通过 reservation 绑定核验的
+金额可作为 `verified=false` 的原始声明保留。只有 `verified=true` 且 currency/
+pricing version 与 reservation 完全一致的非负 `ACTUAL` 可降低累计预算占用并
+产生 `RELEASE`。
 
 成本可沿：
 

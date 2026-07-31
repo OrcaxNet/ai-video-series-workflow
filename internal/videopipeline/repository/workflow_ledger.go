@@ -1358,6 +1358,10 @@ func (p *Postgres) PrepareProviderJob(
 			  FROM video_pipeline.cost_ledger cl
 			  WHERE cl.budget_reservation_id = br.id
 			    AND cl.entry_type = 'ACTUAL'
+			    AND cl.amount_micros >= 0
+			    AND cl.verified = true
+			    AND cl.currency = br.currency
+			    AND cl.pricing_rule_version = br.pricing_rule_version
 			  ORDER BY cl.created_at DESC
 			  LIMIT 1
 			) actual ON true
@@ -1547,10 +1551,16 @@ func (p *Postgres) CompleteProviderJob(
 				"provider completion has no active or settled budget reservation",
 			)
 		}
-		actualMicros := result.Cost.EstimatedMicros
-		if result.Cost.ActualMicros != nil {
+		hasActual := result.Cost.ActualMicros != nil
+		var actualMicros int64
+		if hasActual {
 			actualMicros = *result.Cost.ActualMicros
 		}
+		actualTrustedForAllocation := hasActual &&
+			result.Cost.Verified &&
+			actualMicros >= 0 &&
+			result.Cost.Currency == reservedCurrency &&
+			result.Cost.PricingVersion == reservedPricing
 		budgetExceeded := result.Cost.ActualMicros == nil ||
 			!result.Cost.Verified ||
 			result.Cost.EstimatedMicros < 0 ||
@@ -1560,36 +1570,45 @@ func (p *Postgres) CompleteProviderJob(
 			result.Cost.Currency != reservedCurrency ||
 			result.Cost.PricingVersion != reservedPricing
 		ledgerID := uuid.NewSHA1(jobID, []byte("actual-cost"))
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO video_pipeline.cost_ledger
-				(id, provider_job_id, budget_reservation_id, entry_type, amount_micros,
-				 currency, units, unit_name, pricing_rule_version, verified)
-			VALUES ($1, $2, $3, 'ACTUAL', $4, $5, $6, $7, $8, $9)
-			ON CONFLICT (id) DO NOTHING`,
-			ledgerID, jobID, reservationID, actualMicros, result.Cost.Currency,
-			result.Usage.InputUnits+result.Usage.OutputUnits, result.Usage.Unit,
-			result.Cost.PricingVersion, result.Cost.Verified,
-		); err != nil {
-			return completionOutcome{}, fmt.Errorf("insert actual provider cost: %w", err)
-		}
-		var storedActual int64
-		var storedCurrency, storedPricing string
-		if err := tx.QueryRow(ctx, `
-			SELECT amount_micros, currency, pricing_rule_version
-			FROM video_pipeline.cost_ledger
-			WHERE id = $1
-			FOR SHARE`,
-			ledgerID,
-		).Scan(&storedActual, &storedCurrency, &storedPricing); err != nil {
-			return completionOutcome{}, fmt.Errorf("read actual provider cost: %w", err)
-		}
-		if storedActual != actualMicros ||
-			storedCurrency != result.Cost.Currency ||
-			storedPricing != result.Cost.PricingVersion {
-			return completionOutcome{}, controlplane.NewConflictError(
-				controlplane.CodeRevisionConflict,
-				"Provider completion cost differs from its immutable ledger entry",
-			)
+		if hasActual {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, units, unit_name,
+					 pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ACTUAL', $4, $5, $6, $7, $8, $9)
+				ON CONFLICT (id) DO NOTHING`,
+				ledgerID, jobID, reservationID, actualMicros, result.Cost.Currency,
+				result.Usage.InputUnits+result.Usage.OutputUnits, result.Usage.Unit,
+				result.Cost.PricingVersion, actualTrustedForAllocation,
+			); err != nil {
+				return completionOutcome{}, fmt.Errorf("insert actual provider cost: %w", err)
+			}
+			var storedActual int64
+			var storedCurrency, storedPricing string
+			var storedVerified bool
+			if err := tx.QueryRow(ctx, `
+				SELECT amount_micros, currency, pricing_rule_version, verified
+				FROM video_pipeline.cost_ledger
+				WHERE id = $1
+				FOR SHARE`,
+				ledgerID,
+			).Scan(
+				&storedActual, &storedCurrency, &storedPricing, &storedVerified,
+			); err != nil {
+				return completionOutcome{}, fmt.Errorf(
+					"read actual provider cost: %w", err,
+				)
+			}
+			if storedActual != actualMicros ||
+				storedCurrency != result.Cost.Currency ||
+				storedPricing != result.Cost.PricingVersion ||
+				storedVerified != actualTrustedForAllocation {
+				return completionOutcome{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"Provider completion cost differs from its immutable ledger entry",
+				)
+			}
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE video_pipeline.budget_reservations
@@ -1599,7 +1618,7 @@ func (p *Postgres) CompleteProviderJob(
 		); err != nil {
 			return completionOutcome{}, fmt.Errorf("settle Provider budget reservation: %w", err)
 		}
-		if actualMicros >= 0 && actualMicros < reservedMicros {
+		if actualTrustedForAllocation && actualMicros < reservedMicros {
 			releaseMicros := reservedMicros - actualMicros
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO video_pipeline.cost_ledger
@@ -1622,6 +1641,7 @@ func (p *Postgres) CompleteProviderJob(
 				"reservedCurrency":       reservedCurrency,
 				"reservedPricingVersion": reservedPricing,
 				"providerCost":           result.Cost,
+				"actualTrustedForBudget": actualTrustedForAllocation,
 			})
 			if encodeErr != nil {
 				return completionOutcome{}, fmt.Errorf(

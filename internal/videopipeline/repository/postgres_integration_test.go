@@ -1063,8 +1063,12 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		return &value
 	}
 	billingDriftCases := []struct {
-		name string
-		cost providercontract.Cost
+		name               string
+		cost               providercontract.Cost
+		wantActual         bool
+		wantActualVerified bool
+		wantReleaseMicros  int64
+		wantSecondRejected bool
 	}{
 		{
 			name: "estimated exceeds reservation",
@@ -1072,6 +1076,9 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				EstimatedMicros: 51, ActualMicros: costPointer(40),
 				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
 			},
+			wantActual:         true,
+			wantActualVerified: true,
+			wantReleaseMicros:  10,
 		},
 		{
 			name: "actual exceeds reservation",
@@ -1079,13 +1086,17 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				EstimatedMicros: 50, ActualMicros: costPointer(51),
 				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
 			},
+			wantActual:         true,
+			wantActualVerified: true,
+			wantSecondRejected: true,
 		},
 		{
 			name: "actual is missing",
 			cost: providercontract.Cost{
-				EstimatedMicros: 50, ActualMicros: nil,
+				EstimatedMicros: 40, ActualMicros: nil,
 				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
 			},
+			wantSecondRejected: true,
 		},
 		{
 			name: "cost is unverified",
@@ -1093,6 +1104,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				EstimatedMicros: 50, ActualMicros: costPointer(40),
 				Currency: "CNY", PricingVersion: "pricing-v1", Verified: false,
 			},
+			wantActual:         true,
+			wantSecondRejected: true,
 		},
 		{
 			name: "currency differs from reservation",
@@ -1100,6 +1113,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				EstimatedMicros: 50, ActualMicros: costPointer(40),
 				Currency: "USD", PricingVersion: "pricing-v1", Verified: true,
 			},
+			wantActual:         true,
+			wantSecondRejected: true,
 		},
 		{
 			name: "pricing version differs from reservation",
@@ -1107,6 +1122,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				EstimatedMicros: 50, ActualMicros: costPointer(40),
 				Currency: "CNY", PricingVersion: "pricing-v2", Verified: true,
 			},
+			wantActual:         true,
+			wantSecondRejected: true,
 		},
 	}
 	for _, drift := range billingDriftCases {
@@ -1115,6 +1132,41 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			_, driftCommand := cloneIntegrationShotCommand(
 				t, ctx, pool, store, shotID.String(), publicCommand,
 			)
+			driftPlanCommand := planCommand
+			driftPlanCommand.ShotSpecRevisionIDs = []string{
+				driftCommand.ShotSpecRevisionID,
+			}
+			driftPlanCommand.BudgetLimit = controlplane.BudgetLimit{
+				AmountMicros: 90, Currency: "CNY",
+			}
+			driftPlanCommand.ExecutionPolicy = driftCommand.ExecutionPolicy
+			driftPlanDigest, err := digestValue(driftPlanCommand)
+			if err != nil {
+				t.Fatal(err)
+			}
+			driftPlan, err := store.CreateGenerationPlan(
+				ctx, driftPlanCommand,
+				controlplane.Idempotency{
+					Scope: "completion-billing-drift-plan:" + uuid.NewString(),
+					Key:   uuid.NewString(), RequestHash: driftPlanDigest,
+				},
+				"completion-billing-drift-plan",
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			driftBudgetID := uuid.New()
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.review_tasks
+					(id, series_id, episode_id, review_type, state, assigned_role,
+					 decided_at, generation_plan_id, budget_scope,
+					 budget_limit_micros, budget_currency)
+				VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER',
+				        now(), $4, 'VIDEO', 90, 'CNY')`,
+				driftBudgetID, seriesID, episodeID, driftPlan.Value.GenerationPlanID,
+			)
+			driftCommand.GenerationPlanID = driftPlan.Value.GenerationPlanID
+			driftCommand.BudgetApprovalID = driftBudgetID.String()
 			_, driftRun, driftDispatch := createIntegrationWorkflowRun(
 				t, ctx, store,
 				"completion-billing-drift-"+strings.ReplaceAll(drift.name, " ", "-"),
@@ -1280,29 +1332,36 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 					reservationState, reservedMicros,
 				)
 			}
-			wantActual := drift.cost.EstimatedMicros
-			if drift.cost.ActualMicros != nil {
+			var wantActual int64
+			wantActualCount := 0
+			wantActualCurrency := ""
+			wantActualPricing := ""
+			wantActualVerified := false
+			if drift.wantActual {
+				wantActualCount = 1
 				wantActual = *drift.cost.ActualMicros
+				wantActualCurrency = drift.cost.Currency
+				wantActualPricing = drift.cost.PricingVersion
+				wantActualVerified = drift.wantActualVerified
 			}
 			wantReleaseCount := 0
-			var wantRelease int64
-			if wantActual >= 0 && wantActual < reservedMicros {
+			if drift.wantReleaseMicros > 0 {
 				wantReleaseCount = 1
-				wantRelease = reservedMicros - wantActual
 			}
-			if actualCount != 1 ||
+			if actualCount != wantActualCount ||
 				actualMicros != wantActual ||
-				actualCurrency != drift.cost.Currency ||
-				actualPricing != drift.cost.PricingVersion ||
-				actualVerified != drift.cost.Verified ||
+				actualCurrency != wantActualCurrency ||
+				actualPricing != wantActualPricing ||
+				actualVerified != wantActualVerified ||
 				releaseCount != wantReleaseCount ||
-				releaseMicros != wantRelease {
+				releaseMicros != drift.wantReleaseMicros {
 				t.Fatalf(
-					"billing drift ledger = actual:%d/%d/%s/%s/%t release:%d/%d, want actual:1/%d/%s/%s/%t release:%d/%d",
+					"billing drift ledger = actual:%d/%d/%s/%s/%t release:%d/%d, want actual:%d/%d/%s/%s/%t release:%d/%d",
 					actualCount, actualMicros, actualCurrency, actualPricing,
 					actualVerified, releaseCount, releaseMicros,
-					wantActual, drift.cost.Currency, drift.cost.PricingVersion,
-					drift.cost.Verified, wantReleaseCount, wantRelease,
+					wantActualCount, wantActual, wantActualCurrency,
+					wantActualPricing, wantActualVerified,
+					wantReleaseCount, drift.wantReleaseMicros,
 				)
 			}
 			if artifactCount != 0 || runArtifactCount != 0 ||
@@ -1311,6 +1370,67 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 					"billing drift downstream truth = artifact:%d run-artifact:%d qc:%d manifest:%d lock:%d",
 					artifactCount, runArtifactCount, qcCount, manifestCount, lockCount,
 				)
+			}
+
+			secondCommand := driftCommand
+			secondCommand.CreativeAttempt = 2
+			secondStep, secondRun, secondDispatch := createIntegrationWorkflowRun(
+				t, ctx, store,
+				"completion-billing-drift-second-"+
+					strings.ReplaceAll(drift.name, " ", "-"),
+				secondCommand,
+			)
+			_, secondErr := store.PrepareProviderJob(
+				ctx, secondStep, secondDispatch,
+			)
+			if drift.wantSecondRejected {
+				var domain *controlplane.DomainError
+				if !errors.As(secondErr, &domain) ||
+					domain.Code != controlplane.CodeBudgetExceeded {
+					t.Fatalf(
+						"secondary allocation after %s = %#v, want %s",
+						drift.name, secondErr, controlplane.CodeBudgetExceeded,
+					)
+				}
+				var secondReservations, secondJobs int
+				if err := pool.QueryRow(ctx, `
+					SELECT
+					  (SELECT COUNT(*)
+					   FROM video_pipeline.budget_reservations
+					   WHERE generation_run_id = $1),
+					  (SELECT COUNT(*)
+					   FROM video_pipeline.provider_jobs pj
+					   JOIN video_pipeline.generation_attempts ga
+					     ON ga.id = pj.generation_attempt_id
+					   WHERE ga.generation_run_id = $1)`,
+					secondRun.RunID,
+				).Scan(&secondReservations, &secondJobs); err != nil {
+					t.Fatal(err)
+				}
+				if secondReservations != 0 || secondJobs != 0 {
+					t.Fatalf(
+						"rejected secondary allocation side effects = reservations:%d jobs:%d",
+						secondReservations, secondJobs,
+					)
+				}
+			} else {
+				if secondErr != nil {
+					t.Fatalf(
+						"trusted secondary allocation after %s: %v",
+						drift.name, secondErr,
+					)
+				}
+				if err := store.RecordProviderCancellation(
+					ctx, secondStep,
+					orchestration.CancelProviderJobInput{
+						Dispatch:   secondDispatch,
+						ReasonCode: "INTEGRATION_DRIFT_SECONDARY_CLEANUP",
+						TraceID:    secondStep.TraceID,
+					},
+					orchestration.CancelProviderResult{State: "CANCELLED"},
+				); err != nil {
+					t.Fatal(err)
+				}
 			}
 		})
 	}

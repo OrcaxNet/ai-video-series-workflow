@@ -63,7 +63,10 @@
   Prompt/route B 会在 reservation、ProviderJob 和外部 submit 都为零时被拒绝。
 - Provider 完成必须返回可验证的实际金额、币种与 pricing version，且估算和
   实付都不能超过单 Run reservation。少报、未验证或漂移会持久化
-  `FAILED/BUDGET_EXCEEDED`，不会写 Run Artifact、QC、Manifest 或 G3。
+  `FAILED/BUDGET_EXCEEDED`，不会写 Run Artifact、QC、Manifest 或 G3。实际金额
+  缺失时不创建 `ACTUAL`；未验证或 currency/pricing 漂移的声明落为
+  `verified=false` 且不产生 `RELEASE`。同一 approval 的后续累计分配对此类
+  completion 始终按完整 reservation 计入，不能复用不可信的差额。
 - 取消和完成都锁住 Run/Attempt/ProviderJob/Reservation；最先提交的
   `SUCCEEDED`、`FAILED` 或 `CANCELLED` 是单调终态。取消优先时迟到成功只能
   记为冲突，成功优先时迟到取消不能回退状态。
