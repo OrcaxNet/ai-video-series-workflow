@@ -261,6 +261,11 @@ type Cost struct {
 	Currency        string `json:"currency"`
 	PricingVersion  string `json:"pricing_version"`
 	Verified        bool   `json:"verified"`
+	// BillingMode distinguishes a metered charge from a request included in a
+	// prepaid subscription. ProviderReported is false when the provider returns
+	// usage units but no per-task monetary amount.
+	BillingMode      string `json:"billing_mode,omitempty"`
+	ProviderReported bool   `json:"provider_reported"`
 }
 
 // JobRequest is the secret-free control-plane-to-adapter envelope. Simulation

@@ -59,7 +59,7 @@ func main() {
 	)
 	activities := orchestration.NewProductionActivities(cfg.ProviderAdapterURL, store, store, artifacts)
 	speech, err := postproduction.NewHTTPSpeechProvider(
-		cfg.ProviderAdapterURL,
+		cfg.SpeechProviderAdapterURL,
 		mockprovider.DefaultHTTPClient(),
 	)
 	if err != nil {

@@ -37,12 +37,13 @@ type ControlPlane struct {
 
 // OrchestratorWorker configures the Temporal workflow worker.
 type OrchestratorWorker struct {
-	TemporalAddress    string
-	Namespace          string
-	TaskQueue          string
-	ProviderAdapterURL string
-	PostgresDSN        string
-	ArtifactRoot       string
+	TemporalAddress          string
+	Namespace                string
+	TaskQueue                string
+	ProviderAdapterURL       string
+	SpeechProviderAdapterURL string
+	PostgresDSN              string
+	ArtifactRoot             string
 }
 
 // MockProvider configures the deterministic, no-key provider fixture.
@@ -51,6 +52,24 @@ type MockProvider struct {
 	ArtifactRoot string
 	ProviderID   string
 	Capabilities []string
+}
+
+// VolcengineProvider configures the credential-isolated Agent Plan adapter.
+// APIKey is retained only in memory and must never be logged or serialized.
+type VolcengineProvider struct {
+	HTTPAddress      string
+	ArtifactRoot     string
+	ProviderID       string
+	BaseURL          string
+	APIKey           string
+	Region           string
+	VideoModel       string
+	PlanName         string
+	PricingVersion   string
+	Currency         string
+	MaxDownloadBytes int64
+	RequestTimeout   time.Duration
+	DownloadTimeout  time.Duration
 }
 
 // LoadControlPlane reads namespaced settings with safe local defaults.
@@ -124,11 +143,12 @@ func loadControlPlane(lookup LookupEnv) (ControlPlane, error) {
 // LoadOrchestratorWorker reads Temporal worker settings.
 func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 	cfg := OrchestratorWorker{
-		TemporalAddress:    value(os.LookupEnv, "VIDEO_TEMPORAL_ADDRESS", "temporal:7233"),
-		Namespace:          value(os.LookupEnv, "VIDEO_TEMPORAL_NAMESPACE", "default"),
-		TaskQueue:          value(os.LookupEnv, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
-		ProviderAdapterURL: value(os.LookupEnv, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
-		ArtifactRoot:       value(os.LookupEnv, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
+		TemporalAddress:          value(os.LookupEnv, "VIDEO_TEMPORAL_ADDRESS", "temporal:7233"),
+		Namespace:                value(os.LookupEnv, "VIDEO_TEMPORAL_NAMESPACE", "default"),
+		TaskQueue:                value(os.LookupEnv, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
+		ProviderAdapterURL:       value(os.LookupEnv, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
+		SpeechProviderAdapterURL: value(os.LookupEnv, "VIDEO_SPEECH_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
+		ArtifactRoot:             value(os.LookupEnv, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
 	}
 	if err := validateDialAddress(cfg.TemporalAddress); err != nil {
 		return OrchestratorWorker{}, fmt.Errorf("VIDEO_TEMPORAL_ADDRESS: %w", err)
@@ -138,6 +158,9 @@ func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 	}
 	if err := validateHTTPURL(cfg.ProviderAdapterURL); err != nil {
 		return OrchestratorWorker{}, fmt.Errorf("VIDEO_PROVIDER_ADAPTER_URL: %w", err)
+	}
+	if err := validateHTTPURL(cfg.SpeechProviderAdapterURL); err != nil {
+		return OrchestratorWorker{}, fmt.Errorf("VIDEO_SPEECH_PROVIDER_ADAPTER_URL: %w", err)
 	}
 	var err error
 	postgresAddress := value(os.LookupEnv, "VIDEO_POSTGRES_ADDRESS", "postgres:5432")
@@ -174,6 +197,56 @@ func LoadMockProvider() (MockProvider, error) {
 	return cfg, nil
 }
 
+// LoadVolcengineProvider reads only explicit runtime configuration. It does
+// not scan arkcli profiles, shell history, or developer-machine config files.
+func LoadVolcengineProvider() (VolcengineProvider, error) {
+	return loadVolcengineProvider(os.LookupEnv)
+}
+
+func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
+	cfg := VolcengineProvider{
+		HTTPAddress:      value(lookup, "VIDEO_VOLCENGINE_PROVIDER_HTTP_ADDRESS", ":8091"),
+		ArtifactRoot:     value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
+		ProviderID:       value(lookup, "VIDEO_VOLCENGINE_PROVIDER_ID", "volcengine-agent-plan-large"),
+		BaseURL:          value(lookup, "VIDEO_VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+		APIKey:           value(lookup, "ARK_API_KEY", ""),
+		Region:           value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
+		VideoModel:       value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
+		PlanName:         value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),
+		PricingVersion:   value(lookup, "VIDEO_VOLCENGINE_PRICING_VERSION", "agent-plan-large-included-v1"),
+		Currency:         value(lookup, "VIDEO_VOLCENGINE_CURRENCY", "CNY"),
+		MaxDownloadBytes: 256 << 20,
+		RequestTimeout:   2 * time.Minute,
+		DownloadTimeout:  2 * time.Minute,
+	}
+	var err error
+	if cfg.MaxDownloadBytes, err = positiveInt64(lookup, "VIDEO_VOLCENGINE_MAX_DOWNLOAD_BYTES", cfg.MaxDownloadBytes); err != nil {
+		return VolcengineProvider{}, err
+	}
+	if cfg.RequestTimeout, err = duration(lookup, "VIDEO_VOLCENGINE_REQUEST_TIMEOUT", cfg.RequestTimeout); err != nil {
+		return VolcengineProvider{}, err
+	}
+	if cfg.DownloadTimeout, err = duration(lookup, "VIDEO_VOLCENGINE_DOWNLOAD_TIMEOUT", cfg.DownloadTimeout); err != nil {
+		return VolcengineProvider{}, err
+	}
+	if err := validateListenAddress(cfg.HTTPAddress); err != nil {
+		return VolcengineProvider{}, fmt.Errorf("VIDEO_VOLCENGINE_PROVIDER_HTTP_ADDRESS: %w", err)
+	}
+	if err := validateHTTPURL(cfg.BaseURL); err != nil {
+		return VolcengineProvider{}, fmt.Errorf("VIDEO_VOLCENGINE_BASE_URL: %w", err)
+	}
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		return VolcengineProvider{}, errors.New("ARK_API_KEY is required for the live provider adapter")
+	}
+	if strings.TrimSpace(cfg.ArtifactRoot) == "" || strings.TrimSpace(cfg.ProviderID) == "" ||
+		strings.TrimSpace(cfg.Region) == "" || strings.TrimSpace(cfg.VideoModel) == "" ||
+		strings.TrimSpace(cfg.PlanName) == "" || strings.TrimSpace(cfg.PricingVersion) == "" ||
+		strings.TrimSpace(cfg.Currency) == "" {
+		return VolcengineProvider{}, errors.New("live provider identity, route, plan, pricing, currency, and artifact root are required")
+	}
+	return cfg, nil
+}
+
 func value(lookup LookupEnv, name, fallback string) string {
 	if got, ok := lookup(name); ok {
 		return strings.TrimSpace(got)
@@ -201,6 +274,18 @@ func boolean(lookup LookupEnv, name string, fallback bool) (bool, error) {
 	parsed, err := strconv.ParseBool(raw)
 	if err != nil {
 		return false, fmt.Errorf("%s must be true or false", name)
+	}
+	return parsed, nil
+}
+
+func positiveInt64(lookup LookupEnv, name string, fallback int64) (int64, error) {
+	raw, ok := lookup(name)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || parsed <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
 	}
 	return parsed, nil
 }

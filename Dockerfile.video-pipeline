@@ -15,7 +15,7 @@ RUN test -n "${TARGET}" \
 FROM alpine:3.20 AS runtime
 ARG TARGET
 RUN apk add --no-cache ca-certificates wget \
- && if [ "${TARGET}" = "video-orchestrator-worker" ]; then \
+ && if [ "${TARGET}" = "video-orchestrator-worker" ] || [ "${TARGET}" = "video-volcengine-provider" ]; then \
       apk add --no-cache ffmpeg font-noto-cjk; \
     fi \
  && addgroup -g 10001 -S vpipe \

@@ -125,6 +125,10 @@ func TestVolcengineProvider_SubmitVideoMapping(t *testing.T) {
 			http.Error(w, "missing runtime auth", http.StatusUnauthorized)
 			return
 		}
+		if got := r.Header.Get("Idempotency-Key"); got != "series-1/episode-1/shot-1/attempt-1" {
+			http.Error(w, "missing idempotency key", http.StatusBadRequest)
+			return
+		}
 		var got map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
 			http.Error(w, "invalid JSON", http.StatusBadRequest)
@@ -175,11 +179,12 @@ func TestVolcengineProvider_SubmitVideoMapping(t *testing.T) {
 	if !ok {
 		t.Fatalf("text item = %#v", content[0])
 	}
-	text, _ := textItem["text"].(string)
-	for _, flag := range []string{"--ratio 16:9", "--resolution 720p", "--dur 5", "--generate_audio false"} {
-		if !strings.Contains(text, flag) {
-			t.Errorf("mapped prompt %q does not contain %q", text, flag)
-		}
+	if textItem["text"] != request.Prompt {
+		t.Fatalf("mapped prompt = %#v, want unmodified prompt", textItem["text"])
+	}
+	if gotPayload["ratio"] != "16:9" || gotPayload["resolution"] != "720p" ||
+		gotPayload["duration"] != float64(5) || gotPayload["generate_audio"] != false {
+		t.Fatalf("video output parameters = %#v", gotPayload)
 	}
 	imageItem, ok := content[1].(map[string]any)
 	if !ok || imageItem["role"] != string(AssetRoleReferenceImage) {
@@ -239,6 +244,55 @@ func TestVolcengineProvider_PollMapsManifestEvidence(t *testing.T) {
 		job.Output.Actual.FPS != 24 ||
 		job.Output.Actual.DurationMillis != 5_000 {
 		t.Fatalf("Poll() actual output = %#v", job.Output.Actual)
+	}
+}
+
+func TestVolcengineProvider_PollMapsAgentPlanResponse(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/contents/generations/tasks/cgt-plan-1" {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("X-Request-Id", "plan-poll-request-1")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"cgt-plan-1",
+			"model":"doubao-seedance-2.0",
+			"status":"succeeded",
+			"created_at":1800000000,
+			"updated_at":1800000030,
+			"output_url":"https://example.invalid/plan-result.mp4",
+			"last_frame_url":"https://example.invalid/plan-last.png",
+			"duration":5,
+			"resolution":"720p",
+			"ratio":"16:9",
+			"frames":120,
+			"fileformat":"mp4",
+			"usage":{"prompt_tokens":10,"completion_tokens":20,"total_tokens":250000}
+		}`)
+	}))
+	defer server.Close()
+
+	provider, err := NewVolcengineProvider(VolcengineConfig{
+		BaseURL: server.URL,
+		APIKey:  strings.Join([]string{"test", "runtime", "credential"}, "-"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := provider.Poll(t.Context(), "cgt-plan-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != StatusSucceeded || job.Output == nil || len(job.Output.Assets) != 2 {
+		t.Fatalf("Poll() job = %#v", job)
+	}
+	if job.Output.Assets[0].URI != "https://example.invalid/plan-result.mp4" ||
+		job.Output.Actual.FPS != 24 || job.Output.Actual.DurationMillis != 5_000 ||
+		job.Output.Usage.InputTokens != 10 || job.Output.Usage.OutputTokens != 20 ||
+		job.Output.Usage.VideoTokens != 250_000 {
+		t.Fatalf("Poll() Agent Plan output = %#v", job.Output)
 	}
 }
 

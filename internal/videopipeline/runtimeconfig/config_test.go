@@ -1,6 +1,7 @@
 package runtimeconfig
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -109,5 +110,46 @@ func TestLoadMockProviderDefaults(t *testing.T) {
 	}
 	if cfg.ProviderID != "fixture" || len(cfg.Capabilities) != 4 {
 		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestLoadVolcengineProviderRequiresExplicitKeyAndUsesAgentPlanDefaults(t *testing.T) {
+	base := map[string]string{
+		"VIDEO_ARTIFACT_ROOT": t.TempDir(),
+	}
+	lookup := func(name string) (string, bool) {
+		value, ok := base[name]
+		return value, ok
+	}
+	if _, err := loadVolcengineProvider(lookup); err == nil {
+		t.Fatal("loadVolcengineProvider() error = nil without ARK_API_KEY")
+	}
+	base["ARK_API_KEY"] = "test-runtime-credential"
+	cfg, err := loadVolcengineProvider(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BaseURL != "https://ark.cn-beijing.volces.com/api/plan/v3" ||
+		cfg.VideoModel != "doubao-seedance-2.0" || cfg.PlanName != "agent-plan-large" ||
+		cfg.APIKey != "test-runtime-credential" || cfg.MaxDownloadBytes != 256<<20 {
+		t.Fatalf("unexpected live defaults: %#v", cfg)
+	}
+}
+
+func TestLoadVolcengineProviderErrorNeverContainsCredential(t *testing.T) {
+	credential := "sensitive-runtime-value"
+	values := map[string]string{
+		"ARK_API_KEY":               credential,
+		"VIDEO_VOLCENGINE_BASE_URL": "file:///invalid",
+	}
+	_, err := loadVolcengineProvider(func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	})
+	if err == nil {
+		t.Fatal("loadVolcengineProvider() error = nil")
+	}
+	if strings.Contains(err.Error(), credential) {
+		t.Fatalf("configuration error leaked credential: %v", err)
 	}
 }

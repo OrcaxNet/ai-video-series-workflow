@@ -271,7 +271,10 @@ func (p *VolcengineProvider) submitVideo(ctx context.Context, request Generation
 	var response struct {
 		ID string `json:"id"`
 	}
-	providerRequestID, err := p.do(ctx, http.MethodPost, "/contents/generations/tasks", payload, &response)
+	providerRequestID, err := p.doWithIdempotency(
+		ctx, http.MethodPost, "/contents/generations/tasks", payload, &response,
+		request.IdempotencyKey,
+	)
 	if err != nil {
 		return Job{}, err
 	}
@@ -291,20 +294,7 @@ func (p *VolcengineProvider) submitVideo(ctx context.Context, request Generation
 }
 
 func buildVolcVideoPayload(request GenerationRequest, model string) map[string]any {
-	text := strings.TrimSpace(request.Prompt)
-	if request.Output.AspectRatio != "" {
-		text += " --ratio " + request.Output.AspectRatio
-	}
-	if resolution := videoResolution(request.Output); resolution != "" {
-		text += " --resolution " + resolution
-	}
-	if request.Output.DurationMillis > 0 {
-		seconds := float64(request.Output.DurationMillis) / 1000
-		text += " --dur " + strconv.FormatFloat(seconds, 'f', -1, 64)
-	}
-	text += " --generate_audio " + strconv.FormatBool(request.Output.GenerateAudio)
-
-	content := []map[string]any{{"type": "text", "text": text}}
+	content := []map[string]any{{"type": "text", "text": strings.TrimSpace(request.Prompt)}}
 	for _, asset := range request.Assets {
 		if asset.URI == "" {
 			continue
@@ -322,6 +312,16 @@ func buildVolcVideoPayload(request GenerationRequest, model string) map[string]a
 		"model":             model,
 		"content":           content,
 		"return_last_frame": true,
+		"generate_audio":    request.Output.GenerateAudio,
+	}
+	if request.Output.AspectRatio != "" {
+		payload["ratio"] = request.Output.AspectRatio
+	}
+	if resolution := videoResolution(request.Output); resolution != "" {
+		payload["resolution"] = resolution
+	}
+	if request.Output.DurationMillis > 0 {
+		payload["duration"] = (request.Output.DurationMillis + 500) / 1000
 	}
 	if request.CallbackURL != "" {
 		payload["callback_url"] = request.CallbackURL
@@ -334,6 +334,16 @@ func (p *VolcengineProvider) do(
 	method, path string,
 	payload any,
 	output any,
+) (string, error) {
+	return p.doWithIdempotency(ctx, method, path, payload, output, "")
+}
+
+func (p *VolcengineProvider) doWithIdempotency(
+	ctx context.Context,
+	method, path string,
+	payload any,
+	output any,
+	idempotencyKey string,
 ) (string, error) {
 	var body io.Reader
 	if payload != nil {
@@ -349,6 +359,9 @@ func (p *VolcengineProvider) do(
 	}
 	request.Header.Set("Authorization", "Bearer "+p.apiKey)
 	request.Header.Set("Content-Type", "application/json")
+	if strings.TrimSpace(idempotencyKey) != "" {
+		request.Header.Set("Idempotency-Key", idempotencyKey)
+	}
 
 	response, err := p.client.Do(request)
 	if err != nil {
@@ -451,17 +464,45 @@ type volcVideoTask struct {
 		VideoURL     string `json:"video_url"`
 		LastFrameURL string `json:"last_frame_url"`
 	} `json:"content"`
-	Duration        string `json:"duration"`
-	Resolution      string `json:"resolution"`
-	Ratio           string `json:"ratio"`
-	FramesPerSecond int    `json:"framespersecond"`
+	// Agent Plan exposes transport URLs at the top level, while the platform
+	// endpoint historically nested them below content. Both are transient and
+	// are consumed by the adapter before any durable response is produced.
+	OutputURL       string        `json:"output_url"`
+	LastFrameURL    string        `json:"last_frame_url"`
+	Duration        flexibleInt64 `json:"duration"`
+	Resolution      string        `json:"resolution"`
+	Ratio           string        `json:"ratio"`
+	Frames          int           `json:"frames"`
+	FramesPerSecond int           `json:"framespersecond"`
+	FileFormat      string        `json:"fileformat"`
 	Usage           struct {
-		TotalTokens int64 `json:"total_tokens"`
+		PromptTokens     int64 `json:"prompt_tokens"`
+		CompletionTokens int64 `json:"completion_tokens"`
+		TotalTokens      int64 `json:"total_tokens"`
 	} `json:"usage"`
 	Error *struct {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	} `json:"error"`
+}
+
+// flexibleInt64 accepts the string duration returned by older Ark endpoints
+// and the numeric duration returned by Agent Plan without weakening the rest
+// of the response decoder.
+type flexibleInt64 int64
+
+func (value *flexibleInt64) UnmarshalJSON(data []byte) error {
+	raw := strings.Trim(strings.TrimSpace(string(data)), `"`)
+	if raw == "" || raw == "null" {
+		*value = 0
+		return nil
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil || parsed < 0 {
+		return errors.New("invalid non-negative integer value")
+	}
+	*value = flexibleInt64(parsed)
+	return nil
 }
 
 func (t volcVideoTask) toJob(providerRequestID string) Job {
@@ -480,38 +521,50 @@ func (t volcVideoTask) toJob(providerRequestID string) Job {
 		job.Error = MapHTTPError(http.StatusBadRequest, t.Error.Code, providerRequestID, t.Error.Message)
 	}
 	if job.Status == StatusSucceeded {
-		durationMillis, _ := strconv.ParseInt(t.Duration, 10, 64)
+		durationSeconds := int64(t.Duration)
+		fps := t.FramesPerSecond
+		if fps == 0 && t.Frames > 0 && durationSeconds > 0 {
+			fps = int((int64(t.Frames) + durationSeconds/2) / durationSeconds)
+		}
+		format := strings.TrimSpace(t.FileFormat)
+		if format == "" {
+			format = "mp4"
+		}
 		output := &Output{
 			Actual: OutputSpec{
 				Resolution:     t.Resolution,
 				AspectRatio:    t.Ratio,
-				FPS:            t.FramesPerSecond,
-				DurationMillis: int(durationMillis * 1000),
-				Format:         "mp4",
+				FPS:            fps,
+				DurationMillis: int(durationSeconds * 1000),
+				Format:         format,
 			},
 			Usage: Usage{
+				InputTokens:     t.Usage.PromptTokens,
+				OutputTokens:    t.Usage.CompletionTokens,
 				VideoTokens:     t.Usage.TotalTokens,
-				GeneratedMillis: durationMillis * 1000,
+				GeneratedMillis: durationSeconds * 1000,
 			},
 		}
-		if t.Content.VideoURL != "" {
+		videoURL := firstNonEmpty(t.OutputURL, t.Content.VideoURL)
+		lastFrameURL := firstNonEmpty(t.LastFrameURL, t.Content.LastFrameURL)
+		if videoURL != "" {
 			output.Assets = append(output.Assets, AssetRef{
 				ID:               t.ID + "-video",
 				Revision:         "provider-result",
 				Kind:             ModalityVideo,
 				Role:             AssetRoleOutput,
-				URI:              t.Content.VideoURL,
+				URI:              videoURL,
 				SHA256:           "pending_download",
 				LicenseReference: "request-license-manifest",
 			})
 		}
-		if t.Content.LastFrameURL != "" {
+		if lastFrameURL != "" {
 			output.Assets = append(output.Assets, AssetRef{
 				ID:               t.ID + "-last-frame",
 				Revision:         "provider-result",
 				Kind:             ModalityImage,
 				Role:             AssetRoleLastFrame,
-				URI:              t.Content.LastFrameURL,
+				URI:              lastFrameURL,
 				SHA256:           "pending_download",
 				LicenseReference: "request-license-manifest",
 			})

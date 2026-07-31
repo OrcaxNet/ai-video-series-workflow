@@ -77,6 +77,7 @@ type AssetRef struct {
 	SizeBytes        int64     `json:"size_bytes,omitempty"`
 	Width            int       `json:"width,omitempty"`
 	Height           int       `json:"height,omitempty"`
+	FPS              int       `json:"fps,omitempty"`
 	DurationMillis   int64     `json:"duration_millis,omitempty"`
 }
 

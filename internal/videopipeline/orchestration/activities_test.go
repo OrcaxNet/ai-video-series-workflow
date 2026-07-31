@@ -2,6 +2,8 @@ package orchestration
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,14 +12,70 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 )
+
+type activityLiveProvider struct {
+	outputURL string
+	submits   atomic.Int32
+}
+
+func (p *activityLiveProvider) Discover(context.Context) ([]providercontract.Capability, error) {
+	return nil, nil
+}
+
+func (p *activityLiveProvider) Submit(_ context.Context, request providercontract.GenerationRequest) (providercontract.Job, error) {
+	p.submits.Add(1)
+	return providercontract.Job{
+		ID: "cgt-activity-live-1", Status: providercontract.StatusQueued,
+		Provider: "volcengine_ark", ProviderModel: request.ModelHint,
+		ProviderRegion: "cn-beijing", ProviderRequestID: "activity-submit-request-1",
+		CreatedAt: time.Unix(1_800_000_000, 0), UpdatedAt: time.Unix(1_800_000_000, 0),
+	}, nil
+}
+
+func (p *activityLiveProvider) Poll(context.Context, string) (providercontract.Job, error) {
+	return providercontract.Job{
+		ID: "cgt-activity-live-1", Status: providercontract.StatusSucceeded,
+		Provider: "volcengine_ark", ProviderModel: "doubao-seedance-2.0",
+		ProviderRegion: "cn-beijing", ProviderRequestID: "activity-poll-request-1",
+		CreatedAt: time.Unix(1_800_000_000, 0), UpdatedAt: time.Unix(1_800_000_030, 0),
+		Output: &providercontract.Output{
+			Actual: providercontract.OutputSpec{
+				Resolution: "720p", AspectRatio: "16:9", FPS: 24,
+				DurationMillis: 5_000, Format: "mp4",
+			},
+			Usage: providercontract.Usage{VideoTokens: 250_000, GeneratedMillis: 5_000},
+			Assets: []providercontract.AssetRef{{
+				ID: "activity-video", Revision: "provider-result",
+				Kind: providercontract.ModalityVideo, Role: providercontract.AssetRoleOutput,
+				URI: p.outputURL, SHA256: "pending_download",
+				LicenseReference: "request-license-manifest",
+			}},
+		},
+	}, nil
+}
+
+func (p *activityLiveProvider) Cancel(context.Context, string) (providercontract.Job, error) {
+	return providercontract.Job{ID: "cgt-activity-live-1", Status: providercontract.StatusCancelled}, nil
+}
+
+type activityLiveInspector struct{}
+
+func (activityLiveInspector) Inspect(context.Context, string) (volcengineprovider.MediaSpec, error) {
+	return volcengineprovider.MediaSpec{
+		Width: 1280, Height: 720, FPS: 24, DurationMillis: 5_062, Format: "mp4",
+	}, nil
+}
 
 type activityJournalFixture struct {
 	replay          json.RawMessage
@@ -664,6 +722,84 @@ func TestActivities_CreateGate3PreservesRightsErrorContract(t *testing.T) {
 				t.Fatalf("commit calls = %d, want %d", ledger.commitCalls, wantCommitCalls)
 			}
 		})
+	}
+}
+
+func TestActivities_ExecuteProviderJobUsesLiveAdapterAndReturnsMeasuredCASArtifact(t *testing.T) {
+	t.Parallel()
+	download := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("synthetic-live-activity-video"))
+	}))
+	defer download.Close()
+	provider := &activityLiveProvider{outputURL: download.URL + "/result.mp4?signature=transient"}
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := volcengineprovider.New(runtimeconfig.VolcengineProvider{
+		ProviderID: "volcengine-agent-plan-large", Region: "cn-beijing",
+		VideoModel: "doubao-seedance-2.0", PlanName: "agent-plan-large",
+		PricingVersion: "agent-plan-large-included-v1", Currency: "CNY",
+		MaxDownloadBytes: 1 << 20, DownloadTimeout: 5 * time.Second,
+	}, provider, store, volcengineprovider.Options{
+		DownloadClient: download.Client(), Inspector: activityLiveInspector{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+	capability := sha256.Sum256([]byte("volcengine-agent-plan-large\x00doubao-seedance-2.0"))
+	inputDigest := sha256.Sum256([]byte("immutable activity live input"))
+	activities := NewActivities(server.URL)
+	input := ExecuteProviderJobInput{
+		Run: GenerationRunRef{
+			RunID: "live-activity-run", RunSpecDigest: hex.EncodeToString(inputDigest[:]), Attempt: 1,
+		},
+		Prompt: PromptSnapshotRef{
+			ID: "live-activity-prompt", Digest: hex.EncodeToString(inputDigest[:]),
+			PositivePrompt: "original abstract glass fluid, fixed camera, no people or text",
+			Context: providercontract.ContextRefs{
+				SeriesSnapshotID: "series-live", EpisodeSnapshotID: "episode-live",
+				SceneSnapshotID: "scene-live", ShotSnapshotID: "shot-live",
+			},
+			Output: providercontract.OutputSpec{
+				Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+				FPS: 24, DurationMillis: 5_000, Format: "mp4",
+			},
+		},
+		Route: providercontract.ModelSnapshot{
+			CapabilityAlias: string(providercontract.CapabilityVideo),
+			Provider:        "volcengine_ark", ModelID: "doubao-seedance-2.0",
+			RouteVersion: "agent-plan-large-v1", CapabilityHash: hex.EncodeToString(capability[:]),
+			Verification: providercontract.PendingKey,
+		},
+		BudgetApprovalID: "activity-live-budget", BudgetMaximumMicros: 1_000_000,
+		BudgetCurrency: "CNY", TraceID: "trace-activity-live",
+	}
+	var suite testsuite.WorkflowTestSuite
+	environment := suite.NewTestActivityEnvironment()
+	environment.RegisterActivity(activities.ExecuteProviderJob)
+	encodedResult, err := environment.ExecuteActivity(activities.ExecuteProviderJob, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result ProviderResult
+	if err := encodedResult.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if provider.submits.Load() != 1 || result.UpstreamTaskID != "cgt-activity-live-1" ||
+		result.RequestID != "activity-submit-request-1" || result.Width != 1280 ||
+		result.Height != 720 || result.DurationMillis != 5_062 ||
+		result.ArtifactURI != "cas://sha256/"+result.ArtifactDigest ||
+		result.Usage.VideoTokens != 250_000 || result.Cost.ActualMicros == nil ||
+		*result.Cost.ActualMicros != 0 || result.Cost.BillingMode != "subscription_included" {
+		t.Fatalf("live Activity result = %#v, submits = %d", result, provider.submits.Load())
+	}
+	encoded, _ := json.Marshal(result)
+	if strings.Contains(string(encoded), "signature=") || strings.Contains(string(encoded), download.URL) {
+		t.Fatalf("Activity result leaked signed transport URL: %s", encoded)
 	}
 }
 

@@ -103,8 +103,12 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 | `VIDEO_AUTH_HMAC_SECRET` | 本地未设置 | 生产必填、至少 32 bytes；只从 Secret manager 注入 |
 | `VIDEO_AUTH_AUDIENCE` | `video-control-plane` | JWT `aud` 精确值 |
 | `VIDEO_PROVIDER_ADAPTER_URL` | `http://mock-provider:8090` | Provider-neutral adapter |
+| `VIDEO_SPEECH_PROVIDER_ADAPTER_URL` | `http://mock-provider:8090` | 可与真实视频 Adapter 分离的语音 Adapter |
 | `VIDEO_ARTIFACT_ROOT` | `/var/lib/video-pipeline/artifacts` | 本地 CAS |
 | `ARK_API_KEY` | 未设置 | 火山方舟；只显式注入 |
+| `VIDEO_VOLCENGINE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | Agent Plan 数据面；不得写入 Manifest/BOM |
+| `VIDEO_VOLCENGINE_VIDEO_MODEL` | `doubao-seedance-2.0` | 冻结真实视频模型 |
+| `VIDEO_VOLCENGINE_PLAN` | `agent-plan-large` | 套餐计费模式标识 |
 | `ANTHROPIC_BASE_URL` | 未设置 | 预留 Claude adapter 的显式 endpoint；M0 不启用 |
 | `ANTHROPIC_API_KEY` | 未设置 | 文本备用 Secret |
 | `ANTHROPIC_MODEL` | 未设置 | 文本备用 model |
@@ -121,6 +125,33 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 生产业务 API 要求 HS256 Bearer JWT，并校验 `sub`、RBAC `role`、`aud`、`exp`；mutation body 的 `actor` 必须与签名 claims 完全一致，不能由调用方自报身份。`local/development/test` 且未配置认证 Secret 时才允许无 token 的开发模式；`VIDEO_ENVIRONMENT=production` 缺少 Secret 会启动失败。健康、系统信息和脱敏 Provider 状态保持公开。
 
 `.env.video` 已被 `.gitignore` 忽略，且只能用于非生产本地值。生产使用 Secret manager/容器 secret injection。
+
+### Agent Plan Large 单次探针
+
+真实 Adapter 是 Compose 的 opt-in `live` profile；默认 `make video-up` 仍只启动
+Mock，Mock/Live 证据边界不变。Adapter 同时兼容 Agent Plan 顶层
+`output_url` 与平台旧式 `content.video_url`，但两者都只在内存中用于一次 GET
+下载；成功响应仅返回 `cas://sha256/...`。
+
+```bash
+# ARK_API_KEY 由运行环境注入，不写入 .env.video 或命令输出。
+make video-live-provider-up
+VIDEO_BUILD_VERSION=<fixed-sha> make video-live-probe
+```
+
+`video-live-probe` 固定为一个 1280×720、24 fps、5 秒、无同步音频的原创抽象
+镜头，`maxAttempts=1`。输出目录带原子单次提交锁；即使任务失败，也不能在同一
+目录重提。成功后产出 MP4、Generation Manifest、Service BOM 与脱敏结果 JSON。
+Adapter 在返回成功前使用 ffprobe 实测分辨率/FPS/时长并提交 CAS；任务 ID、
+请求 ID、token 用量和套餐成本语义进入证据。Agent Plan 未返回逐任务货币价格时，
+成本记录为 `subscription_included`、实际增量 `0 CNY`、
+`provider_reported=false`，不得伪造按次价格。
+
+Adapter 会先把不含 prompt/Secret/URL 的提交意图原子写入共享 CAS volume 下的
+`provider-jobs/`，再调用远端；重启后以同一 `jobId` 重放已知 task/result。若进程
+在远端接收与 task ID 落盘之间崩溃，记录转为需人工对账且绝不自动重提，避免重复
+付费任务。回滚不涉及数据库 migration：停止 live profile，将视频路由切回 Mock，
+保留 `provider-jobs/`、CAS 与证据目录用于审计；不得删除在途 task 的对账信息。
 
 `make video-test` 和 CI 使用 `git ls-files --cached --others --exclude-standard` 枚举仓库根目录下全部 tracked 与未忽略文件，再执行 fail-closed Secret 扫描。新增根目录文件、隐藏目录或未来子目录不需要维护扫描白名单；未忽略的潜在凭证会直接使门禁失败。
 
