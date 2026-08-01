@@ -151,18 +151,20 @@ type Record struct {
 	ActualCashMicros    int64  `json:"actualCashMicros,omitempty"`
 	EvidenceComplete    bool   `json:"evidenceComplete"`
 	ContentSafetyFailed bool   `json:"contentSafetyFailed"`
+	FailureClass        string `json:"failureClass,omitempty"`
 }
 
 type Ledger struct {
-	SchemaVersion             string             `json:"schemaVersion"`
-	BatchID                   string             `json:"batchId"`
-	ExecutionPackageHash      string             `json:"executionPackageHash"`
-	Records                   map[string]*Record `json:"records"`
-	ReservedVideoTokens       int64              `json:"reservedVideoTokens"`
-	ReservedAFPMilli          int64              `json:"reservedAfpMilli"`
-	ReservedCashMicros        int64              `json:"reservedCashMicros"`
-	ConsecutiveSafetyFailures int                `json:"consecutiveContentSafetyFailures"`
-	NextTerminalSequence      int64              `json:"nextTerminalSequence"`
+	SchemaVersion              string             `json:"schemaVersion"`
+	BatchID                    string             `json:"batchId"`
+	ExecutionPackageHash       string             `json:"executionPackageHash"`
+	ControlledRetryPackageHash string             `json:"controlledRetryPackageHash,omitempty"`
+	Records                    map[string]*Record `json:"records"`
+	ReservedVideoTokens        int64              `json:"reservedVideoTokens"`
+	ReservedAFPMilli           int64              `json:"reservedAfpMilli"`
+	ReservedCashMicros         int64              `json:"reservedCashMicros"`
+	ConsecutiveSafetyFailures  int                `json:"consecutiveContentSafetyFailures"`
+	NextTerminalSequence       int64              `json:"nextTerminalSequence"`
 }
 
 type Decision string
@@ -174,10 +176,11 @@ const (
 )
 
 type Gate struct {
-	plan                 Plan
-	path                 string
-	executionPackageHash string
-	mu                   sync.Mutex
+	plan                       Plan
+	path                       string
+	executionPackageHash       string
+	controlledRetryPackageHash string
+	mu                         sync.Mutex
 }
 
 func Open(plan Plan, path string) (*Gate, error) {
@@ -226,6 +229,57 @@ func (g *Gate) BindExecutionPackage(contentHash string) error {
 	if ledger.ExecutionPackageHash != contentHash {
 		g.executionPackageHash = previous
 		return errors.New("stage 1 ledger is bound to another execution package")
+	}
+	if err := g.saveLocked(ledger); err != nil {
+		g.executionPackageHash = previous
+		return err
+	}
+	return nil
+}
+
+// BindControlledRetryPackage persists the one post-failure extension without
+// changing the already-bound ten-job package. Competing extensions race under
+// the same cross-process lock and only the first hash can win.
+func (g *Gate) BindControlledRetryPackage(package_ ControlledRetryPackage) error {
+	contentHash := package_.ContentHash
+	if !validLowerDigest(contentHash) {
+		return errors.New("stage 1 controlled retry package hash must be a lowercase SHA-256")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer releaseFileLock(lock)
+	ledger, err := g.loadLocked()
+	if err != nil {
+		return err
+	}
+	if ledger.ExecutionPackageHash == "" {
+		return errors.New("stage 1 execution package must be bound before its controlled retry")
+	}
+	var original *Record
+	for _, record := range ledger.Records {
+		if record.AttemptID == package_.Approval.OriginalAttemptID &&
+			record.ShotID == package_.Job.ShotID {
+			original = record
+			break
+		}
+	}
+	if original == nil || original.State != "TERMINAL_FAILED" ||
+		!original.EvidenceComplete || original.FailureClass != package_.Approval.FailureClass {
+		return providerError(providercontract.CodeForbidden, "controlled retry package does not match an evidence-complete primary failure")
+	}
+	if ledger.ControlledRetryPackageHash != "" && ledger.ControlledRetryPackageHash != contentHash {
+		return providerError(providercontract.CodeConflict, "stage 1 ledger is bound to another controlled retry package")
+	}
+	ledger.ControlledRetryPackageHash = contentHash
+	previous := g.controlledRetryPackageHash
+	g.controlledRetryPackageHash = contentHash
+	if err := g.saveLocked(ledger); err != nil {
+		g.controlledRetryPackageHash = previous
+		return err
 	}
 	return nil
 }
@@ -381,11 +435,12 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 	}
 	for _, record := range ledger.Records {
 		if record.AttemptID == retry.OriginalAttemptID && record.ShotID == attempt.ShotID &&
-			record.State == "TERMINAL_FAILED" {
+			record.State == "TERMINAL_FAILED" && record.EvidenceComplete &&
+			record.FailureClass == retry.FailureClass {
 			return nil
 		}
 	}
-	return providerError(providercontract.CodeForbidden, "controlled retry does not reference the failed terminal original attempt")
+	return providerError(providercontract.CodeForbidden, "controlled retry does not match the evidence-complete failed terminal original attempt")
 }
 
 func (g *Gate) MarkAmbiguous(idempotencyKey string) error {
@@ -412,9 +467,11 @@ type Completion struct {
 	ActualCashMicros    int64
 	EvidenceComplete    bool
 	ContentSafetyFailed bool
+	FailureClass        string
 }
 
 func (g *Gate) Complete(idempotencyKey string, completion Completion) error {
+	completion.FailureClass = normalizedFailureClass(completion)
 	return g.updateRecord(idempotencyKey, func(record *Record, ledger *Ledger) error {
 		if completion.State != "TERMINAL_SUCCEEDED" && completion.State != "TERMINAL_FAILED" {
 			return errors.New("stage 1 completion requires a terminal state")
@@ -427,6 +484,9 @@ func (g *Gate) Complete(idempotencyKey string, completion Completion) error {
 		}
 		if completion.State == "TERMINAL_SUCCEEDED" && completion.ContentSafetyFailed {
 			return errors.New("a succeeded stage 1 completion cannot be a content safety failure")
+		}
+		if completion.State == "TERMINAL_SUCCEEDED" && completion.FailureClass != "" {
+			return errors.New("a succeeded stage 1 completion cannot have a failure class")
 		}
 		if terminalState(record.State) {
 			if sameCompletion(record, completion) {
@@ -446,6 +506,7 @@ func (g *Gate) Complete(idempotencyKey string, completion Completion) error {
 		record.ActualCashMicros = completion.ActualCashMicros
 		record.EvidenceComplete = completion.EvidenceComplete
 		record.ContentSafetyFailed = completion.ContentSafetyFailed
+		record.FailureClass = completion.FailureClass
 		return recalculateLedger(ledger)
 	})
 }
@@ -488,7 +549,9 @@ func (g *Gate) loadLocked() (Ledger, error) {
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&ledger); err != nil || ledger.SchemaVersion != LedgerSchemaVersion ||
 		ledger.BatchID != g.plan.BatchID || ledger.Records == nil ||
-		(g.executionPackageHash != "" && ledger.ExecutionPackageHash != g.executionPackageHash) {
+		(g.executionPackageHash != "" && ledger.ExecutionPackageHash != g.executionPackageHash) ||
+		(g.controlledRetryPackageHash != "" &&
+			ledger.ControlledRetryPackageHash != g.controlledRetryPackageHash) {
 		return Ledger{}, errors.New("stage 1 ledger is invalid or bound to another batch")
 	}
 	if err := validateLedgerDerivedState(ledger); err != nil {
@@ -522,6 +585,10 @@ func deriveLedgerState(ledger Ledger) (derivedLedgerState, error) {
 			}
 			if record.State == "TERMINAL_SUCCEEDED" && record.ContentSafetyFailed {
 				return derivedLedgerState{}, errors.New("stage 1 terminal record has an invalid safety outcome")
+			}
+			if (record.State == "TERMINAL_FAILED" && strings.TrimSpace(record.FailureClass) == "") ||
+				(record.State == "TERMINAL_SUCCEEDED" && record.FailureClass != "") {
+				return derivedLedgerState{}, errors.New("stage 1 terminal record has an invalid failure classification")
 			}
 			if _, duplicate := sequences[record.TerminalSequence]; duplicate {
 				return derivedLedgerState{}, errors.New("stage 1 terminal sequence is duplicated")
@@ -601,6 +668,31 @@ func validateLedgerDerivedState(ledger Ledger) error {
 	return nil
 }
 
+// Snapshot returns a deep, immutable view used to select the exact successful
+// Run set before Stage 1 post-production. Callers cannot mutate live records.
+func (g *Gate) Snapshot() (Ledger, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return Ledger{}, err
+	}
+	defer releaseFileLock(lock)
+	ledger, err := g.loadLocked()
+	if err != nil {
+		return Ledger{}, err
+	}
+	encoded, err := json.Marshal(ledger)
+	if err != nil {
+		return Ledger{}, err
+	}
+	var snapshot Ledger
+	if err := json.Unmarshal(encoded, &snapshot); err != nil {
+		return Ledger{}, err
+	}
+	return snapshot, nil
+}
+
 func (g *Gate) saveLocked(ledger Ledger) error {
 	if err := os.MkdirAll(filepath.Dir(g.path), 0o750); err != nil {
 		return fmt.Errorf("create stage 1 ledger directory: %w", err)
@@ -632,6 +724,17 @@ func (g *Gate) saveLocked(ledger Ledger) error {
 	}
 	if err := os.Rename(tempPath, g.path); err != nil {
 		return fmt.Errorf("commit stage 1 ledger: %w", err)
+	}
+	directory, err := os.Open(filepath.Dir(g.path))
+	if err != nil {
+		return fmt.Errorf("open stage 1 ledger directory for sync: %w", err)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return fmt.Errorf("sync stage 1 ledger directory: %w", err)
+	}
+	if err := directory.Close(); err != nil {
+		return fmt.Errorf("close stage 1 ledger directory: %w", err)
 	}
 	return nil
 }
@@ -783,7 +886,21 @@ func sameCompletion(record *Record, completion Completion) bool {
 		record.ActualAFPMilli == completion.ActualAFPMilli &&
 		record.ActualCashMicros == completion.ActualCashMicros &&
 		record.EvidenceComplete == completion.EvidenceComplete &&
-		record.ContentSafetyFailed == completion.ContentSafetyFailed
+		record.ContentSafetyFailed == completion.ContentSafetyFailed &&
+		record.FailureClass == completion.FailureClass
+}
+
+func normalizedFailureClass(completion Completion) string {
+	if completion.State != "TERMINAL_FAILED" {
+		return strings.TrimSpace(completion.FailureClass)
+	}
+	if value := strings.TrimSpace(completion.FailureClass); value != "" {
+		return value
+	}
+	if completion.ContentSafetyFailed {
+		return string(providercontract.CodeContentBlocked)
+	}
+	return "PROVIDER_TERMINAL_FAILURE"
 }
 
 func terminalState(state string) bool {

@@ -844,6 +844,72 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		BudgetCurrency: "CNY", ProviderProfileID: providerProfileID.String(),
 		TraceID: step.TraceID, PersistProductTruth: true,
 	}
+	atomicMismatch := dispatch
+	atomicMismatch.ExpectedProductTruth = &orchestration.PreparedProductTruth{
+		ShotSpecRevisionID:  shotRevisionID.String(),
+		Run:                 run,
+		PromptSnapshotID:    prompt.ID,
+		PromptSnapshotHash:  prompt.Digest,
+		GenerationPlanID:    uuid.NewString(),
+		BudgetApprovalID:    budgetID.String(),
+		BudgetMaximumMicros: 1_000,
+		BudgetCurrency:      "CNY",
+		ProviderProfileID:   providerProfileID.String(),
+		Route:               model,
+	}
+	if _, err := store.PrepareProviderJob(ctx, step, atomicMismatch); err == nil {
+		t.Fatal("PrepareProviderJob accepted a frozen package / PostgreSQL truth mismatch")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("frozen package atomic mismatch error = %#v", err)
+		}
+	}
+	shotMismatch := dispatch
+	shotMismatch.ExpectedProductTruth = &orchestration.PreparedProductTruth{
+		ShotSpecRevisionID:  uuid.NewString(),
+		Run:                 run,
+		PromptSnapshotID:    prompt.ID,
+		PromptSnapshotHash:  prompt.Digest,
+		GenerationPlanID:    plan.Value.GenerationPlanID,
+		BudgetApprovalID:    budgetID.String(),
+		BudgetMaximumMicros: 1_000,
+		BudgetCurrency:      "CNY",
+		ProviderProfileID:   providerProfileID.String(),
+		Route:               model,
+	}
+	if _, err := store.PrepareProviderJob(ctx, step, shotMismatch); err == nil {
+		t.Fatal("PrepareProviderJob accepted a frozen ShotSpec / PostgreSQL truth mismatch")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("frozen ShotSpec atomic mismatch error = %#v", err)
+		}
+	}
+	var atomicReservations, atomicJobs, atomicCosts int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM video_pipeline.budget_reservations
+		   WHERE generation_run_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+		   JOIN video_pipeline.generation_attempts ga
+		     ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.cost_ledger cl
+		   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+		   JOIN video_pipeline.generation_attempts ga
+		     ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1)`,
+		run.RunID,
+	).Scan(&atomicReservations, &atomicJobs, &atomicCosts); err != nil {
+		t.Fatal(err)
+	}
+	if atomicReservations != 0 || atomicJobs != 0 || atomicCosts != 0 {
+		t.Fatalf(
+			"frozen package atomic rejection side effects = reservations:%d jobs:%d costs:%d",
+			atomicReservations, atomicJobs, atomicCosts,
+		)
+	}
 	lineageShotID, lineageCommand := cloneIntegrationShotCommand(
 		t, ctx, pool, store, shotID.String(), publicCommand,
 	)

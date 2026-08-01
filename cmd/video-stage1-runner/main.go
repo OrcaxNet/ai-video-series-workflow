@@ -34,8 +34,9 @@ func run(
 	output io.Writer,
 	lookup func(string) (string, bool),
 ) error {
-	if len(args) != 1 || args[0] != "submit" && args[0] != "complete" {
-		return errors.New("usage: video-stage1-runner <submit|complete> < invocation.json")
+	if len(args) != 1 || args[0] != "submit" && args[0] != "retry" &&
+		args[0] != "complete" && args[0] != "finalize-input" {
+		return errors.New("usage: video-stage1-runner <submit|retry|complete|finalize-input> < invocation.json")
 	}
 	planPath, err := requiredEnv(lookup, "VIDEO_STAGE1_PLAN_PATH")
 	if err != nil {
@@ -110,7 +111,34 @@ func run(
 	if err != nil {
 		return err
 	}
-	runner, err := stage1.NewRunner(gate, adapter, artifacts, store, executionPackage)
+	var runner *stage1.Runner
+	retryPath, hasRetryPath := lookup("VIDEO_STAGE1_RETRY_PACKAGE_PATH")
+	if strings.TrimSpace(retryPath) != "" {
+		retryFile, openErr := os.Open(retryPath)
+		if openErr != nil {
+			if args[0] == "retry" || args[0] == "finalize-input" {
+				return fmt.Errorf("open immutable stage 1 controlled retry package: %w", openErr)
+			}
+		} else {
+			defer retryFile.Close()
+			var retryPackage stage1.ControlledRetryPackage
+			if decodeErr := decodeOne(retryFile, &retryPackage); decodeErr != nil {
+				return fmt.Errorf("decode immutable stage 1 controlled retry package: %w", decodeErr)
+			}
+			runner, err = stage1.NewRunnerWithControlledRetry(
+				gate, adapter, artifacts, store, executionPackage, retryPackage,
+			)
+		}
+	}
+	if runner == nil && err == nil {
+		if args[0] == "retry" {
+			if !hasRetryPath || strings.TrimSpace(retryPath) == "" {
+				return errors.New("VIDEO_STAGE1_RETRY_PACKAGE_PATH is required for a controlled retry")
+			}
+			return errors.New("stage 1 controlled retry package is unavailable")
+		}
+		runner, err = stage1.NewRunner(gate, adapter, artifacts, store, executionPackage)
+	}
 	if err != nil {
 		return err
 	}
@@ -123,12 +151,23 @@ func run(
 			return fmt.Errorf("decode stage 1 submit invocation: %w", err)
 		}
 		result, err = runner.Submit(ctx, request)
+	case "retry":
+		var request stage1.SubmitInput
+		if err := decodeOne(input, &request); err != nil {
+			return fmt.Errorf("decode stage 1 controlled retry invocation: %w", err)
+		}
+		result, err = runner.SubmitControlledRetry(ctx, request)
 	case "complete":
 		var request stage1.CompleteInput
 		if err := decodeOne(input, &request); err != nil {
 			return fmt.Errorf("decode stage 1 completion invocation: %w", err)
 		}
 		result, err = runner.Complete(ctx, request)
+	case "finalize-input":
+		if err := requireEmptyInput(input); err != nil {
+			return err
+		}
+		result, err = runner.FinalizationInput()
 	}
 	if err != nil {
 		return err
@@ -136,6 +175,17 @@ func run(
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(result)
+}
+
+func requireEmptyInput(reader io.Reader) error {
+	data, err := io.ReadAll(io.LimitReader(reader, 1024))
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(string(data)) != "" {
+		return errors.New("stage 1 finalize-input accepts no caller-supplied fields")
+	}
+	return nil
 }
 
 func decodeOne(reader io.Reader, destination any) error {

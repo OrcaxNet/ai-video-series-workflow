@@ -58,6 +58,7 @@ type CompletionResult struct {
 	ActualCashMicros    int64  `json:"actualCashMicros"`
 	EvidenceComplete    bool   `json:"evidenceComplete"`
 	ContentSafetyFailed bool   `json:"contentSafetyFailed"`
+	FailureClass        string `json:"failureClass,omitempty"`
 }
 
 // Runner is the sole production entry point for formal FLO-104 Stage 1 video
@@ -70,6 +71,7 @@ type Runner struct {
 	artifacts        ArtifactVerifier
 	truth            ProductTruthPreparer
 	executionPackage ExecutionPackage
+	controlledRetry  *ControlledRetryPackage
 }
 
 func NewRunner(
@@ -78,6 +80,30 @@ func NewRunner(
 	artifacts ArtifactVerifier,
 	truth ProductTruthPreparer,
 	executionPackage ExecutionPackage,
+) (*Runner, error) {
+	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil)
+}
+
+// NewRunnerWithControlledRetry enables the separately sealed +1 path without
+// changing the ten-job package already bound to the durable ledger.
+func NewRunnerWithControlledRetry(
+	gate *Gate,
+	adapter *AdapterSubmitter,
+	artifacts ArtifactVerifier,
+	truth ProductTruthPreparer,
+	executionPackage ExecutionPackage,
+	controlledRetry ControlledRetryPackage,
+) (*Runner, error) {
+	return newRunner(gate, adapter, artifacts, truth, executionPackage, &controlledRetry)
+}
+
+func newRunner(
+	gate *Gate,
+	adapter *AdapterSubmitter,
+	artifacts ArtifactVerifier,
+	truth ProductTruthPreparer,
+	executionPackage ExecutionPackage,
+	controlledRetry *ControlledRetryPackage,
 ) (*Runner, error) {
 	if gate == nil || adapter == nil || artifacts == nil || truth == nil {
 		return nil, errors.New("stage 1 gate, authenticated adapter, CAS verifier, and product truth are required")
@@ -88,13 +114,21 @@ func NewRunner(
 	if err := gate.BindExecutionPackage(executionPackage.ContentHash); err != nil {
 		return nil, err
 	}
+	if controlledRetry != nil {
+		if err := controlledRetry.Validate(gate.Plan(), executionPackage); err != nil {
+			return nil, err
+		}
+		if err := gate.BindControlledRetryPackage(*controlledRetry); err != nil {
+			return nil, err
+		}
+	}
 	executor, err := NewExecutor(gate, adapter)
 	if err != nil {
 		return nil, err
 	}
 	return &Runner{
 		gate: gate, adapter: adapter, executor: executor, artifacts: artifacts,
-		truth: truth, executionPackage: executionPackage,
+		truth: truth, executionPackage: executionPackage, controlledRetry: controlledRetry,
 	}, nil
 }
 
@@ -103,17 +137,41 @@ func (r *Runner) Submit(ctx context.Context, input SubmitInput) (SubmitResult, e
 	if !ok {
 		return SubmitResult{}, providerError(providercontract.CodeForbidden, "shot is outside the frozen stage 1 execution package")
 	}
-	attempt := Attempt{
+	return r.submitFrozen(ctx, frozen, nil)
+}
+
+// SubmitControlledRetry is the only production path to the approved +1. The
+// caller selects only the shot; every new identity and approval comes from the
+// immutable retry extension.
+func (r *Runner) SubmitControlledRetry(ctx context.Context, input SubmitInput) (SubmitResult, error) {
+	if r.controlledRetry == nil || r.controlledRetry.Job.ShotID != input.ShotID {
+		return SubmitResult{}, providerError(providercontract.CodeForbidden, "shot is outside the frozen stage 1 controlled retry package")
+	}
+	approval := r.controlledRetry.Approval
+	return r.submitFrozen(ctx, r.controlledRetry.Job, &approval)
+}
+
+func (r *Runner) submitFrozen(
+	ctx context.Context,
+	frozen FrozenJob,
+	retry *RetryApproval,
+) (SubmitResult, error) {
+	attempt := attemptFromFrozen(frozen, retry)
+
+	return r.executor.ExecutePrepared(ctx, attempt, func(ctx context.Context) (providercontract.JobRequest, error) {
+		return r.prepareProductTruth(ctx, frozen)
+	})
+}
+
+func attemptFromFrozen(frozen FrozenJob, retry *RetryApproval) Attempt {
+	return Attempt{
 		AttemptID: frozen.AttemptID, ShotID: frozen.ShotID,
 		IdempotencyKey:                     frozen.IdempotencyKey,
 		EstimatedVideoTokens:               frozen.EstimatedVideoTokens,
 		PredictedAFPMilli:                  frozen.PredictedAFPMilli,
 		EstimatedNonSubscriptionCashMicros: frozen.EstimatedNonSubscriptionCashMicros,
+		Retry:                              retry,
 	}
-
-	return r.executor.ExecutePrepared(ctx, attempt, func(ctx context.Context) (providercontract.JobRequest, error) {
-		return r.prepareProductTruth(ctx, frozen)
-	})
 }
 
 func (r *Runner) prepareProductTruth(
@@ -130,21 +188,6 @@ func (r *Runner) prepareProductTruth(
 			"PostgreSQL prompt snapshot differs from the frozen stage 1 package",
 		)
 	}
-	preparation := orchestration.ExecuteProviderJobInput{
-		Run: frozen.Run, Prompt: prompt, Route: frozen.Route,
-		BudgetApprovalID:    frozen.BudgetApprovalID,
-		BudgetMaximumMicros: frozen.BudgetMaximumMicros,
-		BudgetCurrency:      frozen.BudgetCurrency,
-		ProviderProfileID:   frozen.ProviderProfileID,
-		TraceID:             frozen.TraceID, PersistProductTruth: true,
-	}
-	prepared, err := r.truth.PrepareProviderJob(ctx, orchestration.WorkflowStep{
-		WorkflowID: frozen.WorkflowID, ActivityID: frozen.ActivityID,
-		ActivityType: orchestration.ActivityExecuteProviderJob, TraceID: frozen.TraceID,
-	}, preparation)
-	if err != nil {
-		return providercontract.JobRequest{}, err
-	}
 	expectedTruth := orchestration.PreparedProductTruth{
 		ShotSpecRevisionID: frozen.ShotSpecRevisionID,
 		Run:                frozen.Run, PromptSnapshotID: frozen.PromptSnapshotID,
@@ -154,6 +197,22 @@ func (r *Runner) prepareProductTruth(
 		BudgetMaximumMicros: frozen.BudgetMaximumMicros,
 		BudgetCurrency:      frozen.BudgetCurrency,
 		ProviderProfileID:   frozen.ProviderProfileID, Route: frozen.Route,
+	}
+	preparation := orchestration.ExecuteProviderJobInput{
+		Run: frozen.Run, Prompt: prompt, Route: frozen.Route,
+		BudgetApprovalID:    frozen.BudgetApprovalID,
+		BudgetMaximumMicros: frozen.BudgetMaximumMicros,
+		BudgetCurrency:      frozen.BudgetCurrency,
+		ProviderProfileID:   frozen.ProviderProfileID,
+		TraceID:             frozen.TraceID, PersistProductTruth: true,
+		ExpectedProductTruth: &expectedTruth,
+	}
+	prepared, err := r.truth.PrepareProviderJob(ctx, orchestration.WorkflowStep{
+		WorkflowID: frozen.WorkflowID, ActivityID: frozen.ActivityID,
+		ActivityType: orchestration.ActivityExecuteProviderJob, TraceID: frozen.TraceID,
+	}, preparation)
+	if err != nil {
+		return providercontract.JobRequest{}, err
 	}
 	if prepared.ProductTruth != expectedTruth {
 		return providercontract.JobRequest{}, providerError(
@@ -195,7 +254,7 @@ func (r *Runner) Complete(ctx context.Context, input CompleteInput) (CompletionR
 	}
 	completion, evidenceErr := r.completionFromProvider(response, input)
 	if evidenceErr == nil && completion.State == "TERMINAL_SUCCEEDED" {
-		frozen, ok := r.executionPackage.JobByIdempotencyKey(input.IdempotencyKey)
+		frozen, ok := r.jobByIdempotencyKey(input.IdempotencyKey)
 		if !ok {
 			return CompletionResult{}, providerError(
 				providercontract.CodeForbidden,
@@ -230,11 +289,65 @@ func (r *Runner) Complete(ctx context.Context, input CompleteInput) (CompletionR
 		State: completion.State, ActualVideoTokens: completion.ActualVideoTokens,
 		ActualAFPMilli: completion.ActualAFPMilli, ActualCashMicros: completion.ActualCashMicros,
 		EvidenceComplete: completion.EvidenceComplete, ContentSafetyFailed: completion.ContentSafetyFailed,
+		FailureClass: completion.FailureClass,
 	}
 	if evidenceErr != nil {
 		return result, evidenceErr
 	}
 	return result, nil
+}
+
+func (r *Runner) jobByIdempotencyKey(key string) (FrozenJob, bool) {
+	if job, ok := r.executionPackage.JobByIdempotencyKey(key); ok {
+		return job, true
+	}
+	if r.controlledRetry != nil && r.controlledRetry.Job.IdempotencyKey == key {
+		return r.controlledRetry.Job, true
+	}
+	return FrozenJob{}, false
+}
+
+// FinalizationInput returns the immutable post-production input only when the
+// selected ten Runs have evidence-complete successful terminal records. A
+// successful controlled retry replaces exactly its failed primary Run.
+func (r *Runner) FinalizationInput() (orchestration.FinalizeEpisodeInput, error) {
+	ledger, err := r.gate.Snapshot()
+	if err != nil {
+		return orchestration.FinalizeEpisodeInput{}, err
+	}
+	failedPrimary := ""
+	var failedRecord *Record
+	for _, job := range r.executionPackage.PrimaryJobs {
+		record := ledger.Records[job.IdempotencyKey]
+		if record == nil || !terminalState(record.State) || !record.EvidenceComplete {
+			return orchestration.FinalizeEpisodeInput{}, providerError(providercontract.CodeForbidden, "stage 1 finalization requires complete terminal evidence for every primary Run")
+		}
+		if record.State == "TERMINAL_FAILED" {
+			if failedPrimary != "" {
+				return orchestration.FinalizeEpisodeInput{}, providerError(providercontract.CodeForbidden, "stage 1 finalization has more than one failed primary Run")
+			}
+			failedPrimary = job.AttemptID
+			failedRecord = record
+		}
+	}
+	if failedPrimary == "" {
+		return r.executionPackage.PostProduction, nil
+	}
+	if r.controlledRetry == nil || ledger.ControlledRetryPackageHash != r.controlledRetry.ContentHash ||
+		r.controlledRetry.Approval.OriginalAttemptID != failedPrimary {
+		return orchestration.FinalizeEpisodeInput{}, providerError(providercontract.CodeForbidden, "failed Stage 1 primary Run has no bound controlled retry")
+	}
+	if failedRecord == nil || failedRecord.FailureClass != r.controlledRetry.Approval.FailureClass {
+		return orchestration.FinalizeEpisodeInput{}, providerError(providercontract.CodeForbidden, "controlled retry approval differs from the frozen primary failure")
+	}
+	retryRecord := ledger.Records[r.controlledRetry.Job.IdempotencyKey]
+	approval := r.controlledRetry.Approval
+	expectedAttempt := attemptFromFrozen(r.controlledRetry.Job, &approval)
+	if retryRecord == nil || !sameAttempt(retryRecord.Attempt, expectedAttempt) ||
+		retryRecord.State != "TERMINAL_SUCCEEDED" || !retryRecord.EvidenceComplete {
+		return orchestration.FinalizeEpisodeInput{}, providerError(providercontract.CodeForbidden, "stage 1 controlled retry is not evidence-complete and successful")
+	}
+	return r.controlledRetry.PostProduction, nil
 }
 
 func (r *Runner) completionFromProvider(
@@ -254,6 +367,9 @@ func (r *Runner) completionFromProvider(
 	}
 	if response.Error != nil && response.Error.Code == providercontract.CodeContentBlocked {
 		completion.ContentSafetyFailed = true
+	}
+	if response.Error != nil {
+		completion.FailureClass = string(response.Error.Code)
 	}
 
 	var evidenceProblems []string

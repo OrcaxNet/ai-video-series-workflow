@@ -1466,6 +1466,35 @@ func (p *Postgres) PrepareProviderJob(
 		if err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
+		// The formal Stage 1 package is an additional immutable envelope over
+		// PostgreSQL product truth. It must be compared while all relevant rows
+		// are locked and before the first paid-boundary insert. A caller-side
+		// comparison after this transaction commits is too late: it would leave
+		// a reservation/job/cost row for a package that was never authorized.
+		if input.ExpectedProductTruth != nil &&
+			*input.ExpectedProductTruth != prepared.ProductTruth {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"stage 1 frozen product truth differs from the locked PostgreSQL run",
+			)
+		}
+		if input.ExpectedProductTruth != nil {
+			request, requestErr := orchestration.BuildProviderJobRequest(input, prepared)
+			if requestErr != nil {
+				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"stage 1 frozen envelope cannot produce the locked Provider request",
+				)
+			}
+			if request.JobID != "provider-job-"+input.Run.RunID ||
+				request.RunID != input.Run.RunID ||
+				request.Model != prepared.ProductTruth.Route {
+				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"stage 1 frozen envelope differs from the locked Provider request",
+				)
+			}
+		}
 		jobID := uuid.NewSHA1(runID, []byte("provider-job"))
 		jobKey := "provider-job-" + input.Run.RunID
 		requestEnvelope := immutableProviderRequest{

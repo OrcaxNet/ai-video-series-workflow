@@ -59,6 +59,18 @@ func TestGateBindsLedgerToExactExecutionPackage(t *testing.T) {
 	if err := gate.BindExecutionPackage(hashA); err != nil {
 		t.Fatal(err)
 	}
+	// Binding itself is a durable operation. A restart before the first
+	// PREPARED record must still reject any replacement package.
+	restartedEmpty, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restartedEmpty.BindExecutionPackage(hashB); err == nil {
+		t.Fatal("different execution package replaced an empty bound ledger")
+	}
+	if err := restartedEmpty.BindExecutionPackage(hashA); err != nil {
+		t.Fatalf("same package failed before the first record: %v", err)
+	}
 	if _, err := gate.Authorize(testAttempt("shot-01", "attempt-01")); err != nil {
 		t.Fatal(err)
 	}
@@ -75,6 +87,38 @@ func TestGateBindsLedgerToExactExecutionPackage(t *testing.T) {
 	ledger := readTestLedger(t, path)
 	if ledger.SchemaVersion != LedgerSchemaVersion || ledger.ExecutionPackageHash != hashA {
 		t.Fatalf("bound ledger = %#v", ledger)
+	}
+}
+
+func TestExecutionPackageBindingSurvivesRejectedPrepareAndRestart(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	gate, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindExecutionPackage(hashA); err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("PostgreSQL rejected frozen truth")
+	if _, err := gate.AuthorizePrepared(
+		testAttempt("shot-01", "attempt-01"),
+		func() error { return wantErr },
+	); !errors.Is(err, wantErr) {
+		t.Fatalf("AuthorizePrepared() error = %v, want %v", err, wantErr)
+	}
+	restarted, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.BindExecutionPackage(hashB); err == nil {
+		t.Fatal("different execution package replaced binding after rejected prepare")
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.ExecutionPackageHash != hashA || len(ledger.Records) != 0 {
+		t.Fatalf("rejected prepare ledger = %#v", ledger)
 	}
 }
 

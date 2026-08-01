@@ -20,8 +20,8 @@ func main() {
 }
 
 func run(args []string, output io.Writer) error {
-	if len(args) != 3 || args[0] != "seal" && args[0] != "verify" {
-		return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json>")
+	if len(args) < 3 {
+		return packageUsageError()
 	}
 	var plan stage1.Plan
 	if err := decodeFile(args[1], &plan); err != nil {
@@ -31,20 +31,51 @@ func run(args []string, output io.Writer) error {
 	if err := decodeFile(args[2], &package_); err != nil {
 		return fmt.Errorf("read stage 1 execution package: %w", err)
 	}
-	if args[0] == "seal" {
+	if args[0] == "seal" || args[0] == "verify" {
+		if len(args) != 3 {
+			return packageUsageError()
+		}
+		if args[0] == "seal" {
+			var err error
+			package_, err = stage1.SealExecutionPackage(package_)
+			if err != nil {
+				return err
+			}
+		}
+		if err := package_.Validate(plan); err != nil {
+			return err
+		}
+		return encodePackage(output, package_)
+	}
+	if (args[0] != "seal-retry" && args[0] != "verify-retry") || len(args) != 4 {
+		return packageUsageError()
+	}
+	var retry stage1.ControlledRetryPackage
+	if err := decodeFile(args[3], &retry); err != nil {
+		return fmt.Errorf("read stage 1 controlled retry package: %w", err)
+	}
+	if args[0] == "seal-retry" {
 		var err error
-		package_, err = stage1.SealExecutionPackage(package_)
+		retry, err = stage1.SealControlledRetryPackage(retry)
 		if err != nil {
 			return err
 		}
 	}
-	if err := package_.Validate(plan); err != nil {
+	if err := retry.Validate(plan, package_); err != nil {
 		return err
 	}
+	return encodePackage(output, retry)
+}
+
+func encodePackage(output io.Writer, value any) error {
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	encoder.SetIndent("", "  ")
-	return encoder.Encode(package_)
+	return encoder.Encode(value)
+}
+
+func packageUsageError() error {
+	return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json> OR <seal-retry|verify-retry> <plan.json> <package.json> <retry-package.json>")
 }
 
 func decodeFile(path string, destination any) error {

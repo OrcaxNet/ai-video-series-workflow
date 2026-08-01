@@ -563,6 +563,10 @@ type ExecuteProviderJobInput struct {
 	ProviderProfileID   string                         `json:"providerProfileId,omitempty"`
 	TraceID             string                         `json:"traceId"`
 	PersistProductTruth bool                           `json:"persistProductTruth,omitempty"`
+	// ExpectedProductTruth is set only by the formal Stage 1 runner. The
+	// repository compares it with the facts locked in its SERIALIZABLE
+	// transaction before it inserts a reservation, Provider job, or cost row.
+	ExpectedProductTruth *PreparedProductTruth `json:"expectedProductTruth,omitempty"`
 }
 
 // PreparedProviderJob is the durable per-run budget allocation returned by the
