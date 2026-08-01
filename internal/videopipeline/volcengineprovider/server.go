@@ -33,9 +33,17 @@ import (
 const maxResolvedProviderAssetBytes = 20 << 20
 
 type jobRecord struct {
-	RequestHash string                       `json:"request_hash"`
-	Expected    providercontract.OutputSpec  `json:"expected_output"`
-	Response    providercontract.JobResponse `json:"response"`
+	RequestHash     string                       `json:"request_hash"`
+	Expected        providercontract.OutputSpec  `json:"expected_output"`
+	Response        providercontract.JobResponse `json:"response"`
+	Reconciliations []speechReconciliation       `json:"speech_reconciliations,omitempty"`
+}
+
+type speechReconciliation struct {
+	Attempt                int                          `json:"attempt"`
+	StartedAt              string                       `json:"started_at"`
+	AuthorizedRecordSHA256 string                       `json:"authorized_record_sha256"`
+	PreviousResponse       providercontract.JobResponse `json:"previous_response"`
 }
 
 type Server struct {
@@ -260,35 +268,45 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeProviderError(w, err)
 		return
 	}
+	var intent *jobRecord
+	authorizedRetry := false
 	if ok {
 		if existing.RequestHash != requestHash {
 			writeError(w, http.StatusConflict, safeError(providercontract.CodeConflict, "jobId was already used for different input", false))
 			return
 		}
-		w.Header().Set("Idempotent-Replayed", "true")
-		writeJSON(w, http.StatusOK, existing.Response)
-		return
+		if !s.authorizedSpeechRetry(request, existing) {
+			w.Header().Set("Idempotent-Replayed", "true")
+			writeJSON(w, http.StatusOK, existing.Response)
+			return
+		}
+		authorizedRetry = true
 	}
 	upstreamRequest, err := s.resolveProviderAssets(request.Request)
 	if err != nil {
 		writeProviderError(w, err)
 		return
 	}
+	if authorizedRetry {
+		intent, err = s.beginSpeechRetry(request, existing)
+		if err != nil {
+			writeProviderError(w, err)
+			return
+		}
+	}
 
-	intent := &jobRecord{
-		RequestHash: requestHash,
-		Expected:    request.Request.Output,
-		Response: providercontract.JobResponse{
-			JobID: request.JobID, RunID: request.RunID,
-			State: providercontract.StatusUnknown, Model: request.Model,
-			Cost: s.subscriptionCost(request),
-		},
+	if intent == nil {
+		intent = &jobRecord{
+			RequestHash: requestHash,
+			Expected:    request.Request.Output,
+			Response:    s.pendingResponse(request),
+		}
+		if err := s.createRecord(request.JobID, intent); err != nil {
+			writeProviderError(w, err)
+			return
+		}
+		s.jobs[request.JobID] = intent
 	}
-	if err := s.createRecord(request.JobID, intent); err != nil {
-		writeProviderError(w, err)
-		return
-	}
-	s.jobs[request.JobID] = intent
 	if request.Capability == providercontract.CapabilitySpeech {
 		response, err := s.synthesizeSpeech(r.Context(), request)
 		if err != nil {
@@ -343,6 +361,56 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, response)
+}
+
+func (s *Server) authorizedSpeechRetry(request providercontract.JobRequest, record *jobRecord) bool {
+	if request.Capability != providercontract.CapabilitySpeech || request.Request.Budget.MaxAttempts < 2 ||
+		s.config.SpeechRetryJobID != request.JobID || len(record.Reconciliations) != 0 ||
+		record.Response.State != providercontract.StatusRequiresAction || record.Response.Error == nil ||
+		record.Response.UpstreamTaskID != "" || record.Response.RequestID != "" ||
+		record.Response.ConnectID != "" || record.Response.LogID != "" ||
+		len(record.Response.Artifacts) != 0 || record.Response.Usage != (providercontract.Usage{}) {
+		return false
+	}
+	digest, err := persistedRecordSHA256(record)
+	return err == nil && digest == s.config.SpeechRetryRecord
+}
+
+func (s *Server) beginSpeechRetry(
+	request providercontract.JobRequest,
+	record *jobRecord,
+) (*jobRecord, error) {
+	previous := record.Response
+	record.Reconciliations = append(record.Reconciliations, speechReconciliation{
+		Attempt:                1,
+		StartedAt:              s.now().UTC().Format(time.RFC3339Nano),
+		AuthorizedRecordSHA256: s.config.SpeechRetryRecord,
+		PreviousResponse:       previous,
+	})
+	record.Response = s.pendingResponse(request)
+	if err := s.updateRecord(request.JobID, record); err != nil {
+		record.Response = previous
+		record.Reconciliations = record.Reconciliations[:0]
+		return nil, err
+	}
+	return record, nil
+}
+
+func (s *Server) pendingResponse(request providercontract.JobRequest) providercontract.JobResponse {
+	return providercontract.JobResponse{
+		JobID: request.JobID, RunID: request.RunID,
+		State: providercontract.StatusUnknown, Model: request.Model,
+		Cost: s.subscriptionCost(request),
+	}
+}
+
+func persistedRecordSHA256(record *jobRecord) (string, error) {
+	data, err := json.Marshal(record)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(append(data, '\n'))
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // resolveProviderAssets keeps durable product truth on immutable CAS URIs but

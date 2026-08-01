@@ -69,6 +69,8 @@ type VolcengineProvider struct {
 	SpeechEndpoint    string
 	SpeechModel       string
 	SpeechSpeaker     string
+	SpeechRetryJobID  string
+	SpeechRetryRecord string
 	MaxSpeechBytes    int64
 	PlanName          string
 	PricingVersion    string
@@ -223,6 +225,8 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 		SpeechEndpoint:    value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", "https://openspeech.bytedance.com/api/v3/tts/unidirectional"),
 		SpeechModel:       "doubao-seed-tts-2.0",
 		SpeechSpeaker:     value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", "zh_female_vv_uranus_bigtts"),
+		SpeechRetryJobID:  value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID", ""),
+		SpeechRetryRecord: value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256", ""),
 		PlanName:          value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),
 		PricingVersion:    value(lookup, "VIDEO_VOLCENGINE_PRICING_VERSION", "agent-plan-large-included-v1"),
 		Currency:          value(lookup, "VIDEO_VOLCENGINE_CURRENCY", "CNY"),
@@ -266,7 +270,27 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 		strings.TrimSpace(cfg.Currency) == "" {
 		return VolcengineProvider{}, errors.New("live provider identity, route, plan, pricing, currency, and artifact root are required")
 	}
+	if (cfg.SpeechRetryJobID == "") != (cfg.SpeechRetryRecord == "") {
+		return VolcengineProvider{}, errors.New("TTS retry requires both an exact job ID and provider record SHA-256")
+	}
+	if cfg.SpeechRetryJobID != "" {
+		if !strings.HasPrefix(cfg.SpeechRetryJobID, "speech-") || !lowercaseSHA256(cfg.SpeechRetryRecord) {
+			return VolcengineProvider{}, errors.New("TTS retry requires a speech job ID and lowercase provider record SHA-256")
+		}
+	}
 	return cfg, nil
+}
+
+func lowercaseSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func value(lookup LookupEnv, name, fallback string) string {

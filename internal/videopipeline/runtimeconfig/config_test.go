@@ -160,3 +160,40 @@ func TestLoadVolcengineProviderErrorNeverContainsCredential(t *testing.T) {
 		t.Fatalf("configuration error leaked credential: %v", err)
 	}
 }
+
+func TestLoadVolcengineProviderRequiresExactSpeechRetryPair(t *testing.T) {
+	tests := []struct {
+		name      string
+		jobID     string
+		record    string
+		wantError bool
+	}{
+		{name: "disabled"},
+		{name: "exact pair", jobID: "speech-job-1", record: strings.Repeat("a", 64)},
+		{name: "missing record", jobID: "speech-job-1", wantError: true},
+		{name: "missing job", record: strings.Repeat("a", 64), wantError: true},
+		{name: "non speech job", jobID: "video-job-1", record: strings.Repeat("a", 64), wantError: true},
+		{name: "invalid record", jobID: "speech-job-1", record: strings.Repeat("A", 64), wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]string{
+				"ARK_API_KEY":                              "test-runtime-credential",
+				"VIDEO_PROVIDER_SERVICE_AUTH_SECRET":       "test-service-auth-secret-32-bytes-long",
+				"VIDEO_ARTIFACT_ROOT":                      t.TempDir(),
+				"VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID":        tt.jobID,
+				"VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256": tt.record,
+			}
+			cfg, err := loadVolcengineProvider(func(name string) (string, bool) {
+				value, ok := values[name]
+				return value, ok
+			})
+			if (err != nil) != tt.wantError {
+				t.Fatalf("loadVolcengineProvider() error = %v, wantError = %v", err, tt.wantError)
+			}
+			if err == nil && (cfg.SpeechRetryJobID != tt.jobID || cfg.SpeechRetryRecord != tt.record) {
+				t.Fatalf("retry config = %q/%q", cfg.SpeechRetryJobID, cfg.SpeechRetryRecord)
+			}
+		})
+	}
+}

@@ -14,9 +14,11 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 )
 
 func TestAgentPlanTTS_DefaultEndpointUsesDocumentedV3ChunkedPath(t *testing.T) {
@@ -182,19 +184,33 @@ func TestAgentPlanTTS_RejectsDialogueOver600CharsBeforeHTTP(t *testing.T) {
 }
 
 type fakeSpeechSynthesizer struct {
-	mu    sync.Mutex
-	calls int
+	mu     sync.Mutex
+	calls  int
+	result SpeechSynthesisResult
+	err    error
 }
 
 func (s *fakeSpeechSynthesizer) Synthesize(context.Context, SpeechSynthesisRequest) (SpeechSynthesisResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
+	if s.err != nil {
+		return SpeechSynthesisResult{}, s.err
+	}
+	if len(s.result.Audio) != 0 {
+		return s.result, nil
+	}
 	return SpeechSynthesisResult{
 		Audio: []byte("adapter-speech-fixture"), MediaType: "audio/mpeg",
 		RequestID: "tts-request-id", ConnectID: "tts-connect-id", LogID: "tts-log-id",
 		UsageTokens: 5,
 	}, nil
+}
+
+func (s *fakeSpeechSynthesizer) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 func TestServer_SpeechSubmitCommitsCASAndReplaysWithoutSecondTTSCall(t *testing.T) {
@@ -258,9 +274,193 @@ func TestServer_SpeechSubmitCommitsCASAndReplaysWithoutSecondTTSCall(t *testing.
 		}
 	}
 	replayed := postJob(t, server.URL, request)
-	if replayed.LogID != created.LogID || speech.calls != 1 || provider.submitCount != 0 {
-		t.Fatalf("replay = %#v, TTS calls = %d, video calls = %d", replayed, speech.calls, provider.submitCount)
+	if replayed.LogID != created.LogID || speech.callCount() != 1 || provider.submitCount != 0 {
+		t.Fatalf("replay = %#v, TTS calls = %d, video calls = %d", replayed, speech.callCount(), provider.submitCount)
 	}
+}
+
+func TestServer_SpeechRetryRequiresExactRecordAndPreservesFailure(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		configure  func(*runtimeconfig.VolcengineProvider, string)
+		wantCalls  int
+		wantStatus providercontract.JobStatus
+	}{
+		{
+			name: "exact one-shot authorization",
+			configure: func(cfg *runtimeconfig.VolcengineProvider, digest string) {
+				cfg.SpeechRetryJobID = "speech-job-1"
+				cfg.SpeechRetryRecord = digest
+			},
+			wantCalls: 1, wantStatus: providercontract.StatusSucceeded,
+		},
+		{
+			name: "record hash mismatch",
+			configure: func(cfg *runtimeconfig.VolcengineProvider, _ string) {
+				cfg.SpeechRetryJobID = "speech-job-1"
+				cfg.SpeechRetryRecord = strings.Repeat("0", 64)
+			},
+			wantCalls: 0, wantStatus: providercontract.StatusRequiresAction,
+		},
+		{
+			name: "job mismatch",
+			configure: func(cfg *runtimeconfig.VolcengineProvider, digest string) {
+				cfg.SpeechRetryJobID = "speech-other"
+				cfg.SpeechRetryRecord = digest
+			},
+			wantCalls: 0, wantStatus: providercontract.StatusRequiresAction,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			store, err := artifactstore.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := testSpeechJobRequest(t)
+			record := failedSpeechRecord(t, request)
+			seed, err := New(testLiveConfig(), &fakeProvider{}, store, Options{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := seed.createRecord(request.JobID, record); err != nil {
+				t.Fatal(err)
+			}
+			digest, err := persistedRecordSHA256(record)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg := testLiveConfig()
+			cfg.SpeechModel = AgentPlanTTSModelID
+			tt.configure(&cfg, digest)
+			speech := &fakeSpeechSynthesizer{}
+			adapter, err := New(cfg, &fakeProvider{}, store, Options{
+				Speech: speech,
+				Now:    func() time.Time { return time.Unix(1_800_000_000, 0).UTC() },
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			server := httptest.NewServer(adapter.Handler())
+			defer server.Close()
+
+			response := postJob(t, server.URL, request)
+			if response.State != tt.wantStatus || speech.callCount() != tt.wantCalls {
+				t.Fatalf("response state = %s, calls = %d", response.State, speech.callCount())
+			}
+			persisted, ok, err := adapter.loadRecord(request.JobID)
+			if err != nil || !ok {
+				t.Fatalf("load record ok = %v, err = %v", ok, err)
+			}
+			if tt.wantCalls == 0 {
+				if len(persisted.Reconciliations) != 0 {
+					t.Fatalf("unauthorized retry changed record: %#v", persisted.Reconciliations)
+				}
+				return
+			}
+			if len(persisted.Reconciliations) != 1 ||
+				persisted.Reconciliations[0].PreviousResponse.State != providercontract.StatusRequiresAction ||
+				persisted.Reconciliations[0].AuthorizedRecordSHA256 != digest ||
+				persisted.Reconciliations[0].StartedAt != "2027-01-15T08:00:00Z" {
+				t.Fatalf("reconciliation = %#v", persisted.Reconciliations)
+			}
+			replayed := postJob(t, server.URL, request)
+			if replayed.State != providercontract.StatusSucceeded || speech.callCount() != 1 {
+				t.Fatalf("replay state = %s, calls = %d", replayed.State, speech.callCount())
+			}
+		})
+	}
+}
+
+func TestServer_SpeechRetryConsumesAuthorizationBeforeRetryableFailure(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testSpeechJobRequest(t)
+	record := failedSpeechRecord(t, request)
+	seed, err := New(testLiveConfig(), &fakeProvider{}, store, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.createRecord(request.JobID, record); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := persistedRecordSHA256(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testLiveConfig()
+	cfg.SpeechModel = AgentPlanTTSModelID
+	cfg.SpeechRetryJobID = request.JobID
+	cfg.SpeechRetryRecord = digest
+	speech := &fakeSpeechSynthesizer{err: &providercontract.Error{
+		Code: providercontract.CodeUnavailable, Retryable: true, SafeMessage: "fixture unavailable",
+	}}
+	adapter, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+
+	status := submitSpeechJobStatus(t, server.URL, request)
+	if status != http.StatusServiceUnavailable || speech.callCount() != 1 {
+		t.Fatalf("first status = %d, calls = %d", status, speech.callCount())
+	}
+	replayed := postJob(t, server.URL, request)
+	if replayed.State != providercontract.StatusUnknown || speech.callCount() != 1 {
+		t.Fatalf("replay state = %s, calls = %d", replayed.State, speech.callCount())
+	}
+	persisted, ok, err := adapter.loadRecord(request.JobID)
+	if err != nil || !ok || len(persisted.Reconciliations) != 1 {
+		t.Fatalf("persisted record = %#v, ok = %v, err = %v", persisted, ok, err)
+	}
+}
+
+func failedSpeechRecord(t *testing.T, request providercontract.JobRequest) *jobRecord {
+	t.Helper()
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(encoded)
+	return &jobRecord{
+		RequestHash: hex.EncodeToString(digest[:]),
+		Expected:    request.Request.Output,
+		Response: providercontract.JobResponse{
+			JobID: request.JobID, RunID: request.RunID,
+			State: providercontract.StatusRequiresAction, Model: request.Model,
+			Cost: providercontract.Cost{Currency: "CNY"},
+			Error: &providercontract.Error{
+				Code: providercontract.CodeUnavailable, SafeMessage: "operator reconciliation required",
+				RequiresAction: true,
+			},
+		},
+	}
+}
+
+func submitSpeechJobStatus(t *testing.T, endpoint string, request providercontract.JobRequest) int {
+	t.Helper()
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest, err := http.NewRequest(http.MethodPost, endpoint+"/v1/jobs", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Idempotency-Key", request.JobID)
+	response, err := authenticatedTestClient(t).Do(httpRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	return response.StatusCode
 }
 
 func testSpeechJobRequest(t *testing.T) providercontract.JobRequest {
@@ -281,7 +481,7 @@ func testSpeechJobRequest(t *testing.T) providercontract.JobRequest {
 			Modality: providercontract.ModalityAudio, Prompt: "你好，世界",
 			PromptSnapshotID: "subtitle-1:cue-1", ModelHint: "speaker-v2",
 			Output: providercontract.OutputSpec{DurationMillis: 2_000, Format: "mp3"},
-			Budget: providercontract.BudgetEnvelope{EstimatedCostMicros: 81, MaxCostMicros: 81, MaxAttempts: 1},
+			Budget: providercontract.BudgetEnvelope{EstimatedCostMicros: 81, MaxCostMicros: 81, MaxAttempts: 2},
 		},
 		TraceID: "trace-speech-1",
 	}
