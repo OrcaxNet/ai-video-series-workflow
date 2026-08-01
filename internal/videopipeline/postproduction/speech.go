@@ -195,6 +195,8 @@ func (p *HTTPSpeechProvider) Synthesize(
 		JobID:          response.JobID,
 		RequestID:      response.RequestID,
 		UpstreamTaskID: response.UpstreamTaskID,
+		ConnectID:      response.ConnectID,
+		LogID:          response.LogID,
 		Model:          response.Model,
 		Usage:          response.Usage,
 		Cost:           response.Cost,
@@ -243,6 +245,17 @@ func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error
 	}
 	if err := attempt.Artifact.Validate(); err != nil {
 		return fmt.Errorf("speech attempt artifact: %w", err)
+	}
+	if input.Config.Route.Provider == "volcengine_ark" &&
+		input.Config.Route.ModelID == "doubao-seed-tts-2.0" {
+		if strings.TrimSpace(attempt.ConnectID) == "" || strings.TrimSpace(attempt.LogID) == "" {
+			return errors.New("Agent Plan TTS attempt requires connect and X-Tt-Logid evidence")
+		}
+		if attempt.Usage.GeneratedChars <= 0 || attempt.Usage.GeneratedChars > 600 ||
+			attempt.Usage.Unit != "milli_afp" ||
+			attempt.Usage.OutputUnits != attempt.Usage.GeneratedChars*135 {
+			return errors.New("Agent Plan TTS attempt requires returned usage tokens and exact per-request AFP attribution")
+		}
 	}
 	return nil
 }

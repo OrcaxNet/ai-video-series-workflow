@@ -1,0 +1,571 @@
+// Package stage1 implements the no-cost readiness gate for FLO-104 sample 1.
+// It contains no provider credentials and cannot submit without an injected
+// Submitter. Every authorization is durably reserved before the submit call.
+package stage1
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"syscall"
+
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+)
+
+const (
+	SchemaVersion                  = "v1"
+	FormalVideoModel               = "doubao-seedance-2.0"
+	RequiredPrimaryJobs            = 10
+	MaximumControlledRetries       = 1
+	MaximumNewProviderJobs         = 11
+	MaximumVideoTokens       int64 = 1_200_000
+	MaximumMonthlyAFPMilli   int64 = 38_000_000
+	MaximumCashMicros        int64 = 20_000_000
+	MaximumDialogueChars     int64 = 600
+	MaximumAFPDriftBPS             = 1_000
+)
+
+var requiredEvidence = []string{
+	"artifact_hashes", "generation_manifest", "license_consent_gate",
+	"provider_ids", "qc", "redaction_scan", "service_bom", "usage_cost",
+}
+
+type Plan struct {
+	SchemaVersion             string       `json:"schemaVersion"`
+	BatchID                   string       `json:"batchId"`
+	VideoModel                string       `json:"videoModel"`
+	PrimaryShotIDs            []string     `json:"primaryShotIds"`
+	MaximumNewJobs            int          `json:"maximumNewProviderJobs"`
+	MaximumControlledRetries  int          `json:"maximumControlledRetries"`
+	MaximumVideoTokens        int64        `json:"maximumVideoTokens"`
+	MonthlyBaselineAFPMilli   int64        `json:"monthlyBaselineAfpMilli"`
+	MonthlyMaximumAFPMilli    int64        `json:"monthlyMaximumAfpMilli"`
+	ReferenceJobAFPMilli      int64        `json:"referenceJobAfpMilli"`
+	MaximumAFPDriftBPS        int          `json:"maximumAfpDriftBasisPoints"`
+	MaximumCashMicros         int64        `json:"maximumNonSubscriptionCashMicros"`
+	MaximumDialogueCharacters int64        `json:"maximumDialogueCharacters"`
+	MaximumTTSAFPMilli        int64        `json:"maximumTtsAfpMilli"`
+	RequiredEvidence          []string     `json:"requiredEvidence"`
+	TTSPreflight              TTSPreflight `json:"ttsPreflight"`
+}
+
+type TTSPreflight struct {
+	CompletedNoCost     bool   `json:"completedNoCost"`
+	Provider            string `json:"provider"`
+	Model               string `json:"model"`
+	Region              string `json:"region"`
+	ResourceID          string `json:"resourceId"`
+	CredentialReference string `json:"credentialReference"`
+	CredentialAvailable bool   `json:"credentialAvailable"`
+	Pricing             string `json:"pricing"`
+	UsageAttribution    string `json:"usageAttribution"`
+}
+
+func (p Plan) Validate() error {
+	switch {
+	case p.SchemaVersion != SchemaVersion:
+		return errors.New("stage 1 schemaVersion must be v1")
+	case strings.TrimSpace(p.BatchID) == "":
+		return errors.New("stage 1 batchId is required")
+	case p.VideoModel != FormalVideoModel:
+		return errors.New("formal sample 1 must use doubao-seedance-2.0")
+	case len(p.PrimaryShotIDs) != RequiredPrimaryJobs:
+		return fmt.Errorf("stage 1 requires exactly %d primary shots", RequiredPrimaryJobs)
+	case p.MaximumNewJobs != MaximumNewProviderJobs || p.MaximumControlledRetries != MaximumControlledRetries:
+		return errors.New("stage 1 must be capped at 10 primary jobs plus one controlled retry")
+	case p.MaximumVideoTokens != MaximumVideoTokens:
+		return errors.New("stage 1 video token cap must equal 1200000")
+	case p.MonthlyBaselineAFPMilli < 0 || p.MonthlyBaselineAFPMilli >= p.MonthlyMaximumAFPMilli:
+		return errors.New("stage 1 monthly AFP baseline is invalid")
+	case p.MonthlyMaximumAFPMilli != MaximumMonthlyAFPMilli:
+		return errors.New("stage 1 monthly AFP cap must equal 38000 AFP")
+	case p.ReferenceJobAFPMilli <= 0 || p.MaximumAFPDriftBPS != MaximumAFPDriftBPS:
+		return errors.New("stage 1 reference AFP and 10 percent drift limit are required")
+	case p.MaximumCashMicros != MaximumCashMicros:
+		return errors.New("stage 1 non-subscription cash cap must equal 20 CNY")
+	case p.MaximumDialogueCharacters != MaximumDialogueChars:
+		return errors.New("stage 1 dialogue must be capped at 600 Unicode characters")
+	case p.MaximumTTSAFPMilli != MaximumDialogueChars*135:
+		return errors.New("stage 1 TTS attribution must be capped at 81 AFP")
+	case !p.TTSPreflight.CompletedNoCost || p.TTSPreflight.Provider != "volcengine_ark" ||
+		p.TTSPreflight.Model != "doubao-seed-tts-2.0" || p.TTSPreflight.Region != "cn-beijing" ||
+		p.TTSPreflight.ResourceID != "seed-tts-2.0" ||
+		p.TTSPreflight.CredentialReference != "ARK_API_KEY" || !p.TTSPreflight.CredentialAvailable ||
+		p.TTSPreflight.Pricing != "1350_afp_per_10000_chars" ||
+		p.TTSPreflight.UsageAttribution != "provider_usage_tokens_per_request":
+		return errors.New("stage 1 requires the complete no-cost Agent Plan TTS preflight")
+	}
+	seen := make(map[string]struct{}, len(p.PrimaryShotIDs))
+	for _, shotID := range p.PrimaryShotIDs {
+		if strings.TrimSpace(shotID) == "" {
+			return errors.New("stage 1 shot IDs cannot be empty")
+		}
+		if _, duplicate := seen[shotID]; duplicate {
+			return fmt.Errorf("duplicate stage 1 shot ID %q", shotID)
+		}
+		seen[shotID] = struct{}{}
+	}
+	gotEvidence := append([]string(nil), p.RequiredEvidence...)
+	sort.Strings(gotEvidence)
+	if strings.Join(gotEvidence, "\x00") != strings.Join(requiredEvidence, "\x00") {
+		return errors.New("stage 1 plan does not require the complete evidence set")
+	}
+	return nil
+}
+
+type RetryApproval struct {
+	ApprovalID            string `json:"approvalId"`
+	OriginalAttemptID     string `json:"originalAttemptId"`
+	OriginalTerminal      bool   `json:"originalTerminal"`
+	FailureClass          string `json:"failureClass"`
+	DuplicateTaskRuledOut bool   `json:"duplicateTaskRuledOut"`
+}
+
+type Attempt struct {
+	AttemptID                          string         `json:"attemptId"`
+	ShotID                             string         `json:"shotId"`
+	IdempotencyKey                     string         `json:"idempotencyKey"`
+	EstimatedVideoTokens               int64          `json:"estimatedVideoTokens"`
+	PredictedAFPMilli                  int64          `json:"predictedAfpMilli"`
+	EstimatedNonSubscriptionCashMicros int64          `json:"estimatedNonSubscriptionCashMicros"`
+	LicenseCurrent                     bool           `json:"licenseCurrent"`
+	ConsentCurrent                     bool           `json:"consentCurrent"`
+	GateApproved                       bool           `json:"gateApproved"`
+	BudgetCurrent                      bool           `json:"budgetCurrent"`
+	ContentSafetyApproved              bool           `json:"contentSafetyApproved"`
+	PriorEvidenceComplete              bool           `json:"priorEvidenceComplete"`
+	NonSubscriptionPricingVerified     bool           `json:"nonSubscriptionPricingVerified"`
+	PerRequestCostAttributionReady     bool           `json:"perRequestCostAttributionReady"`
+	Retry                              *RetryApproval `json:"retry,omitempty"`
+	// JobRequest exists only in process memory. The gate deliberately excludes
+	// prompts and transport input from its durable ledger.
+	JobRequest *providercontract.JobRequest `json:"-"`
+}
+
+type Record struct {
+	Attempt
+	State               string `json:"state"`
+	ProviderTaskID      string `json:"providerTaskId,omitempty"`
+	ActualVideoTokens   int64  `json:"actualVideoTokens,omitempty"`
+	ActualAFPMilli      int64  `json:"actualAfpMilli,omitempty"`
+	ActualCashMicros    int64  `json:"actualCashMicros,omitempty"`
+	EvidenceComplete    bool   `json:"evidenceComplete"`
+	ContentSafetyFailed bool   `json:"contentSafetyFailed"`
+}
+
+type Ledger struct {
+	SchemaVersion             string             `json:"schemaVersion"`
+	BatchID                   string             `json:"batchId"`
+	Records                   map[string]*Record `json:"records"`
+	ReservedVideoTokens       int64              `json:"reservedVideoTokens"`
+	ReservedAFPMilli          int64              `json:"reservedAfpMilli"`
+	ReservedCashMicros        int64              `json:"reservedCashMicros"`
+	ConsecutiveSafetyFailures int                `json:"consecutiveContentSafetyFailures"`
+}
+
+type Decision string
+
+const (
+	DecisionSubmit      Decision = "SUBMIT_ONCE"
+	DecisionReplay      Decision = "REPLAY_EXISTING"
+	DecisionRecoverOnly Decision = "RECOVER_ONLY"
+)
+
+type Gate struct {
+	plan Plan
+	path string
+	mu   sync.Mutex
+}
+
+func Open(plan Plan, path string) (*Gate, error) {
+	if err := plan.Validate(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(path) == "" {
+		return nil, errors.New("stage 1 ledger path is required")
+	}
+	gate := &Gate{plan: plan, path: path}
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	lock, err := gate.acquireFileLock()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseFileLock(lock)
+	if _, err := gate.loadLocked(); err != nil {
+		return nil, err
+	}
+	return gate, nil
+}
+
+func (g *Gate) Plan() Plan { return g.plan }
+
+func (g *Gate) Authorize(attempt Attempt) (Decision, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return "", err
+	}
+	defer releaseFileLock(lock)
+	ledger, err := g.loadLocked()
+	if err != nil {
+		return "", err
+	}
+	if existing := ledger.Records[attempt.IdempotencyKey]; existing != nil {
+		if !sameAttempt(existing.Attempt, attempt) {
+			return "", providerError(providercontract.CodeConflict, "idempotency key is bound to different stage 1 input")
+		}
+		if existing.State == "AMBIGUOUS" || existing.State == "PREPARED" {
+			return DecisionRecoverOnly, nil
+		}
+		return DecisionReplay, nil
+	}
+	if err := g.validateNewAttempt(ledger, attempt); err != nil {
+		return "", err
+	}
+	ledger.Records[attempt.IdempotencyKey] = &Record{Attempt: attempt, State: "PREPARED"}
+	ledger.ReservedVideoTokens += attempt.EstimatedVideoTokens
+	ledger.ReservedAFPMilli += attempt.PredictedAFPMilli
+	ledger.ReservedCashMicros += attempt.EstimatedNonSubscriptionCashMicros
+	if err := g.saveLocked(ledger); err != nil {
+		return "", err
+	}
+	return DecisionSubmit, nil
+}
+
+func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
+	if strings.TrimSpace(attempt.AttemptID) == "" || strings.TrimSpace(attempt.IdempotencyKey) == "" ||
+		strings.TrimSpace(attempt.ShotID) == "" {
+		return providerError(providercontract.CodeInvalidRequest, "stage 1 attempt identity is incomplete")
+	}
+	if !contains(g.plan.PrimaryShotIDs, attempt.ShotID) {
+		return providerError(providercontract.CodeForbidden, "shot is outside the approved stage 1 primary set")
+	}
+	if !attempt.LicenseCurrent || !attempt.ConsentCurrent || !attempt.GateApproved ||
+		!attempt.BudgetCurrent || !attempt.ContentSafetyApproved {
+		return providerError(providercontract.CodeForbidden, "license, consent, gate, budget, and safety checks must all be current")
+	}
+	if !attempt.PriorEvidenceComplete {
+		return providerError(providercontract.CodeForbidden, "previous stage 1 attempt evidence is incomplete")
+	}
+	for _, record := range ledger.Records {
+		if (record.State == "TERMINAL_SUCCEEDED" || record.State == "TERMINAL_FAILED") &&
+			!record.EvidenceComplete {
+			return providerError(providercontract.CodeForbidden, "previous stage 1 provider evidence is incomplete")
+		}
+		if record.ActualAFPMilli > 0 && exceedsDrift(
+			record.ActualAFPMilli, g.plan.ReferenceJobAFPMilli, g.plan.MaximumAFPDriftBPS,
+		) {
+			return providerError(providercontract.CodeBudgetExceeded, "a completed stage 1 job exceeded the 10 percent AFP drift limit")
+		}
+	}
+	if ledger.ReservedVideoTokens > g.plan.MaximumVideoTokens ||
+		g.plan.MonthlyBaselineAFPMilli+g.plan.MaximumTTSAFPMilli+ledger.ReservedAFPMilli >
+			g.plan.MonthlyMaximumAFPMilli ||
+		ledger.ReservedCashMicros > g.plan.MaximumCashMicros {
+		return providerError(providercontract.CodeBudgetExceeded, "completed stage 1 usage exceeded an approved hard limit")
+	}
+	if ledger.ConsecutiveSafetyFailures >= 2 {
+		return providerError(providercontract.CodeContentBlocked, "two consecutive content safety failures require reauthorization")
+	}
+	if len(ledger.Records) >= g.plan.MaximumNewJobs {
+		return providerError(providercontract.CodeQuotaExceeded, "stage 1 provider job limit is exhausted")
+	}
+	if attempt.EstimatedVideoTokens <= 0 ||
+		ledger.ReservedVideoTokens+attempt.EstimatedVideoTokens > g.plan.MaximumVideoTokens {
+		return providerError(providercontract.CodeBudgetExceeded, "stage 1 video token cap would be exceeded")
+	}
+	if attempt.PredictedAFPMilli <= 0 || exceedsDrift(
+		attempt.PredictedAFPMilli, g.plan.ReferenceJobAFPMilli, g.plan.MaximumAFPDriftBPS,
+	) {
+		return providerError(providercontract.CodeBudgetExceeded, "next stage 1 job AFP prediction exceeds the 10 percent drift limit")
+	}
+	if g.plan.MonthlyBaselineAFPMilli+g.plan.MaximumTTSAFPMilli+
+		ledger.ReservedAFPMilli+attempt.PredictedAFPMilli >
+		g.plan.MonthlyMaximumAFPMilli {
+		return providerError(providercontract.CodeBudgetExceeded, "stage 1 monthly AFP cap would be exceeded")
+	}
+	if attempt.EstimatedNonSubscriptionCashMicros < 0 ||
+		ledger.ReservedCashMicros+attempt.EstimatedNonSubscriptionCashMicros > g.plan.MaximumCashMicros {
+		return providerError(providercontract.CodeBudgetExceeded, "stage 1 non-subscription cash cap would be exceeded")
+	}
+	if attempt.EstimatedNonSubscriptionCashMicros > 0 &&
+		(!attempt.NonSubscriptionPricingVerified || !attempt.PerRequestCostAttributionReady) {
+		return providerError(providercontract.CodeBudgetExceeded, "non-subscription pricing and per-request cost attribution must be verified before submit")
+	}
+
+	primaryExists := false
+	retries := 0
+	for _, record := range ledger.Records {
+		if record.ShotID == attempt.ShotID && record.Retry == nil {
+			primaryExists = true
+		}
+		if record.Retry != nil {
+			retries++
+		}
+	}
+	if attempt.Retry == nil {
+		if primaryExists {
+			return providerError(providercontract.CodeConflict, "stage 1 primary shot already has a job")
+		}
+		return nil
+	}
+	if retries >= g.plan.MaximumControlledRetries || !primaryExists {
+		return providerError(providercontract.CodeForbidden, "stage 1 controlled retry is not available")
+	}
+	retry := attempt.Retry
+	if strings.TrimSpace(retry.ApprovalID) == "" || strings.TrimSpace(retry.OriginalAttemptID) == "" ||
+		!retry.OriginalTerminal || strings.TrimSpace(retry.FailureClass) == "" || !retry.DuplicateTaskRuledOut {
+		return providerError(providercontract.CodeForbidden, "controlled retry lacks terminal failure, approval, classification, or duplicate-task proof")
+	}
+	for _, record := range ledger.Records {
+		if record.AttemptID == retry.OriginalAttemptID && record.ShotID == attempt.ShotID &&
+			record.State == "TERMINAL_FAILED" {
+			return nil
+		}
+	}
+	return providerError(providercontract.CodeForbidden, "controlled retry does not reference the failed terminal original attempt")
+}
+
+func (g *Gate) MarkAmbiguous(idempotencyKey string) error {
+	return g.updateRecord(idempotencyKey, func(record *Record, _ *Ledger) error {
+		record.State = "AMBIGUOUS"
+		return nil
+	})
+}
+
+type Completion struct {
+	ProviderTaskID      string
+	State               string
+	ActualVideoTokens   int64
+	ActualAFPMilli      int64
+	ActualCashMicros    int64
+	EvidenceComplete    bool
+	ContentSafetyFailed bool
+}
+
+func (g *Gate) Complete(idempotencyKey string, completion Completion) error {
+	return g.updateRecord(idempotencyKey, func(record *Record, ledger *Ledger) error {
+		if strings.TrimSpace(completion.ProviderTaskID) == "" ||
+			(completion.State != "TERMINAL_SUCCEEDED" && completion.State != "TERMINAL_FAILED") {
+			return errors.New("stage 1 completion requires a provider task and terminal state")
+		}
+		if completion.ActualVideoTokens < 0 || completion.ActualAFPMilli < 0 || completion.ActualCashMicros < 0 {
+			return errors.New("stage 1 actual usage cannot be negative")
+		}
+		ledger.ReservedVideoTokens += completion.ActualVideoTokens - record.EstimatedVideoTokens
+		ledger.ReservedAFPMilli += completion.ActualAFPMilli - record.PredictedAFPMilli
+		ledger.ReservedCashMicros += completion.ActualCashMicros - record.EstimatedNonSubscriptionCashMicros
+		record.ProviderTaskID = completion.ProviderTaskID
+		record.State = completion.State
+		record.ActualVideoTokens = completion.ActualVideoTokens
+		record.ActualAFPMilli = completion.ActualAFPMilli
+		record.ActualCashMicros = completion.ActualCashMicros
+		record.EvidenceComplete = completion.EvidenceComplete
+		record.ContentSafetyFailed = completion.ContentSafetyFailed
+		if completion.ContentSafetyFailed {
+			ledger.ConsecutiveSafetyFailures++
+		} else {
+			ledger.ConsecutiveSafetyFailures = 0
+		}
+		return nil
+	})
+}
+
+func (g *Gate) updateRecord(idempotencyKey string, update func(*Record, *Ledger) error) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer releaseFileLock(lock)
+	ledger, err := g.loadLocked()
+	if err != nil {
+		return err
+	}
+	record := ledger.Records[idempotencyKey]
+	if record == nil {
+		return errors.New("stage 1 attempt was not prepared")
+	}
+	if err := update(record, &ledger); err != nil {
+		return err
+	}
+	return g.saveLocked(ledger)
+}
+
+func (g *Gate) loadLocked() (Ledger, error) {
+	data, err := os.ReadFile(g.path)
+	if errors.Is(err, os.ErrNotExist) {
+		return Ledger{SchemaVersion: SchemaVersion, BatchID: g.plan.BatchID, Records: make(map[string]*Record)}, nil
+	}
+	if err != nil {
+		return Ledger{}, fmt.Errorf("read stage 1 ledger: %w", err)
+	}
+	var ledger Ledger
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&ledger); err != nil || ledger.SchemaVersion != SchemaVersion ||
+		ledger.BatchID != g.plan.BatchID || ledger.Records == nil {
+		return Ledger{}, errors.New("stage 1 ledger is invalid or bound to another batch")
+	}
+	return ledger, nil
+}
+
+func (g *Gate) saveLocked(ledger Ledger) error {
+	if err := os.MkdirAll(filepath.Dir(g.path), 0o750); err != nil {
+		return fmt.Errorf("create stage 1 ledger directory: %w", err)
+	}
+	data, err := json.Marshal(ledger)
+	if err != nil {
+		return fmt.Errorf("encode stage 1 ledger: %w", err)
+	}
+	file, err := os.CreateTemp(filepath.Dir(g.path), ".stage1-ledger-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create stage 1 ledger temp file: %w", err)
+	}
+	tempPath := file.Name()
+	defer os.Remove(tempPath)
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempPath, g.path); err != nil {
+		return fmt.Errorf("commit stage 1 ledger: %w", err)
+	}
+	return nil
+}
+
+func (g *Gate) acquireFileLock() (*os.File, error) {
+	if err := os.MkdirAll(filepath.Dir(g.path), 0o750); err != nil {
+		return nil, fmt.Errorf("create stage 1 ledger directory: %w", err)
+	}
+	file, err := os.OpenFile(g.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open stage 1 ledger lock: %w", err)
+	}
+	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+		_ = file.Close()
+		return nil, fmt.Errorf("lock stage 1 ledger: %w", err)
+	}
+	return file, nil
+}
+
+func releaseFileLock(file *os.File) {
+	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	_ = file.Close()
+}
+
+type RecoveryResult struct {
+	Found          bool
+	ProviderTaskID string
+}
+
+type SubmitResult struct {
+	ProviderTaskID string
+}
+
+type Submitter interface {
+	Recover(context.Context, string) (RecoveryResult, error)
+	Submit(context.Context, Attempt) (SubmitResult, error)
+}
+
+type Executor struct {
+	gate      *Gate
+	submitter Submitter
+	mu        sync.Mutex
+}
+
+func NewExecutor(gate *Gate, submitter Submitter) (*Executor, error) {
+	if gate == nil || submitter == nil {
+		return nil, errors.New("stage 1 gate and submitter are required")
+	}
+	return &Executor{gate: gate, submitter: submitter}, nil
+}
+
+func (e *Executor) Execute(ctx context.Context, attempt Attempt) (SubmitResult, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	recovered, err := e.submitter.Recover(ctx, attempt.IdempotencyKey)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	decision, err := e.gate.Authorize(attempt)
+	if err != nil {
+		return SubmitResult{}, err
+	}
+	if recovered.Found {
+		return SubmitResult{ProviderTaskID: recovered.ProviderTaskID}, nil
+	}
+	if decision == DecisionRecoverOnly {
+		return SubmitResult{}, providerError(providercontract.CodeUnavailable, "ambiguous stage 1 submit requires operator recovery and cannot be resubmitted")
+	}
+	if decision == DecisionReplay {
+		return SubmitResult{}, providerError(providercontract.CodeConflict, "stage 1 replay has no recoverable provider task")
+	}
+	result, err := e.submitter.Submit(ctx, attempt)
+	if err != nil {
+		_ = e.gate.MarkAmbiguous(attempt.IdempotencyKey)
+		return SubmitResult{}, err
+	}
+	if strings.TrimSpace(result.ProviderTaskID) == "" {
+		_ = e.gate.MarkAmbiguous(attempt.IdempotencyKey)
+		return SubmitResult{}, providerError(providercontract.CodeUnavailable, "stage 1 provider submit returned no task ID")
+	}
+	return result, nil
+}
+
+func ValidateDialogue(texts []string) (characters int64, afpMilli int64, err error) {
+	for _, text := range texts {
+		characters += int64(len([]rune(strings.TrimSpace(text))))
+	}
+	if characters <= 0 || characters > MaximumDialogueChars {
+		return 0, 0, providerError(providercontract.CodeBudgetExceeded, "stage 1 dialogue must contain 1 to 600 Unicode characters")
+	}
+	return characters, characters * 135, nil
+}
+
+func providerError(code providercontract.ErrorCode, message string) error {
+	return &providercontract.Error{Code: code, SafeMessage: message}
+}
+
+func contains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+func exceedsDrift(value, baseline int64, maximumBPS int) bool {
+	delta := value - baseline
+	if delta < 0 {
+		delta = -delta
+	}
+	return delta*10_000 > baseline*int64(maximumBPS)
+}
+
+func sameAttempt(a, b Attempt) bool {
+	left, _ := json.Marshal(a)
+	right, _ := json.Marshal(b)
+	return string(left) == string(right)
+}

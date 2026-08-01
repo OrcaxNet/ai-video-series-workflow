@@ -109,12 +109,12 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 | `VIDEO_PROVIDER_SERVICE_AUTH_SECRET` | 未设置 | Live Adapter 内部 HMAC 服务认证；至少 32 bytes，只通过 Secret manager 注入 |
 | `VIDEO_VOLCENGINE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | Agent Plan 数据面；不得写入 Manifest/BOM |
 | `VIDEO_VOLCENGINE_VIDEO_MODEL` | `doubao-seedance-2.0` | 冻结真实视频模型 |
+| `VIDEO_VOLCENGINE_TTS_ENDPOINT` | Agent Plan HTTP TTS URL | 只允许 Agent Plan TTS；Resource ID 在代码中固定为 `seed-tts-2.0` |
+| `VIDEO_VOLCENGINE_TTS_SPEAKER` | `zh_female_vv_uranus_bigtts` | TTS 2.0 兼容音色；不是 Secret |
 | `VIDEO_VOLCENGINE_PLAN` | `agent-plan-large` | 套餐计费模式标识 |
 | `ANTHROPIC_BASE_URL` | 未设置 | 预留 Claude adapter 的显式 endpoint；M0 不启用 |
 | `ANTHROPIC_API_KEY` | 未设置 | 文本备用 Secret |
 | `ANTHROPIC_MODEL` | 未设置 | 文本备用 model |
-| `DOUBAO_TTS_APP_ID` | 未设置 | 豆包语音 |
-| `DOUBAO_TTS_ACCESS_TOKEN` | 未设置 | 豆包语音 Secret |
 
 禁止：
 
@@ -282,7 +282,7 @@ RPO/RTO 需在部署环境 SLO 中冻结；M0 只保证流程可演练。
 
 Key 到位后不改领域/Workflow：
 
-1. 通过 Secret manager 注入 `ARK_API_KEY`；语音凭证独立注入；
+1. 通过 Secret manager 注入 `ARK_API_KEY`；Agent Plan TTS 复用该 Key，Resource ID 固定为 `seed-tts-2.0`；
 2. 配置 allowlisted Ark/Speech base URL 与区域；
 3. Provider Adapter 增量的 connection-test 只允许返回 fingerprint/masked identity；控制面当前不公开占位路由；
 4. discover 实际 text/image/video/speech model/endpoint；

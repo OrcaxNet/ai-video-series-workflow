@@ -20,7 +20,7 @@ import (
 func main() {
 	cfg, err := runtimeconfig.LoadVolcengineProvider()
 	if err != nil {
-		log.Fatalf("invalid live video provider configuration: %v", err)
+		log.Fatalf("invalid live provider configuration: %v", err)
 	}
 	store, err := artifactstore.New(cfg.ArtifactRoot)
 	if err != nil {
@@ -34,11 +34,18 @@ func main() {
 		HTTPClient: &http.Client{Timeout: cfg.RequestTimeout},
 	})
 	if err != nil {
-		log.Fatalf("configure live video provider: %v", err)
+		log.Fatalf("configure live video upstream: %v", err)
 	}
-	adapter, err := volcengineprovider.New(cfg, upstream, store, volcengineprovider.Options{})
+	speech, err := volcengineprovider.NewAgentPlanTTS(volcengineprovider.AgentPlanTTSConfig{
+		Endpoint: cfg.SpeechEndpoint, APIKey: cfg.APIKey,
+		HTTPClient: &http.Client{Timeout: cfg.RequestTimeout}, MaxAudioBytes: cfg.MaxSpeechBytes,
+	})
 	if err != nil {
-		log.Fatalf("configure live video adapter: %v", err)
+		log.Fatalf("configure Agent Plan TTS provider: %v", err)
+	}
+	adapter, err := volcengineprovider.New(cfg, upstream, store, volcengineprovider.Options{Speech: speech})
+	if err != nil {
+		log.Fatalf("configure live provider adapter: %v", err)
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -51,8 +58,8 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
-		log.Printf("live video provider %s listening on %s (plan=%s model=%s region=%s)",
-			cfg.ProviderID, cfg.HTTPAddress, cfg.PlanName, cfg.VideoModel, cfg.Region)
+		log.Printf("live provider %s listening on %s (plan=%s video_model=%s speech_model=%s region=%s)",
+			cfg.ProviderID, cfg.HTTPAddress, cfg.PlanName, cfg.VideoModel, cfg.SpeechModel, cfg.Region)
 		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("serve live video provider: %v", err)
 		}

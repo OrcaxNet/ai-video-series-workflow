@@ -215,13 +215,12 @@ type providerCapabilityStatus struct {
 func (s *Server) providerStatus(w http.ResponseWriter, _ *http.Request) {
 	arkConfigured := anyEnvironmentSet("ARK_API_KEY")
 	claudeConfigured := anyEnvironmentSet("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
-	speechConfigured := allEnvironmentSet("DOUBAO_TTS_APP_ID", "DOUBAO_TTS_ACCESS_TOKEN")
 
 	statuses := []providerCapabilityStatus{
 		capabilityStatus("text.primary", arkConfigured || claudeConfigured, "volcengine_ark", []string{"ARK_API_KEY", "ANTHROPIC_API_KEY_OR_AUTH_TOKEN"}),
 		capabilityStatus("image.primary", arkConfigured, "volcengine_ark", []string{"ARK_API_KEY"}),
 		capabilityStatus("video.primary", arkConfigured, "volcengine_ark", []string{"ARK_API_KEY"}),
-		capabilityStatus("speech.primary", speechConfigured, "volcengine_speech", []string{"DOUBAO_TTS_APP_ID", "DOUBAO_TTS_ACCESS_TOKEN"}),
+		capabilityStatus("speech.primary", arkConfigured, "volcengine_agent_plan_tts", []string{"ARK_API_KEY"}),
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"schemaVersion": "v1",

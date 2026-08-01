@@ -66,6 +66,10 @@ type VolcengineProvider struct {
 	ServiceAuthSecret string
 	Region            string
 	VideoModel        string
+	SpeechEndpoint    string
+	SpeechModel       string
+	SpeechSpeaker     string
+	MaxSpeechBytes    int64
 	PlanName          string
 	PricingVersion    string
 	Currency          string
@@ -216,15 +220,22 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 		ServiceAuthSecret: value(lookup, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
 		Region:            value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
 		VideoModel:        value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
+		SpeechEndpoint:    value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"),
+		SpeechModel:       "doubao-seed-tts-2.0",
+		SpeechSpeaker:     value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", "zh_female_vv_uranus_bigtts"),
 		PlanName:          value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),
 		PricingVersion:    value(lookup, "VIDEO_VOLCENGINE_PRICING_VERSION", "agent-plan-large-included-v1"),
 		Currency:          value(lookup, "VIDEO_VOLCENGINE_CURRENCY", "CNY"),
 		MaxDownloadBytes:  256 << 20,
+		MaxSpeechBytes:    32 << 20,
 		RequestTimeout:    2 * time.Minute,
 		DownloadTimeout:   2 * time.Minute,
 	}
 	var err error
 	if cfg.MaxDownloadBytes, err = positiveInt64(lookup, "VIDEO_VOLCENGINE_MAX_DOWNLOAD_BYTES", cfg.MaxDownloadBytes); err != nil {
+		return VolcengineProvider{}, err
+	}
+	if cfg.MaxSpeechBytes, err = positiveInt64(lookup, "VIDEO_VOLCENGINE_MAX_SPEECH_BYTES", cfg.MaxSpeechBytes); err != nil {
 		return VolcengineProvider{}, err
 	}
 	if cfg.RequestTimeout, err = duration(lookup, "VIDEO_VOLCENGINE_REQUEST_TIMEOUT", cfg.RequestTimeout); err != nil {
@@ -239,6 +250,9 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	if err := validateHTTPURL(cfg.BaseURL); err != nil {
 		return VolcengineProvider{}, fmt.Errorf("VIDEO_VOLCENGINE_BASE_URL: %w", err)
 	}
+	if err := validateHTTPURL(cfg.SpeechEndpoint); err != nil {
+		return VolcengineProvider{}, fmt.Errorf("VIDEO_VOLCENGINE_TTS_ENDPOINT: %w", err)
+	}
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return VolcengineProvider{}, errors.New("ARK_API_KEY is required for the live provider adapter")
 	}
@@ -247,6 +261,7 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	}
 	if strings.TrimSpace(cfg.ArtifactRoot) == "" || strings.TrimSpace(cfg.ProviderID) == "" ||
 		strings.TrimSpace(cfg.Region) == "" || strings.TrimSpace(cfg.VideoModel) == "" ||
+		strings.TrimSpace(cfg.SpeechModel) == "" || strings.TrimSpace(cfg.SpeechSpeaker) == "" ||
 		strings.TrimSpace(cfg.PlanName) == "" || strings.TrimSpace(cfg.PricingVersion) == "" ||
 		strings.TrimSpace(cfg.Currency) == "" {
 		return VolcengineProvider{}, errors.New("live provider identity, route, plan, pricing, currency, and artifact root are required")

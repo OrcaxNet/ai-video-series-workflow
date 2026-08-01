@@ -196,7 +196,7 @@ flowchart TB
 ```
 
 - M0 不启用 Claude live adapter；后续实现必须使用官方 Anthropic Go SDK，不使用 OpenAI-compatible shim，且 base URL/model/credential 必须显式配置；
-- 允许的凭证来源只有显式 `ARK_*`、`ANTHROPIC_*`、`DOUBAO_TTS_*` 环境变量或 Secret Store reference；
+- 允许的凭证来源只有显式 `ARK_*`、`ANTHROPIC_*` 环境变量或 Secret Store reference；Agent Plan TTS 与视频共享运行时 `ARK_API_KEY`，不再读取旧版 `DOUBAO_TTS_*`；
 - 禁止读取 `~/.claude`、Claude Code 配置或任意开发者文件；
 - UI 只看 `provider_profile_id`、mask、fingerprint、health；
 - 日志/trace/error/outbox/fixture/Manifest 采用字段 allowlist；

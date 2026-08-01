@@ -35,6 +35,7 @@ type jobRecord struct {
 type Server struct {
 	config         runtimeconfig.VolcengineProvider
 	provider       providercontract.Provider
+	speech         SpeechSynthesizer
 	store          *artifactstore.Store
 	downloadClient *http.Client
 	inspector      MediaInspector
@@ -49,6 +50,7 @@ type Server struct {
 type Options struct {
 	DownloadClient *http.Client
 	Inspector      MediaInspector
+	Speech         SpeechSynthesizer
 	Now            func() time.Time
 	AuthNow        func() time.Time
 }
@@ -88,6 +90,7 @@ func New(
 	}
 	return &Server{
 		config: config, provider: provider, store: store,
+		speech:         options.Speech,
 		downloadClient: client, inspector: inspector, authenticator: authenticator, now: now,
 		stateDir: stateDir, jobs: make(map[string]*jobRecord),
 	}, nil
@@ -114,6 +117,7 @@ func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
 		"requiresKey": true,
 		"plan":        s.config.PlanName,
 		"model":       s.config.VideoModel,
+		"speechModel": s.config.SpeechModel,
 		"region":      s.config.Region,
 	})
 }
@@ -124,60 +128,106 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 		s.config.PlanName, s.config.PricingVersion,
 	}, "\x00")
 	sum := sha256.Sum256([]byte(material))
+	capabilities := []providercontract.CapabilitySnapshot{{
+		Alias: providercontract.CapabilityVideo,
+		Capability: providercontract.Capability{
+			Provider: "volcengine_ark", ModelFamily: s.config.VideoModel,
+			OutputModality: providercontract.ModalityVideo,
+			Async:          true, SupportsPolling: true, SupportsCancel: true,
+			SupportsReferenceImage: true, SupportsLastFrame: true,
+			Resolutions:       []string{"480p", "720p", "1080p"},
+			AspectRatios:      []string{"16:9", "9:16", "4:3", "3:4", "21:9"},
+			MinDurationMillis: 4_000, MaxDurationMillis: 15_000,
+			NativeFPS: []int{24}, Verification: providercontract.PendingKey,
+		},
+		Configured: true, Enabled: true, Mode: "live",
+		RouteVersion: "agent-plan-large-v1",
+		SnapshotHash: hex.EncodeToString(sum[:]),
+		EffectiveAt:  s.now().UTC(),
+		Limits: map[string]any{
+			"maximumConcurrency": 1,
+			"billingMode":        "subscription",
+		},
+		SupportedInputs: []string{"text", "image-reference", "tail-frame"},
+	}}
+	if s.speech != nil {
+		speechMaterial := strings.Join([]string{
+			s.config.ProviderID, s.config.Region, AgentPlanTTSResourceID,
+			s.config.SpeechModel, s.config.PlanName, s.config.PricingVersion,
+		}, "\x00")
+		speechSum := sha256.Sum256([]byte(speechMaterial))
+		capabilities = append(capabilities, providercontract.CapabilitySnapshot{
+			Alias: providercontract.CapabilitySpeech,
+			Capability: providercontract.Capability{
+				Provider: "volcengine_ark", ModelFamily: s.config.SpeechModel,
+				InputModalities: []providercontract.Modality{providercontract.ModalityText},
+				OutputModality:  providercontract.ModalityAudio,
+				Verification:    providercontract.PendingKey,
+			},
+			Configured: true, Enabled: true, Mode: "live",
+			RouteVersion: "agent-plan-large-tts-v1",
+			SnapshotHash: hex.EncodeToString(speechSum[:]),
+			EffectiveAt:  s.now().UTC(),
+			Limits: map[string]any{
+				"resourceId":           AgentPlanTTSResourceID,
+				"defaultSpeaker":       s.config.SpeechSpeaker,
+				"maximumCharacters":    AgentPlanTTSMaxChars,
+				"billingMode":          "subscription",
+				"afpMilliPerCharacter": ttsAFPMilliPerChar,
+			},
+			SupportedInputs: []string{"text", "speaker"},
+		})
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"schemaVersion": "v1",
 		"providerId":    s.config.ProviderID,
-		"capabilities": []providercontract.CapabilitySnapshot{{
-			Alias: providercontract.CapabilityVideo,
-			Capability: providercontract.Capability{
-				Provider: "volcengine_ark", ModelFamily: s.config.VideoModel,
-				OutputModality: providercontract.ModalityVideo,
-				Async:          true, SupportsPolling: true, SupportsCancel: true,
-				SupportsReferenceImage: true, SupportsLastFrame: true,
-				Resolutions:       []string{"480p", "720p", "1080p"},
-				AspectRatios:      []string{"16:9", "9:16", "4:3", "3:4", "21:9"},
-				MinDurationMillis: 4_000, MaxDurationMillis: 15_000,
-				NativeFPS: []int{24}, Verification: providercontract.PendingKey,
-			},
-			Configured: true, Enabled: true, Mode: "live",
-			RouteVersion: "agent-plan-large-v1",
-			SnapshotHash: hex.EncodeToString(sum[:]),
-			EffectiveAt:  s.now().UTC(),
-			Limits: map[string]any{
-				"maximumConcurrency": 1,
-				"billingMode":        "subscription",
-			},
-			SupportedInputs: []string{"text", "image-reference", "tail-frame"},
-		}},
+		"capabilities":  capabilities,
 	})
 }
 
 func (s *Server) estimate(w http.ResponseWriter, r *http.Request) {
 	var request providercontract.EstimateRequest
-	if err := decodeJSON(r, &request); err != nil ||
-		request.Capability != providercontract.CapabilityVideo || request.Candidates < 1 {
+	if err := decodeJSON(r, &request); err != nil || request.Candidates < 1 ||
+		(request.Capability != providercontract.CapabilityVideo &&
+			request.Capability != providercontract.CapabilitySpeech) {
 		writeError(w, http.StatusUnprocessableEntity, safeError(
-			providercontract.CodeInvalidRequest, "a video capability and positive candidate count are required", false,
+			providercontract.CodeInvalidRequest, "a video or speech capability and positive candidate count are required", false,
 		))
 		return
 	}
-	if err := request.Model.Validate(providercontract.CapabilityVideo); err != nil {
+	if err := request.Model.Validate(request.Capability); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, safeError(
-			providercontract.CodeInvalidRequest, "a valid frozen video model route is required", false,
+			providercontract.CodeInvalidRequest, "a valid frozen provider model route is required", false,
 		))
 		return
 	}
-	if request.Model.Provider != "volcengine_ark" || request.Model.ModelID != s.config.VideoModel {
+	expectedModel := s.config.VideoModel
+	if request.Capability == providercontract.CapabilitySpeech {
+		expectedModel = s.config.SpeechModel
+		if s.speech == nil {
+			writeError(w, http.StatusServiceUnavailable, safeError(
+				providercontract.CodeModelUnavailable, "Agent Plan TTS is not configured", false,
+			))
+			return
+		}
+	}
+	if request.Model.Provider != "volcengine_ark" || request.Model.ModelID != expectedModel {
 		writeError(w, http.StatusUnprocessableEntity, safeError(
 			providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false,
 		))
 		return
 	}
-	minimum := int64(request.Candidates) * 1
+	minimum := int64(request.Candidates)
 	maximum := int64(request.Candidates) * 1_000_000
+	unit := "video_tokens"
+	if request.Capability == providercontract.CapabilitySpeech {
+		minimum *= ttsAFPMilliPerChar
+		maximum = int64(request.Candidates*AgentPlanTTSMaxChars) * ttsAFPMilliPerChar
+		unit = "milli_afp"
+	}
 	writeJSON(w, http.StatusOK, providercontract.EstimateResponse{
 		EstimateID:   "agent-plan-" + request.Model.CapabilityHash[:16],
-		UnitsMinimum: minimum, UnitsMaximum: maximum, Unit: "video_tokens",
+		UnitsMinimum: minimum, UnitsMaximum: maximum, Unit: unit,
 		PricingVersion: s.config.PricingVersion,
 		ValidUntil:     s.now().UTC().Add(15 * time.Minute).Format(time.RFC3339),
 	})
@@ -228,6 +278,27 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.jobs[request.JobID] = intent
+	if request.Capability == providercontract.CapabilitySpeech {
+		response, err := s.synthesizeSpeech(r.Context(), request)
+		if err != nil {
+			intent.Response.Error = providerErrorOrGeneric(err)
+			if intent.Response.Error.Retryable {
+				intent.Response.State = providercontract.StatusUnknown
+			} else {
+				intent.Response.State = providercontract.StatusRequiresAction
+			}
+			_ = s.updateRecord(request.JobID, intent)
+			writeProviderError(w, err)
+			return
+		}
+		intent.Response = response
+		if err := s.updateRecord(request.JobID, intent); err != nil {
+			writeProviderError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, response)
+		return
+	}
 	upstream, err := s.provider.Submit(r.Context(), request.Request)
 	if err != nil {
 		intent.Response.Error = providerErrorOrGeneric(err)
@@ -454,15 +525,61 @@ func (s *Server) validateJob(request providercontract.JobRequest, idempotencyKey
 	if request.Simulation != "" {
 		return safeError(providercontract.CodeInvalidRequest, "simulation is not accepted by a live adapter", false)
 	}
-	if request.Capability != providercontract.CapabilityVideo ||
-		request.Request.Modality != providercontract.ModalityVideo {
-		return safeError(providercontract.CodeInvalidRequest, "the live adapter accepts only video.primary", false)
+	if request.Capability != providercontract.CapabilityVideo &&
+		request.Capability != providercontract.CapabilitySpeech {
+		return safeError(providercontract.CodeInvalidRequest, "the live adapter accepts only video.primary or speech.primary", false)
 	}
-	if request.Model.Provider != "volcengine_ark" || request.Model.ModelID != s.config.VideoModel ||
-		request.Request.ModelHint != s.config.VideoModel {
+	expectedModel := s.config.VideoModel
+	if request.Capability == providercontract.CapabilitySpeech {
+		expectedModel = s.config.SpeechModel
+		if s.speech == nil {
+			return safeError(providercontract.CodeModelUnavailable, "Agent Plan TTS is not configured", false)
+		}
+		chars := len([]rune(strings.TrimSpace(request.Request.Prompt)))
+		if chars < 1 || chars > AgentPlanTTSMaxChars || strings.TrimSpace(request.Request.ModelHint) == "" {
+			return safeError(providercontract.CodeInvalidRequest, "speech.primary requires a speaker and at most 600 Unicode characters", false)
+		}
+	} else if request.Request.ModelHint != s.config.VideoModel {
+		return safeError(providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false)
+	}
+	if request.Model.Provider != "volcengine_ark" || request.Model.ModelID != expectedModel {
 		return safeError(providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false)
 	}
 	return nil
+}
+
+func (s *Server) synthesizeSpeech(
+	ctx context.Context,
+	request providercontract.JobRequest,
+) (providercontract.JobResponse, error) {
+	result, err := s.speech.Synthesize(ctx, SpeechSynthesisRequest{
+		Text: request.Request.Prompt, Speaker: request.Request.ModelHint,
+	})
+	if err != nil {
+		return providercontract.JobResponse{}, err
+	}
+	usage, err := TTSUsageAttributes(result.UsageTokens)
+	if err != nil {
+		return providercontract.JobResponse{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS usage evidence is invalid", false)
+	}
+	committed, err := s.store.Put(ctx, bytes.NewReader(result.Audio))
+	if err != nil {
+		return providercontract.JobResponse{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS audio could not be committed to CAS", true)
+	}
+	return providercontract.JobResponse{
+		JobID: request.JobID, RunID: request.RunID,
+		UpstreamTaskID: result.ConnectID, RequestID: result.RequestID,
+		ConnectID: result.ConnectID, LogID: result.LogID,
+		State: providercontract.StatusSucceeded, Progress: 100, Model: request.Model,
+		Artifacts: []providercontract.AssetRef{{
+			ID: request.JobID + "-audio", Revision: committed.Digest,
+			Kind: providercontract.ModalityAudio, Role: providercontract.AssetRoleOutput,
+			URI: committed.URI, SHA256: committed.Digest,
+			LicenseReference: "request-license-manifest", MediaType: result.MediaType,
+			SizeBytes: committed.Size, DurationMillis: int64(request.Request.Output.DurationMillis),
+		}},
+		Usage: usage, Cost: s.subscriptionCost(request),
+	}, nil
 }
 
 func (s *Server) subscriptionCost(request providercontract.JobRequest) providercontract.Cost {

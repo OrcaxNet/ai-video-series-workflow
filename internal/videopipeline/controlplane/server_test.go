@@ -112,8 +112,6 @@ func TestServer_ProviderStatusSupportsNoKeyDryRun(t *testing.T) {
 		"ARK_API_KEY",
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
-		"DOUBAO_TTS_APP_ID",
-		"DOUBAO_TTS_ACCESS_TOKEN",
 	} {
 		t.Setenv(name, "")
 	}
@@ -148,8 +146,6 @@ func TestServer_ProviderStatusNeverEchoesSecrets(t *testing.T) {
 	const secret = "secret-value-must-not-escape"
 	t.Setenv("ARK_API_KEY", secret)
 	t.Setenv("ANTHROPIC_API_KEY", secret)
-	t.Setenv("DOUBAO_TTS_APP_ID", "app-id")
-	t.Setenv("DOUBAO_TTS_ACCESS_TOKEN", secret)
 
 	server := NewWithDependencies(runtimeconfig.ControlPlane{Version: "test"}, nil)
 	recorder := httptest.NewRecorder()

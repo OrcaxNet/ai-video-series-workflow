@@ -24,6 +24,11 @@ G1/G2 approved inputs
 `postProduction` 为可选增量。启用时必须冻结独立的 `speech.primary`
 路由、预算审批和证据等级：
 
+Agent Plan Live 路径由 `volcengine-provider` 同时承载 `speech.primary`，复用运行时
+`ARK_API_KEY` 并固定 `X-Api-Resource-Id: seed-tts-2.0`。每次请求必须返回 usage
+tokens，并在 speech attempt 中保留 request/connect ID 与 `X-Tt-Logid`；默认
+Compose/fixture 路径仍保持 Mock，不会因配置 Live Adapter 而自动产生真实调用。
+
 创建 Generation Plan 时还必须把相同的 `speechBudgetLimit` 纳入请求；
 额度与币种会进入不可变 plan hash 和审计证据。启动生产时的
 `postProduction.speechBudgetLimit` 必须与 Plan 完全一致。

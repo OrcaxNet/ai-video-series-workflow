@@ -114,11 +114,10 @@ web/                            React/TypeScript 创作操作台、Mock API、�
 
 | 能力 | 显式引用 |
 |---|---|
-| 火山方舟文本/图片/视频 | `ARK_API_KEY` |
+| 火山方舟文本/图片/视频与 Agent Plan TTS | `ARK_API_KEY`（TTS Resource ID 固定为 `seed-tts-2.0`） |
 | Claude 文本备用（预留；实现时必须使用官方 Anthropic Go SDK） | `ANTHROPIC_BASE_URL`、`ANTHROPIC_API_KEY` 或 `ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_MODEL` |
-| 豆包语音 | `DOUBAO_TTS_APP_ID`、`DOUBAO_TTS_ACCESS_TOKEN` |
 
-当前 Compose 不传入这些变量，也不启用任何 live adapter；Claude adapter 在 M0 只保留路由与 Secret 契约。前端、数据库、日志、trace、错误、fixture 与 Manifest 只保存 provider profile ID、不可逆凭证指纹、model/endpoint 快照、request/task ID、用量/费用和输入输出 hash，禁止保存 Authorization、Key、token、cookie 或临时签名 URL。
+默认 Compose 不传入这些变量，也不启用 live adapter；仅 `live` profile 从调用环境显式注入 `ARK_API_KEY` 与内部服务认证。Claude adapter 在 M0 只保留路由与 Secret 契约。前端、数据库、日志、trace、错误、fixture 与 Manifest 只保存 provider profile ID、不可逆凭证指纹、model/endpoint 快照、request/task ID、用量/费用和输入输出 hash，禁止保存 Authorization、Key、token、cookie 或临时签名 URL。
 
 本地 `VIDEO_ENVIRONMENT=local` 默认允许无 JWT 开发；生产必须通过 `VIDEO_AUTH_HMAC_SECRET` 启用 HS256 Bearer 校验，且 signed `sub/role` 必须与 mutation 的审计 actor 一致。
 

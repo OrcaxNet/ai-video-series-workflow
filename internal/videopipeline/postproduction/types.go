@@ -264,6 +264,8 @@ type ProviderAttempt struct {
 	JobID          string                         `json:"jobId"`
 	RequestID      string                         `json:"requestId"`
 	UpstreamTaskID string                         `json:"upstreamTaskId"`
+	ConnectID      string                         `json:"connectId,omitempty"`
+	LogID          string                         `json:"logId,omitempty"`
 	Model          providercontract.ModelSnapshot `json:"modelSnapshot"`
 	Usage          providercontract.Usage         `json:"usage"`
 	Cost           providercontract.Cost          `json:"cost"`

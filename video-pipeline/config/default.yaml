@@ -63,8 +63,8 @@ providerRouting:
       priority: 1
       enabledWhenSecretPresent: true
       arkApiKeyEnv: ARK_API_KEY
-      speechAppIdEnv: DOUBAO_TTS_APP_ID
-      speechAccessTokenEnv: DOUBAO_TTS_ACCESS_TOKEN
+      speechApiKeyEnv: ARK_API_KEY
+      speechResourceId: seed-tts-2.0
     claude:
       mode: live
       priority: 2
