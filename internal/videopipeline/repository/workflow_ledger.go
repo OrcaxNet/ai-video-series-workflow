@@ -795,15 +795,22 @@ func loadPromptAssetEvidence(
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT av.id, av.asset_id, av.content_hash, av.artifact_uri,
-		       av.media_type, av.dimensions, ls.license_id, ls.license_hash
+		       av.media_type, a.size_bytes, av.dimensions,
+		       ls.license_id, ls.license_hash
 		FROM video_pipeline.asset_versions av
 		JOIN video_pipeline.license_snapshots ls
 		  ON ls.id = av.license_snapshot_id
+		JOIN video_pipeline.artifacts a
+		  ON a.content_hash = av.content_hash
+		 AND a.artifact_uri = av.artifact_uri
+		 AND a.media_type = av.media_type
 		WHERE av.id = ANY($1::uuid[])
 		  AND av.status = 'APPROVED'
+		  AND a.status = 'ACTIVE'
+		  AND a.size_bytes > 0
 		  AND ls.policy_status = 'ALLOWED'
 		  AND (ls.expires_at IS NULL OR ls.expires_at > now())
-		FOR SHARE OF av, ls`,
+		FOR SHARE OF av, ls, a`,
 		assetVersionIDs,
 	)
 	if err != nil {
@@ -820,12 +827,13 @@ func loadPromptAssetEvidence(
 			versionID, assetID uuid.UUID
 			contentHash, uri   string
 			mediaType          string
+			sizeBytes          int64
 			dimensions         []byte
 			licenseID          string
 			licenseHash        string
 		)
 		if err := rows.Scan(
-			&versionID, &assetID, &contentHash, &uri, &mediaType, &dimensions,
+			&versionID, &assetID, &contentHash, &uri, &mediaType, &sizeBytes, &dimensions,
 			&licenseID, &licenseHash,
 		); err != nil {
 			return nil, nil, fmt.Errorf("scan prompt asset: %w", err)
@@ -850,7 +858,8 @@ func loadPromptAssetEvidence(
 				ID: assetID.String(), Revision: versionID.String(), Kind: modality,
 				Role: role, URI: uri, SHA256: contentHash,
 				LicenseReference: licenseID + ":" + licenseHash,
-				MediaType:        mediaType, Width: mediaSpec.Width, Height: mediaSpec.Height,
+				MediaType:        mediaType, SizeBytes: sizeBytes,
+				Width: mediaSpec.Width, Height: mediaSpec.Height,
 				DurationMillis: mediaSpec.DurationMillis,
 			},
 		}

@@ -217,7 +217,7 @@ func (s *Server) estimate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if request.Model.Provider != "volcengine_ark" || request.Model.ModelID != expectedModel {
+	if !acceptedProviderIdentity(request.Model.Provider) || request.Model.ModelID != expectedModel {
 		writeError(w, http.StatusUnprocessableEntity, safeError(
 			providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false,
 		))
@@ -666,10 +666,14 @@ func (s *Server) validateJob(request providercontract.JobRequest, idempotencyKey
 	} else if request.Request.ModelHint != s.config.VideoModel {
 		return safeError(providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false)
 	}
-	if request.Model.Provider != "volcengine_ark" || request.Model.ModelID != expectedModel {
+	if !acceptedProviderIdentity(request.Model.Provider) || request.Model.ModelID != expectedModel {
 		return safeError(providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false)
 	}
 	return nil
+}
+
+func acceptedProviderIdentity(provider string) bool {
+	return provider == "volcengine_ark" || provider == "VOLCENGINE"
 }
 
 func (s *Server) synthesizeSpeech(

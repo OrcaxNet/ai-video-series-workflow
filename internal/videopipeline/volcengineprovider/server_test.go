@@ -656,6 +656,10 @@ func TestServer_RejectsSimulationAndWrongFrozenModelBeforeSubmit(t *testing.T) {
 			request.Request.ModelHint = "different-model"
 			request.BudgetReservation = bindReservation(t, *request)
 		}},
+		{name: "wrong provider", mutate: func(request *providercontract.JobRequest) {
+			request.Model.Provider = "different-provider"
+			request.BudgetReservation = bindReservation(t, *request)
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

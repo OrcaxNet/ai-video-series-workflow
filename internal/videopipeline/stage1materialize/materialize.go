@@ -476,6 +476,24 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 		return stage1.ExecutionPackage{}, err
 	}
 	defer tx.Rollback(ctx)
+	if err := ensureActiveInputArtifact(
+		ctx, tx, objects["visual"], "image/png",
+		map[string]any{
+			"kind": "reference_image", "width": p.visualAsset.Width,
+			"height": p.visualAsset.Height, "inputPackageHash": p.productHash,
+		},
+	); err != nil {
+		return stage1.ExecutionPackage{}, fmt.Errorf("persist visual artifact evidence: %w", err)
+	}
+	if err := ensureActiveInputArtifact(
+		ctx, tx, objects["voice_descriptor"], "audio/x-voice-profile+json",
+		map[string]any{
+			"kind": "voice_profile", "speaker": p.product.PostProduction.Speaker,
+			"inputPackageHash": p.productHash,
+		},
+	); err != nil {
+		return stage1.ExecutionPackage{}, fmt.Errorf("persist voice artifact evidence: %w", err)
+	}
 	var existing []byte
 	var existingInputHash, existingApprovalComment string
 	err = tx.QueryRow(ctx, `SELECT payload->'executionPackage', payload->>'inputPackageHash', payload->>'approvalCommentId' FROM video_pipeline.audit_events WHERE action='stage1.execution_package.materialized' AND aggregate_id=$1 ORDER BY occurred_at DESC LIMIT 1 FOR SHARE`, mustUUID(p.product.Reserved.GenerationPlanID)).Scan(&existing, &existingInputHash, &existingApprovalComment)
@@ -486,6 +504,13 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 		var package_ stage1.ExecutionPackage
 		if json.Unmarshal(existing, &package_) != nil || package_.Validate(plan) != nil {
 			return stage1.ExecutionPackage{}, errors.New("existing materialization audit is invalid")
+		}
+		// A replay is also the controlled repair path for packages materialized
+		// before input artifact size metadata became mandatory. Commit only the
+		// immutable, identity-checked artifact rows above; all package identity
+		// remains bound to the existing audit event.
+		if err := tx.Commit(ctx); err != nil {
+			return stage1.ExecutionPackage{}, err
 		}
 		return package_, nil
 	}
@@ -727,6 +752,50 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	return package_, nil
 }
 
+func ensureActiveInputArtifact(
+	ctx context.Context,
+	tx pgx.Tx,
+	object artifactstore.Artifact,
+	mediaType string,
+	mediaSpec map[string]any,
+) error {
+	if object.Size <= 0 || strings.TrimSpace(object.Digest) == "" ||
+		strings.TrimSpace(object.URI) == "" || strings.TrimSpace(mediaType) == "" {
+		return errors.New("complete positive-size CAS artifact evidence is required")
+	}
+	artifactID := uuid.NewSHA1(
+		uuid.NameSpaceOID,
+		[]byte("stage1-input-artifact:"+object.Digest),
+	)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES ($1, $2, $3, $4, $5, $6, 'ACTIVE')
+		ON CONFLICT (content_hash) DO NOTHING`,
+		artifactID, object.Digest, object.URI, mediaType, object.Size, mediaSpec,
+	); err != nil {
+		return fmt.Errorf("insert input artifact: %w", err)
+	}
+	if err := tx.QueryRow(ctx, `
+		SELECT id
+		FROM video_pipeline.artifacts
+		WHERE content_hash = $1
+		  AND artifact_uri = $2
+		  AND media_type = $3
+		  AND size_bytes = $4
+		  AND media_spec = $5
+		  AND status = 'ACTIVE'
+		FOR SHARE`,
+		object.Digest, object.URI, mediaType, object.Size, mediaSpec,
+	).Scan(&artifactID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errors.New("artifact hash is bound to incompatible or inactive CAS metadata")
+		}
+		return fmt.Errorf("resolve ACTIVE input artifact: %w", err)
+	}
+	return nil
+}
+
 func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPackage, p prepared, approval Approval, objects map[string]artifactstore.Artifact) (Report, error) {
 	counts := map[string]int64{}
 	for name, query := range map[string]string{"shots": "SELECT count(*) FROM video_pipeline.shot_spec_revisions WHERE storyboard_revision_id='10400000-0000-4000-8000-000000000008'", "prompts": "SELECT count(*) FROM video_pipeline.prompt_snapshots WHERE compiler_version='stage1-product-input-v1'", "runs": "SELECT count(*) FROM video_pipeline.generation_runs WHERE trace_id='flo104-sample1-formal-v1'", "contexts": "SELECT count(*) FROM video_pipeline.context_revisions WHERE resolver_version='stage1-product-input-v1'"} {
@@ -737,6 +806,23 @@ func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPa
 		counts[name] = count
 	}
 	productTruth := repository.NewForPool(pool)
+	expectedAssets := map[string]struct {
+		assetID, digest, uri, mediaType string
+		size                            int64
+	}{
+		p.product.Reserved.VisualAssetVersionID: {
+			assetID:   p.product.Reserved.VisualAssetID,
+			digest:    objects["visual"].Digest,
+			uri:       objects["visual"].URI,
+			mediaType: "image/png", size: objects["visual"].Size,
+		},
+		p.product.Reserved.VoiceAssetVersionID: {
+			assetID:   p.product.Reserved.VoiceAssetID,
+			digest:    objects["voice_descriptor"].Digest,
+			uri:       objects["voice_descriptor"].URI,
+			mediaType: "audio/x-voice-profile+json", size: objects["voice_descriptor"].Size,
+		},
+	}
 	for _, job := range package_.PrimaryJobs {
 		prompt, err := productTruth.ResolvePromptSnapshot(ctx, job.PromptSnapshotID)
 		if err != nil {
@@ -744,6 +830,56 @@ func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPa
 		}
 		if prompt.Digest != job.PromptSnapshotHash || prompt.ID != job.PromptSnapshotID {
 			return Report{}, errors.New("execution package prompt differs from PostgreSQL product truth")
+		}
+		seenAssets := make(map[string]struct{}, len(prompt.Assets))
+		for _, asset := range prompt.Assets {
+			expected, ok := expectedAssets[asset.Revision]
+			if !ok || asset.ID != expected.assetID || asset.SHA256 != expected.digest ||
+				asset.URI != expected.uri || asset.MediaType != expected.mediaType ||
+				asset.SizeBytes != expected.size || asset.SizeBytes <= 0 {
+				return Report{}, errors.New("execution package asset differs from ACTIVE PostgreSQL CAS evidence")
+			}
+			seenAssets[asset.Revision] = struct{}{}
+		}
+		if len(seenAssets) != len(expectedAssets) {
+			return Report{}, errors.New("execution package is missing fixed prompt asset evidence")
+		}
+		budget := providercontract.BudgetEnvelope{
+			EstimatedCostMicros: 1, MaxCostMicros: 1, MaxAttempts: 1,
+		}
+		reservation, err := providercontract.BindBudgetReservation(
+			providercontract.BudgetReservation{
+				ReservationID:  "offline-envelope-" + job.Run.RunID,
+				Currency:       job.BudgetCurrency,
+				AmountMicros:   1,
+				PricingVersion: "offline-envelope-verification-v1",
+				ConfirmedBy:    job.BudgetApprovalID,
+			},
+			providercontract.BudgetBindingInput{
+				RunID: job.Run.RunID, InputHash: job.Run.RunSpecDigest,
+				Model: job.Route, Budget: budget,
+			},
+		)
+		if err != nil {
+			return Report{}, fmt.Errorf("bind offline Provider envelope: %w", err)
+		}
+		request, err := orchestration.BuildProviderJobRequest(
+			orchestration.ExecuteProviderJobInput{
+				Run: job.Run, Prompt: prompt, Route: job.Route,
+				BudgetApprovalID:    job.BudgetApprovalID,
+				BudgetMaximumMicros: job.BudgetMaximumMicros,
+				BudgetCurrency:      job.BudgetCurrency, ProviderProfileID: job.ProviderProfileID,
+				TraceID: job.TraceID, PersistProductTruth: true,
+			},
+			orchestration.PreparedProviderJob{
+				Budget: budget, BudgetReservation: reservation,
+			},
+		)
+		if err != nil {
+			return Report{}, fmt.Errorf("build offline Provider envelope: %w", err)
+		}
+		if len(request.Request.Assets) != len(expectedAssets) {
+			return Report{}, errors.New("offline Provider envelope omitted fixed asset evidence")
 		}
 	}
 	var providerJobs, reservations, cost int64

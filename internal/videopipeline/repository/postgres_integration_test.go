@@ -281,6 +281,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	voiceLicenseID, musicLicenseID, consentID := uuid.New(), uuid.New(), uuid.New()
 	voiceAssetID, voiceAssetVersionID := uuid.New(), uuid.New()
 	musicAssetID, musicAssetVersionID := uuid.New(), uuid.New()
+	voiceArtifactID, musicArtifactID := uuid.New(), uuid.New()
 	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 	episodeHash := strings.Repeat("1", 64)
 	sourceHash := strings.Repeat("0", 64)
@@ -293,6 +294,12 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	profileHash := strings.Repeat("4", 64)
 	capabilityHash := strings.Repeat("5", 64)
 	textCapabilityHash := strings.Repeat("8", 64)
+	voiceContentHash := strings.Repeat(
+		strings.ReplaceAll(voiceArtifactID.String(), "-", ""), 2,
+	)
+	musicContentHash := strings.Repeat(
+		strings.ReplaceAll(musicArtifactID.String(), "-", ""), 2,
+	)
 
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.generation_profiles
@@ -362,10 +369,19 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 'integration-voice', $5, $6, 'integration'),
 			($7, $8, 1, 'APPROVED', $9, $10, 'audio/wav',
 			 'integration-music', $11, NULL, 'integration')`,
-		voiceAssetVersionID, voiceAssetID, strings.Repeat("f", 64),
-		"cas://sha256/"+strings.Repeat("f", 64), voiceLicenseID, consentID,
-		musicAssetVersionID, musicAssetID, strings.Repeat("7", 64),
-		"cas://sha256/"+strings.Repeat("7", 64), musicLicenseID,
+		voiceAssetVersionID, voiceAssetID, voiceContentHash,
+		"cas://sha256/"+voiceContentHash, voiceLicenseID, consentID,
+		musicAssetVersionID, musicAssetID, musicContentHash,
+		"cas://sha256/"+musicContentHash, musicLicenseID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES
+			($1, $2, $3, 'audio/wav', 1024, '{"kind":"voice_fixture"}', 'ACTIVE'),
+			($4, $5, $6, 'audio/wav', 2048, '{"kind":"music_fixture"}', 'ACTIVE')`,
+		voiceArtifactID, voiceContentHash, "cas://sha256/"+voiceContentHash,
+		musicArtifactID, musicContentHash, "cas://sha256/"+musicContentHash,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.episode_revisions
@@ -783,6 +799,28 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(prompt.Assets) != 1 ||
+		prompt.Assets[0].Revision != voiceAssetVersionID.String() ||
+		prompt.Assets[0].SizeBytes != 1024 {
+		t.Fatalf("prompt ACTIVE CAS size evidence = %#v, want voice size 1024", prompt.Assets)
+	}
+	mustExec(t, ctx, pool, `UPDATE video_pipeline.artifacts SET status='DISABLED' WHERE id=$1`, voiceArtifactID)
+	if _, err := store.ResolvePromptSnapshot(ctx, prompt.ID); err == nil {
+		t.Fatal("prompt resolution accepted a DISABLED CAS artifact")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeLicenseBlocked {
+			t.Fatalf("DISABLED prompt artifact error = %#v", err)
+		}
+	}
+	mustExec(t, ctx, pool, `UPDATE video_pipeline.artifacts SET status='ACTIVE' WHERE id=$1`, voiceArtifactID)
+	resolvedPrompt, err := store.ResolvePromptSnapshot(ctx, prompt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolvedPrompt.Assets) != 1 || resolvedPrompt.Assets[0].SizeBytes != 1024 {
+		t.Fatalf("restored ACTIVE CAS size evidence = %#v", resolvedPrompt.Assets)
 	}
 	var promptInputCount, promptAssetCount int
 	if err := pool.QueryRow(ctx, `
