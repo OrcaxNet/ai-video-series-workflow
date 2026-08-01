@@ -640,14 +640,17 @@ func (e *Executor) Execute(ctx context.Context, attempt Attempt) (SubmitResult, 
 	if err != nil {
 		return SubmitResult{}, err
 	}
+	if decision == DecisionReplay {
+		return SubmitResult{}, providerError(providercontract.CodeConflict, "terminal stage 1 attempt cannot be submitted again")
+	}
 	if recovered.Found {
+		if strings.TrimSpace(recovered.ProviderTaskID) == "" {
+			return SubmitResult{}, providerError(providercontract.CodeConflict, "recovered stage 1 job has no provider task")
+		}
 		return SubmitResult{ProviderTaskID: recovered.ProviderTaskID}, nil
 	}
 	if decision == DecisionRecoverOnly {
 		return SubmitResult{}, providerError(providercontract.CodeUnavailable, "ambiguous stage 1 submit requires operator recovery and cannot be resubmitted")
-	}
-	if decision == DecisionReplay {
-		return SubmitResult{}, providerError(providercontract.CodeConflict, "stage 1 replay has no recoverable provider task")
 	}
 	result, err := e.submitter.Submit(ctx, attempt)
 	if err != nil {

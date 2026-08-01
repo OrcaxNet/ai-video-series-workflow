@@ -237,7 +237,18 @@ func TestRunnerFreezesTasklessContentSafetyRejection(t *testing.T) {
 	if _, err := Open(testPlan(), path); err != nil {
 		t.Fatalf("Open() after taskless safety completion = %v", err)
 	}
-	if _, err := runner.Submit(t.Context(), runnerSubmitInput(t, "shot-02", "attempt-02")); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+	restarted := newTestRunner(t, path, server, digest)
+	replayed, err := restarted.Submit(t.Context(), input)
+	if providercontract.ErrorCodeOf(err) != providercontract.CodeContentBlocked {
+		t.Fatalf("taskless terminal submit replay result=%#v error=%v", replayed, err)
+	}
+	if replayed.ProviderTaskID != "" {
+		t.Fatalf("taskless terminal submit replay returned task %q", replayed.ProviderTaskID)
+	}
+	if _, posts := fixture.counts(); posts != 1 {
+		t.Fatalf("provider submits after taskless terminal replay = %d, want 1", posts)
+	}
+	if _, err := restarted.Submit(t.Context(), runnerSubmitInput(t, "shot-02", "attempt-02")); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
 		t.Fatalf("next submit after taskless safety rejection error = %v", err)
 	}
 	if _, posts := fixture.counts(); posts != 1 {

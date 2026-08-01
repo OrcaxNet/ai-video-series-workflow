@@ -39,6 +39,19 @@ func (s *AdapterSubmitter) Recover(
 	if response.JobID != idempotencyKey {
 		return RecoveryResult{}, providerError(providercontract.CodeConflict, "recovered provider job does not match the idempotency key")
 	}
+	if strings.TrimSpace(response.UpstreamTaskID) == "" {
+		if response.State == providercontract.StatusRequiresAction && response.Error != nil &&
+			response.Error.Code == providercontract.CodeContentBlocked {
+			return RecoveryResult{}, providerError(
+				providercontract.CodeContentBlocked,
+				"stage 1 content safety rejected the job before provider task creation",
+			)
+		}
+		return RecoveryResult{}, providerError(
+			providercontract.CodeConflict,
+			"recovered stage 1 provider job has no recoverable provider task",
+		)
+	}
 	return RecoveryResult{Found: true, ProviderTaskID: response.UpstreamTaskID}, nil
 }
 

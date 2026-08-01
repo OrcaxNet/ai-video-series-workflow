@@ -16,7 +16,10 @@ idempotency key。terminal completion 按不可变序号冻结；相同结果任
 no-op，不同结果返回 conflict，token/AFP/现金与连续安全失败均从完整终态序列重新推导。
 Provider 在创建 upstream task 前返回 `requires_action/content_blocked` 时仍会冻结为
 `TERMINAL_FAILED`，并记录内容安全失败及证据不完整，阻断后续提交；这是唯一允许终态
-记录没有 task ID 的情况。`AMBIGUOUS` 只允许由 `PREPARED` 进入，重复标记为 no-op，
+记录没有 task ID 的情况。同幂等 `submit` 重放会返回不可重试 `content_blocked`，绝不把
+空 task 当作恢复成功；任何其他无 task 的 Adapter 恢复结果也 fail-closed。已冻结终态
+优先于 Adapter 的 recover 结果，同幂等 `submit` 返回 conflict。`AMBIGUOUS` 只允许由
+`PREPARED` 进入，重复标记为 no-op，
 任何迟到的 terminal→ambiguous 写入都返回 conflict，不能降级不可变终态。
 未知 submit 结果在重启后也只能 recover，不能再次 submit。受控重试必须绑定原终态
 失败、失败分类、审批 ID 与“无重复任务”证据。任一许可/Consent/Gate/预算/内容安全

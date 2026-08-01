@@ -541,15 +541,19 @@ func TestGateBlocksNextSubmitOnIncompleteEvidenceOrActualAFPDrift(t *testing.T) 
 }
 
 type fakeSubmitter struct {
-	mu        sync.Mutex
-	submits   int
-	tasks     map[string]string
-	submitErr error
+	mu             sync.Mutex
+	submits        int
+	tasks          map[string]string
+	submitErr      error
+	forcedRecovery *RecoveryResult
 }
 
 func (s *fakeSubmitter) Recover(_ context.Context, key string) (RecoveryResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.forcedRecovery != nil {
+		return *s.forcedRecovery, nil
+	}
 	task := s.tasks[key]
 	return RecoveryResult{Found: task != "", ProviderTaskID: task}, nil
 }
@@ -637,6 +641,56 @@ func TestExecutorRecoversIdempotentlyAndNeverAutoResubmitsAmbiguousSubmit(t *tes
 		}
 		if submitter.count() != 1 {
 			t.Fatalf("ambiguous provider submits = %d, want 1", submitter.count())
+		}
+	})
+
+	t.Run("found recovery without task fails closed", func(t *testing.T) {
+		gate, err := Open(testPlan(), filepath.Join(t.TempDir(), "ledger.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		submitter := &fakeSubmitter{
+			tasks: make(map[string]string), forcedRecovery: &RecoveryResult{Found: true},
+		}
+		executor, err := NewExecutor(gate, submitter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := executor.Execute(context.Background(), testAttempt("shot-01", "attempt-01"))
+		if providercontract.ErrorCodeOf(err) != providercontract.CodeConflict || result.ProviderTaskID != "" {
+			t.Fatalf("empty recovery result=%#v error=%v", result, err)
+		}
+		if submitter.count() != 0 {
+			t.Fatalf("provider submits = %d, want 0", submitter.count())
+		}
+	})
+
+	t.Run("terminal ledger wins over recovered task", func(t *testing.T) {
+		gate, err := Open(testPlan(), filepath.Join(t.TempDir(), "ledger.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		attempt := testAttempt("shot-01", "attempt-01")
+		if _, err := gate.Authorize(attempt); err != nil {
+			t.Fatal(err)
+		}
+		if err := gate.Complete(attempt.IdempotencyKey, Completion{
+			ProviderTaskID: "provider-task-attempt-01", State: "TERMINAL_SUCCEEDED",
+			ActualVideoTokens: 50_000, ActualAFPMilli: 2_504_700, EvidenceComplete: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		submitter := &fakeSubmitter{tasks: map[string]string{attempt.IdempotencyKey: "provider-task-attempt-01"}}
+		executor, err := NewExecutor(gate, submitter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := executor.Execute(context.Background(), attempt)
+		if providercontract.ErrorCodeOf(err) != providercontract.CodeConflict || result.ProviderTaskID != "" {
+			t.Fatalf("terminal replay result=%#v error=%v", result, err)
+		}
+		if submitter.count() != 0 {
+			t.Fatalf("provider submits = %d, want 0", submitter.count())
 		}
 	})
 }
