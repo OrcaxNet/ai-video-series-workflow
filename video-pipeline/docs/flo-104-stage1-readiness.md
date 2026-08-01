@@ -77,6 +77,15 @@ Provider profile/capability；Adapter 再匹配 job/input/cue/VOICE/license allo
 一段 canary 后，Finalize 会在媒体合成、Manifest 与 G3 前返回需人工检查的非重试冲突，
 不会继续提交其余 cue。跨进程相同 job 通过原子 intent/replay 保证至多一次 Provider submit。
 
+speech-v2 execution package 还必须冻结 `parentExecutionPackageHash`。Runner 只会在原
+package 的十个视频记录全部为 `TERMINAL_SUCCEEDED` 且证据完整、主 job 身份与额度逐项未变、
+不存在 controlled retry 时，于同一文件锁内把 ledger 提升到 child package；旧 hash 永久写入
+`supersededExecutionPackageHash`。该提升只允许一次并可幂等重放，缺镜、失败/证据不全、
+Attempt 漂移、错误 parent 或第二个 child 均在启动 TTS 前失败关闭。这样 VOICE 修订不会要求
+重提已完成视频，也不能把任意后期包替换到已有视频证据上。物化事务同时写入独立的
+`stage1.execution_package.revision_bound` 审计，以 parent/child package hash、VOICE version
+和批准评论固定这次只改后期语音合同的派生关系；旧 VOICE 修订审计保持只读。
+
 Provider 失败证据保留精确 HTTP status、纯数字 Provider code、脱敏
 `X-Api-Message` 分类与 `X-Tt-Logid`。401/403、非 Plan endpoint、usage/log 缺失、AFP/现金
 越界均失败关闭；仅 `55000000` 分类为已知 resource-or-speaker unavailable，其他未知

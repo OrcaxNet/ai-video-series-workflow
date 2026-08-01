@@ -155,16 +155,17 @@ type Record struct {
 }
 
 type Ledger struct {
-	SchemaVersion              string             `json:"schemaVersion"`
-	BatchID                    string             `json:"batchId"`
-	ExecutionPackageHash       string             `json:"executionPackageHash"`
-	ControlledRetryPackageHash string             `json:"controlledRetryPackageHash,omitempty"`
-	Records                    map[string]*Record `json:"records"`
-	ReservedVideoTokens        int64              `json:"reservedVideoTokens"`
-	ReservedAFPMilli           int64              `json:"reservedAfpMilli"`
-	ReservedCashMicros         int64              `json:"reservedCashMicros"`
-	ConsecutiveSafetyFailures  int                `json:"consecutiveContentSafetyFailures"`
-	NextTerminalSequence       int64              `json:"nextTerminalSequence"`
+	SchemaVersion                  string             `json:"schemaVersion"`
+	BatchID                        string             `json:"batchId"`
+	ExecutionPackageHash           string             `json:"executionPackageHash"`
+	SupersededExecutionPackageHash string             `json:"supersededExecutionPackageHash,omitempty"`
+	ControlledRetryPackageHash     string             `json:"controlledRetryPackageHash,omitempty"`
+	Records                        map[string]*Record `json:"records"`
+	ReservedVideoTokens            int64              `json:"reservedVideoTokens"`
+	ReservedAFPMilli               int64              `json:"reservedAfpMilli"`
+	ReservedCashMicros             int64              `json:"reservedCashMicros"`
+	ConsecutiveSafetyFailures      int                `json:"consecutiveContentSafetyFailures"`
+	NextTerminalSequence           int64              `json:"nextTerminalSequence"`
 }
 
 type Decision string
@@ -232,6 +233,69 @@ func (g *Gate) BindExecutionPackage(contentHash string) error {
 	}
 	if err := g.saveLocked(ledger); err != nil {
 		g.executionPackageHash = previous
+		return err
+	}
+	return nil
+}
+
+// BindExecutionPackageRevision atomically promotes one speech-v2-only child
+// package after all ten primary video jobs have immutable, evidence-complete
+// successful terminal records. The parent binding is retained in the ledger,
+// and no controlled retry or second package revision may cross this boundary.
+func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage) error {
+	if err := package_.Validate(g.plan); err != nil {
+		return err
+	}
+	if package_.ParentExecutionPackageHash == "" {
+		return errors.New("stage 1 execution package revision requires a parent package hash")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer releaseFileLock(lock)
+
+	previousExpected := g.executionPackageHash
+	g.executionPackageHash = ""
+	ledger, err := g.loadLocked()
+	g.executionPackageHash = previousExpected
+	if err != nil {
+		return err
+	}
+	if ledger.ExecutionPackageHash == package_.ContentHash {
+		if ledger.SupersededExecutionPackageHash != package_.ParentExecutionPackageHash {
+			return errors.New("stage 1 ledger revision parent binding is invalid")
+		}
+		g.executionPackageHash = package_.ContentHash
+		return nil
+	}
+	if ledger.ExecutionPackageHash != package_.ParentExecutionPackageHash {
+		return errors.New("stage 1 ledger is not bound to the revision parent package")
+	}
+	if ledger.SupersededExecutionPackageHash != "" {
+		return providerError(providercontract.CodeConflict, "stage 1 ledger already consumed its package revision")
+	}
+	if ledger.ControlledRetryPackageHash != "" {
+		return providerError(providercontract.CodeForbidden, "stage 1 package revision cannot replace a controlled retry binding")
+	}
+	if len(ledger.Records) != len(package_.PrimaryJobs) {
+		return providerError(providercontract.CodeForbidden, "stage 1 package revision requires exactly ten completed primary records")
+	}
+	for _, frozen := range package_.PrimaryJobs {
+		record := ledger.Records[frozen.IdempotencyKey]
+		if record == nil || !sameAttempt(record.Attempt, attemptFromFrozen(frozen, nil)) ||
+			record.State != "TERMINAL_SUCCEEDED" || !record.EvidenceComplete {
+			return providerError(providercontract.CodeForbidden, "stage 1 package revision requires unchanged evidence-complete successful primary records")
+		}
+	}
+
+	ledger.SupersededExecutionPackageHash = package_.ParentExecutionPackageHash
+	ledger.ExecutionPackageHash = package_.ContentHash
+	g.executionPackageHash = package_.ContentHash
+	if err := g.saveLocked(ledger); err != nil {
+		g.executionPackageHash = previousExpected
 		return err
 	}
 	return nil
@@ -553,6 +617,11 @@ func (g *Gate) loadLocked() (Ledger, error) {
 		(g.controlledRetryPackageHash != "" &&
 			ledger.ControlledRetryPackageHash != g.controlledRetryPackageHash) {
 		return Ledger{}, errors.New("stage 1 ledger is invalid or bound to another batch")
+	}
+	if ledger.SupersededExecutionPackageHash != "" &&
+		(!validLowerDigest(ledger.SupersededExecutionPackageHash) ||
+			ledger.SupersededExecutionPackageHash == ledger.ExecutionPackageHash) {
+		return Ledger{}, errors.New("stage 1 ledger superseded package binding is invalid")
 	}
 	if err := validateLedgerDerivedState(ledger); err != nil {
 		return Ledger{}, err

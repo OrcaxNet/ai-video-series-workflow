@@ -797,6 +797,68 @@ func TestRunnerControlledRetryAmbiguousSubmitRemainsRecoverOnly(t *testing.T) {
 	}
 }
 
+func TestRunnerUsesCompletedPrimaryLedgerForSpeechV2PackageRevision(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	parent := testExecutionPackage(t)
+	revised := testSpeechV2ExecutionPackage(t, parent)
+	gate := completePrimaryPackage(t, path, parent, RequiredPrimaryJobs, "TERMINAL_SUCCEEDED", true)
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	adapter, err := NewAdapterSubmitter(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := NewRunner(
+		gate,
+		adapter,
+		runnerArtifactFixture{digests: map[string]bool{}},
+		&runnerTruthFixture{executionPackage: revised},
+		revised,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input, err := runner.FinalizationInput()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if input.TraceID != revised.PostProduction.TraceID ||
+		input.Config.SpeechIdentityVersion != postproduction.SpeechIdentityV2 {
+		t.Fatalf("speech-v2 finalization input = %#v", input)
+	}
+}
+
+func TestRunnerRejectsControlledRetryBeforePromotingSpeechV2Package(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	parent := testExecutionPackage(t)
+	revised := testSpeechV2ExecutionPackage(t, parent)
+	retry := testControlledRetryPackage(t, revised)
+	gate := completePrimaryPackage(t, path, parent, RequiredPrimaryJobs, "TERMINAL_SUCCEEDED", true)
+	server := httptest.NewServer(http.NotFoundHandler())
+	defer server.Close()
+	adapter, err := NewAdapterSubmitter(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRunnerWithControlledRetry(
+		gate,
+		adapter,
+		runnerArtifactFixture{digests: map[string]bool{}},
+		&runnerTruthFixture{executionPackage: revised, controlledRetry: &retry},
+		revised,
+		retry,
+	); err == nil {
+		t.Fatal("speech-v2 package revision unexpectedly accepted a controlled retry")
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.ExecutionPackageHash != parent.ContentHash ||
+		ledger.SupersededExecutionPackageHash != "" {
+		t.Fatalf("rejected runner changed package binding: %#v", ledger)
+	}
+}
+
 func newTestRunner(t *testing.T, path string, server *httptest.Server, digest string) *Runner {
 	t.Helper()
 	gate, err := Open(testPlan(), path)
@@ -883,6 +945,38 @@ func testExecutionPackage(t *testing.T) ExecutionPackage {
 		},
 	}
 	sealed, err := SealExecutionPackage(package_)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sealed.Validate(testPlan()); err != nil {
+		t.Fatal(err)
+	}
+	return sealed
+}
+
+func testSpeechV2ExecutionPackage(t *testing.T, parent ExecutionPackage) ExecutionPackage {
+	t.Helper()
+	revised := parent
+	revised.ParentExecutionPackageHash = parent.ContentHash
+	revised.PostProduction.Config.SpeechIdentityVersion = postproduction.SpeechIdentityV2
+	revised.PostProduction.Config.SpeechVoice = &postproduction.SpeechVoiceBinding{
+		AssetID:              uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-asset")).String(),
+		ParentAssetVersionID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v1-version")).String(),
+		AssetVersionID:       uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-version")).String(),
+		AssetVersionHash:     strings.Repeat("e", 64),
+		LicenseSnapshotID:    uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-license")).String(),
+		LicenseSnapshotHash:  strings.Repeat("f", 64),
+		Provider:             "volcengine_ark",
+		ModelID:              revised.PostProduction.Config.SpeechRoute.ModelID,
+		ResourceID:           "seed-tts-2.0",
+		Speaker:              "zh_female_tianmeitaozi_mars_bigtts",
+	}
+	revised.PostProduction.Config.SpeechAuthorizedCueID = "cue-001"
+	revised.PostProduction.Config.SpeechMaximumAFPMilli = 2_228
+	revised.PostProduction.Config.SpeechMaximumCashMicros = 0
+	revised.PostProduction.Config.SpeechMaxAttempts = 1
+	revised.PostProduction.TraceID += "-speech-v2"
+	sealed, err := SealExecutionPackage(revised)
 	if err != nil {
 		t.Fatal(err)
 	}

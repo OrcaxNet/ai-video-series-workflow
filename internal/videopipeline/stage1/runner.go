@@ -117,7 +117,14 @@ func newRunner(
 	if err := executionPackage.Validate(gate.Plan()); err != nil {
 		return nil, err
 	}
-	if err := gate.BindExecutionPackage(executionPackage.ContentHash); err != nil {
+	if executionPackage.ParentExecutionPackageHash != "" && controlledRetry != nil {
+		return nil, errors.New("speech-v2 package revision cannot be combined with a controlled retry package")
+	}
+	if executionPackage.ParentExecutionPackageHash == "" {
+		if err := gate.BindExecutionPackage(executionPackage.ContentHash); err != nil {
+			return nil, err
+		}
+	} else if err := gate.BindExecutionPackageRevision(executionPackage); err != nil {
 		return nil, err
 	}
 	if controlledRetry != nil {

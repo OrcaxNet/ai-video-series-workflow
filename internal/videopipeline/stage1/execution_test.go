@@ -53,6 +53,44 @@ func TestExecutionPackageRejectsAnyFrozenIdentityOrPostProductionDrift(t *testin
 	}
 }
 
+func TestExecutionPackageRevisionRequiresSpeechV2AndDistinctParent(t *testing.T) {
+	t.Parallel()
+	parent := testExecutionPackage(t)
+	valid := testSpeechV2ExecutionPackage(t, parent)
+	if valid.ParentExecutionPackageHash != parent.ContentHash ||
+		valid.ContentHash == parent.ContentHash {
+		t.Fatalf("speech-v2 package revision = %#v", valid)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ExecutionPackage)
+	}{
+		{name: "missing parent", mutate: func(p *ExecutionPackage) { p.ParentExecutionPackageHash = "" }},
+		{name: "invalid parent", mutate: func(p *ExecutionPackage) { p.ParentExecutionPackageHash = "invalid" }},
+		{name: "legacy speech", mutate: func(p *ExecutionPackage) {
+			p.PostProduction.Config.SpeechIdentityVersion = ""
+			p.PostProduction.Config.SpeechVoice = nil
+			p.PostProduction.Config.SpeechAuthorizedCueID = ""
+			p.PostProduction.Config.SpeechMaximumAFPMilli = 0
+			p.PostProduction.Config.SpeechMaxAttempts = 0
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := valid
+			test.mutate(&candidate)
+			candidate, err := SealExecutionPackage(candidate)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := candidate.Validate(testPlan()); err == nil {
+				t.Fatal("invalid execution package revision unexpectedly passed")
+			}
+		})
+	}
+}
+
 func TestControlledRetryPackageBindsNewIdentityApprovalAndFinalizationRun(t *testing.T) {
 	t.Parallel()
 	primary := testExecutionPackage(t)

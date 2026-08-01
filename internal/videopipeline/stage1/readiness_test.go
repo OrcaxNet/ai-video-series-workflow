@@ -122,6 +122,138 @@ func TestExecutionPackageBindingSurvivesRejectedPrepareAndRestart(t *testing.T) 
 	}
 }
 
+func TestGatePromotesOneSpeechV2PackageAfterAllPrimaryVideoSuccess(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	parent := testExecutionPackage(t)
+	revised := testSpeechV2ExecutionPackage(t, parent)
+	gate := completePrimaryPackage(t, path, parent, RequiredPrimaryJobs, "TERMINAL_SUCCEEDED", true)
+
+	if err := gate.BindExecutionPackageRevision(revised); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindExecutionPackageRevision(revised); err != nil {
+		t.Fatalf("idempotent speech-v2 package revision replay: %v", err)
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.ExecutionPackageHash != revised.ContentHash ||
+		ledger.SupersededExecutionPackageHash != parent.ContentHash ||
+		len(ledger.Records) != RequiredPrimaryJobs {
+		t.Fatalf("revised stage 1 ledger = %#v", ledger)
+	}
+	for _, record := range ledger.Records {
+		if record.State != "TERMINAL_SUCCEEDED" || !record.EvidenceComplete {
+			t.Fatalf("package revision changed primary evidence: %#v", record)
+		}
+	}
+
+	restarted, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.BindExecutionPackageRevision(revised); err != nil {
+		t.Fatalf("speech-v2 package revision failed after restart: %v", err)
+	}
+	if err := restarted.BindExecutionPackage(parent.ContentHash); err == nil {
+		t.Fatal("superseded parent execution package unexpectedly rebound")
+	}
+	second := revised
+	second.ParentExecutionPackageHash = revised.ContentHash
+	second.PostProduction.TraceID += "-second"
+	second, err = SealExecutionPackage(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.BindExecutionPackageRevision(second); providercontract.ErrorCodeOf(err) != providercontract.CodeConflict {
+		t.Fatalf("second package revision error = %v", err)
+	}
+}
+
+func TestGateRejectsSpeechV2PackageRevisionWithoutExactSuccessfulPrimaryEvidence(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		completed      int
+		lastState      string
+		lastEvidence   bool
+		mutateRevision func(*ExecutionPackage)
+	}{
+		{name: "missing primary", completed: RequiredPrimaryJobs - 1, lastState: "TERMINAL_SUCCEEDED", lastEvidence: true},
+		{name: "failed primary", completed: RequiredPrimaryJobs, lastState: "TERMINAL_FAILED", lastEvidence: true},
+		{name: "incomplete evidence", completed: RequiredPrimaryJobs, lastState: "TERMINAL_SUCCEEDED", lastEvidence: false},
+		{name: "attempt drift", completed: RequiredPrimaryJobs, lastState: "TERMINAL_SUCCEEDED", lastEvidence: true, mutateRevision: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].EstimatedVideoTokens++
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "ledger.json")
+			parent := testExecutionPackage(t)
+			gate := completePrimaryPackage(t, path, parent, test.completed, test.lastState, test.lastEvidence)
+			revised := testSpeechV2ExecutionPackage(t, parent)
+			if test.mutateRevision != nil {
+				test.mutateRevision(&revised)
+				var err error
+				revised, err = SealExecutionPackage(revised)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := gate.BindExecutionPackageRevision(revised); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+				t.Fatalf("package revision error = %v", err)
+			}
+			ledger := readTestLedger(t, path)
+			if ledger.ExecutionPackageHash != parent.ContentHash || ledger.SupersededExecutionPackageHash != "" {
+				t.Fatalf("rejected revision changed ledger binding: %#v", ledger)
+			}
+		})
+	}
+}
+
+func completePrimaryPackage(
+	t *testing.T,
+	path string,
+	package_ ExecutionPackage,
+	completed int,
+	lastState string,
+	lastEvidence bool,
+) *Gate {
+	t.Helper()
+	gate, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindExecutionPackage(package_.ContentHash); err != nil {
+		t.Fatal(err)
+	}
+	for index, frozen := range package_.PrimaryJobs[:completed] {
+		attempt := attemptFromFrozen(frozen, nil)
+		if _, err := gate.Authorize(attempt); err != nil {
+			t.Fatal(err)
+		}
+		state := "TERMINAL_SUCCEEDED"
+		evidence := true
+		if index == completed-1 {
+			state = lastState
+			evidence = lastEvidence
+		}
+		completion := Completion{
+			ProviderTaskID:    "provider-task-" + frozen.AttemptID,
+			State:             state,
+			ActualVideoTokens: frozen.EstimatedVideoTokens,
+			ActualAFPMilli:    frozen.PredictedAFPMilli,
+			EvidenceComplete:  evidence,
+		}
+		if state == "TERMINAL_FAILED" {
+			completion.FailureClass = string(providercontract.CodeUnavailable)
+		}
+		if err := gate.Complete(frozen.IdempotencyKey, completion); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return gate
+}
+
 func TestPlanValidatePinsApprovedStage1Boundary(t *testing.T) {
 	t.Parallel()
 	valid := testPlan()

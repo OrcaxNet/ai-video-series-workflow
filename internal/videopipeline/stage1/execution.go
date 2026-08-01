@@ -20,11 +20,12 @@ const ExecutionPackageSchemaVersion = "v1"
 // one formal Stage 1 run. Runtime product truth remains in PostgreSQL; this file
 // pins the exact records that the runner is allowed to resolve and revalidate.
 type ExecutionPackage struct {
-	SchemaVersion  string                             `json:"schemaVersion"`
-	BatchID        string                             `json:"batchId"`
-	ContentHash    string                             `json:"contentHash"`
-	PrimaryJobs    []FrozenJob                        `json:"primaryJobs"`
-	PostProduction orchestration.FinalizeEpisodeInput `json:"postProduction"`
+	SchemaVersion              string                             `json:"schemaVersion"`
+	BatchID                    string                             `json:"batchId"`
+	ParentExecutionPackageHash string                             `json:"parentExecutionPackageHash,omitempty"`
+	ContentHash                string                             `json:"contentHash"`
+	PrimaryJobs                []FrozenJob                        `json:"primaryJobs"`
+	PostProduction             orchestration.FinalizeEpisodeInput `json:"postProduction"`
 }
 
 // FrozenJob contains identifiers and approved limits only. Prompt text, asset
@@ -65,6 +66,19 @@ func (p ExecutionPackage) Validate(plan Plan) error {
 		return fmt.Errorf("stage 1 execution package requires exactly %d primary jobs", RequiredPrimaryJobs)
 	case !validLowerDigest(p.ContentHash):
 		return errors.New("stage 1 execution package requires a lowercase SHA-256 contentHash")
+	}
+	if p.PostProduction.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2 &&
+		p.ParentExecutionPackageHash == "" {
+		return errors.New("speech-v2 execution package requires its immutable parent package hash")
+	}
+	if p.ParentExecutionPackageHash != "" {
+		if !validLowerDigest(p.ParentExecutionPackageHash) ||
+			p.ParentExecutionPackageHash == p.ContentHash {
+			return errors.New("stage 1 execution package revision requires a distinct parent package hash")
+		}
+		if p.PostProduction.Config.SpeechIdentityVersion != postproduction.SpeechIdentityV2 {
+			return errors.New("only a speech-v2 post-production revision may name a parent package")
+		}
 	}
 
 	seenShots := make(map[string]struct{}, len(p.PrimaryJobs))

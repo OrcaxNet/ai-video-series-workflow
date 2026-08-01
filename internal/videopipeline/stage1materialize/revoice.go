@@ -387,6 +387,7 @@ func RevoiceStage1(
 		ResourceID: input.ResourceID, Speaker: input.Speaker,
 	}
 	revised := parent
+	revised.ParentExecutionPackageHash = parent.ContentHash
 	revised.PostProduction.Config.SpeechRoute = route
 	revised.PostProduction.Config.SpeechProviderProfileID = providerProfileID.String()
 	revised.PostProduction.Config.SpeechIdentityVersion = postproduction.SpeechIdentityV2
@@ -433,6 +434,41 @@ func RevoiceStage1(
 		approval.ActorID, voiceVersionID, revised.PostProduction.TraceID, auditPayload,
 	); err != nil {
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("insert speech-v2 audit: %w", err)
+	}
+	packageBindingAuditID := uuid.NewSHA1(
+		voiceVersionID,
+		[]byte("execution-package-revision:"+revised.ContentHash),
+	)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO video_pipeline.audit_events
+			(id, occurred_at, actor_id, actor_role, action, aggregate_type,
+			 aggregate_id, reason_code, trace_id, payload)
+		VALUES ($1, $2, $3, 'ADMIN', 'stage1.execution_package.revision_bound',
+		        'EXECUTION_PACKAGE', $4, 'FLO104_SPEECH_V2_CANARY', $5, $6)
+		ON CONFLICT DO NOTHING`,
+		packageBindingAuditID, time.Now().UTC(), approval.ActorID,
+		voiceVersionID, revised.PostProduction.TraceID, auditPayload,
+	); err != nil {
+		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("insert speech-v2 package binding audit: %w", err)
+	}
+	var verifiedPackageBinding int
+	if err := tx.QueryRow(ctx, `
+		SELECT 1
+		FROM video_pipeline.audit_events
+		WHERE id = $1
+		  AND action = 'stage1.execution_package.revision_bound'
+		  AND aggregate_type = 'EXECUTION_PACKAGE'
+		  AND aggregate_id = $2
+		  AND reason_code = 'FLO104_SPEECH_V2_CANARY'
+		  AND payload->>'parentExecutionPackageHash' = $3
+		  AND payload->>'executionPackageHash' = $4
+		  AND payload->>'voiceAssetVersionId' = $5
+		  AND payload->>'authorizationCommentId' = $6
+		FOR SHARE`,
+		packageBindingAuditID, voiceVersionID, parent.ContentHash,
+		revised.ContentHash, voiceVersionID.String(), approval.CommentID,
+	).Scan(&verifiedPackageBinding); err != nil {
+		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("verify speech-v2 package binding audit: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("commit speech-v2 revision: %w", err)
