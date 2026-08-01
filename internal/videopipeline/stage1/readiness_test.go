@@ -31,6 +31,22 @@ func TestCommittedReadinessPlan(t *testing.T) {
 	}
 }
 
+func TestOpenRejectsLegacyLedgerInsteadOfGuessingTerminalOrder(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	legacy := Ledger{SchemaVersion: SchemaVersion, BatchID: testPlan().BatchID, Records: map[string]*Record{}}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(testPlan(), path); err == nil {
+		t.Fatal("legacy ledger unexpectedly opened")
+	}
+}
+
 func TestPlanValidatePinsApprovedStage1Boundary(t *testing.T) {
 	t.Parallel()
 	valid := testPlan()
@@ -187,6 +203,132 @@ func TestGateBlocksAfterTwoConsecutiveContentSafetyFailures(t *testing.T) {
 	}
 	if _, err := gate.Authorize(testAttempt("shot-03", "attempt-03")); providercontract.ErrorCodeOf(err) != providercontract.CodeContentBlocked {
 		t.Fatalf("third authorization error = %v", err)
+	}
+}
+
+func TestGateTerminalCompletionReplayIsStrictlyIdempotent(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	gate, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := testAttempt("shot-01", "attempt-01")
+	if _, err := gate.Authorize(attempt); err != nil {
+		t.Fatal(err)
+	}
+	completion := Completion{
+		ProviderTaskID: "task-1", State: "TERMINAL_FAILED",
+		ActualVideoTokens: 50_000, ActualAFPMilli: 2_504_700,
+		EvidenceComplete: true, ContentSafetyFailed: true,
+	}
+	for range 3 {
+		if err := gate.Complete(attempt.IdempotencyKey, completion); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.ReservedVideoTokens != 50_000 || ledger.ReservedAFPMilli != 2_504_700 ||
+		ledger.ConsecutiveSafetyFailures != 1 || ledger.NextTerminalSequence != 1 {
+		t.Fatalf("replayed ledger = %#v", ledger)
+	}
+	record := ledger.Records[attempt.IdempotencyKey]
+	if record == nil || record.TerminalSequence != 1 {
+		t.Fatalf("terminal record = %#v", record)
+	}
+
+	conflict := completion
+	conflict.ActualVideoTokens++
+	if err := gate.Complete(attempt.IdempotencyKey, conflict); providercontract.ErrorCodeOf(err) != providercontract.CodeConflict {
+		t.Fatalf("conflicting completion error = %v", err)
+	}
+	if after := readTestLedger(t, path); after.ReservedVideoTokens != 50_000 ||
+		after.ConsecutiveSafetyFailures != 1 || after.NextTerminalSequence != 1 {
+		t.Fatalf("conflicting completion mutated ledger = %#v", after)
+	}
+}
+
+func TestGateOldSuccessReplayCannotResetSafetyCircuit(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	gate, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completions := make(map[string]Completion)
+	for index := 1; index <= 3; index++ {
+		attempt := testAttempt(fmt.Sprintf("shot-%02d", index), fmt.Sprintf("attempt-%02d", index))
+		if _, err := gate.Authorize(attempt); err != nil {
+			t.Fatal(err)
+		}
+		completion := Completion{
+			ProviderTaskID: fmt.Sprintf("task-%02d", index), State: "TERMINAL_SUCCEEDED",
+			ActualVideoTokens: 100_000, ActualAFPMilli: 2_504_700, EvidenceComplete: true,
+		}
+		if index > 1 {
+			completion.State = "TERMINAL_FAILED"
+			completion.ContentSafetyFailed = true
+		}
+		if err := gate.Complete(attempt.IdempotencyKey, completion); err != nil {
+			t.Fatal(err)
+		}
+		completions[attempt.IdempotencyKey] = completion
+	}
+	if _, err := gate.Authorize(testAttempt("shot-04", "attempt-04")); providercontract.ErrorCodeOf(err) != providercontract.CodeContentBlocked {
+		t.Fatalf("circuit before replay error = %v", err)
+	}
+	if err := gate.Complete("idempotency-attempt-01", completions["idempotency-attempt-01"]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.Authorize(testAttempt("shot-04", "attempt-04")); providercontract.ErrorCodeOf(err) != providercontract.CodeContentBlocked {
+		t.Fatalf("old success replay reopened circuit: %v", err)
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.ConsecutiveSafetyFailures != 2 || ledger.NextTerminalSequence != 3 {
+		t.Fatalf("safety sequence after replay = %#v", ledger)
+	}
+}
+
+func TestSeparateGateInstancesReplayCompletionWithoutUsageDrift(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	gateA, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateB, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := testAttempt("shot-01", "attempt-01")
+	if _, err := gateA.Authorize(attempt); err != nil {
+		t.Fatal(err)
+	}
+	completion := Completion{
+		ProviderTaskID: "task-1", State: "TERMINAL_SUCCEEDED",
+		ActualVideoTokens: 50_000, ActualAFPMilli: 2_504_700,
+		ActualCashMicros: 125, EvidenceComplete: true,
+	}
+	errorsSeen := make(chan error, 2)
+	var wait sync.WaitGroup
+	for _, gate := range []*Gate{gateA, gateB} {
+		wait.Add(1)
+		go func(gate *Gate) {
+			defer wait.Done()
+			errorsSeen <- gate.Complete(attempt.IdempotencyKey, completion)
+		}(gate)
+	}
+	wait.Wait()
+	close(errorsSeen)
+	for err := range errorsSeen {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.ReservedVideoTokens != 50_000 || ledger.ReservedAFPMilli != 2_504_700 ||
+		ledger.ReservedCashMicros != 125 || len(ledger.Records) != 1 || ledger.NextTerminalSequence != 1 {
+		t.Fatalf("cross-process replay ledger = %#v", ledger)
 	}
 }
 
@@ -404,4 +546,17 @@ func testAttempt(shotID, attemptID string) Attempt {
 		BudgetCurrent: true, ContentSafetyApproved: true, PriorEvidenceComplete: true,
 		NonSubscriptionPricingVerified: true, PerRequestCostAttributionReady: true,
 	}
+}
+
+func readTestLedger(t *testing.T, path string) Ledger {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ledger Ledger
+	if err := json.Unmarshal(data, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	return ledger
 }

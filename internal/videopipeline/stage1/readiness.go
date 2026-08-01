@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +21,7 @@ import (
 
 const (
 	SchemaVersion                  = "v1"
+	LedgerSchemaVersion            = "v2"
 	FormalVideoModel               = "doubao-seedance-2.0"
 	RequiredPrimaryJobs            = 10
 	MaximumControlledRetries       = 1
@@ -151,6 +153,7 @@ type Attempt struct {
 type Record struct {
 	Attempt
 	State               string `json:"state"`
+	TerminalSequence    int64  `json:"terminalSequence,omitempty"`
 	ProviderTaskID      string `json:"providerTaskId,omitempty"`
 	ActualVideoTokens   int64  `json:"actualVideoTokens,omitempty"`
 	ActualAFPMilli      int64  `json:"actualAfpMilli,omitempty"`
@@ -167,6 +170,7 @@ type Ledger struct {
 	ReservedAFPMilli          int64              `json:"reservedAfpMilli"`
 	ReservedCashMicros        int64              `json:"reservedCashMicros"`
 	ConsecutiveSafetyFailures int                `json:"consecutiveContentSafetyFailures"`
+	NextTerminalSequence      int64              `json:"nextTerminalSequence"`
 }
 
 type Decision string
@@ -231,9 +235,9 @@ func (g *Gate) Authorize(attempt Attempt) (Decision, error) {
 		return "", err
 	}
 	ledger.Records[attempt.IdempotencyKey] = &Record{Attempt: attempt, State: "PREPARED"}
-	ledger.ReservedVideoTokens += attempt.EstimatedVideoTokens
-	ledger.ReservedAFPMilli += attempt.PredictedAFPMilli
-	ledger.ReservedCashMicros += attempt.EstimatedNonSubscriptionCashMicros
+	if err := recalculateLedger(&ledger); err != nil {
+		return "", err
+	}
 	if err := g.saveLocked(ledger); err != nil {
 		return "", err
 	}
@@ -360,9 +364,20 @@ func (g *Gate) Complete(idempotencyKey string, completion Completion) error {
 		if completion.ActualVideoTokens < 0 || completion.ActualAFPMilli < 0 || completion.ActualCashMicros < 0 {
 			return errors.New("stage 1 actual usage cannot be negative")
 		}
-		ledger.ReservedVideoTokens += completion.ActualVideoTokens - record.EstimatedVideoTokens
-		ledger.ReservedAFPMilli += completion.ActualAFPMilli - record.PredictedAFPMilli
-		ledger.ReservedCashMicros += completion.ActualCashMicros - record.EstimatedNonSubscriptionCashMicros
+		if completion.State == "TERMINAL_SUCCEEDED" && completion.ContentSafetyFailed {
+			return errors.New("a succeeded stage 1 completion cannot be a content safety failure")
+		}
+		if terminalState(record.State) {
+			if sameCompletion(record, completion) {
+				return nil
+			}
+			return providerError(providercontract.CodeConflict, "terminal stage 1 completion is immutable")
+		}
+		if record.State != "PREPARED" && record.State != "AMBIGUOUS" {
+			return providerError(providercontract.CodeConflict, "stage 1 attempt is not completable")
+		}
+		ledger.NextTerminalSequence++
+		record.TerminalSequence = ledger.NextTerminalSequence
 		record.ProviderTaskID = completion.ProviderTaskID
 		record.State = completion.State
 		record.ActualVideoTokens = completion.ActualVideoTokens
@@ -370,12 +385,7 @@ func (g *Gate) Complete(idempotencyKey string, completion Completion) error {
 		record.ActualCashMicros = completion.ActualCashMicros
 		record.EvidenceComplete = completion.EvidenceComplete
 		record.ContentSafetyFailed = completion.ContentSafetyFailed
-		if completion.ContentSafetyFailed {
-			ledger.ConsecutiveSafetyFailures++
-		} else {
-			ledger.ConsecutiveSafetyFailures = 0
-		}
-		return nil
+		return recalculateLedger(ledger)
 	})
 }
 
@@ -404,7 +414,7 @@ func (g *Gate) updateRecord(idempotencyKey string, update func(*Record, *Ledger)
 func (g *Gate) loadLocked() (Ledger, error) {
 	data, err := os.ReadFile(g.path)
 	if errors.Is(err, os.ErrNotExist) {
-		return Ledger{SchemaVersion: SchemaVersion, BatchID: g.plan.BatchID, Records: make(map[string]*Record)}, nil
+		return Ledger{SchemaVersion: LedgerSchemaVersion, BatchID: g.plan.BatchID, Records: make(map[string]*Record)}, nil
 	}
 	if err != nil {
 		return Ledger{}, fmt.Errorf("read stage 1 ledger: %w", err)
@@ -412,11 +422,117 @@ func (g *Gate) loadLocked() (Ledger, error) {
 	var ledger Ledger
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&ledger); err != nil || ledger.SchemaVersion != SchemaVersion ||
+	if err := decoder.Decode(&ledger); err != nil || ledger.SchemaVersion != LedgerSchemaVersion ||
 		ledger.BatchID != g.plan.BatchID || ledger.Records == nil {
 		return Ledger{}, errors.New("stage 1 ledger is invalid or bound to another batch")
 	}
+	if err := validateLedgerDerivedState(ledger); err != nil {
+		return Ledger{}, err
+	}
 	return ledger, nil
+}
+
+type derivedLedgerState struct {
+	videoTokens         int64
+	afpMilli            int64
+	cashMicros          int64
+	safetyFailures      int
+	terminalSequence    int64
+	terminalRecordCount int64
+}
+
+func deriveLedgerState(ledger Ledger) (derivedLedgerState, error) {
+	derived := derivedLedgerState{}
+	terminalRecords := make([]*Record, 0, len(ledger.Records))
+	sequences := make(map[int64]struct{}, len(ledger.Records))
+	for key, record := range ledger.Records {
+		if record == nil || record.IdempotencyKey != key {
+			return derivedLedgerState{}, errors.New("stage 1 ledger record identity is invalid")
+		}
+		if terminalState(record.State) {
+			if record.TerminalSequence <= 0 || strings.TrimSpace(record.ProviderTaskID) == "" ||
+				record.ActualVideoTokens < 0 || record.ActualAFPMilli < 0 || record.ActualCashMicros < 0 {
+				return derivedLedgerState{}, errors.New("stage 1 terminal record is incomplete")
+			}
+			if record.State == "TERMINAL_SUCCEEDED" && record.ContentSafetyFailed {
+				return derivedLedgerState{}, errors.New("stage 1 terminal record has an invalid safety outcome")
+			}
+			if _, duplicate := sequences[record.TerminalSequence]; duplicate {
+				return derivedLedgerState{}, errors.New("stage 1 terminal sequence is duplicated")
+			}
+			sequences[record.TerminalSequence] = struct{}{}
+			terminalRecords = append(terminalRecords, record)
+			var err error
+			if derived.videoTokens, err = addUsage(derived.videoTokens, record.ActualVideoTokens); err != nil {
+				return derivedLedgerState{}, err
+			}
+			if derived.afpMilli, err = addUsage(derived.afpMilli, record.ActualAFPMilli); err != nil {
+				return derivedLedgerState{}, err
+			}
+			if derived.cashMicros, err = addUsage(derived.cashMicros, record.ActualCashMicros); err != nil {
+				return derivedLedgerState{}, err
+			}
+			if record.TerminalSequence > derived.terminalSequence {
+				derived.terminalSequence = record.TerminalSequence
+			}
+			continue
+		}
+		if record.TerminalSequence != 0 || record.State != "PREPARED" && record.State != "AMBIGUOUS" {
+			return derivedLedgerState{}, errors.New("stage 1 non-terminal record has an invalid state")
+		}
+		var err error
+		if derived.videoTokens, err = addUsage(derived.videoTokens, record.EstimatedVideoTokens); err != nil {
+			return derivedLedgerState{}, err
+		}
+		if derived.afpMilli, err = addUsage(derived.afpMilli, record.PredictedAFPMilli); err != nil {
+			return derivedLedgerState{}, err
+		}
+		if derived.cashMicros, err = addUsage(derived.cashMicros, record.EstimatedNonSubscriptionCashMicros); err != nil {
+			return derivedLedgerState{}, err
+		}
+	}
+	derived.terminalRecordCount = int64(len(terminalRecords))
+	if derived.terminalSequence != derived.terminalRecordCount {
+		return derivedLedgerState{}, errors.New("stage 1 terminal sequence is not contiguous")
+	}
+	sort.Slice(terminalRecords, func(i, j int) bool {
+		return terminalRecords[i].TerminalSequence < terminalRecords[j].TerminalSequence
+	})
+	for _, record := range terminalRecords {
+		if record.ContentSafetyFailed {
+			derived.safetyFailures++
+		} else {
+			derived.safetyFailures = 0
+		}
+	}
+	return derived, nil
+}
+
+func recalculateLedger(ledger *Ledger) error {
+	derived, err := deriveLedgerState(*ledger)
+	if err != nil {
+		return err
+	}
+	ledger.ReservedVideoTokens = derived.videoTokens
+	ledger.ReservedAFPMilli = derived.afpMilli
+	ledger.ReservedCashMicros = derived.cashMicros
+	ledger.ConsecutiveSafetyFailures = derived.safetyFailures
+	ledger.NextTerminalSequence = derived.terminalSequence
+	return nil
+}
+
+func validateLedgerDerivedState(ledger Ledger) error {
+	derived, err := deriveLedgerState(ledger)
+	if err != nil {
+		return err
+	}
+	if ledger.ReservedVideoTokens != derived.videoTokens || ledger.ReservedAFPMilli != derived.afpMilli ||
+		ledger.ReservedCashMicros != derived.cashMicros ||
+		ledger.ConsecutiveSafetyFailures != derived.safetyFailures ||
+		ledger.NextTerminalSequence != derived.terminalSequence {
+		return errors.New("stage 1 ledger derived state does not match its immutable records")
+	}
+	return nil
 }
 
 func (g *Gate) saveLocked(ledger Ledger) error {
@@ -568,4 +684,25 @@ func sameAttempt(a, b Attempt) bool {
 	left, _ := json.Marshal(a)
 	right, _ := json.Marshal(b)
 	return string(left) == string(right)
+}
+
+func sameCompletion(record *Record, completion Completion) bool {
+	return record.ProviderTaskID == completion.ProviderTaskID &&
+		record.State == completion.State &&
+		record.ActualVideoTokens == completion.ActualVideoTokens &&
+		record.ActualAFPMilli == completion.ActualAFPMilli &&
+		record.ActualCashMicros == completion.ActualCashMicros &&
+		record.EvidenceComplete == completion.EvidenceComplete &&
+		record.ContentSafetyFailed == completion.ContentSafetyFailed
+}
+
+func terminalState(state string) bool {
+	return state == "TERMINAL_SUCCEEDED" || state == "TERMINAL_FAILED"
+}
+
+func addUsage(current, value int64) (int64, error) {
+	if current < 0 || value < 0 || current > math.MaxInt64-value {
+		return 0, errors.New("stage 1 ledger usage overflow")
+	}
+	return current + value, nil
 }

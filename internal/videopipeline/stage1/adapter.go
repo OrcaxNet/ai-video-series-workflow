@@ -29,7 +29,7 @@ func (s *AdapterSubmitter) Recover(
 	ctx context.Context,
 	idempotencyKey string,
 ) (RecoveryResult, error) {
-	response, err := mockprovider.Get(ctx, s.client, s.endpoint, idempotencyKey)
+	response, err := s.Lookup(ctx, idempotencyKey)
 	if providercontract.ErrorCodeOf(err) == providercontract.CodeNotFound {
 		return RecoveryResult{}, nil
 	}
@@ -40,6 +40,18 @@ func (s *AdapterSubmitter) Recover(
 		return RecoveryResult{}, providerError(providercontract.CodeConflict, "recovered provider job does not match the idempotency key")
 	}
 	return RecoveryResult{Found: true, ProviderTaskID: response.UpstreamTaskID}, nil
+}
+
+// Lookup returns the adapter's durable job view without submitting. The Stage
+// 1 runner uses it both for pre-submit recovery and for terminal completion.
+func (s *AdapterSubmitter) Lookup(
+	ctx context.Context,
+	idempotencyKey string,
+) (providercontract.JobResponse, error) {
+	if strings.TrimSpace(idempotencyKey) == "" {
+		return providercontract.JobResponse{}, providerError(providercontract.CodeInvalidRequest, "provider job idempotency key is required")
+	}
+	return mockprovider.Get(ctx, s.client, s.endpoint, idempotencyKey)
 }
 
 func (s *AdapterSubmitter) Submit(
