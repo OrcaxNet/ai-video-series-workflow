@@ -133,7 +133,7 @@ func speechV2Request(t *testing.T) SpeechRequest {
 				LicenseSnapshotID:    "10400000-0000-4000-8000-000000000012",
 				LicenseSnapshotHash:  strings.Repeat("b", 64),
 				Provider:             "volcengine_ark", ModelID: "doubao-seed-tts-2.0",
-				ResourceID: "seed-tts-2.0", Speaker: "zh_female_tianmeitaozi_mars_bigtts",
+				ResourceID: "seed-tts-2.0", Speaker: "zh_female_vv_uranus_bigtts",
 			},
 			AuthorizedCueID: "cue-001", MaximumAFPMilli: 2_228,
 			MaximumNonSubscriptionCashMicros: 0, MaxAttempts: 1,

@@ -74,8 +74,10 @@ func (input SpeechVoiceRevisionInput) Validate(parent stage1.ExecutionPackage) e
 		return errors.New("speech voice revision routeVersion is invalid")
 	case input.ResourceID != volcengineprovider.AgentPlanTTSResourceID:
 		return errors.New("speech voice revision resourceId is invalid")
-	case strings.TrimSpace(input.Speaker) == "" || strings.TrimSpace(input.AuthorizedCueID) == "":
-		return errors.New("speech voice revision speaker and authorized cue are required")
+	case input.Speaker != volcengineprovider.AgentPlanTTSSpeakerID:
+		return errors.New("speech voice revision must use the approved TTS 2.0 speaker")
+	case strings.TrimSpace(input.AuthorizedCueID) == "":
+		return errors.New("speech voice revision authorized cue is required")
 	case strings.TrimSpace(input.PlanName) == "" || strings.TrimSpace(input.PricingVersion) == "":
 		return errors.New("speech voice revision plan and pricing versions are required")
 	case input.MaximumAFPMilli <= 0 || input.MaximumNonSubscriptionCashMicros != 0:
@@ -89,6 +91,10 @@ func (input SpeechVoiceRevisionInput) Validate(parent stage1.ExecutionPackage) e
 	}
 	if _, err := uuid.Parse(input.ParentVoiceAssetVersionID); err != nil {
 		return errors.New("parent voice asset version must be a UUID")
+	}
+	if parent.PostProduction.Config.SpeechVoice != nil &&
+		input.ParentVoiceAssetVersionID != parent.PostProduction.Config.SpeechVoice.AssetVersionID {
+		return errors.New("speech voice revision must extend the current execution package voice")
 	}
 	return nil
 }
@@ -194,6 +200,7 @@ func RevoiceStage1(
 		PricingVersion: input.PricingVersion,
 	}
 	capabilityHash := volcengineprovider.AgentPlanTTSCapabilityHash(adapterConfig)
+	profileDisplayName := "FLO-104 Agent Plan speech v2 " + revisionInputHash[:12]
 	route := providercontract.ModelSnapshot{
 		CapabilityAlias: string(providercontract.CapabilitySpeech),
 		Provider:        "VOLCENGINE", ModelID: input.ModelID,
@@ -309,10 +316,10 @@ func RevoiceStage1(
 		INSERT INTO video_pipeline.provider_profiles
 			(id, provider, display_name, base_url_ref, credential_ref,
 			 enabled, mode, health, config_hash)
-		VALUES ($1, 'VOLCENGINE', 'FLO-104 Agent Plan speech v2', $2,
-		        'env:ARK_API_KEY', true, 'LIVE', 'READY', $3)
+		VALUES ($1, 'VOLCENGINE', $2, $3,
+		        'env:ARK_API_KEY', true, 'LIVE', 'READY', $4)
 		ON CONFLICT DO NOTHING`,
-		providerProfileID, input.Endpoint, capabilityHash,
+		providerProfileID, profileDisplayName, input.Endpoint, capabilityHash,
 	); err != nil {
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("insert speech-v2 provider profile: %w", err)
 	}
@@ -321,12 +328,12 @@ func RevoiceStage1(
 		SELECT 1
 		FROM video_pipeline.provider_profiles
 		WHERE id = $1 AND provider = 'VOLCENGINE'
-		  AND display_name = 'FLO-104 Agent Plan speech v2'
-		  AND base_url_ref = $2 AND credential_ref = 'env:ARK_API_KEY'
+		  AND display_name = $2
+		  AND base_url_ref = $3 AND credential_ref = 'env:ARK_API_KEY'
 		  AND enabled AND mode = 'LIVE' AND health = 'READY'
-		  AND config_hash = $3
+		  AND config_hash = $4
 		FOR SHARE`,
-		providerProfileID, input.Endpoint, capabilityHash,
+		providerProfileID, profileDisplayName, input.Endpoint, capabilityHash,
 	).Scan(&verifiedProfile); err != nil {
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("verify speech-v2 provider profile: %w", err)
 	}

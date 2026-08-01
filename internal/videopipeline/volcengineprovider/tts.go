@@ -23,6 +23,7 @@ const (
 	AgentPlanTTSResourceID   = "seed-tts-2.0"
 	AgentPlanTTSModelID      = "doubao-seed-tts-2.0"
 	AgentPlanTTSEndpoint     = runtimeconfig.AgentPlanTTSEndpoint
+	AgentPlanTTSSpeakerID    = runtimeconfig.AgentPlanTTSSpeakerID
 	AgentPlanTTSRouteVersion = "agent-plan-large-tts-v2"
 	AgentPlanTTSMaxChars     = 600
 	ttsAFPMilliPerChar       = 135

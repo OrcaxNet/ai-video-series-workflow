@@ -104,6 +104,10 @@ func New(
 	if provider == nil || store == nil {
 		return nil, errors.New("live provider and artifact store are required")
 	}
+	if (options.Speech != nil || config.SpeechSpeaker != "") &&
+		config.SpeechSpeaker != AgentPlanTTSSpeakerID {
+		return nil, errors.New("live Adapter requires the approved TTS 2.0 speaker")
+	}
 	client := options.DownloadClient
 	if client == nil {
 		client = &http.Client{Timeout: config.DownloadTimeout}

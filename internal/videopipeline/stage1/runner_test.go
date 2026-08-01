@@ -973,17 +973,21 @@ func testSpeechV2ExecutionPackage(t *testing.T, parent ExecutionPackage) Executi
 	revised.PostProduction.RunIDs = append([]string(nil), parent.PostProduction.RunIDs...)
 	revised.ParentExecutionPackageHash = parent.ContentHash
 	revised.PostProduction.Config.SpeechIdentityVersion = postproduction.SpeechIdentityV2
+	parentVoiceVersionID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v1-version")).String()
+	if parent.PostProduction.Config.SpeechVoice != nil {
+		parentVoiceVersionID = parent.PostProduction.Config.SpeechVoice.AssetVersionID
+	}
 	revised.PostProduction.Config.SpeechVoice = &postproduction.SpeechVoiceBinding{
 		AssetID:              uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-asset")).String(),
-		ParentAssetVersionID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v1-version")).String(),
-		AssetVersionID:       uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-version")).String(),
+		ParentAssetVersionID: parentVoiceVersionID,
+		AssetVersionID:       uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-version:"+parent.ContentHash)).String(),
 		AssetVersionHash:     strings.Repeat("e", 64),
-		LicenseSnapshotID:    uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-license")).String(),
+		LicenseSnapshotID:    uuid.NewSHA1(uuid.NameSpaceOID, []byte("stage1-speech-v2-license:"+parent.ContentHash)).String(),
 		LicenseSnapshotHash:  strings.Repeat("f", 64),
 		Provider:             "volcengine_ark",
 		ModelID:              revised.PostProduction.Config.SpeechRoute.ModelID,
 		ResourceID:           "seed-tts-2.0",
-		Speaker:              "zh_female_tianmeitaozi_mars_bigtts",
+		Speaker:              "zh_female_vv_uranus_bigtts",
 	}
 	revised.PostProduction.Config.SpeechAuthorizedCueID = "cue-001"
 	revised.PostProduction.Config.SpeechMaximumAFPMilli = 2_228

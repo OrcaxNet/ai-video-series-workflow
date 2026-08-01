@@ -48,9 +48,15 @@ attempt。
 ## speech-v2 单镜 canary 修订
 
 已成功的十个视频 Run、旧 VOICE 版本以及旧 speech job/reconciliation 永久只读。新的
-speech-v2 包通过 `video-stage1-revoice` 派生一个 APPROVED VOICE child version、对应
+speech-v2 包通过 `video-stage1-revoice` 从当前包和当前 VOICE 派生一个 APPROVED child
+version、对应
 ALLOWED license snapshot、`agent-plan-large-tts-v2` capability 与新的 execution package；
 命令不接收 Adapter URL、没有 Provider client，并断言运行前后 `provider_jobs` 数量不变。
+FLO-104 当前只接受 `zh_female_vv_uranus_bigtts`（vivi 2.0）；旧 Mars speaker 或任意其他
+speaker 在配置加载、物化输入和 Adapter 构造阶段失败关闭。
+当已有失败 canary 时，新 package 的 VOICE `parentAssetVersionId` 必须精确等于当前 package
+的 VOICE version；PostgreSQL 递归验证这条 APPROVED 谱系最终回到镜头原始批准 VOICE，
+既不允许跳过当前 VOICE，也不允许跨 asset 分叉。
 
 ```bash
 make video-stage1-revoice-test
@@ -85,11 +91,13 @@ route/profile/预算审批、基础 speech 预算、字幕、背景音和其余�
 父包只给 hash、不提供完整 artifact，或任何非语音字段漂移，均在首次 ledger 写入和 Provider
 调用前失败关闭。父/子文件必须使用不同路径，不能用 child 覆盖父包。
 
-通过完整父子投影验证后，Runner 只会在原 package 的十个视频记录全部为
+通过完整父子投影验证后，Runner 只会在当前 package 的十个视频记录全部为
 `TERMINAL_SUCCEEDED` 且证据完整、主 job 身份与额度逐项未变、
-不存在 controlled retry 时，于同一文件锁内把 ledger 提升到 child package；旧 hash 永久写入
-`supersededExecutionPackageHash`。该提升只允许一次并可幂等重放，缺镜、失败/证据不全、
-Attempt 漂移、错误 parent 或第二个 child 均在启动 TTS 前失败关闭。这样 VOICE 修订不会要求
+不存在 controlled retry 时，于同一文件锁内把 ledger 线性提升到 child package；立即父 hash
+写入 `supersededExecutionPackageHash`，完整有序历史写入
+`supersededExecutionPackageHashes`。同一 child 可幂等重放；同一 parent 的竞争 child、分叉、
+缺镜、失败/证据不全、Attempt 漂移或错误 parent 均在启动 TTS 前失败关闭。只有新的明确批准
+才能从当前 child 再派生一个 child。这样 VOICE 修订不会要求
 重提已完成视频，也不能把任意后期包替换到已有视频证据上。物化事务同时写入独立的
 `stage1.execution_package.revision_bound` 审计，以 parent/child package hash、VOICE version
 和批准评论固定这次只改后期语音合同的派生关系；旧 VOICE 修订审计保持只读。

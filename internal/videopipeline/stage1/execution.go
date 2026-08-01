@@ -192,11 +192,14 @@ func (p ExecutionPackage) ValidateSpeechV2Revision(plan Plan, parent ExecutionPa
 	if err := p.Validate(plan); err != nil {
 		return fmt.Errorf("validate child execution package: %w", err)
 	}
-	if parent.ParentExecutionPackageHash != "" {
-		return errors.New("stage 1 package revision parent must be an original execution package")
-	}
 	if p.ParentExecutionPackageHash != parent.ContentHash {
 		return errors.New("stage 1 package revision is bound to another parent artifact")
+	}
+	if parent.PostProduction.Config.SpeechVoice != nil &&
+		(p.PostProduction.Config.SpeechVoice == nil ||
+			p.PostProduction.Config.SpeechVoice.ParentAssetVersionID !=
+				parent.PostProduction.Config.SpeechVoice.AssetVersionID) {
+		return errors.New("stage 1 package revision voice does not extend the current parent voice")
 	}
 
 	expected := parent

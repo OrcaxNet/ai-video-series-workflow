@@ -175,6 +175,25 @@ func TestSpeechV2RevisionRejectsEveryFrozenNonSpeechProjection(t *testing.T) {
 	}
 }
 
+func TestSpeechV2RevisionMustExtendCurrentVoice(t *testing.T) {
+	t.Parallel()
+	parent := testExecutionPackage(t)
+	first := testSpeechV2ExecutionPackage(t, parent)
+	second := testSpeechV2ExecutionPackage(t, first)
+	second.PostProduction.Config.SpeechVoice.ParentAssetVersionID =
+		first.PostProduction.Config.SpeechVoice.ParentAssetVersionID
+	second, err := SealExecutionPackage(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Validate(testPlan()); err != nil {
+		t.Fatalf("voice lineage probe must remain a well-formed standalone package: %v", err)
+	}
+	if err := second.ValidateSpeechV2Revision(testPlan(), first); err == nil {
+		t.Fatal("speech revision skipped the current parent voice")
+	}
+}
+
 func TestControlledRetryPackageBindsNewIdentityApprovalAndFinalizationRun(t *testing.T) {
 	t.Parallel()
 	primary := testExecutionPackage(t)

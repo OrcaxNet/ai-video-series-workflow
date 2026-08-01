@@ -152,6 +152,7 @@ func TestGatePromotesOneSpeechV2PackageAfterAllPrimaryVideoSuccess(t *testing.T)
 	ledger := readTestLedger(t, path)
 	if ledger.ExecutionPackageHash != revised.ContentHash ||
 		ledger.SupersededExecutionPackageHash != parent.ContentHash ||
+		!equalOrderedStrings(ledger.SupersededExecutionPackageHashes, []string{parent.ContentHash}) ||
 		len(ledger.Records) != RequiredPrimaryJobs {
 		t.Fatalf("revised stage 1 ledger = %#v", ledger)
 	}
@@ -171,15 +172,21 @@ func TestGatePromotesOneSpeechV2PackageAfterAllPrimaryVideoSuccess(t *testing.T)
 	if err := restarted.BindExecutionPackage(parent.ContentHash); err == nil {
 		t.Fatal("superseded parent execution package unexpectedly rebound")
 	}
-	second := revised
-	second.ParentExecutionPackageHash = revised.ContentHash
-	second.PostProduction.TraceID += "-second"
-	second, err = SealExecutionPackage(second)
-	if err != nil {
-		t.Fatal(err)
+	second := testSpeechV2ExecutionPackage(t, revised)
+	if err := restarted.BindExecutionPackageRevision(second, revised); err != nil {
+		t.Fatalf("linear second package revision: %v", err)
 	}
-	if err := restarted.BindExecutionPackageRevision(second, revised); providercontract.ErrorCodeOf(err) != providercontract.CodeConflict {
-		t.Fatalf("second package revision error = %v", err)
+	if err := restarted.BindExecutionPackageRevision(second, revised); err != nil {
+		t.Fatalf("idempotent linear second package revision: %v", err)
+	}
+	ledger = readTestLedger(t, path)
+	if ledger.ExecutionPackageHash != second.ContentHash ||
+		ledger.SupersededExecutionPackageHash != revised.ContentHash ||
+		!equalOrderedStrings(
+			ledger.SupersededExecutionPackageHashes,
+			[]string{parent.ContentHash, revised.ContentHash},
+		) {
+		t.Fatalf("linearly revised stage 1 ledger = %#v", ledger)
 	}
 }
 

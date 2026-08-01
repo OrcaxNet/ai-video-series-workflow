@@ -155,17 +155,21 @@ type Record struct {
 }
 
 type Ledger struct {
-	SchemaVersion                  string             `json:"schemaVersion"`
-	BatchID                        string             `json:"batchId"`
-	ExecutionPackageHash           string             `json:"executionPackageHash"`
-	SupersededExecutionPackageHash string             `json:"supersededExecutionPackageHash,omitempty"`
-	ControlledRetryPackageHash     string             `json:"controlledRetryPackageHash,omitempty"`
-	Records                        map[string]*Record `json:"records"`
-	ReservedVideoTokens            int64              `json:"reservedVideoTokens"`
-	ReservedAFPMilli               int64              `json:"reservedAfpMilli"`
-	ReservedCashMicros             int64              `json:"reservedCashMicros"`
-	ConsecutiveSafetyFailures      int                `json:"consecutiveContentSafetyFailures"`
-	NextTerminalSequence           int64              `json:"nextTerminalSequence"`
+	SchemaVersion                  string `json:"schemaVersion"`
+	BatchID                        string `json:"batchId"`
+	ExecutionPackageHash           string `json:"executionPackageHash"`
+	SupersededExecutionPackageHash string `json:"supersededExecutionPackageHash,omitempty"`
+	// SupersededExecutionPackageHashes preserves the complete ordered lineage
+	// when an explicitly approved speech correction follows an earlier terminal
+	// canary. The singular field remains the immediate parent for compatibility.
+	SupersededExecutionPackageHashes []string           `json:"supersededExecutionPackageHashes,omitempty"`
+	ControlledRetryPackageHash       string             `json:"controlledRetryPackageHash,omitempty"`
+	Records                          map[string]*Record `json:"records"`
+	ReservedVideoTokens              int64              `json:"reservedVideoTokens"`
+	ReservedAFPMilli                 int64              `json:"reservedAfpMilli"`
+	ReservedCashMicros               int64              `json:"reservedCashMicros"`
+	ConsecutiveSafetyFailures        int                `json:"consecutiveContentSafetyFailures"`
+	NextTerminalSequence             int64              `json:"nextTerminalSequence"`
 }
 
 type Decision string
@@ -241,8 +245,8 @@ func (g *Gate) BindExecutionPackage(contentHash string) error {
 // BindExecutionPackageRevision atomically promotes one speech-v2-only child
 // package after comparing it with the complete immutable parent artifact and
 // confirming all ten primary video jobs have evidence-complete successful
-// terminal records. The parent binding is retained in the ledger, and no
-// controlled retry or second package revision may cross this boundary.
+// terminal records. Every superseded binding is retained in order; another
+// explicitly approved child may only extend the currently bound package.
 //
 // parentArtifact is variadic only to keep older callers source-compatible:
 // promotion fails closed unless exactly one complete parent package is given.
@@ -269,16 +273,20 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArt
 		if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
 			return UnverifiableRevisionParentError(err)
 		}
-		if ledger.SupersededExecutionPackageHash != package_.ParentExecutionPackageHash {
+		if ledger.SupersededExecutionPackageHash != package_.ParentExecutionPackageHash ||
+			latestSupersededExecutionPackageHash(ledger) != package_.ParentExecutionPackageHash {
 			return UnverifiableRevisionParentError(errors.New("stage 1 ledger revision parent binding is invalid"))
 		}
 		g.executionPackageHash = package_.ContentHash
 		return nil
 	}
-	if ledger.SupersededExecutionPackageHash != "" {
-		return providerError(providercontract.CodeConflict, "stage 1 ledger already consumed its package revision")
-	}
 	if ledger.ExecutionPackageHash != package_.ParentExecutionPackageHash {
+		if containsExecutionPackageHash(
+			ledger.SupersededExecutionPackageHashes,
+			package_.ParentExecutionPackageHash,
+		) || ledger.SupersededExecutionPackageHash == package_.ParentExecutionPackageHash {
+			return providerError(providercontract.CodeConflict, "stage 1 ledger already consumed this package revision parent")
+		}
 		return UnverifiableRevisionParentError(errors.New("stage 1 ledger is not bound to the revision parent package"))
 	}
 	if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
@@ -298,6 +306,17 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArt
 		}
 	}
 
+	if len(ledger.SupersededExecutionPackageHashes) == 0 &&
+		ledger.SupersededExecutionPackageHash != "" {
+		ledger.SupersededExecutionPackageHashes = append(
+			ledger.SupersededExecutionPackageHashes,
+			ledger.SupersededExecutionPackageHash,
+		)
+	}
+	ledger.SupersededExecutionPackageHashes = append(
+		ledger.SupersededExecutionPackageHashes,
+		package_.ParentExecutionPackageHash,
+	)
 	ledger.SupersededExecutionPackageHash = package_.ParentExecutionPackageHash
 	ledger.ExecutionPackageHash = package_.ContentHash
 	g.executionPackageHash = package_.ContentHash
@@ -306,6 +325,22 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArt
 		return err
 	}
 	return nil
+}
+
+func latestSupersededExecutionPackageHash(ledger Ledger) string {
+	if count := len(ledger.SupersededExecutionPackageHashes); count > 0 {
+		return ledger.SupersededExecutionPackageHashes[count-1]
+	}
+	return ledger.SupersededExecutionPackageHash
+}
+
+func containsExecutionPackageHash(hashes []string, candidate string) bool {
+	for _, hash := range hashes {
+		if hash == candidate {
+			return true
+		}
+	}
+	return false
 }
 
 // BindControlledRetryPackage persists the one post-failure extension without
@@ -629,6 +664,20 @@ func (g *Gate) loadLocked() (Ledger, error) {
 		(!validLowerDigest(ledger.SupersededExecutionPackageHash) ||
 			ledger.SupersededExecutionPackageHash == ledger.ExecutionPackageHash) {
 		return Ledger{}, errors.New("stage 1 ledger superseded package binding is invalid")
+	}
+	seenSuperseded := make(map[string]struct{}, len(ledger.SupersededExecutionPackageHashes))
+	for _, hash := range ledger.SupersededExecutionPackageHashes {
+		if !validLowerDigest(hash) || hash == ledger.ExecutionPackageHash {
+			return Ledger{}, errors.New("stage 1 ledger superseded package history is invalid")
+		}
+		if _, duplicate := seenSuperseded[hash]; duplicate {
+			return Ledger{}, errors.New("stage 1 ledger superseded package history is duplicated")
+		}
+		seenSuperseded[hash] = struct{}{}
+	}
+	if len(ledger.SupersededExecutionPackageHashes) > 0 &&
+		latestSupersededExecutionPackageHash(ledger) != ledger.SupersededExecutionPackageHash {
+		return Ledger{}, errors.New("stage 1 ledger superseded package history does not match its immediate parent")
 	}
 	if err := validateLedgerDerivedState(ledger); err != nil {
 		return Ledger{}, err

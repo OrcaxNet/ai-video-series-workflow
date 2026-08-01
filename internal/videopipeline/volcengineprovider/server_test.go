@@ -86,6 +86,23 @@ func (p *fakeProvider) Submit(_ context.Context, request providercontract.Genera
 	}, nil
 }
 
+func TestNewRejectsUnapprovedTTSSpeakerBeforeProviderUse(t *testing.T) {
+	t.Parallel()
+	provider := &fakeProvider{}
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := testLiveConfig()
+	config.SpeechSpeaker = "zh_female_tianmeitaozi_mars_bigtts"
+	if _, err := New(config, provider, store, Options{}); err == nil {
+		t.Fatal("live Adapter accepted an unapproved TTS speaker")
+	}
+	if submits, polls, cancels := provider.counts(); submits != 0 || polls != 0 || cancels != 0 {
+		t.Fatalf("Provider calls = submit %d, poll %d, cancel %d", submits, polls, cancels)
+	}
+}
+
 func TestServer_ResolvesCASVisualInputAndOmitsVoiceDescriptorBeforeSubmit(t *testing.T) {
 	t.Parallel()
 	provider := &fakeProvider{}
@@ -735,7 +752,7 @@ func testLiveConfig() runtimeconfig.VolcengineProvider {
 		VideoModel: "doubao-seedance-2.0", PlanName: "agent-plan-large",
 		PricingVersion: "agent-plan-large-included-v1", Currency: "CNY",
 		SpeechEndpoint: AgentPlanTTSEndpoint, SpeechModel: AgentPlanTTSModelID,
-		SpeechSpeaker:    "zh_female_tianmeitaozi_mars_bigtts",
+		SpeechSpeaker:    AgentPlanTTSSpeakerID,
 		MaxDownloadBytes: 1 << 20, DownloadTimeout: 5 * time.Second,
 		ServiceAuthSecret: testServiceAuthSecret,
 	}

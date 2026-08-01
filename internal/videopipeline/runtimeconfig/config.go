@@ -22,7 +22,13 @@ type LookupEnv func(string) (string, bool)
 // Agent Plan. The standard OpenSpeech route is intentionally not accepted:
 // using it can bypass plan attribution and create an unauthenticated or
 // separately billed request.
-const AgentPlanTTSEndpoint = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
+const (
+	AgentPlanTTSEndpoint = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
+	// AgentPlanTTSSpeakerID is the TTS 2.0 voice explicitly approved for the
+	// FLO-104 canary. Keeping it beside the endpoint lets configuration reject
+	// a mismatched speaker before constructing the live Adapter.
+	AgentPlanTTSSpeakerID = "zh_female_vv_uranus_bigtts"
+)
 
 // ControlPlane configures the video control-plane health/API process.
 type ControlPlane struct {
@@ -243,7 +249,7 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 		VideoModel:                     value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
 		SpeechEndpoint:                 value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", AgentPlanTTSEndpoint),
 		SpeechModel:                    "doubao-seed-tts-2.0",
-		SpeechSpeaker:                  value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", "zh_female_tianmeitaozi_mars_bigtts"),
+		SpeechSpeaker:                  value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", AgentPlanTTSSpeakerID),
 		SpeechRetryJobID:               value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID", ""),
 		SpeechRetryRecord:              value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256", ""),
 		SpeechCanaryJobID:              value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID", ""),
@@ -293,6 +299,9 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	}
 	if cfg.SpeechEndpoint != AgentPlanTTSEndpoint {
 		return VolcengineProvider{}, errors.New("VIDEO_VOLCENGINE_TTS_ENDPOINT must use the exact Agent Plan subscription endpoint")
+	}
+	if cfg.SpeechSpeaker != AgentPlanTTSSpeakerID {
+		return VolcengineProvider{}, errors.New("VIDEO_VOLCENGINE_TTS_SPEAKER must use the approved TTS 2.0 speaker")
 	}
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return VolcengineProvider{}, errors.New("ARK_API_KEY is required for the live provider adapter")

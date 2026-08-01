@@ -2609,11 +2609,19 @@ func (p *Postgres) PrepareEpisodePostProduction(
 				if strings.TrimSpace(shotCues[cueIndex].VoiceRef) == "" {
 					continue
 				}
-				if shotCues[cueIndex].VoiceRef != input.Config.SpeechVoice.ParentAssetVersionID {
+				matched, err := p.voiceVersionDescendsFrom(
+					ctx,
+					input.Config.SpeechVoice.ParentAssetVersionID,
+					shotCues[cueIndex].VoiceRef,
+				)
+				if err != nil {
+					return postproduction.Request{}, err
+				}
+				if !matched {
 					return postproduction.Request{}, controlplane.NewPolicyError(
 						controlplane.CodeLicenseBlocked,
-						"speech-v2 parent voice does not match the approved shot binding",
-						"create the voice revision from the exact approved parent asset",
+						"speech-v2 parent voice does not descend from the approved shot binding",
+						"create a linear approved voice revision from the current package voice",
 					)
 				}
 				shotCues[cueIndex].VoiceRef = input.Config.SpeechVoice.AssetVersionID
@@ -4574,6 +4582,41 @@ func collectVoiceAssetBindings(
 		result[voiceAssetID] = struct{}{}
 	}
 	return nil
+}
+
+func (p *Postgres) voiceVersionDescendsFrom(
+	ctx context.Context,
+	candidateParentVersionID string,
+	approvedShotVersionID string,
+) (bool, error) {
+	candidateID, err := uuid.Parse(candidateParentVersionID)
+	if err != nil {
+		return false, errors.New("speech parent voice asset version must be a UUID")
+	}
+	approvedID, err := uuid.Parse(approvedShotVersionID)
+	if err != nil {
+		return false, errors.New("approved shot voice asset version must be a UUID")
+	}
+	var matched bool
+	if err := p.pool.QueryRow(ctx, `
+		WITH RECURSIVE voice_lineage(id, parent_revision_id, asset_id) AS (
+			SELECT id, parent_revision_id, asset_id
+			FROM video_pipeline.asset_versions
+			WHERE id = $1 AND status = 'APPROVED'
+			UNION
+			SELECT parent.id, parent.parent_revision_id, parent.asset_id
+			FROM video_pipeline.asset_versions parent
+			JOIN voice_lineage child
+			  ON child.parent_revision_id = parent.id
+			 AND child.asset_id = parent.asset_id
+			WHERE parent.status = 'APPROVED'
+		)
+		SELECT EXISTS(SELECT 1 FROM voice_lineage WHERE id = $2)`,
+		candidateID, approvedID,
+	).Scan(&matched); err != nil {
+		return false, fmt.Errorf("validate speech voice ancestry: %w", err)
+	}
+	return matched, nil
 }
 
 type speechConfigurationQueryer interface {
