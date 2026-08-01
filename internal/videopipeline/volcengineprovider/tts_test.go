@@ -19,6 +19,18 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 )
 
+func TestAgentPlanTTS_DefaultEndpointUsesDocumentedV3ChunkedPath(t *testing.T) {
+	t.Parallel()
+	client, err := NewAgentPlanTTS(AgentPlanTTSConfig{APIKey: "fixture-key"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+	if client.endpoint != want {
+		t.Fatalf("default endpoint = %q, want %q", client.endpoint, want)
+	}
+}
+
 func TestAgentPlanTTS_UsesFixedPlanContractAndReturnsAuditableUsage(t *testing.T) {
 	t.Parallel()
 	credential := strings.Join([]string{"runtime", "plan", "credential"}, "-")

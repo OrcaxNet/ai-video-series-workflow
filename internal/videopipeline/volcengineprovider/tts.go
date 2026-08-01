@@ -20,7 +20,7 @@ import (
 const (
 	AgentPlanTTSResourceID = "seed-tts-2.0"
 	AgentPlanTTSModelID    = "doubao-seed-tts-2.0"
-	AgentPlanTTSEndpoint   = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
+	AgentPlanTTSEndpoint   = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
 	AgentPlanTTSMaxChars   = 600
 	ttsAFPMilliPerChar     = 135
 	defaultMaxSpeechBytes  = 32 << 20

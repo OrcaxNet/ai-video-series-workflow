@@ -135,7 +135,7 @@ func TestLoadVolcengineProviderRequiresExplicitKeyAndUsesAgentPlanDefaults(t *te
 	}
 	if cfg.BaseURL != "https://ark.cn-beijing.volces.com/api/plan/v3" ||
 		cfg.VideoModel != "doubao-seedance-2.0" || cfg.PlanName != "agent-plan-large" ||
-		cfg.SpeechEndpoint != "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional" ||
+		cfg.SpeechEndpoint != "https://openspeech.bytedance.com/api/v3/tts/unidirectional" ||
 		cfg.SpeechModel != "doubao-seed-tts-2.0" || cfg.SpeechSpeaker != "zh_female_vv_uranus_bigtts" ||
 		cfg.APIKey != "test-runtime-credential" || cfg.ServiceAuthSecret != "test-service-auth-secret-32-bytes-long" ||
 		cfg.MaxDownloadBytes != 256<<20 || cfg.MaxSpeechBytes != 32<<20 {

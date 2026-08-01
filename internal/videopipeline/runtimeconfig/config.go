@@ -220,7 +220,7 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 		ServiceAuthSecret: value(lookup, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
 		Region:            value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
 		VideoModel:        value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
-		SpeechEndpoint:    value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"),
+		SpeechEndpoint:    value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", "https://openspeech.bytedance.com/api/v3/tts/unidirectional"),
 		SpeechModel:       "doubao-seed-tts-2.0",
 		SpeechSpeaker:     value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", "zh_female_vv_uranus_bigtts"),
 		PlanName:          value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),

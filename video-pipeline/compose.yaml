@@ -124,7 +124,7 @@ services:
       VIDEO_VOLCENGINE_BASE_URL: https://ark.cn-beijing.volces.com/api/plan/v3
       VIDEO_VOLCENGINE_REGION: cn-beijing
       VIDEO_VOLCENGINE_VIDEO_MODEL: doubao-seedance-2.0
-      VIDEO_VOLCENGINE_TTS_ENDPOINT: https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional
+      VIDEO_VOLCENGINE_TTS_ENDPOINT: https://openspeech.bytedance.com/api/v3/tts/unidirectional
       VIDEO_VOLCENGINE_TTS_SPEAKER: ${VIDEO_VOLCENGINE_TTS_SPEAKER:-zh_female_vv_uranus_bigtts}
       VIDEO_VOLCENGINE_PLAN: agent-plan-large
       VIDEO_VOLCENGINE_PRICING_VERSION: agent-plan-large-included-v1
