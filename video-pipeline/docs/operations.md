@@ -109,7 +109,7 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 | `VIDEO_PROVIDER_SERVICE_AUTH_SECRET` | 未设置 | Live Adapter 内部 HMAC 服务认证；至少 32 bytes，只通过 Secret manager 注入 |
 | `VIDEO_VOLCENGINE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | Agent Plan 数据面；不得写入 Manifest/BOM |
 | `VIDEO_VOLCENGINE_VIDEO_MODEL` | `doubao-seedance-2.0` | 冻结真实视频模型 |
-| `VIDEO_VOLCENGINE_TTS_ENDPOINT` | Agent Plan HTTP TTS URL | 固定使用 V3 HTTP Chunked `/api/v3/tts/unidirectional`；Resource ID 在代码中固定为 `seed-tts-2.0` |
+| `VIDEO_VOLCENGINE_TTS_ENDPOINT` | Agent Plan HTTP TTS URL | 只接受套餐专属 V3 HTTP Chunked `/api/v3/plan/tts/unidirectional`；标准 `/api/v3/tts/...`、query、尾斜杠或 host 漂移均在网络调用前失败关闭；Resource ID 固定为 `seed-tts-2.0` |
 | `VIDEO_VOLCENGINE_TTS_SPEAKER` | `zh_female_vv_uranus_bigtts` | TTS 2.0 兼容音色；不是 Secret |
 | `VIDEO_VOLCENGINE_PLAN` | `agent-plan-large` | 套餐计费模式标识 |
 | `ANTHROPIC_BASE_URL` | 未设置 | 预留 Claude adapter 的显式 endpoint；M0 不启用 |

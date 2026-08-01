@@ -4,6 +4,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"go.yaml.in/yaml/v4"
 )
 
@@ -35,5 +36,8 @@ func TestLiveAdapterIsInternalOnlyAndRequiresServiceAuthentication(t *testing.T)
 	}
 	if _, ok := provider.Environment["VIDEO_PROVIDER_SERVICE_AUTH_SECRET"]; !ok {
 		t.Fatal("live adapter does not receive the internal service authentication secret")
+	}
+	if endpoint := provider.Environment["VIDEO_VOLCENGINE_TTS_ENDPOINT"]; endpoint != runtimeconfig.AgentPlanTTSEndpoint {
+		t.Fatalf("live adapter TTS endpoint = %q, want exact Agent Plan endpoint", endpoint)
 	}
 }

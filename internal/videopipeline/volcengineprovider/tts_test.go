@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,15 +22,52 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (fn roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return fn(request)
+}
+
 func TestAgentPlanTTS_DefaultEndpointUsesDocumentedV3ChunkedPath(t *testing.T) {
 	t.Parallel()
 	client, err := NewAgentPlanTTS(AgentPlanTTSConfig{APIKey: "fixture-key"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	const want = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+	const want = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
 	if client.endpoint != want {
 		t.Fatalf("default endpoint = %q, want %q", client.endpoint, want)
+	}
+}
+
+func TestAgentPlanTTS_RejectsNonPlanEndpointBeforeHTTP(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "standard OpenSpeech route", endpoint: "https://openspeech.bytedance.com/api/v3/tts/unidirectional"},
+		{name: "plan route with query", endpoint: AgentPlanTTSEndpoint + "?billing=other"},
+		{name: "plan route with trailing slash", endpoint: AgentPlanTTSEndpoint + "/"},
+		{name: "plan route with whitespace", endpoint: " " + AgentPlanTTSEndpoint},
+		{name: "different host", endpoint: "https://example.com/api/v3/plan/tts/unidirectional"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			calls := 0
+			_, err := NewAgentPlanTTS(AgentPlanTTSConfig{
+				Endpoint: tt.endpoint,
+				APIKey:   "fixture-key",
+				HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					calls++
+					return nil, fmt.Errorf("unexpected HTTP call")
+				})},
+			})
+			if providercontract.ErrorCodeOf(err) != providercontract.CodeInvalidRequest || calls != 0 {
+				t.Fatalf("error = %v, HTTP calls = %d", err, calls)
+			}
+		})
 	}
 }
 
@@ -37,10 +75,9 @@ func TestAgentPlanTTS_UsesFixedPlanContractAndReturnsAuditableUsage(t *testing.T
 	t.Parallel()
 	credential := strings.Join([]string{"runtime", "plan", "credential"}, "-")
 	audio := []byte("fixture-mp3-audio")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || r.URL.Path != "/tts" {
-			http.NotFound(w, r)
-			return
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method != http.MethodPost || r.URL.String() != AgentPlanTTSEndpoint {
+			t.Errorf("request = %s %s", r.Method, r.URL)
 		}
 		for name, want := range map[string]string{
 			"X-Api-Key":                             credential,
@@ -70,23 +107,30 @@ func TestAgentPlanTTS_UsesFixedPlanContractAndReturnsAuditableUsage(t *testing.T
 			payload.Request.Audio.Format != "mp3" || payload.Request.Audio.SampleRate != 24_000 {
 			t.Errorf("payload = %#v", payload)
 		}
-		w.Header().Set("X-Tt-Logid", "tts-log-id")
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		fmt.Fprintf(w, "{\"code\":0,\"data\":%q}\n", base64.StdEncoding.EncodeToString(audio[:7]))
-		fmt.Fprintf(w, "{\"code\":0,\"data\":%q}\n", base64.StdEncoding.EncodeToString(audio[7:]))
-		fmt.Fprintln(w, `{"code":20000000,"usage":{"text_words":5}}`)
-	}))
-	defer server.Close()
+		body := fmt.Sprintf(
+			"{\"code\":0,\"data\":%q}\n{\"code\":0,\"data\":%q}\n{\"code\":20000000,\"usage\":{\"text_words\":5}}\n",
+			base64.StdEncoding.EncodeToString(audio[:7]),
+			base64.StdEncoding.EncodeToString(audio[7:]),
+		)
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header: http.Header{
+				"Content-Type": []string{"application/x-ndjson"},
+				"X-Tt-Logid":   []string{"tts-log-id"},
+			},
+			Body: io.NopCloser(strings.NewReader(body)),
+		}, nil
+	})}
 
-	client, err := NewAgentPlanTTS(AgentPlanTTSConfig{
-		Endpoint: server.URL + "/tts", APIKey: credential, HTTPClient: server.Client(),
+	provider, err := NewAgentPlanTTS(AgentPlanTTSConfig{
+		APIKey: credential, HTTPClient: client,
 		NewRequestID: func() string { return "request-uuid" },
 		NewConnectID: func() string { return "connect-uuid" },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.Synthesize(t.Context(), SpeechSynthesisRequest{Text: "你好，世界", Speaker: "speaker-v2"})
+	result, err := provider.Synthesize(t.Context(), SpeechSynthesisRequest{Text: "你好，世界", Speaker: "speaker-v2"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,23 +166,30 @@ func TestAgentPlanTTS_FailsClosedOnMissingEvidenceAndClassifiesErrors(t *testing
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				w.Header().Set("X-Tt-Logid", "safe-log-id")
-				w.WriteHeader(tt.status)
-				_, _ = fmt.Fprint(w, tt.body)
-			}))
-			defer server.Close()
 			client, err := NewAgentPlanTTS(AgentPlanTTSConfig{
-				Endpoint: server.URL, APIKey: "fixture-key", HTTPClient: server.Client(),
+				APIKey: "fixture-key",
+				HTTPClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+					if request.URL.String() != AgentPlanTTSEndpoint {
+						t.Errorf("request URL = %q", request.URL)
+					}
+					return &http.Response{
+						StatusCode: tt.status,
+						Header:     http.Header{"X-Tt-Logid": []string{"safe-log-id"}},
+						Body:       io.NopCloser(strings.NewReader(tt.body)),
+					}, nil
+				})},
 				NewRequestID: func() string { return "request-uuid" },
 				NewConnectID: func() string { return "connect-uuid" },
 			})
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = client.Synthesize(t.Context(), SpeechSynthesisRequest{Text: "测试", Speaker: "speaker-v2"})
+			result, err := client.Synthesize(t.Context(), SpeechSynthesisRequest{Text: "测试", Speaker: "speaker-v2"})
 			if providercontract.ErrorCodeOf(err) != tt.want {
 				t.Fatalf("error = %v (%s), want %s", err, providercontract.ErrorCodeOf(err), tt.want)
+			}
+			if result.RequestID != "request-uuid" || result.ConnectID != "connect-uuid" || result.LogID != "safe-log-id" {
+				t.Fatalf("failure evidence = %#v", result)
 			}
 			if strings.Contains(fmt.Sprint(err), "fixture-key") || strings.Contains(fmt.Sprint(err), "测试") {
 				t.Fatalf("error leaked protected input: %v", err)
@@ -160,10 +211,12 @@ func TestFindUsageTokensAcceptsDocumentedNestedAdditionEncoding(t *testing.T) {
 func TestAgentPlanTTS_RejectsDialogueOver600CharsBeforeHTTP(t *testing.T) {
 	t.Parallel()
 	var calls int
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
-	defer server.Close()
 	client, err := NewAgentPlanTTS(AgentPlanTTSConfig{
-		Endpoint: server.URL, APIKey: "fixture-key", HTTPClient: server.Client(),
+		APIKey: "fixture-key",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			return nil, fmt.Errorf("unexpected HTTP call")
+		})},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -195,7 +248,7 @@ func (s *fakeSpeechSynthesizer) Synthesize(context.Context, SpeechSynthesisReque
 	defer s.mu.Unlock()
 	s.calls++
 	if s.err != nil {
-		return SpeechSynthesisResult{}, s.err
+		return s.result, s.err
 	}
 	if len(s.result.Audio) != 0 {
 		return s.result, nil
@@ -418,6 +471,168 @@ func TestServer_SpeechRetryConsumesAuthorizationBeforeRetryableFailure(t *testin
 	persisted, ok, err := adapter.loadRecord(request.JobID)
 	if err != nil || !ok || len(persisted.Reconciliations) != 1 {
 		t.Fatalf("persisted record = %#v, ok = %v, err = %v", persisted, ok, err)
+	}
+}
+
+func TestServer_SpeechSecondReconciliationPersistsEvidenceAndBlocksThirdCall(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testSpeechJobRequest(t)
+	initial := failedSpeechRecord(t, request)
+	seed, err := New(testLiveConfig(), &fakeProvider{}, store, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.createRecord(request.JobID, initial); err != nil {
+		t.Fatal(err)
+	}
+
+	firstDigest, err := persistedRecordSHA256(initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstConfig := testLiveConfig()
+	firstConfig.SpeechModel = AgentPlanTTSModelID
+	firstConfig.SpeechRetryJobID = request.JobID
+	firstConfig.SpeechRetryRecord = firstDigest
+	firstSpeech := &fakeSpeechSynthesizer{err: &providercontract.Error{
+		Code:        providercontract.CodeUnauthenticated,
+		SafeMessage: "first fixture authentication failure",
+	}}
+	firstAdapter, err := New(firstConfig, &fakeProvider{}, store, Options{
+		Speech: firstSpeech,
+		Now:    func() time.Time { return time.Unix(1_800_000_000, 0).UTC() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstServer := httptest.NewServer(firstAdapter.Handler())
+	if status := submitSpeechJobStatus(t, firstServer.URL, request); status != http.StatusUnauthorized {
+		firstServer.Close()
+		t.Fatalf("first reconciliation status = %d", status)
+	}
+	firstServer.Close()
+	if firstSpeech.callCount() != 1 {
+		t.Fatalf("first reconciliation calls = %d", firstSpeech.callCount())
+	}
+	firstFailure, ok, err := firstAdapter.loadRecord(request.JobID)
+	if err != nil || !ok || len(firstFailure.Reconciliations) != 1 {
+		t.Fatalf("first failure = %#v, ok = %v, err = %v", firstFailure, ok, err)
+	}
+	secondAuthorizedDigest, err := persistedRecordSHA256(firstFailure)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	secondConfig := testLiveConfig()
+	secondConfig.SpeechModel = AgentPlanTTSModelID
+	secondConfig.SpeechRetryJobID = request.JobID
+	secondConfig.SpeechRetryRecord = secondAuthorizedDigest
+	secondSpeech := &fakeSpeechSynthesizer{
+		result: SpeechSynthesisResult{
+			MediaType: "audio/mpeg", RequestID: "failed-request-id",
+			ConnectID: "failed-connect-id", LogID: "failed-log-id", UsageTokens: 2,
+		},
+		err: &providercontract.Error{
+			Code:        providercontract.CodeUnauthenticated,
+			SafeMessage: "second fixture authentication failure",
+		},
+	}
+	secondAdapter, err := New(secondConfig, &fakeProvider{}, store, Options{
+		Speech: secondSpeech,
+		Now:    func() time.Time { return time.Unix(1_800_000_100, 0).UTC() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondServer := httptest.NewServer(secondAdapter.Handler())
+	if status := submitSpeechJobStatus(t, secondServer.URL, request); status != http.StatusUnauthorized {
+		secondServer.Close()
+		t.Fatalf("second reconciliation status = %d", status)
+	}
+	secondServer.Close()
+	if secondSpeech.callCount() != 1 {
+		t.Fatalf("second reconciliation calls = %d", secondSpeech.callCount())
+	}
+	secondFailure, ok, err := secondAdapter.loadRecord(request.JobID)
+	if err != nil || !ok {
+		t.Fatalf("second failure ok = %v, err = %v", ok, err)
+	}
+	if len(secondFailure.Reconciliations) != 2 ||
+		secondFailure.Reconciliations[0].Attempt != 1 ||
+		secondFailure.Reconciliations[0].AuthorizedRecordSHA256 != firstDigest ||
+		secondFailure.Reconciliations[1].Attempt != 2 ||
+		secondFailure.Reconciliations[1].AuthorizedRecordSHA256 != secondAuthorizedDigest ||
+		secondFailure.Reconciliations[1].PreviousResponse.Error == nil ||
+		secondFailure.Reconciliations[1].PreviousResponse.Error.Code != providercontract.CodeUnauthenticated {
+		t.Fatalf("reconciliation history = %#v", secondFailure.Reconciliations)
+	}
+	if secondFailure.Response.State != providercontract.StatusRequiresAction ||
+		secondFailure.Response.RequestID != "failed-request-id" ||
+		secondFailure.Response.ConnectID != "failed-connect-id" ||
+		secondFailure.Response.LogID != "failed-log-id" ||
+		secondFailure.Response.Usage.GeneratedChars != 2 ||
+		secondFailure.Response.Usage.OutputUnits != 270 {
+		t.Fatalf("second failure response = %#v", secondFailure.Response)
+	}
+
+	thirdDigest, err := persistedRecordSHA256(secondFailure)
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdConfig := testLiveConfig()
+	thirdConfig.SpeechModel = AgentPlanTTSModelID
+	thirdConfig.SpeechRetryJobID = request.JobID
+	thirdConfig.SpeechRetryRecord = thirdDigest
+	thirdSpeech := &fakeSpeechSynthesizer{}
+	thirdAdapter, err := New(thirdConfig, &fakeProvider{}, store, Options{Speech: thirdSpeech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	thirdServer := httptest.NewServer(thirdAdapter.Handler())
+	defer thirdServer.Close()
+	replayed := postJob(t, thirdServer.URL, request)
+	if replayed.State != providercontract.StatusRequiresAction || thirdSpeech.callCount() != 0 {
+		t.Fatalf("third replay state = %s, calls = %d", replayed.State, thirdSpeech.callCount())
+	}
+}
+
+func TestServer_SpeechSecondReconciliationCommitFailurePreservesFirstHistory(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testSpeechJobRequest(t)
+	record := failedSpeechRecord(t, request)
+	record.Reconciliations = []speechReconciliation{{
+		Attempt:                1,
+		StartedAt:              "2027-01-15T08:00:00Z",
+		AuthorizedRecordSHA256: strings.Repeat("a", 64),
+		PreviousResponse:       record.Response,
+	}}
+	adapter, err := New(testLiveConfig(), &fakeProvider{}, store, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(adapter.stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(adapter.stateDir, []byte("not-a-directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	adapter.config.SpeechRetryRecord = strings.Repeat("b", 64)
+	if _, err := adapter.beginSpeechRetry(request, record); err == nil {
+		t.Fatal("beginSpeechRetry() error = nil")
+	}
+	if len(record.Reconciliations) != 1 ||
+		record.Reconciliations[0].Attempt != 1 ||
+		record.Reconciliations[0].AuthorizedRecordSHA256 != strings.Repeat("a", 64) ||
+		record.Response.State != providercontract.StatusRequiresAction {
+		t.Fatalf("record after failed commit = %#v", record)
 	}
 }
 

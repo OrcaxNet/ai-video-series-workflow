@@ -10,17 +10,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"github.com/google/uuid"
 )
 
 const (
 	AgentPlanTTSResourceID = "seed-tts-2.0"
 	AgentPlanTTSModelID    = "doubao-seed-tts-2.0"
-	AgentPlanTTSEndpoint   = "https://openspeech.bytedance.com/api/v3/tts/unidirectional"
+	AgentPlanTTSEndpoint   = runtimeconfig.AgentPlanTTSEndpoint
 	AgentPlanTTSMaxChars   = 600
 	ttsAFPMilliPerChar     = 135
 	defaultMaxSpeechBytes  = 32 << 20
@@ -72,13 +72,16 @@ func NewAgentPlanTTS(config AgentPlanTTSConfig) (*AgentPlanTTS, error) {
 	if strings.TrimSpace(config.APIKey) == "" {
 		return nil, safeError(providercontract.CodeUnauthenticated, "ARK_API_KEY is not configured", false)
 	}
-	endpoint := strings.TrimSpace(config.Endpoint)
+	endpoint := config.Endpoint
 	if endpoint == "" {
 		endpoint = AgentPlanTTSEndpoint
 	}
-	parsed, err := url.Parse(endpoint)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return nil, safeError(providercontract.CodeInvalidRequest, "invalid Agent Plan TTS endpoint", false)
+	if endpoint != AgentPlanTTSEndpoint {
+		return nil, safeError(
+			providercontract.CodeInvalidRequest,
+			"Agent Plan TTS requires the exact subscription endpoint",
+			false,
+		)
 	}
 	client := config.HTTPClient
 	if client == nil {
@@ -123,6 +126,9 @@ func (p *AgentPlanTTS) Synthesize(
 	if requestID == "" || connectID == "" || requestID == connectID {
 		return SpeechSynthesisResult{}, safeError(providercontract.CodeUnavailable, "unique TTS request and connect IDs could not be allocated", false)
 	}
+	result := SpeechSynthesisResult{
+		MediaType: "audio/mpeg", RequestID: requestID, ConnectID: connectID,
+	}
 	payload := map[string]any{
 		"req_params": map[string]any{
 			"text":    text,
@@ -134,11 +140,11 @@ func (p *AgentPlanTTS) Synthesize(
 	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return SpeechSynthesisResult{}, safeError(providercontract.CodeInvalidRequest, "Agent Plan TTS request could not be encoded", false)
+		return result, safeError(providercontract.CodeInvalidRequest, "Agent Plan TTS request could not be encoded", false)
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, bytes.NewReader(encoded))
 	if err != nil {
-		return SpeechSynthesisResult{}, safeError(providercontract.CodeInvalidRequest, "Agent Plan TTS request could not be created", false)
+		return result, safeError(providercontract.CodeInvalidRequest, "Agent Plan TTS request could not be created", false)
 	}
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("X-Api-Key", p.apiKey)
@@ -149,23 +155,20 @@ func (p *AgentPlanTTS) Synthesize(
 
 	response, err := p.client.Do(request)
 	if err != nil {
-		return SpeechSynthesisResult{}, providerErrorOrGeneric(providercontract.MapContextError(err))
+		return result, providerErrorOrGeneric(providercontract.MapContextError(err))
 	}
 	defer response.Body.Close()
-	logID := strings.TrimSpace(response.Header.Get("X-Tt-Logid"))
+	result.LogID = strings.TrimSpace(response.Header.Get("X-Tt-Logid"))
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		var errorFrame map[string]any
 		decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
 		decoder.UseNumber()
 		_ = decoder.Decode(&errorFrame)
-		return SpeechSynthesisResult{}, mapTTSError(
-			response.StatusCode, fmt.Sprint(int64Value(errorFrame["code"])), logID,
+		return result, mapTTSError(
+			response.StatusCode, fmt.Sprint(int64Value(errorFrame["code"])), result.LogID,
 		)
 	}
 
-	result := SpeechSynthesisResult{
-		MediaType: "audio/mpeg", RequestID: requestID, ConnectID: connectID, LogID: logID,
-	}
 	scanner := bufio.NewScanner(io.LimitReader(response.Body, p.maxAudioBytes*2))
 	scanner.Buffer(make([]byte, 64*1024), 4<<20)
 	terminal := false
@@ -178,19 +181,19 @@ func (p *AgentPlanTTS) Synthesize(
 		decoder := json.NewDecoder(bytes.NewReader(line))
 		decoder.UseNumber()
 		if err := decoder.Decode(&frame); err != nil {
-			return SpeechSynthesisResult{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS returned an invalid stream frame", true)
+			return result, safeError(providercontract.CodeUnavailable, "Agent Plan TTS returned an invalid stream frame", true)
 		}
 		code := int64Value(frame["code"])
 		if code != 0 && code != 20_000_000 {
-			return SpeechSynthesisResult{}, mapTTSError(response.StatusCode, fmt.Sprint(code), logID)
+			return result, mapTTSError(response.StatusCode, fmt.Sprint(code), result.LogID)
 		}
 		if audio, _ := frame["data"].(string); audio != "" {
 			chunk, err := base64.StdEncoding.DecodeString(audio)
 			if err != nil {
-				return SpeechSynthesisResult{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS returned invalid audio data", true)
+				return result, safeError(providercontract.CodeUnavailable, "Agent Plan TTS returned invalid audio data", true)
 			}
 			if int64(len(result.Audio)+len(chunk)) > p.maxAudioBytes {
-				return SpeechSynthesisResult{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS audio exceeds the configured size limit", false)
+				return result, safeError(providercontract.CodeUnavailable, "Agent Plan TTS audio exceeds the configured size limit", false)
 			}
 			result.Audio = append(result.Audio, chunk...)
 		}
@@ -203,10 +206,10 @@ func (p *AgentPlanTTS) Synthesize(
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return SpeechSynthesisResult{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS stream could not be read", true)
+		return result, safeError(providercontract.CodeUnavailable, "Agent Plan TTS stream could not be read", true)
 	}
 	if !terminal || len(result.Audio) == 0 || result.UsageTokens <= 0 || result.LogID == "" {
-		return SpeechSynthesisResult{}, safeError(
+		return result, safeError(
 			providercontract.CodeUnavailable,
 			"Agent Plan TTS response lacks terminal audio, usage tokens, or log ID evidence",
 			true,

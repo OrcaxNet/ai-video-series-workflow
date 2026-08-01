@@ -135,11 +135,39 @@ func TestLoadVolcengineProviderRequiresExplicitKeyAndUsesAgentPlanDefaults(t *te
 	}
 	if cfg.BaseURL != "https://ark.cn-beijing.volces.com/api/plan/v3" ||
 		cfg.VideoModel != "doubao-seedance-2.0" || cfg.PlanName != "agent-plan-large" ||
-		cfg.SpeechEndpoint != "https://openspeech.bytedance.com/api/v3/tts/unidirectional" ||
+		cfg.SpeechEndpoint != AgentPlanTTSEndpoint ||
 		cfg.SpeechModel != "doubao-seed-tts-2.0" || cfg.SpeechSpeaker != "zh_female_vv_uranus_bigtts" ||
 		cfg.APIKey != "test-runtime-credential" || cfg.ServiceAuthSecret != "test-service-auth-secret-32-bytes-long" ||
 		cfg.MaxDownloadBytes != 256<<20 || cfg.MaxSpeechBytes != 32<<20 {
 		t.Fatalf("unexpected live defaults: %#v", cfg)
+	}
+}
+
+func TestLoadVolcengineProviderRejectsNonPlanSpeechEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "standard route", endpoint: "https://openspeech.bytedance.com/api/v3/tts/unidirectional"},
+		{name: "query drift", endpoint: AgentPlanTTSEndpoint + "?billing=other"},
+		{name: "trailing slash", endpoint: AgentPlanTTSEndpoint + "/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]string{
+				"ARK_API_KEY":                        "test-runtime-credential",
+				"VIDEO_PROVIDER_SERVICE_AUTH_SECRET": "test-service-auth-secret-32-bytes-long",
+				"VIDEO_ARTIFACT_ROOT":                t.TempDir(),
+				"VIDEO_VOLCENGINE_TTS_ENDPOINT":      tt.endpoint,
+			}
+			_, err := loadVolcengineProvider(func(name string) (string, bool) {
+				value, ok := values[name]
+				return value, ok
+			})
+			if err == nil || !strings.Contains(err.Error(), "exact Agent Plan subscription endpoint") {
+				t.Fatalf("loadVolcengineProvider() error = %v", err)
+			}
+		})
 	}
 }
 

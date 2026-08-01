@@ -25,16 +25,23 @@ G1/G2 approved inputs
 路由、预算审批和证据等级：
 
 Agent Plan Live 路径由 `volcengine-provider` 同时承载 `speech.primary`，复用运行时
-`ARK_API_KEY` 并固定 `X-Api-Resource-Id: seed-tts-2.0`。每次请求必须返回 usage
+`ARK_API_KEY`，固定套餐专属
+`https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional` 与
+`X-Api-Resource-Id: seed-tts-2.0`。标准 OpenSpeech URL、query、尾斜杠或 host 漂移
+均在网络调用前失败关闭，防止绕开套餐归因或产生额外费用。每次请求必须返回 usage
 tokens，并在 speech attempt 中保留 request/connect ID 与 `X-Tt-Logid`；默认
 Compose/fixture 路径仍保持 Mock，不会因配置 Live Adapter 而自动产生真实调用。
 
 若同步 TTS 在上游任务、音频、request/connect/log ID 与 usage 均为空时进入
 `requires_action`，不得删除幂等记录或直接重提。操作员只能同时注入精确的
 `VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID` 与当前持久记录
-`VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256`；Adapter 在首次重提前原子保留旧响应和
-授权 hash，且每个 job 只允许一次。若在重提前后崩溃，已消费的授权不会再次调用
-Provider。
+`VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256`；Adapter 在每次重提前原子保留旧响应和
+授权 hash。为覆盖本样片已发生的错误路由恢复，单个 job 的审计历史硬上限为两次
+reconciliation；每次都必须授权当时完整持久记录的精确 SHA-256，attempt 连续为 1、2，
+第三次永远失败关闭。若在任一次重提前后崩溃，已消费的授权不会再次调用 Provider；
+第二次授权落盘失败也不得清空或改写第一次历史。错误响应仍持久化已分配的
+request/connect ID、服务端返回的 `X-Tt-Logid` 和可获得的 usage，且不保存 Secret、正文或
+transport URL。
 
 创建 Generation Plan 时还必须把相同的 `speechBudgetLimit` 纳入请求；
 额度与币种会进入不可变 plan hash 和审计证据。启动生产时的

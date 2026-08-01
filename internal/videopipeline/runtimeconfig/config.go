@@ -16,6 +16,12 @@ import (
 // LookupEnv matches os.LookupEnv and makes configuration tests hermetic.
 type LookupEnv func(string) (string, bool)
 
+// AgentPlanTTSEndpoint is the subscription-only HTTP endpoint documented by
+// Agent Plan. The standard OpenSpeech route is intentionally not accepted:
+// using it can bypass plan attribution and create an unauthenticated or
+// separately billed request.
+const AgentPlanTTSEndpoint = "https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional"
+
 // ControlPlane configures the video control-plane health/API process.
 type ControlPlane struct {
 	Environment        string
@@ -222,7 +228,7 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 		ServiceAuthSecret: value(lookup, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
 		Region:            value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
 		VideoModel:        value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
-		SpeechEndpoint:    value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", "https://openspeech.bytedance.com/api/v3/tts/unidirectional"),
+		SpeechEndpoint:    value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", AgentPlanTTSEndpoint),
 		SpeechModel:       "doubao-seed-tts-2.0",
 		SpeechSpeaker:     value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", "zh_female_vv_uranus_bigtts"),
 		SpeechRetryJobID:  value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID", ""),
@@ -256,6 +262,9 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	}
 	if err := validateHTTPURL(cfg.SpeechEndpoint); err != nil {
 		return VolcengineProvider{}, fmt.Errorf("VIDEO_VOLCENGINE_TTS_ENDPOINT: %w", err)
+	}
+	if cfg.SpeechEndpoint != AgentPlanTTSEndpoint {
+		return VolcengineProvider{}, errors.New("VIDEO_VOLCENGINE_TTS_ENDPOINT must use the exact Agent Plan subscription endpoint")
 	}
 	if strings.TrimSpace(cfg.APIKey) == "" {
 		return VolcengineProvider{}, errors.New("ARK_API_KEY is required for the live provider adapter")

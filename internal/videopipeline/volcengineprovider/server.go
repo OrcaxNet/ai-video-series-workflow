@@ -310,13 +310,17 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	if request.Capability == providercontract.CapabilitySpeech {
 		response, err := s.synthesizeSpeech(r.Context(), request)
 		if err != nil {
-			intent.Response.Error = providerErrorOrGeneric(err)
-			if intent.Response.Error.Retryable {
-				intent.Response.State = providercontract.StatusUnknown
+			response.Error = providerErrorOrGeneric(err)
+			if response.Error.Retryable {
+				response.State = providercontract.StatusUnknown
 			} else {
-				intent.Response.State = providercontract.StatusRequiresAction
+				response.State = providercontract.StatusRequiresAction
 			}
-			_ = s.updateRecord(request.JobID, intent)
+			intent.Response = response
+			if persistErr := s.updateRecord(request.JobID, intent); persistErr != nil {
+				writeProviderError(w, persistErr)
+				return
+			}
 			writeProviderError(w, err)
 			return
 		}
@@ -365,7 +369,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) authorizedSpeechRetry(request providercontract.JobRequest, record *jobRecord) bool {
 	if request.Capability != providercontract.CapabilitySpeech || request.Request.Budget.MaxAttempts < 2 ||
-		s.config.SpeechRetryJobID != request.JobID || len(record.Reconciliations) != 0 ||
+		s.config.SpeechRetryJobID != request.JobID || !validSpeechReconciliationHistory(record) ||
 		record.Response.State != providercontract.StatusRequiresAction || record.Response.Error == nil ||
 		record.Response.UpstreamTaskID != "" || record.Response.RequestID != "" ||
 		record.Response.ConnectID != "" || record.Response.LogID != "" ||
@@ -376,13 +380,36 @@ func (s *Server) authorizedSpeechRetry(request providercontract.JobRequest, reco
 	return err == nil && digest == s.config.SpeechRetryRecord
 }
 
+func validSpeechReconciliationHistory(record *jobRecord) bool {
+	if len(record.Reconciliations) >= 2 {
+		return false
+	}
+	for index, reconciliation := range record.Reconciliations {
+		digest, err := hex.DecodeString(reconciliation.AuthorizedRecordSHA256)
+		if reconciliation.Attempt != index+1 || err != nil || len(digest) != sha256.Size ||
+			strings.ToLower(reconciliation.AuthorizedRecordSHA256) != reconciliation.AuthorizedRecordSHA256 ||
+			reconciliation.StartedAt == "" ||
+			reconciliation.PreviousResponse.JobID != record.Response.JobID ||
+			reconciliation.PreviousResponse.RunID != record.Response.RunID ||
+			reconciliation.PreviousResponse.State != providercontract.StatusRequiresAction ||
+			reconciliation.PreviousResponse.Error == nil {
+			return false
+		}
+		if _, err := time.Parse(time.RFC3339Nano, reconciliation.StartedAt); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) beginSpeechRetry(
 	request providercontract.JobRequest,
 	record *jobRecord,
 ) (*jobRecord, error) {
 	previous := record.Response
+	previousReconciliationCount := len(record.Reconciliations)
 	record.Reconciliations = append(record.Reconciliations, speechReconciliation{
-		Attempt:                1,
+		Attempt:                len(record.Reconciliations) + 1,
 		StartedAt:              s.now().UTC().Format(time.RFC3339Nano),
 		AuthorizedRecordSHA256: s.config.SpeechRetryRecord,
 		PreviousResponse:       previous,
@@ -390,7 +417,7 @@ func (s *Server) beginSpeechRetry(
 	record.Response = s.pendingResponse(request)
 	if err := s.updateRecord(request.JobID, record); err != nil {
 		record.Response = previous
-		record.Reconciliations = record.Reconciliations[:0]
+		record.Reconciliations = record.Reconciliations[:previousReconciliationCount]
 		return nil, err
 	}
 	return record, nil
@@ -748,21 +775,32 @@ func (s *Server) synthesizeSpeech(
 	ctx context.Context,
 	request providercontract.JobRequest,
 ) (providercontract.JobResponse, error) {
+	response := providercontract.JobResponse{
+		JobID: request.JobID, RunID: request.RunID,
+		State: providercontract.StatusUnknown, Model: request.Model,
+		Cost: s.subscriptionCost(request),
+	}
 	result, err := s.speech.Synthesize(ctx, SpeechSynthesisRequest{
 		Text: request.Request.Prompt, Speaker: request.Request.ModelHint,
 	})
+	response.RequestID = result.RequestID
+	response.ConnectID = result.ConnectID
+	response.LogID = result.LogID
+	if result.UsageTokens > 0 {
+		response.Usage, _ = TTSUsageAttributes(result.UsageTokens)
+	}
 	if err != nil {
-		return providercontract.JobResponse{}, err
+		return response, err
 	}
 	usage, err := TTSUsageAttributes(result.UsageTokens)
 	if err != nil {
-		return providercontract.JobResponse{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS usage evidence is invalid", false)
+		return response, safeError(providercontract.CodeUnavailable, "Agent Plan TTS usage evidence is invalid", false)
 	}
 	committed, err := s.store.Put(ctx, bytes.NewReader(result.Audio))
 	if err != nil {
-		return providercontract.JobResponse{}, safeError(providercontract.CodeUnavailable, "Agent Plan TTS audio could not be committed to CAS", true)
+		return response, safeError(providercontract.CodeUnavailable, "Agent Plan TTS audio could not be committed to CAS", true)
 	}
-	return providercontract.JobResponse{
+	response = providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		UpstreamTaskID: result.ConnectID, RequestID: result.RequestID,
 		ConnectID: result.ConnectID, LogID: result.LogID,
@@ -775,7 +813,8 @@ func (s *Server) synthesizeSpeech(
 			SizeBytes: committed.Size, DurationMillis: int64(request.Request.Output.DurationMillis),
 		}},
 		Usage: usage, Cost: s.subscriptionCost(request),
-	}, nil
+	}
+	return response, nil
 }
 
 func (s *Server) subscriptionCost(request providercontract.JobRequest) providercontract.Cost {
