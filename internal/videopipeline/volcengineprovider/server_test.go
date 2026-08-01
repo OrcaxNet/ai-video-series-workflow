@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -28,12 +29,19 @@ type fakeProvider struct {
 	cancelCount int
 	outputURL   string
 	submitErr   error
+	lastRequest providercontract.GenerationRequest
 }
 
 func (p *fakeProvider) counts() (submits, polls, cancels int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return p.submitCount, p.pollCount, p.cancelCount
+}
+
+func (p *fakeProvider) submittedRequest() providercontract.GenerationRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastRequest
 }
 
 type lockedClock struct {
@@ -61,6 +69,7 @@ func (p *fakeProvider) Submit(_ context.Context, request providercontract.Genera
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.submitCount++
+	p.lastRequest = request
 	if p.submitErr != nil {
 		return providercontract.Job{}, p.submitErr
 	}
@@ -71,6 +80,99 @@ func (p *fakeProvider) Submit(_ context.Context, request providercontract.Genera
 		ProviderRegion: "cn-beijing", ProviderRequestID: "submit-request-1",
 		CreatedAt: time.Unix(1_800_000_000, 0), UpdatedAt: time.Unix(1_800_000_000, 0),
 	}, nil
+}
+
+func TestServer_ResolvesCASVisualInputAndOmitsVoiceDescriptorBeforeSubmit(t *testing.T) {
+	t.Parallel()
+	provider := &fakeProvider{}
+	adapter, store := testAdapter(t, provider, fixedInspector{})
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+
+	imageBytes := []byte("immutable-reference-image")
+	image, err := store.Put(t.Context(), bytes.NewReader(imageBytes))
+	if err != nil {
+		t.Fatal(err)
+	}
+	voice, err := store.Put(t.Context(), strings.NewReader(`{"speaker":"approved-voice"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testJobRequest(t)
+	request.Request.Assets = []providercontract.AssetRef{
+		{
+			ID: "visual-asset", Revision: "visual-version", Kind: providercontract.ModalityImage,
+			Role: providercontract.AssetRoleReferenceImage, URI: image.URI, SHA256: image.Digest,
+			LicenseReference: "license:visual", MediaType: "image/png", SizeBytes: image.Size,
+		},
+		{
+			ID: "voice-asset", Revision: "voice-version", Kind: providercontract.ModalityAudio,
+			Role: providercontract.AssetRoleReferenceAudio, URI: voice.URI, SHA256: voice.Digest,
+			LicenseReference: "license:voice", MediaType: "audio/x-voice-profile+json", SizeBytes: voice.Size,
+		},
+	}
+	postJob(t, server.URL, request)
+
+	submitted := provider.submittedRequest()
+	if len(submitted.Assets) != 1 {
+		t.Fatalf("upstream assets = %d, want one visual input", len(submitted.Assets))
+	}
+	asset := submitted.Assets[0]
+	const prefix = "data:image/png;base64,"
+	if !strings.HasPrefix(asset.URI, prefix) {
+		t.Fatalf("upstream visual URI scheme = %q, want transient image data URL", strings.SplitN(asset.URI, ":", 2)[0])
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(asset.URI, prefix))
+	if err != nil {
+		t.Fatalf("decode upstream visual data URL: %v", err)
+	}
+	if !bytes.Equal(decoded, imageBytes) {
+		t.Fatal("upstream visual bytes differ from the immutable CAS object")
+	}
+	if asset.SHA256 != image.Digest || asset.URI == image.URI {
+		t.Fatal("upstream visual input did not retain its digest or remained an unreachable CAS URI")
+	}
+	if submits, _, _ := provider.counts(); submits != 1 {
+		t.Fatalf("upstream submits = %d, want one", submits)
+	}
+}
+
+func TestServer_MissingCASInputFailsBeforeUpstreamSubmit(t *testing.T) {
+	t.Parallel()
+	provider := &fakeProvider{}
+	adapter, _ := testAdapter(t, provider, fixedInspector{})
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+
+	request := testJobRequest(t)
+	missing := strings.Repeat("a", 64)
+	request.Request.Assets = []providercontract.AssetRef{{
+		ID: "visual-asset", Revision: "visual-version", Kind: providercontract.ModalityImage,
+		Role: providercontract.AssetRoleReferenceImage, URI: "cas://sha256/" + missing, SHA256: missing,
+		LicenseReference: "license:visual", MediaType: "image/png",
+	}}
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest, err := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Idempotency-Key", request.JobID)
+	response, err := authenticatedTestClient(t).Do(httpRequest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		encoded, _ := io.ReadAll(response.Body)
+		t.Fatalf("missing CAS response = HTTP %d: %s", response.StatusCode, encoded)
+	}
+	if submits, _, _ := provider.counts(); submits != 0 {
+		t.Fatalf("upstream submits = %d, want zero", submits)
+	}
 }
 
 func (p *fakeProvider) Poll(context.Context, string) (providercontract.Job, error) {

@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -25,6 +26,8 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 )
+
+const maxResolvedProviderAssetBytes = 20 << 20
 
 type jobRecord struct {
 	RequestHash string                       `json:"request_hash"`
@@ -263,6 +266,11 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, existing.Response)
 		return
 	}
+	upstreamRequest, err := s.resolveProviderAssets(request.Request)
+	if err != nil {
+		writeProviderError(w, err)
+		return
+	}
 
 	intent := &jobRecord{
 		RequestHash: requestHash,
@@ -299,7 +307,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusCreated, response)
 		return
 	}
-	upstream, err := s.provider.Submit(r.Context(), request.Request)
+	upstream, err := s.provider.Submit(r.Context(), upstreamRequest)
 	if err != nil {
 		intent.Response.Error = providerErrorOrGeneric(err)
 		if intent.Response.Error.Retryable {
@@ -332,6 +340,80 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusCreated, response)
+}
+
+// resolveProviderAssets keeps durable product truth on immutable CAS URIs but
+// converts provider-facing visual inputs to transient data URLs. Private CAS
+// paths are not reachable from Ark, while temporary signed URLs must never be
+// persisted in PromptSnapshots, job records, logs, or evidence packages.
+// Voice profile descriptors contribute to rights/consent and TTS lineage, but
+// are metadata rather than audio accepted by the video model and therefore do
+// not cross the video Provider boundary.
+func (s *Server) resolveProviderAssets(
+	request providercontract.GenerationRequest,
+) (providercontract.GenerationRequest, error) {
+	resolved := request
+	resolved.Assets = make([]providercontract.AssetRef, 0, len(request.Assets))
+	for _, asset := range request.Assets {
+		if asset.MediaType == "audio/x-voice-profile+json" {
+			continue
+		}
+		if !strings.HasPrefix(asset.URI, "cas://sha256/") {
+			resolved.Assets = append(resolved.Assets, asset)
+			continue
+		}
+		if asset.URI != "cas://sha256/"+asset.SHA256 {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeConflict, SafeMessage: "provider input CAS identity does not match its immutable digest",
+			}
+		}
+		mediaType, _, err := mime.ParseMediaType(asset.MediaType)
+		if err != nil || !providerInputMediaType(mediaType, asset.Kind) {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeInvalidRequest, SafeMessage: "provider input CAS object has an unsupported media type",
+			}
+		}
+		object, err := s.store.Open(asset.SHA256)
+		if err != nil {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeUnavailable, SafeMessage: "provider input CAS object is unavailable", Retryable: true,
+			}
+		}
+		content, readErr := io.ReadAll(io.LimitReader(object, maxResolvedProviderAssetBytes+1))
+		closeErr := object.Close()
+		if readErr != nil || closeErr != nil {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeUnavailable, SafeMessage: "provider input CAS object could not be read", Retryable: true,
+			}
+		}
+		if len(content) == 0 || len(content) > maxResolvedProviderAssetBytes {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeInvalidRequest, SafeMessage: "provider input CAS object exceeds the supported size",
+			}
+		}
+		digest := sha256.Sum256(content)
+		if hex.EncodeToString(digest[:]) != asset.SHA256 {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeConflict, SafeMessage: "provider input CAS object failed its immutable digest check",
+			}
+		}
+		asset.URI = "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(content)
+		resolved.Assets = append(resolved.Assets, asset)
+	}
+	return resolved, nil
+}
+
+func providerInputMediaType(mediaType string, kind providercontract.Modality) bool {
+	switch kind {
+	case providercontract.ModalityImage:
+		return strings.HasPrefix(mediaType, "image/")
+	case providercontract.ModalityVideo:
+		return strings.HasPrefix(mediaType, "video/")
+	case providercontract.ModalityAudio:
+		return strings.HasPrefix(mediaType, "audio/")
+	default:
+		return false
+	}
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {

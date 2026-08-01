@@ -55,6 +55,12 @@ task、request、用量、费用、错误分类与 CAS artifact 后再调用 `Ga
 显式注入至少 32 字节的内部服务认证。默认 Compose 与 `make video-stage1-readiness`
 仍保持 Mock/纯校验，不会启动 runner 或产生 Provider 调用。
 
+PromptSnapshot 与数据库始终只保存不可变 `cas://sha256/...` 资产引用。Live
+Adapter 在外部 Provider submit 前校验 CAS digest，并仅在内存中把可视媒体转换为
+Provider 可读取的 data URL；临时字节不会进入 job registry、日志或证据包。用于
+License/Consent 与 TTS 谱系的 `audio/x-voice-profile+json` 语音画像不会被误发为
+Seedance 音频输入。CAS 缺失、损坏、类型不匹配会在 upstream POST 前失败关闭。
+
 正式执行前必须由当前 PostgreSQL 产品真相冻结单独的 execution package。管理员批准的
 product-input/source/safety/visual 四个固定附件只能通过 `video-stage1-materialize` 导入：
 命令先逐文件校验 bytes/SHA-256，把原始附件写入 CAS，再在一个 `SERIALIZABLE` 事务中
