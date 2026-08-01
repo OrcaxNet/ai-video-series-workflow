@@ -952,8 +952,11 @@ func (s *Server) validateJob(request providercontract.JobRequest, idempotencyKey
 }
 
 func (s *Server) validateSpeechCanary(request providercontract.JobRequest) error {
-	if s.config.SpeechCanaryJobID == "" {
+	if !strings.HasPrefix(request.JobID, "speech-v2-") && !speechCanaryConfigured(s.config) {
 		return nil
+	}
+	if !completeSpeechCanaryConfig(s.config) {
+		return speechCanaryViolation()
 	}
 	if request.JobID != s.config.SpeechCanaryJobID ||
 		request.InputHash != s.config.SpeechCanaryInputHash ||
@@ -964,14 +967,14 @@ func (s *Server) validateSpeechCanary(request providercontract.JobRequest) error
 		request.Request.Budget.MaxAttempts != 1 ||
 		request.Request.Output.Format != "mp3" ||
 		s.config.SpeechCanaryMaximumCashMicros != 0 {
-		return safeError(providercontract.CodeInvalidRequest, "speech job is outside the frozen single-call canary", false)
+		return speechCanaryViolation()
 	}
 	predictedAFPMilli := int64(len([]rune(strings.TrimSpace(request.Request.Prompt)))) * ttsAFPMilliPerChar
 	if predictedAFPMilli <= 0 || predictedAFPMilli > s.config.SpeechCanaryMaximumAFPMilli {
-		return safeError(providercontract.CodeBudgetExceeded, "speech canary exceeds the frozen AFP ceiling", false)
+		return speechCanaryViolation()
 	}
 	if len(request.Request.Assets) != 1 {
-		return safeError(providercontract.CodeInvalidRequest, "speech canary requires one frozen VOICE descriptor", false)
+		return speechCanaryViolation()
 	}
 	voice := request.Request.Assets[0]
 	if voice.ID != s.config.SpeechCanaryVoiceAssetID ||
@@ -983,9 +986,61 @@ func (s *Server) validateSpeechCanary(request providercontract.JobRequest) error
 		voice.MediaType != "audio/x-voice-profile+json" ||
 		voice.LicenseReference != s.config.SpeechCanaryLicenseSnapshotID+":"+
 			s.config.SpeechCanaryLicenseHash {
-		return safeError(providercontract.CodeInvalidRequest, "speech canary VOICE or license binding drifted", false)
+		return speechCanaryViolation()
 	}
 	return nil
+}
+
+func speechCanaryConfigured(config runtimeconfig.VolcengineProvider) bool {
+	if config.SpeechCanaryMaximumAFPMilli != 0 || config.SpeechCanaryMaximumCashMicros != 0 {
+		return true
+	}
+	for _, value := range []string{
+		config.SpeechCanaryJobID,
+		config.SpeechCanaryInputHash,
+		config.SpeechCanaryCueID,
+		config.SpeechCanaryVoiceAssetID,
+		config.SpeechCanaryParentVoiceVersion,
+		config.SpeechCanaryVoiceVersion,
+		config.SpeechCanaryVoiceHash,
+		config.SpeechCanaryLicenseSnapshotID,
+		config.SpeechCanaryLicenseHash,
+	} {
+		if value != "" {
+			return true
+		}
+	}
+	return false
+}
+
+func completeSpeechCanaryConfig(config runtimeconfig.VolcengineProvider) bool {
+	if config.SpeechCanaryMaximumAFPMilli <= 0 || config.SpeechCanaryMaximumCashMicros != 0 {
+		return false
+	}
+	for _, value := range []string{
+		config.SpeechCanaryJobID,
+		config.SpeechCanaryInputHash,
+		config.SpeechCanaryCueID,
+		config.SpeechCanaryVoiceAssetID,
+		config.SpeechCanaryParentVoiceVersion,
+		config.SpeechCanaryVoiceVersion,
+		config.SpeechCanaryVoiceHash,
+		config.SpeechCanaryLicenseSnapshotID,
+		config.SpeechCanaryLicenseHash,
+	} {
+		if value == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func speechCanaryViolation() *providercontract.Error {
+	return safeError(
+		providercontract.CodeInvalidRequest,
+		"speech job is outside the frozen single-call canary",
+		false,
+	)
 }
 
 func acceptedProviderIdentity(provider string) bool {
