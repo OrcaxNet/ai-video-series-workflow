@@ -239,15 +239,16 @@ func (g *Gate) BindExecutionPackage(contentHash string) error {
 }
 
 // BindExecutionPackageRevision atomically promotes one speech-v2-only child
-// package after all ten primary video jobs have immutable, evidence-complete
-// successful terminal records. The parent binding is retained in the ledger,
-// and no controlled retry or second package revision may cross this boundary.
-func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage) error {
-	if err := package_.Validate(g.plan); err != nil {
-		return err
-	}
-	if package_.ParentExecutionPackageHash == "" {
-		return errors.New("stage 1 execution package revision requires a parent package hash")
+// package after comparing it with the complete immutable parent artifact and
+// confirming all ten primary video jobs have evidence-complete successful
+// terminal records. The parent binding is retained in the ledger, and no
+// controlled retry or second package revision may cross this boundary.
+//
+// parentArtifact is variadic only to keep older callers source-compatible:
+// promotion fails closed unless exactly one complete parent package is given.
+func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArtifact ...ExecutionPackage) error {
+	if len(parentArtifact) != 1 {
+		return providerError(providercontract.CodeForbidden, "stage 1 package revision requires exactly one immutable parent artifact")
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -265,17 +266,23 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage) error {
 		return err
 	}
 	if ledger.ExecutionPackageHash == package_.ContentHash {
+		if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
+			return providerError(providercontract.CodeForbidden, "stage 1 package revision contains non-speech drift")
+		}
 		if ledger.SupersededExecutionPackageHash != package_.ParentExecutionPackageHash {
 			return errors.New("stage 1 ledger revision parent binding is invalid")
 		}
 		g.executionPackageHash = package_.ContentHash
 		return nil
 	}
+	if ledger.SupersededExecutionPackageHash != "" {
+		return providerError(providercontract.CodeConflict, "stage 1 ledger already consumed its package revision")
+	}
 	if ledger.ExecutionPackageHash != package_.ParentExecutionPackageHash {
 		return errors.New("stage 1 ledger is not bound to the revision parent package")
 	}
-	if ledger.SupersededExecutionPackageHash != "" {
-		return providerError(providercontract.CodeConflict, "stage 1 ledger already consumed its package revision")
+	if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
+		return providerError(providercontract.CodeForbidden, "stage 1 package revision contains non-speech drift")
 	}
 	if ledger.ControlledRetryPackageHash != "" {
 		return providerError(providercontract.CodeForbidden, "stage 1 package revision cannot replace a controlled retry binding")

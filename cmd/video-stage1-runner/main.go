@@ -91,6 +91,26 @@ func run(
 	if err := executionPackage.Validate(plan); err != nil {
 		return fmt.Errorf("validate immutable stage 1 execution package: %w", err)
 	}
+	var parentExecutionPackage *stage1.ExecutionPackage
+	if executionPackage.ParentExecutionPackageHash != "" {
+		parentPath, parentPathErr := requiredEnv(lookup, "VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH")
+		if parentPathErr != nil {
+			return parentPathErr
+		}
+		parentFile, openErr := os.Open(parentPath)
+		if openErr != nil {
+			return fmt.Errorf("open immutable stage 1 parent execution package: %w", openErr)
+		}
+		defer parentFile.Close()
+		var parent stage1.ExecutionPackage
+		if decodeErr := decodeOne(parentFile, &parent); decodeErr != nil {
+			return fmt.Errorf("decode immutable stage 1 parent execution package: %w", decodeErr)
+		}
+		if validateErr := executionPackage.ValidateSpeechV2Revision(plan, parent); validateErr != nil {
+			return fmt.Errorf("validate immutable stage 1 execution package revision: %w", validateErr)
+		}
+		parentExecutionPackage = &parent
+	}
 	gate, err := stage1.Open(plan, ledgerPath)
 	if err != nil {
 		return err
@@ -140,7 +160,13 @@ func run(
 			}
 			return errors.New("stage 1 controlled retry package is unavailable")
 		}
-		runner, err = stage1.NewRunner(gate, adapter, artifacts, store, executionPackage)
+		if parentExecutionPackage != nil {
+			runner, err = stage1.NewRunnerWithExecutionPackageRevision(
+				gate, adapter, artifacts, store, *parentExecutionPackage, executionPackage,
+			)
+		} else {
+			runner, err = stage1.NewRunner(gate, adapter, artifacts, store, executionPackage)
+		}
 	}
 	if err != nil {
 		return err

@@ -47,6 +47,16 @@ func run(args []string, output io.Writer) error {
 		}
 		return encodePackage(output, package_)
 	}
+	if args[0] == "verify-revision" && len(args) == 4 {
+		var child stage1.ExecutionPackage
+		if err := decodeFile(args[3], &child); err != nil {
+			return fmt.Errorf("read stage 1 child execution package: %w", err)
+		}
+		if err := child.ValidateSpeechV2Revision(plan, package_); err != nil {
+			return err
+		}
+		return encodePackage(output, child)
+	}
 	if (args[0] != "seal-retry" && args[0] != "verify-retry") || len(args) != 4 {
 		return packageUsageError()
 	}
@@ -75,7 +85,7 @@ func encodePackage(output io.Writer, value any) error {
 }
 
 func packageUsageError() error {
-	return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json> OR <seal-retry|verify-retry> <plan.json> <package.json> <retry-package.json>")
+	return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json> OR verify-revision <plan.json> <parent-package.json> <child-package.json> OR <seal-retry|verify-retry> <plan.json> <package.json> <retry-package.json>")
 }
 
 func decodeFile(path string, destination any) error {

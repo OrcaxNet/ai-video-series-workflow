@@ -401,7 +401,7 @@ func RevoiceStage1(
 	if err != nil {
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, err
 	}
-	if err := revised.Validate(plan); err != nil {
+	if err := revised.ValidateSpeechV2Revision(plan, parent); err != nil {
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("validate revised execution package: %w", err)
 	}
 	auditPayload := map[string]any{

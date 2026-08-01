@@ -77,14 +77,37 @@ Provider profile/capability；Adapter 再匹配 job/input/cue/VOICE/license allo
 一段 canary 后，Finalize 会在媒体合成、Manifest 与 G3 前返回需人工检查的非重试冲突，
 不会继续提交其余 cue。跨进程相同 job 通过原子 intent/replay 保证至多一次 Provider submit。
 
-speech-v2 execution package 还必须冻结 `parentExecutionPackageHash`。Runner 只会在原
-package 的十个视频记录全部为 `TERMINAL_SUCCEEDED` 且证据完整、主 job 身份与额度逐项未变、
+speech-v2 execution package 还必须冻结 `parentExecutionPackageHash`，且 Runner 必须同时读取
+`VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH` 指向的完整只读父包。Runner 会先复算父包 hash，
+再构造唯一允许的 child 投影；只允许 Speech route/profile、VOICE binding、授权 cue、AFP/现金/
+attempt canary 上限以及固定 `-speech-v2` trace 后缀变化。PrimaryJobs、Episode/Run/Plan、视频
+route/profile/预算审批、基础 speech 预算、字幕、背景音和其余后期目标必须逐字节保持不变。
+父包只给 hash、不提供完整 artifact，或任何非语音字段漂移，均在首次 ledger 写入和 Provider
+调用前失败关闭。父/子文件必须使用不同路径，不能用 child 覆盖父包。
+
+通过完整父子投影验证后，Runner 只会在原 package 的十个视频记录全部为
+`TERMINAL_SUCCEEDED` 且证据完整、主 job 身份与额度逐项未变、
 不存在 controlled retry 时，于同一文件锁内把 ledger 提升到 child package；旧 hash 永久写入
 `supersededExecutionPackageHash`。该提升只允许一次并可幂等重放，缺镜、失败/证据不全、
 Attempt 漂移、错误 parent 或第二个 child 均在启动 TTS 前失败关闭。这样 VOICE 修订不会要求
 重提已完成视频，也不能把任意后期包替换到已有视频证据上。物化事务同时写入独立的
 `stage1.execution_package.revision_bound` 审计，以 parent/child package hash、VOICE version
 和批准评论固定这次只改后期语音合同的派生关系；旧 VOICE 修订审计保持只读。
+
+```bash
+VIDEO_STAGE1_EXECUTION_PACKAGE_PATH=/var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package-speech-v2.json \
+VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH=/var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json \
+docker compose --profile stage1 run --rm stage1-runner finalize-input
+```
+
+在连接 ledger、PostgreSQL 或 Adapter 前可独立执行同一父子投影验证：
+
+```bash
+go run ./cmd/video-stage1-package verify-revision \
+  video-pipeline/config/flo104-stage1-readiness.json \
+  flo104-sample1-execution-package.json \
+  flo104-sample1-execution-package-speech-v2.json
+```
 
 Provider 失败证据保留精确 HTTP status、纯数字 Provider code、脱敏
 `X-Api-Message` 分类与 `X-Tt-Logid`。401/403、非 Plan endpoint、usage/log 缺失、AFP/现金

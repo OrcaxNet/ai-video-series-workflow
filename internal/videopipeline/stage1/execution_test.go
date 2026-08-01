@@ -3,6 +3,8 @@ package stage1
 import (
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestExecutionPackageFreezesTenRunsAndCompletePostProduction(t *testing.T) {
@@ -86,6 +88,88 @@ func TestExecutionPackageRevisionRequiresSpeechV2AndDistinctParent(t *testing.T)
 			}
 			if err := candidate.Validate(testPlan()); err == nil {
 				t.Fatal("invalid execution package revision unexpectedly passed")
+			}
+		})
+	}
+}
+
+func TestSpeechV2RevisionRejectsEveryFrozenNonSpeechProjection(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		mutate func(*ExecutionPackage)
+	}{
+		{name: "shot revision", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].ShotSpecRevisionID = uuid.NewString()
+		}},
+		{name: "run spec", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].Run.RunSpecDigest = strings.Repeat("a", 64)
+		}},
+		{name: "prompt snapshot", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].PromptSnapshotHash = strings.Repeat("a", 64)
+		}},
+		{name: "generation plan", mutate: func(p *ExecutionPackage) {
+			planID := uuid.NewString()
+			for index := range p.PrimaryJobs {
+				p.PrimaryJobs[index].GenerationPlanID = planID
+			}
+			p.PostProduction.GenerationPlanID = planID
+		}},
+		{name: "video budget approval", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].BudgetApprovalID = uuid.NewString()
+		}},
+		{name: "video budget ceiling", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].BudgetMaximumMicros++
+		}},
+		{name: "video provider profile", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].ProviderProfileID = uuid.NewString()
+		}},
+		{name: "video route", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].Route.CapabilityHash = strings.Repeat("a", 64)
+		}},
+		{name: "video workflow identity", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0].WorkflowID = "other-stage1-workflow"
+		}},
+		{name: "episode revision", mutate: func(p *ExecutionPackage) {
+			p.PostProduction.EpisodeRevisionID = uuid.NewString()
+		}},
+		{name: "run order", mutate: func(p *ExecutionPackage) {
+			p.PrimaryJobs[0], p.PrimaryJobs[1] = p.PrimaryJobs[1], p.PrimaryJobs[0]
+			p.PostProduction.RunIDs[0], p.PostProduction.RunIDs[1] =
+				p.PostProduction.RunIDs[1], p.PostProduction.RunIDs[0]
+		}},
+		{name: "base speech budget approval", mutate: func(p *ExecutionPackage) {
+			p.PostProduction.Config.SpeechBudgetApprovalID = uuid.NewString()
+		}},
+		{name: "base speech budget ceiling", mutate: func(p *ExecutionPackage) {
+			p.PostProduction.Config.SpeechBudgetMaximumMicros++
+		}},
+		{name: "subtitle language", mutate: func(p *ExecutionPackage) {
+			p.PostProduction.Config.SubtitleLanguage = "en-US"
+		}},
+		{name: "background audio", mutate: func(p *ExecutionPackage) {
+			p.PostProduction.Config.BackgroundAudioAssetVersionID = uuid.NewString()
+		}},
+		{name: "finalization trace", mutate: func(p *ExecutionPackage) {
+			p.PostProduction.TraceID = "other-speech-v2-trace"
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			parent := testExecutionPackage(t)
+			child := testSpeechV2ExecutionPackage(t, parent)
+			test.mutate(&child)
+			child, err := SealExecutionPackage(child)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := child.Validate(testPlan()); err != nil {
+				t.Fatalf("drift probe must remain a well-formed standalone package: %v", err)
+			}
+			if err := child.ValidateSpeechV2Revision(testPlan(), parent); err == nil {
+				t.Fatal("non-speech drift was accepted by the canonical parent projection")
 			}
 		})
 	}

@@ -129,10 +129,10 @@ func TestGatePromotesOneSpeechV2PackageAfterAllPrimaryVideoSuccess(t *testing.T)
 	revised := testSpeechV2ExecutionPackage(t, parent)
 	gate := completePrimaryPackage(t, path, parent, RequiredPrimaryJobs, "TERMINAL_SUCCEEDED", true)
 
-	if err := gate.BindExecutionPackageRevision(revised); err != nil {
+	if err := gate.BindExecutionPackageRevision(revised, parent); err != nil {
 		t.Fatal(err)
 	}
-	if err := gate.BindExecutionPackageRevision(revised); err != nil {
+	if err := gate.BindExecutionPackageRevision(revised, parent); err != nil {
 		t.Fatalf("idempotent speech-v2 package revision replay: %v", err)
 	}
 	ledger := readTestLedger(t, path)
@@ -151,7 +151,7 @@ func TestGatePromotesOneSpeechV2PackageAfterAllPrimaryVideoSuccess(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.BindExecutionPackageRevision(revised); err != nil {
+	if err := restarted.BindExecutionPackageRevision(revised, parent); err != nil {
 		t.Fatalf("speech-v2 package revision failed after restart: %v", err)
 	}
 	if err := restarted.BindExecutionPackage(parent.ContentHash); err == nil {
@@ -164,8 +164,78 @@ func TestGatePromotesOneSpeechV2PackageAfterAllPrimaryVideoSuccess(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := restarted.BindExecutionPackageRevision(second); providercontract.ErrorCodeOf(err) != providercontract.CodeConflict {
+	if err := restarted.BindExecutionPackageRevision(second, revised); providercontract.ErrorCodeOf(err) != providercontract.CodeConflict {
 		t.Fatalf("second package revision error = %v", err)
+	}
+}
+
+func TestGateAllowsOnlyOneCompetingSpeechV2Child(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	parent := testExecutionPackage(t)
+	first := testSpeechV2ExecutionPackage(t, parent)
+	second := testSpeechV2ExecutionPackage(t, parent)
+	second.PostProduction.Config.SpeechAuthorizedCueID = "cue-002"
+	var err error
+	second, err = SealExecutionPackage(second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := second.ValidateSpeechV2Revision(testPlan(), parent); err != nil {
+		t.Fatal(err)
+	}
+	completePrimaryPackage(t, path, parent, RequiredPrimaryJobs, "TERMINAL_SUCCEEDED", true)
+
+	children := []ExecutionPackage{first, second}
+	errorsByChild := make([]error, len(children))
+	var wait sync.WaitGroup
+	for index, child := range children {
+		wait.Add(1)
+		go func(index int, child ExecutionPackage) {
+			defer wait.Done()
+			gate, openErr := Open(testPlan(), path)
+			if openErr != nil {
+				errorsByChild[index] = openErr
+				return
+			}
+			errorsByChild[index] = gate.BindExecutionPackageRevision(child, parent)
+		}(index, child)
+	}
+	wait.Wait()
+
+	var succeeded, conflicted int
+	for _, bindErr := range errorsByChild {
+		switch providercontract.ErrorCodeOf(bindErr) {
+		case "":
+			if bindErr == nil {
+				succeeded++
+			} else {
+				t.Fatalf("unexpected package revision error: %v", bindErr)
+			}
+		case providercontract.CodeConflict:
+			conflicted++
+		default:
+			t.Fatalf("unexpected package revision error: %v", bindErr)
+		}
+	}
+	if succeeded != 1 || conflicted != 1 {
+		t.Fatalf("competing revisions: succeeded=%d conflicted=%d", succeeded, conflicted)
+	}
+}
+
+func TestGateRejectsSpeechV2RevisionWithoutCompleteParentArtifact(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	parent := testExecutionPackage(t)
+	child := testSpeechV2ExecutionPackage(t, parent)
+	gate := completePrimaryPackage(t, path, parent, RequiredPrimaryJobs, "TERMINAL_SUCCEEDED", true)
+
+	if err := gate.BindExecutionPackageRevision(child); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+		t.Fatalf("missing parent artifact error = %v", err)
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.ExecutionPackageHash != parent.ContentHash || ledger.SupersededExecutionPackageHash != "" {
+		t.Fatalf("missing parent artifact changed ledger: %#v", ledger)
 	}
 }
 
@@ -199,7 +269,7 @@ func TestGateRejectsSpeechV2PackageRevisionWithoutExactSuccessfulPrimaryEvidence
 					t.Fatal(err)
 				}
 			}
-			if err := gate.BindExecutionPackageRevision(revised); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+			if err := gate.BindExecutionPackageRevision(revised, parent); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
 				t.Fatalf("package revision error = %v", err)
 			}
 			ledger := readTestLedger(t, path)

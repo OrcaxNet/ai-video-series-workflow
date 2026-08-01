@@ -809,11 +809,21 @@ func TestRunnerUsesCompletedPrimaryLedgerForSpeechV2PackageRevision(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner, err := NewRunner(
+	if _, err := NewRunner(
 		gate,
 		adapter,
 		runnerArtifactFixture{digests: map[string]bool{}},
 		&runnerTruthFixture{executionPackage: revised},
+		revised,
+	); err == nil {
+		t.Fatal("speech-v2 runner accepted only a parent hash without the parent artifact")
+	}
+	runner, err := NewRunnerWithExecutionPackageRevision(
+		gate,
+		adapter,
+		runnerArtifactFixture{digests: map[string]bool{}},
+		&runnerTruthFixture{executionPackage: revised},
+		parent,
 		revised,
 	)
 	if err != nil {
@@ -957,6 +967,8 @@ func testExecutionPackage(t *testing.T) ExecutionPackage {
 func testSpeechV2ExecutionPackage(t *testing.T, parent ExecutionPackage) ExecutionPackage {
 	t.Helper()
 	revised := parent
+	revised.PrimaryJobs = append([]FrozenJob(nil), parent.PrimaryJobs...)
+	revised.PostProduction.RunIDs = append([]string(nil), parent.PostProduction.RunIDs...)
 	revised.ParentExecutionPackageHash = parent.ContentHash
 	revised.PostProduction.Config.SpeechIdentityVersion = postproduction.SpeechIdentityV2
 	revised.PostProduction.Config.SpeechVoice = &postproduction.SpeechVoiceBinding{

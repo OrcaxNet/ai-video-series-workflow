@@ -211,7 +211,8 @@ services:
     environment:
       VIDEO_STAGE1_PLAN_PATH: /etc/video-pipeline/flo104-stage1-plan.json
       VIDEO_STAGE1_LEDGER_PATH: /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-ledger.json
-      VIDEO_STAGE1_EXECUTION_PACKAGE_PATH: /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json
+      VIDEO_STAGE1_EXECUTION_PACKAGE_PATH: ${VIDEO_STAGE1_EXECUTION_PACKAGE_PATH:-/var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json}
+      VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH: ${VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH:-}
       VIDEO_STAGE1_RETRY_PACKAGE_PATH: ${VIDEO_STAGE1_RETRY_PACKAGE_PATH:-}
       VIDEO_PROVIDER_ADAPTER_URL: http://volcengine-provider:8091
       VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}

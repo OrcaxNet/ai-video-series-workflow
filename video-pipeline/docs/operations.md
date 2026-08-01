@@ -107,6 +107,8 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 | `VIDEO_ARTIFACT_ROOT` | `/var/lib/video-pipeline/artifacts` | 本地 CAS |
 | `ARK_API_KEY` | 未设置 | 火山方舟；只显式注入 |
 | `VIDEO_PROVIDER_SERVICE_AUTH_SECRET` | 未设置 | Live Adapter 内部 HMAC 服务认证；至少 32 bytes，只通过 Secret manager 注入 |
+| `VIDEO_STAGE1_EXECUTION_PACKAGE_PATH` | Stage 1 原始包路径 | speech-v2 时必须切到独立 child 文件，禁止覆盖父包 |
+| `VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH` | 未设置 | 仅 speech-v2 修订必填；完整只读父包用于 canonical 非语音投影校验 |
 | `VIDEO_VOLCENGINE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | Agent Plan 数据面；不得写入 Manifest/BOM |
 | `VIDEO_VOLCENGINE_VIDEO_MODEL` | `doubao-seedance-2.0` | 冻结真实视频模型 |
 | `VIDEO_VOLCENGINE_TTS_ENDPOINT` | Agent Plan HTTP TTS URL | 只接受套餐专属 V3 HTTP Chunked `/api/v3/plan/tts/unidirectional`；标准 `/api/v3/tts/...`、query、尾斜杠或 host 漂移均在网络调用前失败关闭；Resource ID 固定为 `seed-tts-2.0` |

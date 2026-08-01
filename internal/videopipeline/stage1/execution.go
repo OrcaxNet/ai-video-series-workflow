@@ -153,6 +153,46 @@ func (p ExecutionPackage) Validate(plan Plan) error {
 	return nil
 }
 
+// ValidateSpeechV2Revision proves that p is derived from the exact immutable
+// parent package and changes only the fields materialized by RevoiceStage1.
+// The complete parent artifact is required: its hash alone cannot prove that
+// already-executed video lineage or unrelated finalization settings stayed
+// frozen.
+func (p ExecutionPackage) ValidateSpeechV2Revision(plan Plan, parent ExecutionPackage) error {
+	if err := parent.Validate(plan); err != nil {
+		return fmt.Errorf("validate parent execution package: %w", err)
+	}
+	if err := p.Validate(plan); err != nil {
+		return fmt.Errorf("validate child execution package: %w", err)
+	}
+	if parent.ParentExecutionPackageHash != "" {
+		return errors.New("stage 1 package revision parent must be an original execution package")
+	}
+	if p.ParentExecutionPackageHash != parent.ContentHash {
+		return errors.New("stage 1 package revision is bound to another parent artifact")
+	}
+
+	expected := parent
+	expected.ParentExecutionPackageHash = parent.ContentHash
+	expected.PostProduction.Config.SpeechRoute = p.PostProduction.Config.SpeechRoute
+	expected.PostProduction.Config.SpeechProviderProfileID = p.PostProduction.Config.SpeechProviderProfileID
+	expected.PostProduction.Config.SpeechIdentityVersion = p.PostProduction.Config.SpeechIdentityVersion
+	expected.PostProduction.Config.SpeechVoice = p.PostProduction.Config.SpeechVoice
+	expected.PostProduction.Config.SpeechAuthorizedCueID = p.PostProduction.Config.SpeechAuthorizedCueID
+	expected.PostProduction.Config.SpeechMaximumAFPMilli = p.PostProduction.Config.SpeechMaximumAFPMilli
+	expected.PostProduction.Config.SpeechMaximumCashMicros = p.PostProduction.Config.SpeechMaximumCashMicros
+	expected.PostProduction.Config.SpeechMaxAttempts = p.PostProduction.Config.SpeechMaxAttempts
+	expected.PostProduction.TraceID = parent.PostProduction.TraceID + "-speech-v2"
+	expected, err := SealExecutionPackage(expected)
+	if err != nil {
+		return err
+	}
+	if expected.ContentHash != p.ContentHash {
+		return errors.New("stage 1 package revision contains fields outside the approved speech-v2 projection")
+	}
+	return nil
+}
+
 func (j FrozenJob) validate(plan Plan) error {
 	for name, value := range map[string]string{
 		"shotId": j.ShotID, "attemptId": j.AttemptID, "idempotencyKey": j.IdempotencyKey,

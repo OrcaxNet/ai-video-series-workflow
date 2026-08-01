@@ -87,7 +87,22 @@ func NewRunner(
 	truth ProductTruthPreparer,
 	executionPackage ExecutionPackage,
 ) (*Runner, error) {
-	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil)
+	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil, nil)
+}
+
+// NewRunnerWithExecutionPackageRevision requires both immutable artifacts so
+// the gate can prove that the child changes only the approved speech-v2 fields.
+func NewRunnerWithExecutionPackageRevision(
+	gate *Gate,
+	adapter *AdapterSubmitter,
+	artifacts ArtifactVerifier,
+	truth ProductTruthPreparer,
+	parentExecutionPackage ExecutionPackage,
+	executionPackage ExecutionPackage,
+) (*Runner, error) {
+	return newRunner(
+		gate, adapter, artifacts, truth, executionPackage, &parentExecutionPackage, nil,
+	)
 }
 
 // NewRunnerWithControlledRetry enables the separately sealed +1 path without
@@ -100,7 +115,7 @@ func NewRunnerWithControlledRetry(
 	executionPackage ExecutionPackage,
 	controlledRetry ControlledRetryPackage,
 ) (*Runner, error) {
-	return newRunner(gate, adapter, artifacts, truth, executionPackage, &controlledRetry)
+	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil, &controlledRetry)
 }
 
 func newRunner(
@@ -109,6 +124,7 @@ func newRunner(
 	artifacts ArtifactVerifier,
 	truth ProductTruthPreparer,
 	executionPackage ExecutionPackage,
+	parentExecutionPackage *ExecutionPackage,
 	controlledRetry *ControlledRetryPackage,
 ) (*Runner, error) {
 	if gate == nil || adapter == nil || artifacts == nil || truth == nil {
@@ -121,11 +137,19 @@ func newRunner(
 		return nil, errors.New("speech-v2 package revision cannot be combined with a controlled retry package")
 	}
 	if executionPackage.ParentExecutionPackageHash == "" {
+		if parentExecutionPackage != nil {
+			return nil, errors.New("an original execution package cannot name a revision parent artifact")
+		}
 		if err := gate.BindExecutionPackage(executionPackage.ContentHash); err != nil {
 			return nil, err
 		}
-	} else if err := gate.BindExecutionPackageRevision(executionPackage); err != nil {
-		return nil, err
+	} else {
+		if parentExecutionPackage == nil {
+			return nil, errors.New("speech-v2 package revision requires its immutable parent artifact")
+		}
+		if err := gate.BindExecutionPackageRevision(executionPackage, *parentExecutionPackage); err != nil {
+			return nil, err
+		}
 	}
 	if controlledRetry != nil {
 		if err := controlledRetry.Validate(gate.Plan(), executionPackage); err != nil {
