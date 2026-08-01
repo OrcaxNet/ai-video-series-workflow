@@ -786,12 +786,15 @@ func ensureGenerationRunPlanBindings(
 	for _, job := range package_.PrimaryJobs {
 		var shotID, promptID, profileID uuid.UUID
 		var runDigest, state, budgetApprovalID string
-		var creativeAttempt int
+		var attemptKind, attemptState, attemptInputHash string
+		var creativeAttempt, attemptSequence int
 		var modelSnapshotJSON []byte
 		if err := tx.QueryRow(ctx, `
 			SELECT gr.shot_spec_revision_id, gr.prompt_snapshot_id,
 			       gr.generation_profile_id, gr.run_spec_digest, gr.state,
-			       gr.creative_attempt, gr.budget_approval_id, ga.model_snapshot
+			       gr.creative_attempt, gr.budget_approval_id,
+			       ga.sequence, ga.attempt_kind, ga.state, ga.input_hash,
+			       ga.model_snapshot
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.generation_attempts ga
 			  ON ga.generation_run_id = gr.id AND ga.sequence = 1
@@ -800,7 +803,8 @@ func ensureGenerationRunPlanBindings(
 			mustUUID(job.Run.RunID),
 		).Scan(
 			&shotID, &promptID, &profileID, &runDigest, &state,
-			&creativeAttempt, &budgetApprovalID, &modelSnapshotJSON,
+			&creativeAttempt, &budgetApprovalID, &attemptSequence,
+			&attemptKind, &attemptState, &attemptInputHash, &modelSnapshotJSON,
 		); err != nil {
 			return fmt.Errorf("resolve imported generation run %s: %w", job.Run.RunID, err)
 		}
@@ -808,12 +812,19 @@ func ensureGenerationRunPlanBindings(
 		if err := json.Unmarshal(modelSnapshotJSON, &modelSnapshot); err != nil {
 			return fmt.Errorf("decode imported generation run route %s: %w", job.Run.RunID, err)
 		}
+		expectedAttemptKind := "PROVIDER_REQUEST"
+		if creativeAttempt > 1 {
+			expectedAttemptKind = "CREATIVE_REVISION"
+		}
 		if shotID.String() != job.ShotSpecRevisionID ||
 			promptID.String() != job.PromptSnapshotID ||
 			profileID.String() != generationProfileID ||
 			runDigest != job.Run.RunSpecDigest || state != "VALIDATED" ||
 			creativeAttempt != job.Run.Attempt ||
-			budgetApprovalID != job.BudgetApprovalID || modelSnapshot != job.Route {
+			budgetApprovalID != job.BudgetApprovalID ||
+			attemptSequence != 1 || attemptKind != expectedAttemptKind ||
+			attemptState != "VALIDATED" || attemptInputHash != runDigest ||
+			modelSnapshot != job.Route {
 			return fmt.Errorf("imported generation run %s differs from the sealed execution package", job.Run.RunID)
 		}
 		var paidBoundaryRecords int64

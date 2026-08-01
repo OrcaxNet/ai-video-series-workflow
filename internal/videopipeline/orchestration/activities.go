@@ -938,6 +938,7 @@ func classifyPostProductionError(err error) error {
 		case controlplane.CodeConsentRequired,
 			controlplane.CodeLicenseBlocked,
 			controlplane.CodeBudgetExceeded,
+			controlplane.CodeConflict,
 			controlplane.CodeGateRequired,
 			controlplane.CodeContentBlocked,
 			controlplane.CodeRevisionConflict,

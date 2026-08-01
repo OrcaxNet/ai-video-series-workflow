@@ -854,6 +854,59 @@ func TestActivities_ExecuteProviderJobPreservesVideoBudgetErrorBeforeProvider(
 	}
 }
 
+func TestActivities_ExecuteProviderJobPreservesAttemptContractErrorsBeforeProvider(
+	t *testing.T,
+) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		code controlplane.ErrorCode
+	}{
+		{name: "terminal attempt", code: controlplane.CodeConflict},
+		{name: "immutable attempt drift", code: controlplane.CodeRevisionConflict},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var providerCalls atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				providerCalls.Add(1)
+				http.Error(response, "provider must not be called", http.StatusInternalServerError)
+			}))
+			defer provider.Close()
+
+			ledger := &providerPreparationLedgerFixture{
+				prepareErr: controlplane.NewConflictError(
+					test.code,
+					"fixture generation attempt is terminal or drifted",
+				),
+			}
+			activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestActivityEnvironment()
+			env.RegisterActivity(activities.ExecuteProviderJob)
+			_, err := env.ExecuteActivity(
+				activities.ExecuteProviderJob,
+				ExecuteProviderJobInput{
+					Run:     GenerationRunRef{RunID: "run-attempt-contract"},
+					TraceID: "trace-attempt-contract", PersistProductTruth: true,
+				},
+			)
+			assertNonRetryableApplicationError(t, err, string(test.code))
+			if ledger.prepareCalls != 1 || providerCalls.Load() != 0 {
+				t.Fatalf(
+					"attempt contract boundary side effects = prepare:%d provider:%d, want 1/0",
+					ledger.prepareCalls, providerCalls.Load(),
+				)
+			}
+		})
+	}
+}
+
 func TestActivities_ExecuteProviderJobRejectsTamperedPersistedPromptBeforeProvider(
 	t *testing.T,
 ) {

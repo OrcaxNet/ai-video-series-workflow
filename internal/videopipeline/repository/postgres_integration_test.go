@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -882,6 +883,128 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		BudgetCurrency: "CNY", ProviderProfileID: providerProfileID.String(),
 		TraceID: step.TraceID, PersistProductTruth: true,
 	}
+	attemptDriftCases := []struct {
+		name     string
+		wantCode controlplane.ErrorCode
+		mutate   func(t *testing.T)
+	}{
+		{
+			name:     "failed attempt",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'FAILED'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "cancelled attempt",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'CANCELLED'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "succeeded attempt",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'SUCCEEDED'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "unknown attempt without a prepared job",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'UNKNOWN'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "input hash drift",
+			wantCode: controlplane.CodeRevisionConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET input_hash = $2
+					WHERE generation_run_id = $1`, run.RunID, strings.Repeat("f", 64))
+			},
+		},
+		{
+			name:     "attempt kind drift",
+			wantCode: controlplane.CodeRevisionConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET attempt_kind = 'CREATIVE_REVISION'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "attempt sequence drift",
+			wantCode: controlplane.CodeRevisionConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET sequence = 2
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+	}
+	for _, test := range attemptDriftCases {
+		t.Run("PrepareProviderJob rejects "+test.name, func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				UPDATE video_pipeline.generation_attempts
+				SET sequence = 1, attempt_kind = 'PROVIDER_REQUEST', state = 'VALIDATED',
+				    input_hash = $2, model_snapshot = $3
+				WHERE generation_run_id = $1`, run.RunID, run.RunSpecDigest, model)
+			test.mutate(t)
+			if _, err := store.PrepareProviderJob(ctx, step, dispatch); err == nil {
+				t.Fatal("PrepareProviderJob accepted a drifted generation attempt")
+			} else {
+				var domain *controlplane.DomainError
+				if !errors.As(err, &domain) || domain.Code != test.wantCode {
+					t.Fatalf("drifted generation attempt error = %#v, want %s", err, test.wantCode)
+				}
+			}
+			var reservations, jobs, costs int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT count(*) FROM video_pipeline.budget_reservations
+				   WHERE generation_run_id = $1),
+				  (SELECT count(*) FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1),
+				  (SELECT count(*) FROM video_pipeline.cost_ledger cl
+				   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`, run.RunID,
+			).Scan(&reservations, &jobs, &costs); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || costs != 0 {
+				t.Fatalf(
+					"drift rejection side effects = reservations:%d jobs:%d costs:%d",
+					reservations, jobs, costs,
+				)
+			}
+		})
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_attempts
+		SET sequence = 1, attempt_kind = 'PROVIDER_REQUEST', state = 'VALIDATED',
+		    input_hash = $2, model_snapshot = $3
+		WHERE generation_run_id = $1`, run.RunID, run.RunSpecDigest, model)
 	atomicMismatch := dispatch
 	atomicMismatch.ExpectedProductTruth = &orchestration.PreparedProductTruth{
 		ShotSpecRevisionID:  shotRevisionID.String(),
@@ -2041,6 +2164,51 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err := store.ValidateWorkerUpgradeReadiness(ctx); err != nil {
 		t.Fatalf("v6 worker rejected restored Provider reservation lineage: %v", err)
 	}
+	replayedPreparedProvider, err := store.PrepareProviderJob(ctx, step, dispatch)
+	if err != nil {
+		t.Fatalf("exact prepared Provider job replay failed: %v", err)
+	}
+	if !reflect.DeepEqual(replayedPreparedProvider, preparedProvider) {
+		t.Fatal("exact prepared Provider job replay changed the durable allocation")
+	}
+	// A late Temporal Activity replay can arrive after completion has already
+	// frozen both product records. It must recover the exact durable job rather
+	// than allocate a second paid boundary or reject the workflow's history.
+	var beforeReplayRunState, beforeReplayAttemptState string
+	if err := pool.QueryRow(ctx, `
+		SELECT gr.state, ga.state
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.generation_run_id = gr.id AND ga.sequence = 1
+		WHERE gr.id = $1`, run.RunID,
+	).Scan(&beforeReplayRunState, &beforeReplayAttemptState); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_runs SET state = 'SUCCEEDED' WHERE id = $1`,
+		run.RunID,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_attempts
+		SET state = 'SUCCEEDED' WHERE generation_run_id = $1 AND sequence = 1`,
+		run.RunID,
+	)
+	terminalReplay, err := store.PrepareProviderJob(ctx, step, dispatch)
+	if err != nil {
+		t.Fatalf("terminal exact prepared Provider job replay failed: %v", err)
+	}
+	if !reflect.DeepEqual(terminalReplay, preparedProvider) {
+		t.Fatal("terminal exact Provider replay changed the durable allocation")
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_runs SET state = $2 WHERE id = $1`,
+		run.RunID, beforeReplayRunState,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_attempts
+		SET state = $2 WHERE generation_run_id = $1 AND sequence = 1`,
+		run.RunID, beforeReplayAttemptState,
+	)
 	qaPauseActor := controlplane.Actor{ActorID: "qa-operator", Role: "OPERATOR"}
 	qaPauseDigest, _ := digestValue(map[string]any{"runId": run.RunID, "reason": "QA_PAUSE"})
 	if _, err := store.RequestRunPause(

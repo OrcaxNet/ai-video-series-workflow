@@ -1227,15 +1227,18 @@ func (p *Postgres) PrepareProviderJob(
 		var attemptID, promptID, shotID, profileID, gate2DecisionID uuid.UUID
 		var seriesID, episodeID uuid.UUID
 		var runDigest, runState, persistedBudgetApprovalID, generationPlanID string
+		var attemptKind, attemptState, attemptInputHash string
 		var promptHash string
-		var creativeAttempt int
+		var creativeAttempt, attemptSequence int
 		var persistedRouteJSON []byte
 		if err := tx.QueryRow(ctx, `
 			SELECT ga.id, gr.prompt_snapshot_id, gr.shot_spec_revision_id,
 			       gr.generation_profile_id, gr.creative_attempt,
 			       gr.run_spec_digest, gr.state, gr.budget_approval_id,
 			       COALESCE(audit.payload->>'generationPlanId', ''),
-			       ep.series_id, ep.id, ps.content_hash, ga.model_snapshot,
+			       ep.series_id, ep.id, ps.content_hash,
+			       ga.sequence, ga.attempt_kind, ga.state, ga.input_hash,
+			       ga.model_snapshot,
 			       ssr.gate2_decision_id
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.generation_attempts ga
@@ -1262,8 +1265,15 @@ func (p *Postgres) PrepareProviderJob(
 			&attemptID, &promptID, &shotID, &profileID, &creativeAttempt,
 			&runDigest, &runState, &persistedBudgetApprovalID,
 			&generationPlanID, &seriesID, &episodeID, &promptHash,
+			&attemptSequence, &attemptKind, &attemptState, &attemptInputHash,
 			&persistedRouteJSON, &gate2DecisionID,
 		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"generation run has no exact sequence-one Provider attempt",
+				)
+			}
 			return orchestration.PreparedProviderJob{}, fmt.Errorf("lock provider run: %w", err)
 		}
 		if runDigest != input.Run.RunSpecDigest {
@@ -1272,10 +1282,15 @@ func (p *Postgres) PrepareProviderJob(
 				"provider dispatch digest differs from the persisted run",
 			)
 		}
-		if runState == "CANCELLED" || runState == "FAILED" {
+		expectedAttemptKind := "PROVIDER_REQUEST"
+		if creativeAttempt > 1 {
+			expectedAttemptKind = "CREATIVE_REVISION"
+		}
+		if attemptSequence != 1 || attemptKind != expectedAttemptKind ||
+			attemptInputHash != runDigest {
 			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
-				controlplane.CodeConflict,
-				"a terminal generation run cannot create or replay a paid Provider job",
+				controlplane.CodeRevisionConflict,
+				"provider attempt identity differs from the immutable generation run",
 			)
 		}
 		if generationPlanID == "" {
@@ -1686,6 +1701,24 @@ func (p *Postgres) PrepareProviderJob(
 		if !errors.Is(existingErr, pgx.ErrNoRows) {
 			return orchestration.PreparedProviderJob{}, fmt.Errorf(
 				"read durable Provider reservation: %w", existingErr,
+			)
+		}
+		// Terminal product state forbids a new paid-boundary allocation, but it
+		// must not hide an exact durable job above. Temporal may replay the
+		// Activity after the job and run have already reached terminal state;
+		// that path is recover-only and is safe only after every immutable
+		// reservation and request field has matched.
+		if runState == "CANCELLED" || runState == "FAILED" || runState == "SUCCEEDED" ||
+			attemptState == "CANCELLED" || attemptState == "FAILED" || attemptState == "SUCCEEDED" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a terminal generation run or attempt cannot create a paid Provider job",
+			)
+		}
+		if attemptState != "VALIDATED" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a non-validated generation attempt has no exact prepared Provider job to recover",
 			)
 		}
 		var allocatedMicros int64

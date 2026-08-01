@@ -77,7 +77,14 @@ derived Prompt UUID 合同保持不变，只有带完整导入 audit 的 `stage1
 每个导入 Run 还必须有与普通工作流一致的 `generation_run.created` 审计，并在 payload 中
 精确绑定冻结 `generationPlanId`。旧物化包重放只可在 Run/Attempt 与原封印包完全一致、且
 reservation/provider job/cost ledger 全为零时补齐该审计；错 Plan、重复审计或已经跨过
-付费边界均失败关闭。`PrepareProviderJob` 不从 materialization report 或调用方输入猜测 Plan。
+付费边界均失败关闭。first attempt 必须仍为 `VALIDATED`、sequence=1，kind 与 creative
+attempt 一致，`input_hash` 必须等于冻结 Run digest，route 也必须逐字段一致；terminal、hash、
+kind、sequence 或 route 漂移均不得补写 Plan provenance。`PrepareProviderJob` 不从
+materialization report 或调用方输入猜测 Plan，并在任何 reservation/job/cost 写入前独立
+复查相同 Attempt 身份。只有已存在且请求快照、reservation 完全一致的 Provider job 可以幂等
+恢复；Run/Attempt 已终态时也只能走这条精确恢复路径。不存在既有 job 时，Run 必须非终态且
+first Attempt 必须仍为 `VALIDATED`（控制面可在 Activity 开始前把 Run 生命周期推进为
+`RUNNING`，但不会提前推进 Attempt）。
 
 示例（路径仅为操作占位，必须换成 issue 中四个固定附件；不传任何 Secret）：
 
