@@ -74,6 +74,11 @@ canonicalizer 派生的 Prompt/Run hash 单独写入，不会静默覆盖原始�
 derived Prompt UUID 合同保持不变，只有带完整导入 audit 的 `stage1-product-input-v1`
 记录允许使用管理员预留 UUID。
 
+每个导入 Run 还必须有与普通工作流一致的 `generation_run.created` 审计，并在 payload 中
+精确绑定冻结 `generationPlanId`。旧物化包重放只可在 Run/Attempt 与原封印包完全一致、且
+reservation/provider job/cost ledger 全为零时补齐该审计；错 Plan、重复审计或已经跨过
+付费边界均失败关闭。`PrepareProviderJob` 不从 materialization report 或调用方输入猜测 Plan。
+
 示例（路径仅为操作占位，必须换成 issue 中四个固定附件；不传任何 Secret）：
 
 ```bash

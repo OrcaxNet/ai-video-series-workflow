@@ -505,10 +505,19 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 		if json.Unmarshal(existing, &package_) != nil || package_.Validate(plan) != nil {
 			return stage1.ExecutionPackage{}, errors.New("existing materialization audit is invalid")
 		}
+		if err := ensureGenerationRunPlanBindings(
+			ctx, tx, package_, p.product.Reserved.GenerationProfileRevisionID,
+			approval, p.productHash, time.Now().UTC(),
+		); err != nil {
+			return stage1.ExecutionPackage{}, fmt.Errorf(
+				"repair immutable generation plan bindings: %w", err,
+			)
+		}
 		// A replay is also the controlled repair path for packages materialized
-		// before input artifact size metadata became mandatory. Commit only the
-		// immutable, identity-checked artifact rows above; all package identity
-		// remains bound to the existing audit event.
+		// before input artifact size metadata and imported-run plan audit bindings
+		// became mandatory. Commit only identity-checked evidence derived from the
+		// existing package; the package identity remains bound to its original
+		// materialization audit event.
 		if err := tx.Commit(ctx); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
@@ -743,6 +752,14 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	if err := package_.Validate(plan); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
+	if err := ensureGenerationRunPlanBindings(
+		ctx, tx, package_, ids.GenerationProfileRevisionID,
+		approval, p.productHash, now,
+	); err != nil {
+		return stage1.ExecutionPackage{}, fmt.Errorf(
+			"persist immutable generation plan bindings: %w", err,
+		)
+	}
 	if err := exec("materialization audit", `INSERT INTO video_pipeline.audit_events (id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload) VALUES ($1,$2,$3,'ADMIN','stage1.execution_package.materialized','GENERATION_PLAN',$4,'FLO104_FIXED_SAMPLE1',$5,$6)`, uuid.NewSHA1(mustUUID(ids.GenerationPlanID), []byte("stage1-materialization")), now, approval.ActorID, mustUUID(ids.GenerationPlanID), p.product.PostProduction.TraceID, map[string]any{"inputPackageHash": p.productHash, "sourceHash": objects["source"].Digest, "safetyHash": objects["safety"].Digest, "visualHash": objects["visual"].Digest, "voiceDescriptorHash": objects["voice_descriptor"].Digest, "executionPackageHash": package_.ContentHash, "executionPackage": package_, "approvalCommentId": approval.CommentID, "approvalValidUntil": approval.ValidUntil, "originalShotHashes": originalHashes(p.product.Shots), "derivedShotHashes": shotHashes, "providerCalls": 0}); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
@@ -750,6 +767,121 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 		return stage1.ExecutionPackage{}, err
 	}
 	return package_, nil
+}
+
+// ensureGenerationRunPlanBindings gives imported Runs the same immutable plan
+// provenance that PrepareProviderJob requires from ordinary workflow-created
+// Runs. A replay may repair a package created by an older materializer, but only
+// after every persisted Run and first attempt exactly matches the already-sealed
+// execution package.
+func ensureGenerationRunPlanBindings(
+	ctx context.Context,
+	tx pgx.Tx,
+	package_ stage1.ExecutionPackage,
+	generationProfileID string,
+	approval Approval,
+	inputPackageHash string,
+	occurredAt time.Time,
+) error {
+	for _, job := range package_.PrimaryJobs {
+		var shotID, promptID, profileID uuid.UUID
+		var runDigest, state, budgetApprovalID string
+		var creativeAttempt int
+		var modelSnapshotJSON []byte
+		if err := tx.QueryRow(ctx, `
+			SELECT gr.shot_spec_revision_id, gr.prompt_snapshot_id,
+			       gr.generation_profile_id, gr.run_spec_digest, gr.state,
+			       gr.creative_attempt, gr.budget_approval_id, ga.model_snapshot
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga
+			  ON ga.generation_run_id = gr.id AND ga.sequence = 1
+			WHERE gr.id = $1
+			FOR SHARE OF gr, ga`,
+			mustUUID(job.Run.RunID),
+		).Scan(
+			&shotID, &promptID, &profileID, &runDigest, &state,
+			&creativeAttempt, &budgetApprovalID, &modelSnapshotJSON,
+		); err != nil {
+			return fmt.Errorf("resolve imported generation run %s: %w", job.Run.RunID, err)
+		}
+		var modelSnapshot providercontract.ModelSnapshot
+		if err := json.Unmarshal(modelSnapshotJSON, &modelSnapshot); err != nil {
+			return fmt.Errorf("decode imported generation run route %s: %w", job.Run.RunID, err)
+		}
+		if shotID.String() != job.ShotSpecRevisionID ||
+			promptID.String() != job.PromptSnapshotID ||
+			profileID.String() != generationProfileID ||
+			runDigest != job.Run.RunSpecDigest || state != "VALIDATED" ||
+			creativeAttempt != job.Run.Attempt ||
+			budgetApprovalID != job.BudgetApprovalID || modelSnapshot != job.Route {
+			return fmt.Errorf("imported generation run %s differs from the sealed execution package", job.Run.RunID)
+		}
+		var paidBoundaryRecords int64
+		if err := tx.QueryRow(ctx, `
+			SELECT
+			  (SELECT count(*) FROM video_pipeline.budget_reservations
+			   WHERE generation_run_id = $1) +
+			  (SELECT count(*) FROM video_pipeline.provider_jobs pj
+			   JOIN video_pipeline.generation_attempts ga
+			     ON ga.id = pj.generation_attempt_id
+			   WHERE ga.generation_run_id = $1) +
+			  (SELECT count(*) FROM video_pipeline.cost_ledger cl
+			   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+			   JOIN video_pipeline.generation_attempts ga
+			     ON ga.id = pj.generation_attempt_id
+			   WHERE ga.generation_run_id = $1)`,
+			mustUUID(job.Run.RunID),
+		).Scan(&paidBoundaryRecords); err != nil {
+			return fmt.Errorf("inspect imported generation run paid boundary %s: %w", job.Run.RunID, err)
+		}
+		if paidBoundaryRecords != 0 {
+			return fmt.Errorf("imported generation run %s already crossed the paid boundary", job.Run.RunID)
+		}
+
+		var auditCount int64
+		var generationPlanID string
+		if err := tx.QueryRow(ctx, `
+			SELECT count(*), COALESCE(min(payload->>'generationPlanId'), '')
+			FROM video_pipeline.audit_events
+			WHERE aggregate_type = 'GENERATION_RUN'
+			  AND aggregate_id = $1
+			  AND action = 'generation_run.created'`,
+			mustUUID(job.Run.RunID),
+		).Scan(&auditCount, &generationPlanID); err != nil {
+			return fmt.Errorf("read imported generation plan binding %s: %w", job.Run.RunID, err)
+		}
+		if auditCount == 1 {
+			if generationPlanID != job.GenerationPlanID {
+				return fmt.Errorf("imported generation run %s is bound to another generation plan", job.Run.RunID)
+			}
+			continue
+		}
+		if auditCount != 0 {
+			return fmt.Errorf("imported generation run %s has duplicate generation plan bindings", job.Run.RunID)
+		}
+		payload := map[string]any{
+			"workflowId":         job.WorkflowID,
+			"shotSpecRevisionId": job.ShotSpecRevisionID,
+			"promptSnapshotId":   job.PromptSnapshotID,
+			"runSpecDigest":      job.Run.RunSpecDigest,
+			"creativeAttempt":    job.Run.Attempt,
+			"generationPlanId":   job.GenerationPlanID,
+			"inputPackageHash":   inputPackageHash,
+			"approvalCommentId":  approval.CommentID,
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.audit_events
+				(id, occurred_at, actor_id, actor_role, action,
+				 aggregate_type, aggregate_id, reason_code, trace_id, payload)
+			VALUES ($1, $2, $3, 'ADMIN', 'generation_run.created',
+			        'GENERATION_RUN', $4, 'FLO104_FIXED_SAMPLE1', $5, $6)`,
+			uuid.NewSHA1(mustUUID(job.Run.RunID), []byte("audit")), occurredAt,
+			approval.ActorID, mustUUID(job.Run.RunID), job.TraceID, payload,
+		); err != nil {
+			return fmt.Errorf("persist imported generation plan binding %s: %w", job.Run.RunID, err)
+		}
+	}
+	return nil
 }
 
 func ensureActiveInputArtifact(
@@ -824,6 +956,22 @@ func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPa
 		},
 	}
 	for _, job := range package_.PrimaryJobs {
+		var generationPlanID string
+		if err := pool.QueryRow(ctx, `
+			SELECT payload->>'generationPlanId'
+			FROM video_pipeline.audit_events
+			WHERE aggregate_type = 'GENERATION_RUN'
+			  AND aggregate_id = $1
+			  AND action = 'generation_run.created'
+			ORDER BY occurred_at
+			LIMIT 1`,
+			mustUUID(job.Run.RunID),
+		).Scan(&generationPlanID); err != nil {
+			return Report{}, fmt.Errorf("resolve imported Run plan binding %s: %w", job.Run.RunID, err)
+		}
+		if generationPlanID != job.GenerationPlanID {
+			return Report{}, errors.New("execution package Run differs from its immutable generation plan binding")
+		}
 		prompt, err := productTruth.ResolvePromptSnapshot(ctx, job.PromptSnapshotID)
 		if err != nil {
 			return Report{}, fmt.Errorf("resolve imported prompt %s: %w", job.PromptSnapshotID, err)

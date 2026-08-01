@@ -59,31 +59,46 @@ func TestFixedSample1MaterializationBuildsAuthenticatedCASProviderEnvelope(t *te
 		t.Fatalf("fixed prompt assets = %d, want visual and voice", len(prompt.Assets))
 	}
 
-	budget := providercontract.BudgetEnvelope{
-		EstimatedCostMicros: 1, MaxCostMicros: 1, MaxAttempts: 1,
+	expectedTruth := orchestration.PreparedProductTruth{
+		ShotSpecRevisionID:  job.ShotSpecRevisionID,
+		Run:                 job.Run,
+		PromptSnapshotID:    job.PromptSnapshotID,
+		PromptSnapshotHash:  job.PromptSnapshotHash,
+		GenerationPlanID:    job.GenerationPlanID,
+		BudgetApprovalID:    job.BudgetApprovalID,
+		BudgetMaximumMicros: job.BudgetMaximumMicros,
+		BudgetCurrency:      job.BudgetCurrency,
+		ProviderProfileID:   job.ProviderProfileID,
+		Route:               job.Route,
 	}
-	reservation, err := providercontract.BindBudgetReservation(
-		providercontract.BudgetReservation{
-			ReservationID: "fixed-sample1-offline-envelope", Currency: job.BudgetCurrency,
-			AmountMicros: 1, PricingVersion: "offline-envelope-verification-v1",
-			ConfirmedBy: job.BudgetApprovalID,
+	preparation := orchestration.ExecuteProviderJobInput{
+		Run: job.Run, Prompt: prompt, Route: job.Route,
+		BudgetApprovalID:     job.BudgetApprovalID,
+		BudgetMaximumMicros:  job.BudgetMaximumMicros,
+		BudgetCurrency:       job.BudgetCurrency,
+		ProviderProfileID:    job.ProviderProfileID,
+		TraceID:              job.TraceID,
+		PersistProductTruth:  true,
+		ExpectedProductTruth: &expectedTruth,
+	}
+	prepared, err := repository.NewForPool(pool).PrepareProviderJob(
+		ctx,
+		orchestration.WorkflowStep{
+			WorkflowID: job.WorkflowID, ActivityID: job.ActivityID,
+			ActivityType: orchestration.ActivityExecuteProviderJob,
+			TraceID:      job.TraceID,
 		},
-		providercontract.BudgetBindingInput{
-			RunID: job.Run.RunID, InputHash: job.Run.RunSpecDigest,
-			Model: job.Route, Budget: budget,
-		},
+		preparation,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if prepared.ProductTruth != expectedTruth {
+		t.Fatal("prepared Provider job differs from the sealed Stage 1 product truth")
+	}
 	request, err := orchestration.BuildProviderJobRequest(
-		orchestration.ExecuteProviderJobInput{
-			Run: job.Run, Prompt: prompt, Route: job.Route,
-			BudgetApprovalID: job.BudgetApprovalID, BudgetMaximumMicros: job.BudgetMaximumMicros,
-			BudgetCurrency: job.BudgetCurrency, ProviderProfileID: job.ProviderProfileID,
-			TraceID: job.TraceID, PersistProductTruth: true,
-		},
-		orchestration.PreparedProviderJob{Budget: budget, BudgetReservation: reservation},
+		preparation,
+		prepared,
 	)
 	if err != nil {
 		t.Fatal(err)
