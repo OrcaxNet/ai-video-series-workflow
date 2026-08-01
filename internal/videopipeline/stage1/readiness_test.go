@@ -248,6 +248,77 @@ func TestGateTerminalCompletionReplayIsStrictlyIdempotent(t *testing.T) {
 	}
 }
 
+func TestGateAllowsMissingProviderTaskOnlyForIncompleteSafetyRejection(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		completion Completion
+		wantOK     bool
+	}{
+		{
+			name: "incomplete content safety rejection",
+			completion: Completion{
+				State: "TERMINAL_FAILED", ContentSafetyFailed: true, EvidenceComplete: false,
+			},
+			wantOK: true,
+		},
+		{
+			name: "ordinary failure",
+			completion: Completion{
+				State: "TERMINAL_FAILED", EvidenceComplete: false,
+			},
+		},
+		{
+			name: "claimed complete evidence",
+			completion: Completion{
+				State: "TERMINAL_FAILED", ContentSafetyFailed: true, EvidenceComplete: true,
+			},
+		},
+		{
+			name: "success",
+			completion: Completion{
+				State: "TERMINAL_SUCCEEDED", EvidenceComplete: false,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "ledger.json")
+			gate, err := Open(testPlan(), path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempt := testAttempt("shot-01", "attempt-01")
+			if _, err := gate.Authorize(attempt); err != nil {
+				t.Fatal(err)
+			}
+			err = gate.Complete(attempt.IdempotencyKey, test.completion)
+			if test.wantOK && err != nil {
+				t.Fatalf("Complete() error = %v", err)
+			}
+			if !test.wantOK && err == nil {
+				t.Fatal("Complete() error = nil")
+			}
+			ledger := readTestLedger(t, path)
+			record := ledger.Records[attempt.IdempotencyKey]
+			if test.wantOK {
+				if record.State != "TERMINAL_FAILED" || record.TerminalSequence != 1 ||
+					!record.ContentSafetyFailed || record.EvidenceComplete {
+					t.Fatalf("taskless terminal record = %#v", record)
+				}
+				if _, err := Open(testPlan(), path); err != nil {
+					t.Fatalf("Open() after taskless completion = %v", err)
+				}
+				return
+			}
+			if record.State != "PREPARED" || record.TerminalSequence != 0 {
+				t.Fatalf("rejected taskless completion mutated record = %#v", record)
+			}
+		})
+	}
+}
+
 func TestGateOldSuccessReplayCannotResetSafetyCircuit(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "ledger.json")
@@ -329,6 +400,99 @@ func TestSeparateGateInstancesReplayCompletionWithoutUsageDrift(t *testing.T) {
 	if ledger.ReservedVideoTokens != 50_000 || ledger.ReservedAFPMilli != 2_504_700 ||
 		ledger.ReservedCashMicros != 125 || len(ledger.Records) != 1 || ledger.NextTerminalSequence != 1 {
 		t.Fatalf("cross-process replay ledger = %#v", ledger)
+	}
+}
+
+func TestGateTerminalCompletionCannotBeDowngradedToAmbiguous(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	gateA, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateB, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := testAttempt("shot-01", "attempt-01")
+	if _, err := gateA.Authorize(attempt); err != nil {
+		t.Fatal(err)
+	}
+	completion := Completion{
+		ProviderTaskID: "task-1", State: "TERMINAL_SUCCEEDED",
+		ActualVideoTokens: 50_000, ActualAFPMilli: 2_504_700, EvidenceComplete: true,
+	}
+	if err := gateA.Complete(attempt.IdempotencyKey, completion); err != nil {
+		t.Fatal(err)
+	}
+	if err := gateB.MarkAmbiguous(attempt.IdempotencyKey); providercontract.ErrorCodeOf(err) != providercontract.CodeConflict {
+		t.Fatalf("late MarkAmbiguous() error = %v", err)
+	}
+	restarted, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatalf("Open() after late ambiguous transition = %v", err)
+	}
+	if decision, err := restarted.Authorize(attempt); err != nil || decision != DecisionReplay {
+		t.Fatalf("terminal replay decision=%s err=%v", decision, err)
+	}
+	ledger := readTestLedger(t, path)
+	record := ledger.Records[attempt.IdempotencyKey]
+	if record == nil || record.State != "TERMINAL_SUCCEEDED" || record.TerminalSequence != 1 ||
+		ledger.NextTerminalSequence != 1 {
+		t.Fatalf("terminal record after late ambiguous callback = %#v, ledger=%#v", record, ledger)
+	}
+}
+
+func TestSeparateGateInstancesSerializeAmbiguousCompletionRace(t *testing.T) {
+	t.Parallel()
+	for iteration := range 20 {
+		path := filepath.Join(t.TempDir(), fmt.Sprintf("ledger-%02d.json", iteration))
+		gateA, err := Open(testPlan(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		gateB, err := Open(testPlan(), path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		attempt := testAttempt("shot-01", fmt.Sprintf("attempt-%02d", iteration))
+		if _, err := gateA.Authorize(attempt); err != nil {
+			t.Fatal(err)
+		}
+		completion := Completion{
+			ProviderTaskID: fmt.Sprintf("task-%02d", iteration), State: "TERMINAL_SUCCEEDED",
+			ActualVideoTokens: 50_000, ActualAFPMilli: 2_504_700, EvidenceComplete: true,
+		}
+		start := make(chan struct{})
+		errorsSeen := make(chan error, 2)
+		var wait sync.WaitGroup
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			<-start
+			errorsSeen <- gateA.Complete(attempt.IdempotencyKey, completion)
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			errorsSeen <- gateB.MarkAmbiguous(attempt.IdempotencyKey)
+		}()
+		close(start)
+		wait.Wait()
+		close(errorsSeen)
+		for err := range errorsSeen {
+			if err != nil && providercontract.ErrorCodeOf(err) != providercontract.CodeConflict {
+				t.Fatalf("race error = %v", err)
+			}
+		}
+		if _, err := Open(testPlan(), path); err != nil {
+			t.Fatalf("Open() after race = %v", err)
+		}
+		ledger := readTestLedger(t, path)
+		record := ledger.Records[attempt.IdempotencyKey]
+		if record == nil || record.State != "TERMINAL_SUCCEEDED" || record.TerminalSequence != 1 {
+			t.Fatalf("race terminal record = %#v", record)
+		}
 	}
 }
 

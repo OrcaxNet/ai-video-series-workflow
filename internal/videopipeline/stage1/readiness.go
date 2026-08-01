@@ -340,8 +340,17 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 
 func (g *Gate) MarkAmbiguous(idempotencyKey string) error {
 	return g.updateRecord(idempotencyKey, func(record *Record, _ *Ledger) error {
-		record.State = "AMBIGUOUS"
-		return nil
+		switch record.State {
+		case "PREPARED":
+			record.State = "AMBIGUOUS"
+			return nil
+		case "AMBIGUOUS":
+			return nil
+		case "TERMINAL_SUCCEEDED", "TERMINAL_FAILED":
+			return providerError(providercontract.CodeConflict, "terminal stage 1 completion cannot be downgraded to ambiguous")
+		default:
+			return providerError(providercontract.CodeConflict, "stage 1 attempt cannot transition to ambiguous")
+		}
 	})
 }
 
@@ -357,9 +366,11 @@ type Completion struct {
 
 func (g *Gate) Complete(idempotencyKey string, completion Completion) error {
 	return g.updateRecord(idempotencyKey, func(record *Record, ledger *Ledger) error {
-		if strings.TrimSpace(completion.ProviderTaskID) == "" ||
-			(completion.State != "TERMINAL_SUCCEEDED" && completion.State != "TERMINAL_FAILED") {
-			return errors.New("stage 1 completion requires a provider task and terminal state")
+		if completion.State != "TERMINAL_SUCCEEDED" && completion.State != "TERMINAL_FAILED" {
+			return errors.New("stage 1 completion requires a terminal state")
+		}
+		if strings.TrimSpace(completion.ProviderTaskID) == "" && !tasklessSafetyRejection(completion) {
+			return errors.New("stage 1 completion requires a provider task unless safety rejected the request before task creation")
 		}
 		if completion.ActualVideoTokens < 0 || completion.ActualAFPMilli < 0 || completion.ActualCashMicros < 0 {
 			return errors.New("stage 1 actual usage cannot be negative")
@@ -450,7 +461,8 @@ func deriveLedgerState(ledger Ledger) (derivedLedgerState, error) {
 			return derivedLedgerState{}, errors.New("stage 1 ledger record identity is invalid")
 		}
 		if terminalState(record.State) {
-			if record.TerminalSequence <= 0 || strings.TrimSpace(record.ProviderTaskID) == "" ||
+			if record.TerminalSequence <= 0 ||
+				(strings.TrimSpace(record.ProviderTaskID) == "" && !tasklessSafetyRecord(record)) ||
 				record.ActualVideoTokens < 0 || record.ActualAFPMilli < 0 || record.ActualCashMicros < 0 {
 				return derivedLedgerState{}, errors.New("stage 1 terminal record is incomplete")
 			}
@@ -698,6 +710,14 @@ func sameCompletion(record *Record, completion Completion) bool {
 
 func terminalState(state string) bool {
 	return state == "TERMINAL_SUCCEEDED" || state == "TERMINAL_FAILED"
+}
+
+func tasklessSafetyRejection(completion Completion) bool {
+	return completion.State == "TERMINAL_FAILED" && completion.ContentSafetyFailed && !completion.EvidenceComplete
+}
+
+func tasklessSafetyRecord(record *Record) bool {
+	return record.State == "TERMINAL_FAILED" && record.ContentSafetyFailed && !record.EvidenceComplete
 }
 
 func addUsage(current, value int64) (int64, error) {

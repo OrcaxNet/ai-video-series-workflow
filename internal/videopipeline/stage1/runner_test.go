@@ -69,6 +69,13 @@ func (s *runnerAdapterFixture) counts() (gets, posts int) {
 	return s.gets, s.posts
 }
 
+func (s *runnerAdapterFixture) publish(job providercontract.JobResponse) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.created = true
+	s.job = job
+}
+
 func TestRunnerIsTheGatedSubmitAndImmutableCompletionPath(t *testing.T) {
 	t.Parallel()
 	digest := strings.Repeat("a", 64)
@@ -173,6 +180,68 @@ func TestRunnerAmbiguousSubmitIsRecoverOnlyAcrossRestart(t *testing.T) {
 	}
 	if _, posts := fixture.counts(); posts != 1 {
 		t.Fatalf("ambiguous provider submits = %d, want 1", posts)
+	}
+}
+
+func TestRunnerFreezesTasklessContentSafetyRejection(t *testing.T) {
+	t.Parallel()
+	digest := strings.Repeat("a", 64)
+	fixture := &runnerAdapterFixture{ambiguous: true, job: successfulRunnerJob(digest)}
+	server := httptest.NewServer(http.HandlerFunc(fixture.handler))
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	input := runnerSubmitInput(t, "shot-01", "attempt-01")
+	runner := newTestRunner(t, path, server, digest)
+	if _, err := runner.Submit(t.Context(), input); err == nil {
+		t.Fatal("ambiguous submit error = nil")
+	}
+
+	zero := int64(0)
+	rejection := successfulRunnerJob(digest)
+	rejection.UpstreamTaskID = ""
+	rejection.RequestID = "provider-request-safety-1"
+	rejection.State = providercontract.StatusRequiresAction
+	rejection.Progress = 0
+	rejection.Artifacts = nil
+	rejection.Usage = providercontract.Usage{}
+	rejection.Cost = providercontract.Cost{
+		ActualMicros: &zero, Currency: "CNY", PricingVersion: "agent-plan-large-included-v1",
+		BillingMode: "subscription", Verified: true,
+	}
+	rejection.Error = &providercontract.Error{
+		Code: providercontract.CodeContentBlocked, SafeMessage: "provider rejected content before task creation",
+	}
+	fixture.publish(rejection)
+
+	completionInput := CompleteInput{
+		IdempotencyKey: input.Attempt.IdempotencyKey,
+		ActualAFPMilli: 0, EvidenceComplete: true,
+	}
+	for range 2 {
+		result, err := runner.Complete(t.Context(), completionInput)
+		if providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+			t.Fatalf("taskless safety completion error = %v", err)
+		}
+		if result.ProviderTaskID != "" || result.State != "TERMINAL_FAILED" || result.EvidenceComplete ||
+			!result.ContentSafetyFailed {
+			t.Fatalf("taskless safety completion = %#v", result)
+		}
+	}
+	ledger := readTestLedger(t, path)
+	record := ledger.Records[input.Attempt.IdempotencyKey]
+	if record == nil || record.State != "TERMINAL_FAILED" || record.ProviderTaskID != "" ||
+		record.EvidenceComplete || !record.ContentSafetyFailed || record.TerminalSequence != 1 ||
+		ledger.ConsecutiveSafetyFailures != 1 || ledger.NextTerminalSequence != 1 {
+		t.Fatalf("taskless safety record = %#v, ledger=%#v", record, ledger)
+	}
+	if _, err := Open(testPlan(), path); err != nil {
+		t.Fatalf("Open() after taskless safety completion = %v", err)
+	}
+	if _, err := runner.Submit(t.Context(), runnerSubmitInput(t, "shot-02", "attempt-02")); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+		t.Fatalf("next submit after taskless safety rejection error = %v", err)
+	}
+	if _, posts := fixture.counts(); posts != 1 {
+		t.Fatalf("provider submits after taskless safety rejection = %d, want 1", posts)
 	}
 }
 

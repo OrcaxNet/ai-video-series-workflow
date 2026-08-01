@@ -14,6 +14,10 @@ make video-stage1-readiness
 `internal/videopipeline/stage1` 的 v2 ledger 在 Provider submit 前原子预留额度并持久化
 idempotency key。terminal completion 按不可变序号冻结；相同结果任意重放是幂等
 no-op，不同结果返回 conflict，token/AFP/现金与连续安全失败均从完整终态序列重新推导。
+Provider 在创建 upstream task 前返回 `requires_action/content_blocked` 时仍会冻结为
+`TERMINAL_FAILED`，并记录内容安全失败及证据不完整，阻断后续提交；这是唯一允许终态
+记录没有 task ID 的情况。`AMBIGUOUS` 只允许由 `PREPARED` 进入，重复标记为 no-op，
+任何迟到的 terminal→ambiguous 写入都返回 conflict，不能降级不可变终态。
 未知 submit 结果在重启后也只能 recover，不能再次 submit。受控重试必须绑定原终态
 失败、失败分类、审批 ID 与“无重复任务”证据。任一许可/Consent/Gate/预算/内容安全
 检查失效、连续两次内容安全失败、既有证据不完整、额度或 10% AFP 漂移越界都会
