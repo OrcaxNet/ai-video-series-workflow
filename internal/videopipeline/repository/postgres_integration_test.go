@@ -1627,6 +1627,77 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			budgetID, plan.Value.GenerationPlanID,
 		)
 	}
+	restorePaidBoundaryTruth := func() {
+		t.Helper()
+		restoreVideoApproval()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.consent_assets
+			SET status = 'ACTIVE', expires_at = now() + interval '1 hour'
+			WHERE id = $1`, consentID)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.license_snapshots
+			SET policy_status = 'ALLOWED', expires_at = now() + interval '1 hour'
+			WHERE id = $1`, voiceLicenseID)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.shot_spec_revisions
+			SET freshness = 'FRESH'
+			WHERE id = $1`, shotRevisionID)
+	}
+	paidTruthRegressions := []struct {
+		name   string
+		code   controlplane.ErrorCode
+		mutate func()
+	}{
+		{
+			name: "consent revoked after run creation", code: controlplane.CodeConsentRequired,
+			mutate: func() {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`, consentID)
+			},
+		},
+		{
+			name: "license expired after run creation", code: controlplane.CodeLicenseBlocked,
+			mutate: func() {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.license_snapshots SET expires_at = now() - interval '1 second' WHERE id = $1`, voiceLicenseID)
+			},
+		},
+		{
+			name: "shot freshness drift after run creation", code: controlplane.CodeGateRequired,
+			mutate: func() {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.shot_spec_revisions SET freshness = 'STALE' WHERE id = $1`, shotRevisionID)
+			},
+		},
+	}
+	for _, regression := range paidTruthRegressions {
+		regression := regression
+		t.Run("provider submit product truth "+regression.name, func(t *testing.T) {
+			restorePaidBoundaryTruth()
+			regression.mutate()
+			_, activityErr := videoActivityEnvironment.ExecuteActivity(
+				videoActivities.ExecuteProviderJob, dispatch,
+			)
+			var applicationErr *temporal.ApplicationError
+			if !errors.As(activityErr, &applicationErr) ||
+				applicationErr.Type() != string(regression.code) ||
+				!applicationErr.NonRetryable() {
+				t.Fatalf("paid-boundary Activity error = %#v, want non-retryable %s", activityErr, regression.code)
+			}
+			var reservations, jobs int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT COUNT(*) FROM video_pipeline.budget_reservations WHERE generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`,
+				run.RunID,
+			).Scan(&reservations, &jobs); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || videoProviderCalls.Load() != 0 {
+				t.Fatalf("blocked paid-boundary side effects = reservations:%d jobs:%d provider:%d", reservations, jobs, videoProviderCalls.Load())
+			}
+		})
+	}
+	restorePaidBoundaryTruth()
 	videoBudgetRegressions := []struct {
 		name        string
 		mutate      func()

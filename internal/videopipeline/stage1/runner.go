@@ -85,6 +85,9 @@ func NewRunner(
 	if err := executionPackage.Validate(gate.Plan()); err != nil {
 		return nil, err
 	}
+	if err := gate.BindExecutionPackage(executionPackage.ContentHash); err != nil {
+		return nil, err
+	}
 	executor, err := NewExecutor(gate, adapter)
 	if err != nil {
 		return nil, err
@@ -108,35 +111,9 @@ func (r *Runner) Submit(ctx context.Context, input SubmitInput) (SubmitResult, e
 		EstimatedNonSubscriptionCashMicros: frozen.EstimatedNonSubscriptionCashMicros,
 	}
 
-	// Existing remote work is recovery, not a new paid submit. It must remain
-	// recoverable even if current product truth has since drifted.
-	recovered, err := r.adapter.Recover(ctx, attempt.IdempotencyKey)
-	if err != nil {
-		return SubmitResult{}, err
-	}
-	decision, err := r.gate.Inspect(attempt)
-	if err != nil {
-		return SubmitResult{}, err
-	}
-	if decision == DecisionReplay {
-		return SubmitResult{}, providerError(providercontract.CodeConflict, "terminal stage 1 attempt cannot be submitted again")
-	}
-	if recovered.Found {
-		if strings.TrimSpace(recovered.ProviderTaskID) == "" {
-			return SubmitResult{}, providerError(providercontract.CodeConflict, "recovered stage 1 job has no provider task")
-		}
-		return r.executor.Execute(ctx, attempt)
-	}
-	if decision == DecisionRecoverOnly {
-		return SubmitResult{}, providerError(providercontract.CodeUnavailable, "ambiguous stage 1 submit requires operator recovery and cannot be resubmitted")
-	}
-
-	jobRequest, err := r.prepareProductTruth(ctx, frozen)
-	if err != nil {
-		return SubmitResult{}, err
-	}
-	attempt.JobRequest = &jobRequest
-	return r.executor.Execute(ctx, attempt)
+	return r.executor.ExecutePrepared(ctx, attempt, func(ctx context.Context) (providercontract.JobRequest, error) {
+		return r.prepareProductTruth(ctx, frozen)
+	})
 }
 
 func (r *Runner) prepareProductTruth(
@@ -184,21 +161,8 @@ func (r *Runner) prepareProductTruth(
 			"PostgreSQL product truth differs from the frozen stage 1 package",
 		)
 	}
-	request := providercontract.JobRequest{
-		SchemaVersion: "v1", JobID: frozen.IdempotencyKey,
-		RunID: frozen.Run.RunID, Capability: providercontract.CapabilityVideo,
-		InputHash: frozen.Run.RunSpecDigest, Model: frozen.Route,
-		Request: providercontract.GenerationRequest{
-			RequestID: frozen.IdempotencyKey, IdempotencyKey: frozen.IdempotencyKey,
-			Modality: providercontract.ModalityVideo,
-			Prompt:   prompt.PositivePrompt, PromptSnapshotID: prompt.ID,
-			Context: prompt.Context, Assets: prompt.Assets, Output: prompt.Output,
-			ModelHint: frozen.Route.ModelID, Budget: prepared.Budget,
-		},
-		BudgetReservation: prepared.BudgetReservation,
-		TraceID:           frozen.TraceID,
-	}
-	if err := request.Validate(); err != nil {
+	request, err := orchestration.BuildProviderJobRequest(preparation, prepared)
+	if err != nil {
 		return providercontract.JobRequest{}, providerError(
 			providercontract.CodeConflict,
 			"PostgreSQL product truth did not produce an executable stage 1 request",

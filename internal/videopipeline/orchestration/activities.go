@@ -332,18 +332,6 @@ func (a *Activities) executeProviderJob(
 		return ProviderResult{}, errors.New("provider HTTP client is required")
 	}
 	activity.RecordHeartbeat(ctx, map[string]any{"phase": "submitting", "runId": input.Run.RunID})
-	jobID := "provider-job-" + input.Run.RunID
-	promptText := input.Prompt.PositivePrompt
-	if input.Prompt.NegativePrompt != "" {
-		promptText += "\nNEGATIVE CONSTRAINTS: " + input.Prompt.NegativePrompt
-	}
-	if promptText == "" {
-		return ProviderResult{}, errors.New("immutable compiled prompt text is required")
-	}
-	outputSpec := input.Prompt.Output
-	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
-		return ProviderResult{}, errors.New("immutable compiled output specification is required")
-	}
 	budget := prepared.Budget
 	budgetReservation := prepared.BudgetReservation
 	if !input.PersistProductTruth {
@@ -372,35 +360,13 @@ func (a *Activities) executeProviderJob(
 			return ProviderResult{}, fmt.Errorf("bind budget approval: %w", err)
 		}
 	}
-	if err := budgetReservation.ValidateFor(providercontract.BudgetBindingInput{
-		RunID: input.Run.RunID, InputHash: input.Run.RunSpecDigest,
-		Model: input.Route, Budget: budget,
-	}); err != nil {
-		return ProviderResult{}, fmt.Errorf("validate prepared budget allocation: %w", err)
-	}
-	generationRequest := providercontract.GenerationRequest{
-		RequestID:        jobID,
-		IdempotencyKey:   jobID,
-		Modality:         providercontract.ModalityVideo,
-		Prompt:           promptText,
-		PromptSnapshotID: input.Prompt.ID,
-		Context:          input.Prompt.Context,
-		Assets:           input.Prompt.Assets,
-		Output:           outputSpec,
-		ModelHint:        input.Route.ModelID,
-		Budget:           budget,
-	}
-	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, providercontract.JobRequest{
-		SchemaVersion:     "v1",
-		JobID:             jobID,
-		RunID:             input.Run.RunID,
-		Capability:        providercontract.CapabilityVideo,
-		InputHash:         input.Run.RunSpecDigest,
-		Model:             input.Route,
-		Request:           generationRequest,
-		BudgetReservation: budgetReservation,
-		TraceID:           input.TraceID,
+	jobRequest, err := BuildProviderJobRequest(input, PreparedProviderJob{
+		Budget: budget, BudgetReservation: budgetReservation,
 	})
+	if err != nil {
+		return ProviderResult{}, err
+	}
+	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, jobRequest)
 	if err != nil {
 		return ProviderResult{}, classifyProviderError(err)
 	}
@@ -467,6 +433,52 @@ func (a *Activities) executeProviderJob(
 		Usage:          result.Usage,
 		Cost:           result.Cost,
 	}, nil
+}
+
+// BuildProviderJobRequest is the single prompt-bearing Provider envelope
+// builder shared by Temporal and the formal Stage 1 runner. Callers may only
+// invoke it after PostgreSQL PrepareProviderJob returns the durable budget
+// reservation; the prompt and output specification must be the exact resolved
+// snapshot, never stdin-supplied execution truth.
+func BuildProviderJobRequest(
+	input ExecuteProviderJobInput,
+	prepared PreparedProviderJob,
+) (providercontract.JobRequest, error) {
+	jobID := "provider-job-" + input.Run.RunID
+	promptText := input.Prompt.PositivePrompt
+	if input.Prompt.NegativePrompt != "" {
+		promptText += "\nNEGATIVE CONSTRAINTS: " + input.Prompt.NegativePrompt
+	}
+	if promptText == "" {
+		return providercontract.JobRequest{}, errors.New("immutable compiled prompt text is required")
+	}
+	outputSpec := input.Prompt.Output
+	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
+		return providercontract.JobRequest{}, errors.New("immutable compiled output specification is required")
+	}
+	if err := prepared.BudgetReservation.ValidateFor(providercontract.BudgetBindingInput{
+		RunID: input.Run.RunID, InputHash: input.Run.RunSpecDigest,
+		Model: input.Route, Budget: prepared.Budget,
+	}); err != nil {
+		return providercontract.JobRequest{}, fmt.Errorf("validate prepared budget allocation: %w", err)
+	}
+	request := providercontract.JobRequest{
+		SchemaVersion: "v1", JobID: jobID, RunID: input.Run.RunID,
+		Capability: providercontract.CapabilityVideo, InputHash: input.Run.RunSpecDigest,
+		Model: input.Route, TraceID: input.TraceID,
+		Request: providercontract.GenerationRequest{
+			RequestID: jobID, IdempotencyKey: jobID,
+			Modality: providercontract.ModalityVideo, Prompt: promptText,
+			PromptSnapshotID: input.Prompt.ID, Context: input.Prompt.Context,
+			Assets: input.Prompt.Assets, Output: outputSpec,
+			ModelHint: input.Route.ModelID, Budget: prepared.Budget,
+		},
+		BudgetReservation: prepared.BudgetReservation,
+	}
+	if err := request.Validate(); err != nil {
+		return providercontract.JobRequest{}, fmt.Errorf("validate immutable Provider request: %w", err)
+	}
+	return request, nil
 }
 
 func toPromptSnapshotRef(snapshot production.PromptSnapshot) PromptSnapshotRef {
@@ -926,6 +938,8 @@ func classifyPostProductionError(err error) error {
 		case controlplane.CodeConsentRequired,
 			controlplane.CodeLicenseBlocked,
 			controlplane.CodeBudgetExceeded,
+			controlplane.CodeGateRequired,
+			controlplane.CodeContentBlocked,
 			controlplane.CodeRevisionConflict,
 			controlplane.CodeStaleDependency,
 			controlplane.CodeCapability:

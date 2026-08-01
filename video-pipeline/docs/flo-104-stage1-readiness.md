@@ -11,14 +11,16 @@ make video-stage1-readiness
 1,200,000 tokens；月度总量不超过 38,000 AFP；非订阅调用不超过 20 CNY；对白
 总文本不超过 600 个 Unicode 字符（按 135 milli-AFP/字符归因，最大 81 AFP）。
 
-`internal/videopipeline/stage1` 的 v2 batch ledger 在 Provider submit 前预留 10+1、video
+`internal/videopipeline/stage1` 的 v3 batch ledger 在 Provider submit 前预留 10+1、video
 token、AFP、现金和安全熔断额度并持久化 idempotency key；它不再接收调用方自报的
 License/Consent/Gate/预算/安全布尔值。正式入口先依据只含 ID/hash 的 execution package
 定位 PostgreSQL Run/PromptSnapshot/Plan/审批，再由 `PrepareProviderJob` 在同一
 `SERIALIZABLE` 产品真相事务里锁定并复查 G2、SAFETY、Plan 的 episode/shot 集合、完整
 资产 License/Consent（含地域、商用范围和有效期）、Provider capability、VIDEO
 approval 的 Plan/scope/amount/currency，并写入预算 reservation 与 Provider job。任一漂移
-均在 Adapter POST 前失败，且不会写 Stage 1 新 attempt。
+均在 Adapter POST 前失败，且不会写 Stage 1 新 attempt。PostgreSQL prepare 回调与 v3
+ledger reservation 共用 Stage 1 跨进程文件锁：第二个 runner 不能在产品真相事务与本地
+额度落盘之间插入另一笔授权；拒绝的 prepare 不产生 Provider POST。
 
 terminal completion 按不可变序号冻结；相同结果任意重放是幂等
 no-op，不同结果返回 conflict，token/AFP/现金与连续安全失败均从完整终态序列重新推导。
@@ -63,7 +65,8 @@ go run ./cmd/video-stage1-package verify \
   /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json
 ```
 
-Runner 启动时和每次新 submit 都验证 package；缺文件、hash 漂移、十镜/顺序/后期包不完整，
+Runner 启动时和每次新 submit 都验证 package；v3 ledger 还永久绑定 package 的
+`contentHash`。缺文件、hash 漂移、十镜/顺序/后期包不完整，
 或任一引用在 PostgreSQL 中不存在/已漂移时均在 Provider POST 前停止。已存在 Provider task
 仅走 recover，不因事后授权漂移重复 POST。
 
@@ -91,7 +94,7 @@ worker 的 `VIDEO_SPEECH_PROVIDER_ADAPTER_URL` 显式指向内部 Live Adapter�
 Mock。
 
 回滚只需停止阶段 1 runner 并恢复上一镜像。无数据库迁移；本轮复用既有 PostgreSQL
-Run/Prompt/Plan/approval/reservation/provider_job 表，v1 readiness ledger 不会被
-v2 runner 接受。本阶段尚无真实 Stage 1 job，readiness QA 应先归档任何无费用 v1
-ledger；v2 runner 会在首个获批 reservation 时原子创建新 ledger。ledger 与 CAS 均保留
+Run/Prompt/Plan/approval/reservation/provider_job 表，v1/v2 readiness ledger 不会被
+v3 runner 接受。本阶段尚无真实 Stage 1 job，readiness QA 应先归档任何无费用旧版
+ledger；v3 runner 会在首个获批 reservation 时原子创建新 ledger。ledger 与 CAS 均保留
 为审计证据，不删除历史任务；任何 `AMBIGUOUS` 记录必须人工恢复。

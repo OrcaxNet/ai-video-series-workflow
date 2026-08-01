@@ -21,7 +21,7 @@ import (
 
 const (
 	SchemaVersion                  = "v1"
-	LedgerSchemaVersion            = "v2"
+	LedgerSchemaVersion            = "v3"
 	FormalVideoModel               = "doubao-seedance-2.0"
 	RequiredPrimaryJobs            = 10
 	MaximumControlledRetries       = 1
@@ -156,6 +156,7 @@ type Record struct {
 type Ledger struct {
 	SchemaVersion             string             `json:"schemaVersion"`
 	BatchID                   string             `json:"batchId"`
+	ExecutionPackageHash      string             `json:"executionPackageHash"`
 	Records                   map[string]*Record `json:"records"`
 	ReservedVideoTokens       int64              `json:"reservedVideoTokens"`
 	ReservedAFPMilli          int64              `json:"reservedAfpMilli"`
@@ -173,9 +174,10 @@ const (
 )
 
 type Gate struct {
-	plan Plan
-	path string
-	mu   sync.Mutex
+	plan                 Plan
+	path                 string
+	executionPackageHash string
+	mu                   sync.Mutex
 }
 
 func Open(plan Plan, path string) (*Gate, error) {
@@ -201,7 +203,41 @@ func Open(plan Plan, path string) (*Gate, error) {
 
 func (g *Gate) Plan() Plan { return g.plan }
 
+// BindExecutionPackage permanently binds this ledger to the exact immutable
+// execution package. It must happen before the production executor is created.
+func (g *Gate) BindExecutionPackage(contentHash string) error {
+	if !validLowerDigest(contentHash) {
+		return errors.New("stage 1 execution package hash must be a lowercase SHA-256")
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer releaseFileLock(lock)
+	previous := g.executionPackageHash
+	g.executionPackageHash = contentHash
+	ledger, err := g.loadLocked()
+	if err != nil {
+		g.executionPackageHash = previous
+		return err
+	}
+	if ledger.ExecutionPackageHash != contentHash {
+		g.executionPackageHash = previous
+		return errors.New("stage 1 ledger is bound to another execution package")
+	}
+	return nil
+}
+
 func (g *Gate) Authorize(attempt Attempt) (Decision, error) {
+	return g.AuthorizePrepared(attempt, nil)
+}
+
+// AuthorizePrepared validates the local Stage 1 caps and invokes prepare while
+// holding the cross-process ledger lock. Only after PostgreSQL product truth is
+// prepared is the exact attempt durably reserved.
+func (g *Gate) AuthorizePrepared(attempt Attempt, prepare func() error) (Decision, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	lock, err := g.acquireFileLock()
@@ -225,6 +261,11 @@ func (g *Gate) Authorize(attempt Attempt) (Decision, error) {
 	if err := g.validateNewAttempt(ledger, attempt); err != nil {
 		return "", err
 	}
+	if prepare != nil {
+		if err := prepare(); err != nil {
+			return "", err
+		}
+	}
 	ledger.Records[attempt.IdempotencyKey] = &Record{Attempt: attempt, State: "PREPARED"}
 	if err := recalculateLedger(&ledger); err != nil {
 		return "", err
@@ -236,8 +277,8 @@ func (g *Gate) Authorize(attempt Attempt) (Decision, error) {
 }
 
 // Inspect performs the exact local ledger decision without reserving a new
-// attempt. The production runner uses it before PostgreSQL product-truth
-// preparation, preventing rejected limits from leaving a paid reservation.
+// attempt. It is available for no-cost diagnostics; the production runner uses
+// AuthorizePrepared so inspection and reservation cannot race across processes.
 func (g *Gate) Inspect(attempt Attempt) (Decision, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -434,7 +475,10 @@ func (g *Gate) updateRecord(idempotencyKey string, update func(*Record, *Ledger)
 func (g *Gate) loadLocked() (Ledger, error) {
 	data, err := os.ReadFile(g.path)
 	if errors.Is(err, os.ErrNotExist) {
-		return Ledger{SchemaVersion: LedgerSchemaVersion, BatchID: g.plan.BatchID, Records: make(map[string]*Record)}, nil
+		return Ledger{
+			SchemaVersion: LedgerSchemaVersion, BatchID: g.plan.BatchID,
+			ExecutionPackageHash: g.executionPackageHash, Records: make(map[string]*Record),
+		}, nil
 	}
 	if err != nil {
 		return Ledger{}, fmt.Errorf("read stage 1 ledger: %w", err)
@@ -443,7 +487,8 @@ func (g *Gate) loadLocked() (Ledger, error) {
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&ledger); err != nil || ledger.SchemaVersion != LedgerSchemaVersion ||
-		ledger.BatchID != g.plan.BatchID || ledger.Records == nil {
+		ledger.BatchID != g.plan.BatchID || ledger.Records == nil ||
+		(g.executionPackageHash != "" && ledger.ExecutionPackageHash != g.executionPackageHash) {
 		return Ledger{}, errors.New("stage 1 ledger is invalid or bound to another batch")
 	}
 	if err := validateLedgerDerivedState(ledger); err != nil {
@@ -639,13 +684,34 @@ func NewExecutor(gate *Gate, submitter Submitter) (*Executor, error) {
 }
 
 func (e *Executor) Execute(ctx context.Context, attempt Attempt) (SubmitResult, error) {
+	return e.ExecutePrepared(ctx, attempt, nil)
+}
+
+// ExecutePrepared performs recovery first and invokes prepare only for a new
+// submit. The request returned by prepare remains in memory and never enters
+// the prompt-free Stage 1 ledger.
+func (e *Executor) ExecutePrepared(
+	ctx context.Context,
+	attempt Attempt,
+	prepare func(context.Context) (providercontract.JobRequest, error),
+) (SubmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	recovered, err := e.submitter.Recover(ctx, attempt.IdempotencyKey)
 	if err != nil {
 		return SubmitResult{}, err
 	}
-	decision, err := e.gate.Authorize(attempt)
+	decision, err := e.gate.AuthorizePrepared(attempt, func() error {
+		if prepare == nil {
+			return nil
+		}
+		request, prepareErr := prepare(ctx)
+		if prepareErr != nil {
+			return prepareErr
+		}
+		attempt.JobRequest = &request
+		return nil
+	})
 	if err != nil {
 		return SubmitResult{}, err
 	}

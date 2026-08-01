@@ -814,6 +814,78 @@ func loadShotAssetIDs(
 	return assetIDs, nil
 }
 
+// requireFrozenPlanShots locks and revalidates the complete shot set before a
+// paid submission. One valid current shot cannot mask drift elsewhere in the
+// execution package.
+func requireFrozenPlanShots(
+	ctx context.Context,
+	tx pgx.Tx,
+	shotIDs []uuid.UUID,
+	profileID uuid.UUID,
+	seriesID uuid.UUID,
+	episodeID uuid.UUID,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT ssr.id, ssr.generation_profile_id, ssr.freshness,
+		       ssr.gate2_decision_id
+		FROM video_pipeline.shot_spec_revisions ssr
+		JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+		JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+		JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+		WHERE ssr.id = ANY($1::uuid[])
+		  AND ep.id = $2
+		  AND ep.series_id = $3
+		ORDER BY ssr.id
+		FOR SHARE OF ssr`,
+		shotIDs, episodeID, seriesID,
+	)
+	if err != nil {
+		return fmt.Errorf("lock frozen generation-plan shots: %w", err)
+	}
+	defer rows.Close()
+	type frozenShot struct {
+		id, generationProfileID, gate2DecisionID uuid.UUID
+		freshness                                string
+	}
+	shots := make([]frozenShot, 0, len(shotIDs))
+	for rows.Next() {
+		var shot frozenShot
+		if err := rows.Scan(
+			&shot.id, &shot.generationProfileID, &shot.freshness, &shot.gate2DecisionID,
+		); err != nil {
+			return fmt.Errorf("scan frozen generation-plan shot: %w", err)
+		}
+		shots = append(shots, shot)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate frozen generation-plan shots: %w", err)
+	}
+	if len(shots) != len(shotIDs) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"generation plan no longer resolves its complete frozen shot set",
+			"freeze a new plan for the exact approved shots",
+		)
+	}
+	for _, shot := range shots {
+		if shot.generationProfileID != profileID ||
+			shot.freshness != "FRESH" && shot.freshness != "REVALIDATED" {
+			return controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"a frozen generation-plan shot has drifted before paid submission",
+				"revalidate the complete shot set and freeze a new execution package",
+			)
+		}
+		if err := requireApprovedDecision(
+			ctx, tx, shot.gate2DecisionID.String(), "G2", seriesID, episodeID,
+			"SHOT_SPEC_REVISION", shot.id,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func promptAssetType(mediaType string) (providercontract.Modality, providercontract.AssetRole, error) {
 	switch {
 	case strings.HasPrefix(mediaType, "image/"):
@@ -1170,12 +1242,17 @@ func (p *Postgres) PrepareProviderJob(
 		).Scan(&episodeStatus); err != nil {
 			return orchestration.PreparedProviderJob{}, fmt.Errorf("read provider episode gate: %w", err)
 		}
-		if episodeStatus != "G2_APPROVED" {
+		if episodeStatus != "G2_APPROVED" && episodeStatus != "G3_LOCKED" {
 			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
 				controlplane.CodeGateRequired,
-				"provider episode revision is no longer G2_APPROVED",
+				"provider episode revision is no longer approved for generation",
 				"approve the exact episode revision before paid submission",
 			)
+		}
+		if err := requireFrozenPlanShots(
+			ctx, tx, planShotIDs, profileID, seriesID, episodeID,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
 		}
 		if err := requireApprovedDecision(
 			ctx, tx, gate2DecisionID.String(), "G2", seriesID, episodeID,

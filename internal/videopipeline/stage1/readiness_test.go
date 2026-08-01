@@ -47,6 +47,37 @@ func TestOpenRejectsLegacyLedgerInsteadOfGuessingTerminalOrder(t *testing.T) {
 	}
 }
 
+func TestGateBindsLedgerToExactExecutionPackage(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	hashA := strings.Repeat("a", 64)
+	hashB := strings.Repeat("b", 64)
+	gate, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindExecutionPackage(hashA); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gate.Authorize(testAttempt("shot-01", "attempt-01")); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.BindExecutionPackage(hashA); err != nil {
+		t.Fatalf("same execution package failed after restart: %v", err)
+	}
+	if err := restarted.BindExecutionPackage(hashB); err == nil {
+		t.Fatal("different execution package unexpectedly opened the existing ledger")
+	}
+	ledger := readTestLedger(t, path)
+	if ledger.SchemaVersion != LedgerSchemaVersion || ledger.ExecutionPackageHash != hashA {
+		t.Fatalf("bound ledger = %#v", ledger)
+	}
+}
+
 func TestPlanValidatePinsApprovedStage1Boundary(t *testing.T) {
 	t.Parallel()
 	valid := testPlan()
@@ -719,6 +750,76 @@ func TestSeparateGateInstancesShareTheDurableSubmissionLock(t *testing.T) {
 	}
 	if submitter.count() != 1 {
 		t.Fatalf("cross-instance provider submits = %d, want 1", submitter.count())
+	}
+}
+
+func TestPreparedProductTruthAndLedgerReservationShareCrossProcessLock(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	gateA, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gateB, err := Open(testPlan(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitter := &fakeSubmitter{tasks: make(map[string]string)}
+	executorA, _ := NewExecutor(gateA, submitter)
+	executorB, _ := NewExecutor(gateB, submitter)
+	attempt := testAttempt("shot-01", "attempt-01")
+	var prepareMu sync.Mutex
+	prepares := 0
+	prepare := func(context.Context) (providercontract.JobRequest, error) {
+		prepareMu.Lock()
+		prepares++
+		prepareMu.Unlock()
+		return providercontract.JobRequest{}, nil
+	}
+	results := make(chan error, 2)
+	var wait sync.WaitGroup
+	for _, executor := range []*Executor{executorA, executorB} {
+		wait.Add(1)
+		go func(executor *Executor) {
+			defer wait.Done()
+			_, callErr := executor.ExecutePrepared(context.Background(), attempt, prepare)
+			results <- callErr
+		}(executor)
+	}
+	wait.Wait()
+	close(results)
+	for callErr := range results {
+		if callErr != nil && providercontract.ErrorCodeOf(callErr) != providercontract.CodeUnavailable {
+			t.Fatalf("unexpected concurrent error = %v", callErr)
+		}
+	}
+	prepareMu.Lock()
+	preparedCount := prepares
+	prepareMu.Unlock()
+	if preparedCount != 1 || submitter.count() != 1 {
+		t.Fatalf("product-truth prepares=%d provider submits=%d, want 1/1", preparedCount, submitter.count())
+	}
+
+	rejectedGate, err := Open(testPlan(), filepath.Join(t.TempDir(), "rejected-ledger.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rejectedSubmitter := &fakeSubmitter{tasks: make(map[string]string)}
+	rejectedExecutor, _ := NewExecutor(rejectedGate, rejectedSubmitter)
+	prepareErr := errors.New("PostgreSQL product truth rejected")
+	if _, err := rejectedExecutor.ExecutePrepared(
+		context.Background(), attempt,
+		func(context.Context) (providercontract.JobRequest, error) {
+			return providercontract.JobRequest{}, prepareErr
+		},
+	); !errors.Is(err, prepareErr) {
+		t.Fatalf("prepare error = %v, want %v", err, prepareErr)
+	}
+	if decision, err := rejectedGate.Inspect(attempt); err != nil || decision != DecisionSubmit {
+		t.Fatalf("rejected product truth left reservation: decision=%s err=%v", decision, err)
+	}
+	if rejectedSubmitter.count() != 0 {
+		t.Fatalf("rejected product truth Provider submits=%d, want 0", rejectedSubmitter.count())
 	}
 }
 
