@@ -55,19 +55,43 @@ task、request、用量、费用、错误分类与 CAS artifact 后再调用 `Ga
 显式注入至少 32 字节的内部服务认证。默认 Compose 与 `make video-stage1-readiness`
 仍保持 Mock/纯校验，不会启动 runner 或产生 Provider 调用。
 
-正式执行前必须由当前 PostgreSQL 产品真相冻结单独的 execution package。该文件只含十个
-Run、ShotSpecRevision、PromptSnapshot ID/hash、Plan、VIDEO approval、route 和额度，以及
-同一顺序的完整 `FinalizeEpisodeInput`（TTS route/approval、UTF-8 字幕、对白轨、720p/24fps
-成片、Manifest/SBOM）；不得包含 Prompt 文本、Secret 或 signed URL。先准备未带
-`contentHash` 的 draft，再无费用封印并验证：
+正式执行前必须由当前 PostgreSQL 产品真相冻结单独的 execution package。管理员批准的
+product-input/source/safety/visual 四个固定附件只能通过 `video-stage1-materialize` 导入：
+命令先逐文件校验 bytes/SHA-256，把原始附件写入 CAS，再在一个 `SERIALIZABLE` 事务中
+写入精确 UUID 的 Series/Episode/Scene/Shot、四层 Context、资产/License、G1/G2/SAFETY、
+VIDEO/SPEECH budget、Plan、Prompt 和十个 VALIDATED Run。它没有 Adapter URL、认证客户端
+或 submit 操作，离线报告还会断言本包的 reservation/provider_job/cost ledger 均为 0。
+外部 product hash、每镜原始 hash 和 ADMIN comment/validUntil 保存在不可变 audit 中；数据库
+canonicalizer 派生的 Prompt/Run hash 单独写入，不会静默覆盖原始证据。普通编译器的
+derived Prompt UUID 合同保持不变，只有带完整导入 audit 的 `stage1-product-input-v1`
+记录允许使用管理员预留 UUID。
+
+示例（路径仅为操作占位，必须换成 issue 中四个固定附件；不传任何 Secret）：
 
 ```bash
-go run ./cmd/video-stage1-package seal \
-  video-pipeline/config/flo104-stage1-readiness.json approved-execution-package.draft.json \
-  > /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json
+VIDEO_POSTGRES_DSN=postgres://... VIDEO_ARTIFACT_ROOT=/var/lib/video-pipeline/artifacts \
+go run ./cmd/video-stage1-materialize \
+  --product flo-104-sample1-product-input-v1.json \
+  --source flo-104-sample1-source-v1.txt \
+  --safety flo-104-sample1-safety-evidence-v1.json \
+  --visual flo-104-sample1-visual-reference-board-v1.png \
+  --plan video-pipeline/config/flo104-stage1-readiness.json \
+  --approval-comment <ADMIN-comment-uuid> --approval-actor <ADMIN-agent-uuid> \
+  --approval-valid-until <RFC3339> \
+  --output flo104-sample1-execution-package.json \
+  --report flo104-sample1-materialization-report.json
+```
+
+输出文件只含十个
+Run、ShotSpecRevision、PromptSnapshot ID/hash、Plan、VIDEO approval、route 和额度，以及
+同一顺序的完整 `FinalizeEpisodeInput`（TTS route/approval、UTF-8 字幕、对白轨、720p/24fps
+成片、Manifest/SBOM）；不得包含 Prompt 文本、Secret 或 signed URL。独立 QA 继续用
+同一 verifier 复核：
+
+```bash
 go run ./cmd/video-stage1-package verify \
   video-pipeline/config/flo104-stage1-readiness.json \
-  /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json
+  flo104-sample1-execution-package.json
 ```
 
 Runner 启动时和每次新 submit 都验证 package；v3 ledger 还永久绑定 package 的
@@ -119,7 +143,8 @@ Mock。
 
 回滚只需停止阶段 1 runner 并恢复上一镜像。无数据库迁移；本轮复用既有 PostgreSQL
 Run/Prompt/Plan/approval/reservation/provider_job 表，v1/v2 readiness ledger 不会被
-v3 runner 接受。本阶段尚无真实 Stage 1 job，readiness QA 应先归档任何无费用旧版
+v3 runner 接受。已导入的产品记录和 CAS 是不可变审计证据，不在代码回滚时删除；旧镜像
+无法执行 `stage1-product-input-v1` Prompt，会 fail-closed。本阶段尚无真实 Stage 1 job，readiness QA 应先归档任何无费用旧版
 ledger；v3 runner 会在首次绑定基础 package 时原子创建新 ledger，retry extension hash
 同样只可绑定一次。ledger 与 CAS 均保留
 为审计证据，不删除历史任务；任何 `AMBIGUOUS` 记录必须人工恢复。

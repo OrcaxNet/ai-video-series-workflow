@@ -121,7 +121,20 @@ func (p *Postgres) ValidateWorkerUpgradeReadiness(ctx context.Context) error {
 		  'RECONCILING', 'REQUIRES_ACTION', 'CANCEL_REQUESTED', 'PAUSED'
 		)
 		  AND (
-		    ps.compiler_version <> 'control-plane-compiler-v1'
+		    ps.compiler_version NOT IN ('control-plane-compiler-v1', 'stage1-product-input-v1')
+		    OR (
+		      ps.compiler_version = 'stage1-product-input-v1'
+		      AND NOT EXISTS (
+		        SELECT 1
+		        FROM video_pipeline.audit_events imported
+		        WHERE imported.action = 'prompt_snapshot.imported'
+		          AND imported.aggregate_type = 'PROMPT_SNAPSHOT'
+		          AND imported.aggregate_id = ps.id
+		          AND imported.payload->>'derivedPromptHash' = ps.content_hash
+		          AND imported.payload->>'inputPackageHash' ~ '^[0-9a-f]{64}$'
+		          AND imported.payload->>'originalPromptHash' ~ '^[0-9a-f]{64}$'
+		      )
+		    )
 		    OR ps.output_spec = '{}'::jsonb
 		    OR ps.input_revision_hashes = '{}'::jsonb
 		    OR (

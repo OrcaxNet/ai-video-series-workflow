@@ -275,7 +275,8 @@ func loadExactPromptSnapshot(
 		}
 		return orchestration.PromptSnapshotRef{}, fmt.Errorf("read immutable prompt snapshot: %w", err)
 	}
-	if schemaVersion != "v1" || compilerVersion != "control-plane-compiler-v1" {
+	if schemaVersion != "v1" ||
+		compilerVersion != "control-plane-compiler-v1" && compilerVersion != "stage1-product-input-v1" {
 		return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"prompt snapshot compiler identity is not executable",
@@ -313,20 +314,64 @@ func loadExactPromptSnapshot(
 			"prompt snapshot input hashes differ from their immutable producers",
 		)
 	}
-	expectedHash, err := workflowPromptHash(
-		shotID.String(),
-		profileID.String(),
-		effectiveHash,
-		assetIDs,
-		json.RawMessage(positivePrompt),
-		output,
-		expectedInputRevisionHashes,
-	)
+	var expectedHash string
+	if compilerVersion == "stage1-product-input-v1" {
+		var imported struct {
+			InputPackageHash   string `json:"inputPackageHash"`
+			OriginalPromptHash string `json:"originalPromptHash"`
+			DerivedPromptHash  string `json:"derivedPromptHash"`
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT payload
+			FROM video_pipeline.audit_events
+			WHERE action = 'prompt_snapshot.imported'
+			  AND aggregate_type = 'PROMPT_SNAPSHOT'
+			  AND aggregate_id = $1
+			ORDER BY occurred_at DESC
+			LIMIT 1
+			FOR SHARE`, promptID).Scan(&imported); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"imported prompt snapshot has no immutable package evidence",
+				)
+			}
+			return orchestration.PromptSnapshotRef{}, fmt.Errorf("read imported prompt evidence: %w", err)
+		}
+		if !validImportedDigest(imported.InputPackageHash) || !validImportedDigest(imported.OriginalPromptHash) {
+			return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"imported prompt package evidence is incomplete",
+			)
+		}
+		expectedHash, err = ImportedPromptHash(
+			shotID.String(), profileID.String(), effectiveHash, assetIDs,
+			positivePrompt, negativePrompt, output, expectedInputRevisionHashes,
+			imported.InputPackageHash,
+		)
+		if err == nil && imported.DerivedPromptHash != expectedHash {
+			return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"imported prompt audit digest differs from its database content",
+			)
+		}
+	} else {
+		expectedHash, err = workflowPromptHash(
+			shotID.String(),
+			profileID.String(),
+			effectiveHash,
+			assetIDs,
+			json.RawMessage(positivePrompt),
+			output,
+			expectedInputRevisionHashes,
+		)
+	}
 	if err != nil {
 		return orchestration.PromptSnapshotRef{}, err
 	}
 	expectedID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("prompt:"+expectedHash))
-	if contentHash != expectedHash || normalizedHash != expectedHash || promptID != expectedID {
+	if contentHash != expectedHash || normalizedHash != expectedHash ||
+		compilerVersion == "control-plane-compiler-v1" && promptID != expectedID {
 		return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"prompt snapshot hash or ID differs from its immutable content",
@@ -351,6 +396,65 @@ func loadExactPromptSnapshot(
 		Context: contextRefs, Assets: assets, Output: output,
 		InputRevisionHashes: storedInputRevisionHashes,
 	}, nil
+}
+
+func validImportedDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ImportedPromptHash binds a product-approved prompt to its exact imported
+// package without weakening the derived-ID contract used by normal compiler
+// output. The importing transaction records the original external digest and
+// this database-derived digest in an immutable audit event.
+func ImportedPromptHash(
+	shotSpecRevisionID string,
+	generationProfileRevisionID string,
+	effectiveContextHash string,
+	assetVersionIDs []uuid.UUID,
+	positivePrompt string,
+	negativePrompt string,
+	output providercontract.OutputSpec,
+	inputRevisionHashes map[string]string,
+	inputPackageHash string,
+) (string, error) {
+	return digestValue(map[string]any{
+		"schemaVersion":             "v1",
+		"compilerVersion":           "stage1-product-input-v1",
+		"shotSpecRevisionId":        shotSpecRevisionID,
+		"generationProfileRevision": generationProfileRevisionID,
+		"effectiveContextHash":      effectiveContextHash,
+		"assetVersionRefs":          uuidStrings(assetVersionIDs),
+		"positivePrompt":            positivePrompt,
+		"negativePrompt":            negativePrompt,
+		"output":                    output,
+		"inputRevisionHashes":       inputRevisionHashes,
+		"inputPackageHash":          inputPackageHash,
+	})
+}
+
+// GenerationRunSpecDigest exposes the repository's canonical run identity to
+// the offline Stage 1 materializer. Paid submission recomputes the same value.
+func GenerationRunSpecDigest(
+	shotSpecRevisionID string,
+	promptSnapshotID string,
+	promptHash string,
+	generationProfileID string,
+	generationPlanID string,
+	route providercontract.ModelSnapshot,
+	creativeAttempt int,
+) (string, error) {
+	return generationRunSpecDigest(
+		shotSpecRevisionID, promptSnapshotID, promptHash, generationProfileID,
+		generationPlanID, route, creativeAttempt,
+	)
 }
 
 func persistPromptLineage(

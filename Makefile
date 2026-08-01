@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-stage1-readiness video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-stage1-readiness video-stage1-materialize-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -43,6 +43,11 @@ video-flo104-mock-evidence:
 # Pure validation: this command has no Provider client and cannot incur cost.
 video-stage1-readiness:
 	go run ./cmd/video-stage1-readiness video-pipeline/config/flo104-stage1-readiness.json
+
+# Build/test only. Actual import additionally requires the four fixed issue
+# attachments, explicit ADMIN approval identity, PostgreSQL, and a CAS root.
+video-stage1-materialize-test:
+	go test ./cmd/video-stage1-materialize ./internal/videopipeline/stage1materialize ./internal/videopipeline/repository
 
 # Build-only QA gate: does not start a container or contact an adapter.
 video-stage1-runner-build:
