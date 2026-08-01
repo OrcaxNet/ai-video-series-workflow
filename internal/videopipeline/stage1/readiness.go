@@ -122,11 +122,10 @@ func (p Plan) Validate() error {
 }
 
 type RetryApproval struct {
-	ApprovalID            string `json:"approvalId"`
-	OriginalAttemptID     string `json:"originalAttemptId"`
-	OriginalTerminal      bool   `json:"originalTerminal"`
-	FailureClass          string `json:"failureClass"`
-	DuplicateTaskRuledOut bool   `json:"duplicateTaskRuledOut"`
+	ApprovalID              string `json:"approvalId"`
+	OriginalAttemptID       string `json:"originalAttemptId"`
+	FailureClass            string `json:"failureClass"`
+	DuplicateTaskEvidenceID string `json:"duplicateTaskEvidenceId"`
 }
 
 type Attempt struct {
@@ -136,14 +135,6 @@ type Attempt struct {
 	EstimatedVideoTokens               int64          `json:"estimatedVideoTokens"`
 	PredictedAFPMilli                  int64          `json:"predictedAfpMilli"`
 	EstimatedNonSubscriptionCashMicros int64          `json:"estimatedNonSubscriptionCashMicros"`
-	LicenseCurrent                     bool           `json:"licenseCurrent"`
-	ConsentCurrent                     bool           `json:"consentCurrent"`
-	GateApproved                       bool           `json:"gateApproved"`
-	BudgetCurrent                      bool           `json:"budgetCurrent"`
-	ContentSafetyApproved              bool           `json:"contentSafetyApproved"`
-	PriorEvidenceComplete              bool           `json:"priorEvidenceComplete"`
-	NonSubscriptionPricingVerified     bool           `json:"nonSubscriptionPricingVerified"`
-	PerRequestCostAttributionReady     bool           `json:"perRequestCostAttributionReady"`
 	Retry                              *RetryApproval `json:"retry,omitempty"`
 	// JobRequest exists only in process memory. The gate deliberately excludes
 	// prompts and transport input from its durable ledger.
@@ -244,6 +235,36 @@ func (g *Gate) Authorize(attempt Attempt) (Decision, error) {
 	return DecisionSubmit, nil
 }
 
+// Inspect performs the exact local ledger decision without reserving a new
+// attempt. The production runner uses it before PostgreSQL product-truth
+// preparation, preventing rejected limits from leaving a paid reservation.
+func (g *Gate) Inspect(attempt Attempt) (Decision, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return "", err
+	}
+	defer releaseFileLock(lock)
+	ledger, err := g.loadLocked()
+	if err != nil {
+		return "", err
+	}
+	if existing := ledger.Records[attempt.IdempotencyKey]; existing != nil {
+		if !sameAttempt(existing.Attempt, attempt) {
+			return "", providerError(providercontract.CodeConflict, "idempotency key is bound to different stage 1 input")
+		}
+		if existing.State == "AMBIGUOUS" || existing.State == "PREPARED" {
+			return DecisionRecoverOnly, nil
+		}
+		return DecisionReplay, nil
+	}
+	if err := g.validateNewAttempt(ledger, attempt); err != nil {
+		return "", err
+	}
+	return DecisionSubmit, nil
+}
+
 func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 	if strings.TrimSpace(attempt.AttemptID) == "" || strings.TrimSpace(attempt.IdempotencyKey) == "" ||
 		strings.TrimSpace(attempt.ShotID) == "" {
@@ -251,13 +272,6 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 	}
 	if !contains(g.plan.PrimaryShotIDs, attempt.ShotID) {
 		return providerError(providercontract.CodeForbidden, "shot is outside the approved stage 1 primary set")
-	}
-	if !attempt.LicenseCurrent || !attempt.ConsentCurrent || !attempt.GateApproved ||
-		!attempt.BudgetCurrent || !attempt.ContentSafetyApproved {
-		return providerError(providercontract.CodeForbidden, "license, consent, gate, budget, and safety checks must all be current")
-	}
-	if !attempt.PriorEvidenceComplete {
-		return providerError(providercontract.CodeForbidden, "previous stage 1 attempt evidence is incomplete")
 	}
 	for _, record := range ledger.Records {
 		if (record.State == "TERMINAL_SUCCEEDED" || record.State == "TERMINAL_FAILED") &&
@@ -300,11 +314,6 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 		ledger.ReservedCashMicros+attempt.EstimatedNonSubscriptionCashMicros > g.plan.MaximumCashMicros {
 		return providerError(providercontract.CodeBudgetExceeded, "stage 1 non-subscription cash cap would be exceeded")
 	}
-	if attempt.EstimatedNonSubscriptionCashMicros > 0 &&
-		(!attempt.NonSubscriptionPricingVerified || !attempt.PerRequestCostAttributionReady) {
-		return providerError(providercontract.CodeBudgetExceeded, "non-subscription pricing and per-request cost attribution must be verified before submit")
-	}
-
 	primaryExists := false
 	retries := 0
 	for _, record := range ledger.Records {
@@ -326,8 +335,8 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 	}
 	retry := attempt.Retry
 	if strings.TrimSpace(retry.ApprovalID) == "" || strings.TrimSpace(retry.OriginalAttemptID) == "" ||
-		!retry.OriginalTerminal || strings.TrimSpace(retry.FailureClass) == "" || !retry.DuplicateTaskRuledOut {
-		return providerError(providercontract.CodeForbidden, "controlled retry lacks terminal failure, approval, classification, or duplicate-task proof")
+		strings.TrimSpace(retry.FailureClass) == "" || strings.TrimSpace(retry.DuplicateTaskEvidenceID) == "" {
+		return providerError(providercontract.CodeForbidden, "controlled retry lacks approval, classification, or duplicate-task evidence")
 	}
 	for _, record := range ledger.Records {
 		if record.AttemptID == retry.OriginalAttemptID && record.ShotID == attempt.ShotID &&

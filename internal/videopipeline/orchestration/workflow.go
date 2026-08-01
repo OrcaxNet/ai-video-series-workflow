@@ -570,6 +570,24 @@ type ExecuteProviderJobInput struct {
 type PreparedProviderJob struct {
 	Budget            providercontract.BudgetEnvelope    `json:"budget"`
 	BudgetReservation providercontract.BudgetReservation `json:"budgetReservation"`
+	ProductTruth      PreparedProductTruth               `json:"productTruth"`
+}
+
+// PreparedProductTruth echoes the exact immutable PostgreSQL facts that were
+// revalidated in the same transaction as the Provider job and budget
+// reservation. A narrow runner can compare it with its signed-off package
+// without accepting any caller-reported authorization state.
+type PreparedProductTruth struct {
+	ShotSpecRevisionID  string                         `json:"shotSpecRevisionId"`
+	Run                 GenerationRunRef               `json:"run"`
+	PromptSnapshotID    string                         `json:"promptSnapshotId"`
+	PromptSnapshotHash  string                         `json:"promptSnapshotHash"`
+	GenerationPlanID    string                         `json:"generationPlanId"`
+	BudgetApprovalID    string                         `json:"budgetApprovalId"`
+	BudgetMaximumMicros int64                          `json:"budgetMaximumMicros"`
+	BudgetCurrency      string                         `json:"budgetCurrency"`
+	ProviderProfileID   string                         `json:"providerProfileId"`
+	Route               providercontract.ModelSnapshot `json:"route"`
 }
 
 type RunQCInput struct {

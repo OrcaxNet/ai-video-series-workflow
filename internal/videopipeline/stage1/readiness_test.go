@@ -104,20 +104,10 @@ func TestGateFailsClosedBeforeSubmitAcrossBudgetAndEvidenceBoundaries(t *testing
 		want       providercontract.ErrorCode
 	}{
 		{name: "unapproved shot", mutate: func(attempt *Attempt) { attempt.ShotID = "outside" }, want: providercontract.CodeForbidden},
-		{name: "license revoked", mutate: func(attempt *Attempt) { attempt.LicenseCurrent = false }, want: providercontract.CodeForbidden},
-		{name: "consent revoked", mutate: func(attempt *Attempt) { attempt.ConsentCurrent = false }, want: providercontract.CodeForbidden},
-		{name: "gate stale", mutate: func(attempt *Attempt) { attempt.GateApproved = false }, want: providercontract.CodeForbidden},
-		{name: "budget stale", mutate: func(attempt *Attempt) { attempt.BudgetCurrent = false }, want: providercontract.CodeForbidden},
-		{name: "safety stale", mutate: func(attempt *Attempt) { attempt.ContentSafetyApproved = false }, want: providercontract.CodeForbidden},
-		{name: "evidence incomplete", mutate: func(attempt *Attempt) { attempt.PriorEvidenceComplete = false }, want: providercontract.CodeForbidden},
 		{name: "token cap", mutate: func(attempt *Attempt) { attempt.EstimatedVideoTokens = MaximumVideoTokens + 1 }, want: providercontract.CodeBudgetExceeded},
 		{name: "AFP drift", mutate: func(attempt *Attempt) { attempt.PredictedAFPMilli = 2_755_171 }, want: providercontract.CodeBudgetExceeded},
 		{name: "monthly AFP cap", mutatePlan: func(plan *Plan) { plan.MonthlyBaselineAFPMilli = 37_000_000 }, want: providercontract.CodeBudgetExceeded},
 		{name: "cash cap", mutate: func(attempt *Attempt) { attempt.EstimatedNonSubscriptionCashMicros = MaximumCashMicros + 1 }, want: providercontract.CodeBudgetExceeded},
-		{name: "unpriced non-subscription call", mutate: func(attempt *Attempt) {
-			attempt.EstimatedNonSubscriptionCashMicros = 1
-			attempt.NonSubscriptionPricingVerified = false
-		}, want: providercontract.CodeBudgetExceeded},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -170,7 +160,7 @@ func TestGateAllowsExactlyTenPrimaryJobsAndOneControlledRetry(t *testing.T) {
 	retry := testAttempt("shot-01", "attempt-retry")
 	retry.Retry = &RetryApproval{
 		ApprovalID: "retry-approval-1", OriginalAttemptID: "attempt-01",
-		OriginalTerminal: true, FailureClass: "PROVIDER_TERMINAL_FAILURE", DuplicateTaskRuledOut: true,
+		FailureClass: "PROVIDER_TERMINAL_FAILURE", DuplicateTaskEvidenceID: "recovery-evidence-1",
 	}
 	if decision, err := gate.Authorize(retry); err != nil || decision != DecisionSubmit {
 		t.Fatalf("controlled retry decision=%s err=%v", decision, err)
@@ -760,9 +750,6 @@ func testAttempt(shotID, attemptID string) Attempt {
 	return Attempt{
 		AttemptID: attemptID, ShotID: shotID, IdempotencyKey: "idempotency-" + attemptID,
 		EstimatedVideoTokens: 100_000, PredictedAFPMilli: 2_504_700,
-		LicenseCurrent: true, ConsentCurrent: true, GateApproved: true,
-		BudgetCurrent: true, ContentSafetyApproved: true, PriorEvidenceComplete: true,
-		NonSubscriptionPricingVerified: true, PerRequestCostAttributionReady: true,
 	}
 }
 

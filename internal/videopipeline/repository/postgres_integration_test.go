@@ -2914,6 +2914,16 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if temporalAddress := os.Getenv("VIDEO_TEST_TEMPORAL_ADDRESS"); temporalAddress != "" {
+		// This monolithic integration scenario has already exercised G3 and
+		// publication locking above. Reset only the fixture lifecycle state so
+		// the independent pause/outage cases still model a pre-G3 paid submit;
+		// PrepareProviderJob must reject a genuinely G3_LOCKED revision.
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.episode_revisions
+			SET status = 'G2_APPROVED'
+			WHERE id = $1`,
+			episodeRevisionID,
+		)
 		testHTTPTemporalRecoveryAndPause(
 			t,
 			ctx,
@@ -3813,6 +3823,7 @@ func cloneIntegrationShotCommand(
 	t.Helper()
 	newShotID := uuid.New()
 	newShotRevisionID := uuid.New()
+	newGate2ID := uuid.New()
 	newShotHash := strings.Repeat(
 		strings.ReplaceAll(uuid.NewString(), "-", ""),
 		2,
@@ -3828,6 +3839,21 @@ func cloneIntegrationShotCommand(
 		t.Fatalf("clone integration shot: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.approval_decisions
+		  (id, series_id, episode_id, gate, decision, reason_code,
+		   actor_id, actor_role, trace_id)
+		SELECT $3, source.series_id, source.episode_id, 'G2', 'APPROVED',
+		       'integration-clone', 'integration-director', 'DIRECTOR',
+		       'integration-clone-' || $2::text
+		FROM video_pipeline.shot_spec_revisions ssr
+		JOIN video_pipeline.approval_decisions source
+		  ON source.id = ssr.gate2_decision_id
+		WHERE ssr.id = $1`,
+		source.ShotSpecRevisionID, newShotID, newGate2ID,
+	); err != nil {
+		t.Fatalf("clone integration G2 decision: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO video_pipeline.shot_spec_revisions
 		  (id, shot_id, storyboard_revision_id, revision, parent_revision_id,
 		   lifecycle_state, freshness, duration_ms, aspect_profile, fps, width, height,
@@ -3838,12 +3864,27 @@ func cloneIntegrationShotCommand(
 		       'READY', 'FRESH', duration_ms, aspect_profile, fps, width, height,
 		       cast_count, primary_action_count, narrative, asset_version_refs,
 		       context_revision_ids, $4, continuity, cinematography,
-		       generation_profile_id, gate2_decision_id, $4, 'integration-clone'
+		       generation_profile_id, $5, $4, 'integration-clone'
 		FROM video_pipeline.shot_spec_revisions
 		WHERE id = $1`,
-		source.ShotSpecRevisionID, newShotRevisionID, newShotID, newShotHash,
+		source.ShotSpecRevisionID, newShotRevisionID, newShotID, newShotHash, newGate2ID,
 	); err != nil {
 		t.Fatalf("clone integration shot revision: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.approval_bindings
+		  (decision_id, object_type, revision_id, content_hash)
+		SELECT $1::uuid, original.object_type, original.revision_id, original.content_hash
+		FROM video_pipeline.shot_spec_revisions ssr
+		JOIN video_pipeline.approval_bindings original
+		  ON original.decision_id = ssr.gate2_decision_id
+		 AND original.object_type = 'EPISODE_REVISION'
+		WHERE ssr.id = $2
+		UNION ALL
+		SELECT $1::uuid, 'SHOT_SPEC_REVISION', $3::uuid, $4`,
+		newGate2ID, source.ShotSpecRevisionID, newShotRevisionID, newShotHash,
+	); err != nil {
+		t.Fatalf("clone integration G2 bindings: %v", err)
 	}
 	clonedPrompt, err := store.CompilePromptSnapshot(
 		ctx,

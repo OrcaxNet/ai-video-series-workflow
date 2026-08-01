@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
 )
@@ -44,6 +45,14 @@ func run(
 	if err != nil {
 		return err
 	}
+	executionPackagePath, err := requiredEnv(lookup, "VIDEO_STAGE1_EXECUTION_PACKAGE_PATH")
+	if err != nil {
+		return err
+	}
+	postgresDSN, err := requiredEnv(lookup, "VIDEO_POSTGRES_DSN")
+	if err != nil {
+		return err
+	}
 	adapterURL, err := requiredEnv(lookup, "VIDEO_PROVIDER_ADAPTER_URL")
 	if err != nil {
 		return err
@@ -66,10 +75,27 @@ func run(
 	if err := decodeOne(planFile, &plan); err != nil {
 		return fmt.Errorf("decode immutable stage 1 plan: %w", err)
 	}
+	executionPackageFile, err := os.Open(executionPackagePath)
+	if err != nil {
+		return fmt.Errorf("open immutable stage 1 execution package: %w", err)
+	}
+	defer executionPackageFile.Close()
+	var executionPackage stage1.ExecutionPackage
+	if err := decodeOne(executionPackageFile, &executionPackage); err != nil {
+		return fmt.Errorf("decode immutable stage 1 execution package: %w", err)
+	}
+	if err := executionPackage.Validate(plan); err != nil {
+		return fmt.Errorf("validate immutable stage 1 execution package: %w", err)
+	}
 	gate, err := stage1.Open(plan, ledgerPath)
 	if err != nil {
 		return err
 	}
+	store, err := repository.Open(ctx, postgresDSN, repository.PoolConfig{})
+	if err != nil {
+		return fmt.Errorf("connect to stage 1 PostgreSQL product truth: %w", err)
+	}
+	defer store.Close()
 	client, err := volcengineprovider.AuthenticatedHTTPClient(
 		&http.Client{Timeout: 2 * time.Minute}, serviceAuth,
 	)
@@ -84,7 +110,7 @@ func run(
 	if err != nil {
 		return err
 	}
-	runner, err := stage1.NewRunner(gate, adapter, artifacts)
+	runner, err := stage1.NewRunner(gate, adapter, artifacts, store, executionPackage)
 	if err != nil {
 		return err
 	}

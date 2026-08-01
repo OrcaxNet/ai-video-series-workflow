@@ -1,0 +1,66 @@
+// Command video-stage1-package seals or verifies a prompt-free Stage 1
+// execution package. It performs no Provider call and accepts no credentials.
+package main
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"os"
+
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
+)
+
+func main() {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
+		log.Fatalf("stage 1 package failed: %v", err)
+	}
+}
+
+func run(args []string, output io.Writer) error {
+	if len(args) != 3 || args[0] != "seal" && args[0] != "verify" {
+		return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json>")
+	}
+	var plan stage1.Plan
+	if err := decodeFile(args[1], &plan); err != nil {
+		return fmt.Errorf("read stage 1 plan: %w", err)
+	}
+	var package_ stage1.ExecutionPackage
+	if err := decodeFile(args[2], &package_); err != nil {
+		return fmt.Errorf("read stage 1 execution package: %w", err)
+	}
+	if args[0] == "seal" {
+		var err error
+		package_, err = stage1.SealExecutionPackage(package_)
+		if err != nil {
+			return err
+		}
+	}
+	if err := package_.Validate(plan); err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(output)
+	encoder.SetEscapeHTML(false)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(package_)
+}
+
+func decodeFile(path string, destination any) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	decoder := json.NewDecoder(io.LimitReader(file, 4<<20))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("file must contain exactly one JSON value")
+	}
+	return nil
+}

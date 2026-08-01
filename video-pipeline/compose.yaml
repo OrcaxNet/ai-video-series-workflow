@@ -198,15 +198,19 @@ services:
     environment:
       VIDEO_STAGE1_PLAN_PATH: /etc/video-pipeline/flo104-stage1-plan.json
       VIDEO_STAGE1_LEDGER_PATH: /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-ledger.json
+      VIDEO_STAGE1_EXECUTION_PACKAGE_PATH: /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json
       VIDEO_PROVIDER_ADAPTER_URL: http://volcengine-provider:8091
       VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+      VIDEO_POSTGRES_DSN: postgres://${VIDEO_POSTGRES_USER:-video}:${VIDEO_POSTGRES_PASSWORD:-video-local-only}@postgres:5432/${VIDEO_POSTGRES_DATABASE:-video_pipeline}?sslmode=disable
     volumes:
       - video-artifacts:/var/lib/video-pipeline/artifacts
       - ./config/flo104-stage1-readiness.json:/etc/video-pipeline/flo104-stage1-plan.json:ro
     depends_on:
       volcengine-provider:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     networks: [video-backplane]
     read_only: true
     tmpfs:

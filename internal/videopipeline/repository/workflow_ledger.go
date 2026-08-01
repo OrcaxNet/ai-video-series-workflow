@@ -771,6 +771,49 @@ func loadPromptAssetEvidence(
 	return refs, hashes, nil
 }
 
+func loadShotAssetIDs(
+	ctx context.Context,
+	tx pgx.Tx,
+	shotIDs []uuid.UUID,
+) ([]uuid.UUID, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT asset_version_refs
+		FROM video_pipeline.shot_spec_revisions
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id
+		FOR SHARE`,
+		shotIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read frozen shot asset references: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[uuid.UUID]struct{})
+	for rows.Next() {
+		var refs []uuid.UUID
+		if err := rows.Scan(&refs); err != nil {
+			return nil, fmt.Errorf("scan frozen shot asset references: %w", err)
+		}
+		for _, id := range refs {
+			seen[id] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate frozen shot asset references: %w", err)
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	assetIDs := make([]uuid.UUID, 0, len(seen))
+	for id := range seen {
+		assetIDs = append(assetIDs, id)
+	}
+	sort.Slice(assetIDs, func(left, right int) bool {
+		return assetIDs[left].String() < assetIDs[right].String()
+	})
+	return assetIDs, nil
+}
+
 func promptAssetType(mediaType string) (providercontract.Modality, providercontract.AssetRole, error) {
 	switch {
 	case strings.HasPrefix(mediaType, "image/"):
@@ -996,7 +1039,7 @@ func (p *Postgres) PrepareProviderJob(
 	prepared, err := withSerializable(ctx, p.pool, func(
 		tx pgx.Tx,
 	) (orchestration.PreparedProviderJob, error) {
-		var attemptID, promptID, shotID, profileID uuid.UUID
+		var attemptID, promptID, shotID, profileID, gate2DecisionID uuid.UUID
 		var seriesID, episodeID uuid.UUID
 		var runDigest, runState, persistedBudgetApprovalID, generationPlanID string
 		var promptHash string
@@ -1007,7 +1050,8 @@ func (p *Postgres) PrepareProviderJob(
 			       gr.generation_profile_id, gr.creative_attempt,
 			       gr.run_spec_digest, gr.state, gr.budget_approval_id,
 			       COALESCE(audit.payload->>'generationPlanId', ''),
-			       ep.series_id, ep.id, ps.content_hash, ga.model_snapshot
+			       ep.series_id, ep.id, ps.content_hash, ga.model_snapshot,
+			       ssr.gate2_decision_id
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.generation_attempts ga
 			  ON ga.generation_run_id = gr.id AND ga.sequence = 1
@@ -1033,7 +1077,7 @@ func (p *Postgres) PrepareProviderJob(
 			&attemptID, &promptID, &shotID, &profileID, &creativeAttempt,
 			&runDigest, &runState, &persistedBudgetApprovalID,
 			&generationPlanID, &seriesID, &episodeID, &promptHash,
-			&persistedRouteJSON,
+			&persistedRouteJSON, &gate2DecisionID,
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, fmt.Errorf("lock provider run: %w", err)
 		}
@@ -1089,6 +1133,72 @@ func (p *Postgres) PrepareProviderJob(
 		}
 		plan, err := readPlan(ctx, tx, generationPlanID)
 		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if plan.SeriesID != seriesID.String() || plan.Plan.State == "BLOCKED" ||
+			plan.EpisodeRevisionID == "" ||
+			!containsString(plan.ShotSpecRevisionIDs, shotID.String()) {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"provider run is outside the current immutable generation plan",
+				"create a new run from the exact approved episode and shot set",
+			)
+		}
+		episodeRevisionID, err := uuid.Parse(plan.EpisodeRevisionID)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"generation plan episode revision is invalid",
+				"create a new plan for the exact approved episode revision",
+			)
+		}
+		planShotIDs, err := parseUUIDs(plan.ShotSpecRevisionIDs)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"generation plan shot revisions are invalid",
+				"create a new plan for the exact approved shot set",
+			)
+		}
+		var episodeStatus string
+		if err := tx.QueryRow(ctx, `
+			SELECT status
+			FROM video_pipeline.episode_revisions
+			WHERE id = $1 AND episode_id = $2
+			FOR SHARE`,
+			episodeRevisionID, episodeID,
+		).Scan(&episodeStatus); err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf("read provider episode gate: %w", err)
+		}
+		if episodeStatus != "G2_APPROVED" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"provider episode revision is no longer G2_APPROVED",
+				"approve the exact episode revision before paid submission",
+			)
+		}
+		if err := requireApprovedDecision(
+			ctx, tx, gate2DecisionID.String(), "G2", seriesID, episodeID,
+			"SHOT_SPEC_REVISION", shotID,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		assetIDs, err := loadShotAssetIDs(ctx, tx, planShotIDs)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := lockPostProductionRights(ctx, tx, assetIDs); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := requireAssetLicenses(
+			ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := requireContentSafetyDecision(
+			ctx, tx, plan.ExecutionPolicy, seriesID, episodeRevisionID,
+			planShotIDs, p.now().UTC(),
+		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
 		if input.BudgetMaximumMicros != plan.BudgetLimit.AmountMicros ||
@@ -1211,6 +1321,11 @@ func (p *Postgres) PrepareProviderJob(
 				"decode Provider capability pricing limits: %w", err,
 			)
 		}
+		if err := requireExecutionPolicy(
+			capabilityLimits, plan.ExecutionPolicy, plan.Plan.ProviderCallCount,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
 		unitPrice, priced := numericLimit(capabilityLimits, "unitPriceMicros")
 		if !priced || unitPrice <= 0 || pricingVersion == "" {
 			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
@@ -1256,6 +1371,18 @@ func (p *Postgres) PrepareProviderJob(
 			}
 			return orchestration.PreparedProviderJob{
 				Budget: budget, BudgetReservation: reservation,
+				ProductTruth: orchestration.PreparedProductTruth{
+					ShotSpecRevisionID: shotID.String(),
+					Run: orchestration.GenerationRunRef{
+						RunID: input.Run.RunID, RunSpecDigest: runDigest,
+						Attempt: creativeAttempt,
+					},
+					PromptSnapshotID: promptID.String(), PromptSnapshotHash: promptHash,
+					GenerationPlanID:    generationPlanID,
+					BudgetApprovalID:    persistedBudgetApprovalID,
+					BudgetMaximumMicros: approvedMicros, BudgetCurrency: approvedCurrency,
+					ProviderProfileID: providerProfileID.String(), Route: persistedRoute,
+				},
 			}, nil
 		}
 		prepared, err := bindReservation()
@@ -1452,6 +1579,44 @@ func (p *Postgres) PrepareProviderJob(
 
 // CompleteProviderJob atomically commits provider provenance, CAS metadata,
 // cost, and terminal run state.
+// CompletePreparedProviderJob reloads the exact prompt-bearing dispatch from
+// PostgreSQL so a separate completion process never needs prompt text or asset
+// transport locations in its invocation or local ledger.
+func (p *Postgres) CompletePreparedProviderJob(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	runIDRaw string,
+	result orchestration.ProviderResult,
+) error {
+	runID, err := uuid.Parse(runIDRaw)
+	if err != nil {
+		return errors.New("runId must be a UUID")
+	}
+	var requestSnapshot []byte
+	if err := p.pool.QueryRow(ctx, `
+		SELECT pj.request_snapshot
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+		WHERE ga.generation_run_id = $1
+		ORDER BY ga.sequence, pj.created_at
+		LIMIT 1`,
+		runID,
+	).Scan(&requestSnapshot); err != nil {
+		return fmt.Errorf("read prepared Provider completion input: %w", err)
+	}
+	var prepared immutableProviderRequest
+	if err := json.Unmarshal(requestSnapshot, &prepared); err != nil {
+		return fmt.Errorf("decode prepared Provider completion input: %w", err)
+	}
+	if prepared.Input.Run.RunID != runIDRaw || !prepared.Input.PersistProductTruth {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"prepared Provider completion input is not bound to the exact product-truth run",
+		)
+	}
+	return p.CompleteProviderJob(ctx, step, prepared.Input, result)
+}
+
 func (p *Postgres) CompleteProviderJob(
 	ctx context.Context,
 	step orchestration.WorkflowStep,
