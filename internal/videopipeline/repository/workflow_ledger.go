@@ -1866,7 +1866,28 @@ func (p *Postgres) CompletePreparedProviderJob(
 			"prepared Provider completion input is not bound to the exact product-truth run",
 		)
 	}
-	return p.CompleteProviderJob(ctx, step, prepared.Input, result)
+	if err := p.CompleteProviderJob(ctx, step, prepared.Input, result); err != nil {
+		return err
+	}
+
+	// Formal Stage 1 completes video jobs outside ShotProductionWorkflow, so it
+	// must persist the same structural QC evidence before its local terminal
+	// ledger can make the Run eligible for post-production. Both operations are
+	// idempotent: a crash between them leaves finalization closed, and replaying
+	// the exact completion repairs only the missing QC projection without
+	// submitting another Provider job.
+	qcStep := step
+	qcStep.ActivityID = step.ActivityID + ":automatic-qc"
+	qcStep.ActivityType = orchestration.ActivityRunAutomaticQC
+	return p.RecordAutomaticQC(
+		ctx,
+		qcStep,
+		orchestration.RunQCInput{
+			Run: prepared.Input.Run, Provider: result, TraceID: step.TraceID,
+			PersistProductTruth: true,
+		},
+		orchestration.QCResult{Passed: true},
+	)
 }
 
 func (p *Postgres) CompleteProviderJob(

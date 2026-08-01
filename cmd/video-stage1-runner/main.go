@@ -205,12 +205,12 @@ func run(
 		}
 		defer temporalClient.Close()
 		workflowID := "stage1-finalization-" + executionPackage.BatchID + "-" + executionPackage.ContentHash[:16]
-		workflowRun, startErr := temporalClient.ExecuteWorkflow(ctx, temporalclient.StartWorkflowOptions{
-			ID:                       workflowID,
-			TaskQueue:                temporalTaskQueue,
-			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
-			WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
-		}, orchestration.Stage1FinalizationWorkflowName, finalizationInput)
+		workflowRun, startErr := temporalClient.ExecuteWorkflow(
+			ctx,
+			stage1FinalizationStartOptions(workflowID, temporalTaskQueue),
+			orchestration.Stage1FinalizationWorkflowName,
+			finalizationInput,
+		)
 		if startErr != nil {
 			return fmt.Errorf("start or recover Stage 1 finalization workflow: %w", startErr)
 		}
@@ -226,6 +226,21 @@ func run(
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(result)
+}
+
+func stage1FinalizationStartOptions(
+	workflowID string,
+	taskQueue string,
+) temporalclient.StartWorkflowOptions {
+	return temporalclient.StartWorkflowOptions{
+		ID:                       workflowID,
+		TaskQueue:                taskQueue,
+		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+		// The immutable workflow ID must recover an in-flight run and may start
+		// again only after a fail-closed terminal failure. A successful formal
+		// finalization remains permanently non-duplicable.
+		WorkflowIDReusePolicy: enumspb.WORKFLOW_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY,
+	}
 }
 
 func requireEmptyInput(reader io.Reader) error {

@@ -2268,8 +2268,34 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			PricingVersion: "pricing-v1", Verified: true,
 		},
 	}
-	if err := store.CompleteProviderJob(ctx, step, dispatch, providerResult); err != nil {
+	for replay := 1; replay <= 2; replay++ {
+		if err := store.CompletePreparedProviderJob(
+			ctx, step, run.RunID, providerResult,
+		); err != nil {
+			t.Fatalf("Stage 1 prepared completion replay %d: %v", replay, err)
+		}
+	}
+	var stage1PassedQC int
+	var stage1ShotState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*)
+		   FROM video_pipeline.qc_reports
+		   WHERE generation_run_id = $1 AND state = 'PASSED'),
+		  (SELECT ssr.lifecycle_state
+		   FROM video_pipeline.shot_spec_revisions ssr
+		   JOIN video_pipeline.generation_runs gr
+		     ON gr.shot_spec_revision_id = ssr.id
+		   WHERE gr.id = $1)`,
+		run.RunID,
+	).Scan(&stage1PassedQC, &stage1ShotState); err != nil {
 		t.Fatal(err)
+	}
+	if stage1PassedQC != 1 || stage1ShotState != "REVIEW" {
+		t.Fatalf(
+			"Stage 1 completion QC projection = reports:%d shot:%s, want 1/REVIEW",
+			stage1PassedQC, stage1ShotState,
+		)
 	}
 	if err := store.RecordProviderCancellation(
 		ctx, step,
@@ -2289,13 +2315,6 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if completedAfterPause.State != "SUCCEEDED" ||
 		completedAfterPause.FailureClass != "" || completedAfterPause.FailureCode != "" {
 		t.Fatalf("success-first cancellation race projection = %#v", completedAfterPause)
-	}
-	step.ActivityID, step.ActivityType = "qc", orchestration.ActivityRunAutomaticQC
-	qcInput := orchestration.RunQCInput{
-		Run: run, Provider: providerResult, TraceID: step.TraceID, PersistProductTruth: true,
-	}
-	if err := store.RecordAutomaticQC(ctx, step, qcInput, orchestration.QCResult{Passed: true}); err != nil {
-		t.Fatal(err)
 	}
 	step.ActivityID, step.ActivityType = "review", orchestration.ActivityCreateShotReview
 	if err := store.OpenShotReview(ctx, step, orchestration.CreateReviewInput{
