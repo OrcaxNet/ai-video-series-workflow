@@ -154,6 +154,10 @@ FLO-104 speech-v2 使用独立的新 VOICE 版本，不修改旧音色或旧
 `speech-b3f099e406a02073ed1ab94b2fe5bd94` 记录。新 job ID 绑定 episode revision、
 subtitle content hash、cue、VOICE version、route、resource 与 speaker；Adapter 还必须匹配
 完整 `VIDEO_VOLCENGINE_TTS_CANARY_*` allowlist，才会执行一个 `MaxAttempts=1` 请求。
+其中 parent VOICE version 不是仅做非空检查：Adapter 会在付费边界打开 allowlist hash
+指向的 `audio/x-voice-profile+json` CAS descriptor，复算 digest，并精确核对 parent/child
+version、license snapshot、provider/model/resource/speaker/route 与内部 MVP 标志。CAS
+缺失、损坏、schema 不合法或任一谱系漂移都统一失败关闭，descriptor 本身不会发送给 Provider。
 跨进程竞争先原子提交同一 job intent，只有一个进程能越过 TTS 边界；重放只读取持久记录。
 HTTP status、纯数字 Provider code、脱敏后的 `X-Api-Message` 分类及 `X-Tt-Logid` 会分别保存，
 未知 `55*` 只标为未分类 unavailable，不推断为 resource/speaker mismatch。

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"testing"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
@@ -18,6 +19,7 @@ func TestSpeechV2RequiresConfiguredCanaryAllowlist(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg, request := testSpeechCanaryFixture(t)
+	storeSpeechCanaryVoiceDescriptor(t, store, &cfg, &request)
 	cfg.SpeechCanaryJobID = ""
 	cfg.SpeechCanaryInputHash = ""
 	cfg.SpeechCanaryCueID = ""
@@ -63,6 +65,13 @@ func TestSpeechV2CanaryAllowlistContract(t *testing.T) {
 			name: "partial allowlist",
 			mutate: func(config *runtimeconfig.VolcengineProvider) {
 				config.SpeechCanaryParentVoiceVersion = ""
+			},
+			wantStatus: http.StatusUnprocessableEntity,
+		},
+		{
+			name: "parent voice version drift",
+			mutate: func(config *runtimeconfig.VolcengineProvider) {
+				config.SpeechCanaryParentVoiceVersion = "10400000-0000-4000-8000-000000000099"
 			},
 			wantStatus: http.StatusUnprocessableEntity,
 		},
@@ -145,6 +154,7 @@ func TestSpeechV2CanaryAllowlistContract(t *testing.T) {
 				t.Fatal(err)
 			}
 			config, request := testSpeechCanaryFixture(t)
+			storeSpeechCanaryVoiceDescriptor(t, store, &config, &request)
 			tt.mutate(&config)
 			speech := &fakeSpeechSynthesizer{}
 			server, err := New(config, &fakeProvider{}, store, Options{Speech: speech})
@@ -168,6 +178,94 @@ func TestSpeechV2CanaryAllowlistContract(t *testing.T) {
 				providerErr.Retryable || !providerErr.RequiresAction ||
 				providerErr.SafeMessage != "speech job is outside the frozen single-call canary" {
 				t.Fatalf("fail-closed error = %#v", providerErr)
+			}
+		})
+	}
+}
+
+func TestSpeechV2CanaryValidatesFrozenVoiceDescriptorCAS(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *artifactstore.Store, *runtimeconfig.VolcengineProvider, *providercontract.JobRequest)
+	}{
+		{
+			name: "CAS object missing",
+			setup: func(*testing.T, *artifactstore.Store, *runtimeconfig.VolcengineProvider, *providercontract.JobRequest) {
+			},
+		},
+		{
+			name: "CAS object digest corrupted",
+			setup: func(t *testing.T, store *artifactstore.Store, config *runtimeconfig.VolcengineProvider, request *providercontract.JobRequest) {
+				artifact := storeSpeechCanaryVoiceDescriptor(t, store, config, request)
+				if err := os.Chmod(artifact.Path, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(artifact.Path, []byte(`{"schemaVersion":"v2"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "descriptor JSON invalid",
+			setup: func(t *testing.T, store *artifactstore.Store, config *runtimeconfig.VolcengineProvider, request *providercontract.JobRequest) {
+				artifact, err := store.Put(t.Context(), bytes.NewBufferString("not-json"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				config.SpeechCanaryVoiceHash = artifact.Digest
+				request.Request.Assets[0].URI = artifact.URI
+				request.Request.Assets[0].SHA256 = artifact.Digest
+				request.Request.Assets[0].SizeBytes = artifact.Size
+			},
+		},
+		{
+			name: "descriptor parent version drift",
+			setup: func(t *testing.T, store *artifactstore.Store, config *runtimeconfig.VolcengineProvider, request *providercontract.JobRequest) {
+				storeSpeechCanaryVoiceDescriptor(t, store, config, request, func(descriptor *speechVoiceDescriptor) {
+					descriptor.ParentAssetVersionID = "10400000-0000-4000-8000-000000000099"
+				})
+			},
+		},
+		{
+			name: "descriptor child version drift",
+			setup: func(t *testing.T, store *artifactstore.Store, config *runtimeconfig.VolcengineProvider, request *providercontract.JobRequest) {
+				storeSpeechCanaryVoiceDescriptor(t, store, config, request, func(descriptor *speechVoiceDescriptor) {
+					descriptor.AssetVersionID = "10400000-0000-4000-8000-000000000099"
+				})
+			},
+		},
+		{
+			name: "descriptor license drift",
+			setup: func(t *testing.T, store *artifactstore.Store, config *runtimeconfig.VolcengineProvider, request *providercontract.JobRequest) {
+				storeSpeechCanaryVoiceDescriptor(t, store, config, request, func(descriptor *speechVoiceDescriptor) {
+					descriptor.LicenseSnapshotID = "10400000-0000-4000-8000-000000000099"
+				})
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			store, err := artifactstore.New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			config, request := testSpeechCanaryFixture(t)
+			tt.setup(t, store, &config, &request)
+			speech := &fakeSpeechSynthesizer{}
+			server, err := New(config, &fakeProvider{}, store, Options{Speech: speech})
+			if err != nil {
+				t.Fatal(err)
+			}
+			httpServer := httptest.NewServer(server.Handler())
+			defer httpServer.Close()
+
+			status, providerErr := submitSpeechCanary(t, httpServer.URL, request)
+			if status != http.StatusUnprocessableEntity || speech.callCount() != 0 ||
+				providerErr == nil || providerErr.Code != providercontract.CodeInvalidRequest ||
+				providerErr.Retryable || !providerErr.RequiresAction ||
+				providerErr.SafeMessage != "speech job is outside the frozen single-call canary" {
+				t.Fatalf("descriptor violation returned status=%d, calls=%d, error=%#v", status, speech.callCount(), providerErr)
 			}
 		})
 	}

@@ -30,7 +30,10 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 )
 
-const maxResolvedProviderAssetBytes = 20 << 20
+const (
+	maxResolvedProviderAssetBytes = 20 << 20
+	maxSpeechVoiceDescriptorBytes = 64 << 10
+)
 
 var errProviderJobIntentExists = errors.New("provider job intent already exists")
 
@@ -53,6 +56,21 @@ type speechRetryClaim struct {
 	JobID                  string `json:"job_id"`
 	AuthorizedRecordSHA256 string `json:"authorized_record_sha256"`
 	ClaimedAt              string `json:"claimed_at"`
+}
+
+type speechVoiceDescriptor struct {
+	SchemaVersion        string `json:"schemaVersion"`
+	Provider             string `json:"provider"`
+	ModelID              string `json:"modelId"`
+	ResourceID           string `json:"resourceId"`
+	Speaker              string `json:"speaker"`
+	RouteVersion         string `json:"routeVersion"`
+	VoiceClone           *bool  `json:"voiceClone"`
+	InternalMVPOnly      *bool  `json:"internalMvpOnly"`
+	ParentAssetVersionID string `json:"parentAssetVersionId"`
+	AssetVersionID       string `json:"assetVersionId"`
+	LicenseSnapshotID    string `json:"licenseSnapshotId"`
+	RevisionInputHash    string `json:"revisionInputHash"`
 }
 
 type Server struct {
@@ -988,7 +1006,58 @@ func (s *Server) validateSpeechCanary(request providercontract.JobRequest) error
 			s.config.SpeechCanaryLicenseHash {
 		return speechCanaryViolation()
 	}
+	if err := s.validateSpeechCanaryVoiceDescriptor(voice); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (s *Server) validateSpeechCanaryVoiceDescriptor(voice providercontract.AssetRef) error {
+	object, err := s.store.Open(voice.SHA256)
+	if err != nil {
+		return speechCanaryViolation()
+	}
+	content, readErr := io.ReadAll(io.LimitReader(object, maxSpeechVoiceDescriptorBytes+1))
+	closeErr := object.Close()
+	if readErr != nil || closeErr != nil || len(content) == 0 || len(content) > maxSpeechVoiceDescriptorBytes {
+		return speechCanaryViolation()
+	}
+	digest := sha256.Sum256(content)
+	if hex.EncodeToString(digest[:]) != voice.SHA256 ||
+		(voice.SizeBytes > 0 && voice.SizeBytes != int64(len(content))) {
+		return speechCanaryViolation()
+	}
+	var descriptor speechVoiceDescriptor
+	if err := json.Unmarshal(content, &descriptor); err != nil {
+		return speechCanaryViolation()
+	}
+	if descriptor.SchemaVersion != "v2" ||
+		descriptor.Provider != "volcengine_ark" ||
+		descriptor.ModelID != s.config.SpeechModel ||
+		descriptor.ResourceID != AgentPlanTTSResourceID ||
+		descriptor.Speaker != s.config.SpeechSpeaker ||
+		descriptor.RouteVersion != AgentPlanTTSRouteVersion ||
+		descriptor.VoiceClone == nil || *descriptor.VoiceClone ||
+		descriptor.InternalMVPOnly == nil || !*descriptor.InternalMVPOnly ||
+		descriptor.ParentAssetVersionID != s.config.SpeechCanaryParentVoiceVersion ||
+		descriptor.AssetVersionID != s.config.SpeechCanaryVoiceVersion ||
+		descriptor.LicenseSnapshotID != s.config.SpeechCanaryLicenseSnapshotID ||
+		!lowercaseSHA256(descriptor.RevisionInputHash) {
+		return speechCanaryViolation()
+	}
+	return nil
+}
+
+func lowercaseSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func speechCanaryConfigured(config runtimeconfig.VolcengineProvider) bool {

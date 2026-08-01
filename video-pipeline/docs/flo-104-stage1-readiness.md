@@ -71,7 +71,9 @@ go run ./cmd/video-stage1-revoice \
 `speech-v2-<sha256(canonical(episodeRevisionId, subtitleContentHash, cueId, voiceAssetVersionId, routeVersion, resourceId, speaker))[:32]>`。
 FLO-104 的包只授权 `cue-001`、`MaxAttempts=1`、10% hard cap `2228 milli-AFP`、
 非订阅现金 `0`。PostgreSQL 在 Prepare 与付费事务内重新锁定 VOICE parent/child、license、
-Provider profile/capability；Adapter 再匹配 job/input/cue/VOICE/license allowlist。成功生成
+Provider profile/capability；Adapter 再匹配 job/input/cue/VOICE/license allowlist，并从 CAS
+复算 VOICE descriptor digest、精确核对 parent/child version 与 license/route 身份。CAS
+缺失、损坏、descriptor schema 或谱系漂移均在 Provider 调用前失败关闭。成功生成
 一段 canary 后，Finalize 会在媒体合成、Manifest 与 G3 前返回需人工检查的非重试冲突，
 不会继续提交其余 cue。跨进程相同 job 通过原子 intent/replay 保证至多一次 Provider submit。
 

@@ -812,6 +812,7 @@ func TestSpeechV2CanaryAcrossAdapterInstancesSubmitsExactlyOnceAndReplays(t *tes
 		t.Fatal(err)
 	}
 	cfg, request := testSpeechCanaryFixture(t)
+	storeSpeechCanaryVoiceDescriptor(t, store, &cfg, &request)
 	speech := &fakeSpeechSynthesizer{}
 	first, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
 	if err != nil {
@@ -1106,4 +1107,42 @@ func testSpeechCanaryFixture(t *testing.T) (runtimeconfig.VolcengineProvider, pr
 	}
 	request.BudgetReservation = reservation
 	return cfg, request
+}
+
+func storeSpeechCanaryVoiceDescriptor(
+	t *testing.T,
+	store *artifactstore.Store,
+	config *runtimeconfig.VolcengineProvider,
+	request *providercontract.JobRequest,
+	mutations ...func(*speechVoiceDescriptor),
+) artifactstore.Artifact {
+	t.Helper()
+	voiceClone := false
+	internalMVPOnly := true
+	descriptor := speechVoiceDescriptor{
+		SchemaVersion: "v2", Provider: "volcengine_ark",
+		ModelID: config.SpeechModel, ResourceID: AgentPlanTTSResourceID,
+		Speaker: config.SpeechSpeaker, RouteVersion: AgentPlanTTSRouteVersion,
+		VoiceClone: &voiceClone, InternalMVPOnly: &internalMVPOnly,
+		ParentAssetVersionID: config.SpeechCanaryParentVoiceVersion,
+		AssetVersionID:       config.SpeechCanaryVoiceVersion,
+		LicenseSnapshotID:    config.SpeechCanaryLicenseSnapshotID,
+		RevisionInputHash:    strings.Repeat("7", 64),
+	}
+	for _, mutate := range mutations {
+		mutate(&descriptor)
+	}
+	encoded, err := json.Marshal(descriptor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := store.Put(t.Context(), bytes.NewReader(encoded))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config.SpeechCanaryVoiceHash = artifact.Digest
+	request.Request.Assets[0].URI = artifact.URI
+	request.Request.Assets[0].SHA256 = artifact.Digest
+	request.Request.Assets[0].SizeBytes = artifact.Size
+	return artifact
 }
