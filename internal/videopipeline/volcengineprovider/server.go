@@ -46,6 +46,13 @@ type speechReconciliation struct {
 	PreviousResponse       providercontract.JobResponse `json:"previous_response"`
 }
 
+type speechRetryClaim struct {
+	SchemaVersion          string `json:"schema_version"`
+	JobID                  string `json:"job_id"`
+	AuthorizedRecordSHA256 string `json:"authorized_record_sha256"`
+	ClaimedAt              string `json:"claimed_at"`
+}
+
 type Server struct {
 	config         runtimeconfig.VolcengineProvider
 	provider       providercontract.Provider
@@ -57,8 +64,7 @@ type Server struct {
 	now            func() time.Time
 	stateDir       string
 
-	mu   sync.Mutex
-	jobs map[string]*jobRecord
+	mu sync.Mutex
 }
 
 type Options struct {
@@ -106,7 +112,7 @@ func New(
 		config: config, provider: provider, store: store,
 		speech:         options.Speech,
 		downloadClient: client, inspector: inspector, authenticator: authenticator, now: now,
-		stateDir: stateDir, jobs: make(map[string]*jobRecord),
+		stateDir: stateDir,
 	}, nil
 }
 
@@ -288,9 +294,14 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if authorizedRetry {
-		intent, err = s.beginSpeechRetry(request, existing)
+		intent, authorizedRetry, err = s.prepareSpeechRetry(request, requestHash)
 		if err != nil {
 			writeProviderError(w, err)
+			return
+		}
+		if !authorizedRetry {
+			w.Header().Set("Idempotent-Replayed", "true")
+			writeJSON(w, http.StatusOK, intent.Response)
 			return
 		}
 	}
@@ -305,7 +316,6 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			writeProviderError(w, err)
 			return
 		}
-		s.jobs[request.JobID] = intent
 	}
 	if request.Capability == providercontract.CapabilitySpeech {
 		response, err := s.synthesizeSpeech(r.Context(), request)
@@ -378,6 +388,72 @@ func (s *Server) authorizedSpeechRetry(request providercontract.JobRequest, reco
 	}
 	digest, err := persistedRecordSHA256(record)
 	return err == nil && digest == s.config.SpeechRetryRecord
+}
+
+// prepareSpeechRetry turns a configured record hash into a durable, one-shot
+// authorization. The claim is immutable and intentionally never removed: its
+// existence means that authorization was consumed, including after a crash or
+// an ambiguous persistence failure. The record is read from disk both before
+// and after claiming so a process-local cache can never authorize a Provider
+// call from stale state.
+func (s *Server) prepareSpeechRetry(
+	request providercontract.JobRequest,
+	requestHash string,
+) (*jobRecord, bool, error) {
+	record, ok, err := s.loadRecordFromDisk(request.JobID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, safeError(providercontract.CodeUnavailable, "live provider job registry is unavailable", true)
+	}
+	if record.RequestHash != requestHash {
+		return nil, false, safeError(providercontract.CodeConflict, "jobId was already used for different input", false)
+	}
+	if !s.authorizedSpeechRetry(request, record) {
+		return record, false, nil
+	}
+
+	claimed, err := s.createSpeechRetryClaim(request.JobID, s.config.SpeechRetryRecord)
+	if err != nil {
+		return nil, false, err
+	}
+	if !claimed {
+		return s.reloadSpeechRetryRecord(request.JobID)
+	}
+
+	// Re-read after the exclusive claim. This is the compare-and-set check:
+	// only the claimant may persist the next attempt, and only if the claimed
+	// SHA still describes the current durable record.
+	record, ok, err = s.loadRecordFromDisk(request.JobID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, safeError(providercontract.CodeUnavailable, "live provider job registry is unavailable", true)
+	}
+	if record.RequestHash != requestHash {
+		return nil, false, safeError(providercontract.CodeConflict, "jobId was already used for different input", false)
+	}
+	if !s.authorizedSpeechRetry(request, record) {
+		return record, false, nil
+	}
+	record, err = s.beginSpeechRetry(request, record)
+	if err != nil {
+		return nil, false, err
+	}
+	return record, true, nil
+}
+
+func (s *Server) reloadSpeechRetryRecord(jobID string) (*jobRecord, bool, error) {
+	record, ok, err := s.loadRecordFromDisk(jobID)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, safeError(providercontract.CodeUnavailable, "live provider job registry is unavailable", true)
+	}
+	return record, false, nil
 }
 
 func validSpeechReconciliationHistory(record *jobRecord) bool {
@@ -654,9 +730,10 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) loadRecord(jobID string) (*jobRecord, bool, error) {
-	if record, ok := s.jobs[jobID]; ok {
-		return record, true, nil
-	}
+	return s.loadRecordFromDisk(jobID)
+}
+
+func (s *Server) loadRecordFromDisk(jobID string) (*jobRecord, bool, error) {
 	data, err := os.ReadFile(s.recordPath(jobID))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, false, nil
@@ -670,8 +747,48 @@ func (s *Server) loadRecord(jobID string) (*jobRecord, bool, error) {
 	if err := decoder.Decode(&record); err != nil || record.Response.JobID != jobID || record.RequestHash == "" {
 		return nil, false, safeError(providercontract.CodeUnavailable, "live provider job registry is invalid", false)
 	}
-	s.jobs[jobID] = &record
 	return &record, true, nil
+}
+
+func (s *Server) createSpeechRetryClaim(jobID, authorizedRecordSHA256 string) (bool, error) {
+	claim := speechRetryClaim{
+		SchemaVersion:          "v1",
+		JobID:                  jobID,
+		AuthorizedRecordSHA256: authorizedRecordSHA256,
+		ClaimedAt:              s.now().UTC().Format(time.RFC3339Nano),
+	}
+	data, err := json.Marshal(claim)
+	if err != nil {
+		return false, safeError(providercontract.CodeUnavailable, "speech reconciliation claim could not be encoded", false)
+	}
+	file, err := os.OpenFile(
+		s.speechRetryClaimPath(jobID, authorizedRecordSHA256),
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL,
+		0o600,
+	)
+	if errors.Is(err, os.ErrExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, safeError(providercontract.CodeUnavailable, "speech reconciliation claim could not be committed", true)
+	}
+	// Never remove a partially written claim. Once O_EXCL succeeds the
+	// authorization is consumed, so every later process must fail closed.
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		_ = file.Close()
+		return false, safeError(providercontract.CodeUnavailable, "speech reconciliation claim could not be committed", true)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return false, safeError(providercontract.CodeUnavailable, "speech reconciliation claim could not be committed", true)
+	}
+	if err := file.Close(); err != nil {
+		return false, safeError(providercontract.CodeUnavailable, "speech reconciliation claim could not be committed", true)
+	}
+	if err := s.syncStateDirectory(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Server) createRecord(jobID string, record *jobRecord) error {
@@ -694,7 +811,7 @@ func (s *Server) createRecord(jobID string, record *jobRecord) error {
 	if err := file.Close(); err != nil {
 		return safeError(providercontract.CodeUnavailable, "live provider job intent could not be committed", true)
 	}
-	return nil
+	return s.syncStateDirectory()
 }
 
 func (s *Server) updateRecord(jobID string, record *jobRecord) error {
@@ -726,12 +843,35 @@ func (s *Server) updateRecord(jobID string, record *jobRecord) error {
 	if err := os.Rename(tempPath, s.recordPath(jobID)); err != nil {
 		return safeError(providercontract.CodeUnavailable, "live provider job state could not be committed", true)
 	}
-	return nil
+	return s.syncStateDirectory()
 }
 
 func (s *Server) recordPath(jobID string) string {
 	sum := sha256.Sum256([]byte(jobID))
 	return filepath.Join(s.stateDir, hex.EncodeToString(sum[:])+".json")
+}
+
+func (s *Server) speechRetryClaimPath(jobID, authorizedRecordSHA256 string) string {
+	sum := sha256.Sum256([]byte(jobID))
+	return filepath.Join(
+		s.stateDir,
+		hex.EncodeToString(sum[:])+"."+authorizedRecordSHA256+".speech-retry.claim",
+	)
+}
+
+func (s *Server) syncStateDirectory() error {
+	directory, err := os.Open(s.stateDir)
+	if err != nil {
+		return safeError(providercontract.CodeUnavailable, "live provider job registry could not be committed", true)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return safeError(providercontract.CodeUnavailable, "live provider job registry could not be committed", true)
+	}
+	if err := directory.Close(); err != nil {
+		return safeError(providercontract.CodeUnavailable, "live provider job registry could not be committed", true)
+	}
+	return nil
 }
 
 func (s *Server) validateJob(request providercontract.JobRequest, idempotencyKey string) error {

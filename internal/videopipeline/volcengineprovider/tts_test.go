@@ -600,6 +600,194 @@ func TestServer_SpeechSecondReconciliationPersistsEvidenceAndBlocksThirdCall(t *
 	}
 }
 
+func TestQASecondReconciliationAcrossAdapterInstancesIsSingleCall(t *testing.T) {
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testSpeechJobRequest(t)
+	record := failedSpeechRecord(t, request)
+	record.Reconciliations = []speechReconciliation{{
+		Attempt:                1,
+		StartedAt:              "2027-01-15T08:00:00Z",
+		AuthorizedRecordSHA256: strings.Repeat("a", 64),
+		PreviousResponse:       record.Response,
+	}}
+	seed, err := New(testLiveConfig(), &fakeProvider{}, store, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.createRecord(request.JobID, record); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := persistedRecordSHA256(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := testLiveConfig()
+	cfg.SpeechModel = AgentPlanTTSModelID
+	cfg.SpeechRetryJobID = request.JobID
+	cfg.SpeechRetryRecord = digest
+	speech := &fakeSpeechSynthesizer{}
+	first, err := New(cfg, &fakeProvider{}, store, Options{
+		Speech: speech,
+		Now:    func() time.Time { return time.Unix(1_800_000_100, 0).UTC() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(cfg, &fakeProvider{}, store, Options{
+		Speech: speech,
+		Now:    func() time.Time { return time.Unix(1_800_000_101, 0).UTC() },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Model two long-lived processes that cached the same attempt-1 record
+	// before the attempt-2 authorization was consumed.
+	if _, ok, err := first.loadRecord(request.JobID); err != nil || !ok {
+		t.Fatalf("first cache prime: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := second.loadRecord(request.JobID); err != nil || !ok {
+		t.Fatalf("second cache prime: ok=%v err=%v", ok, err)
+	}
+
+	firstHTTP := httptest.NewServer(first.Handler())
+	defer firstHTTP.Close()
+	secondHTTP := httptest.NewServer(second.Handler())
+	defer secondHTTP.Close()
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := authenticatedTestClient(t)
+	urls := []string{firstHTTP.URL, secondHTTP.URL}
+	type result struct {
+		status int
+		err    error
+	}
+	results := make(chan result, len(urls))
+	var wg sync.WaitGroup
+	for _, endpoint := range urls {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			httpRequest, requestErr := http.NewRequest(http.MethodPost, endpoint+"/v1/jobs", bytes.NewReader(body))
+			if requestErr != nil {
+				results <- result{err: requestErr}
+				return
+			}
+			httpRequest.Header.Set("Content-Type", "application/json")
+			httpRequest.Header.Set("Idempotency-Key", request.JobID)
+			response, requestErr := client.Do(httpRequest)
+			if requestErr != nil {
+				results <- result{err: requestErr}
+				return
+			}
+			response.Body.Close()
+			results <- result{status: response.StatusCode}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	statuses := make(map[int]int)
+	for result := range results {
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		statuses[result.status]++
+	}
+	if calls := speech.callCount(); calls != 1 {
+		t.Fatalf("durable attempt-2 authorization produced %d Provider calls, want 1", calls)
+	}
+	if statuses[http.StatusCreated] != 1 || statuses[http.StatusOK] != 1 {
+		t.Fatalf("submit statuses = %#v, want one created and one replay", statuses)
+	}
+	persisted, ok, err := first.loadRecordFromDisk(request.JobID)
+	if err != nil || !ok {
+		t.Fatalf("persisted record: ok=%v err=%v", ok, err)
+	}
+	if len(persisted.Reconciliations) != 2 ||
+		persisted.Reconciliations[1].Attempt != 2 ||
+		persisted.Reconciliations[1].AuthorizedRecordSHA256 != digest ||
+		persisted.Response.State != providercontract.StatusSucceeded {
+		t.Fatalf("persisted attempt-2 record = %#v", persisted)
+	}
+	claimData, err := os.ReadFile(first.speechRetryClaimPath(request.JobID, digest))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claim speechRetryClaim
+	if err := json.Unmarshal(claimData, &claim); err != nil {
+		t.Fatal(err)
+	}
+	if claim.SchemaVersion != "v1" || claim.JobID != request.JobID || claim.AuthorizedRecordSHA256 != digest {
+		t.Fatalf("durable claim = %#v", claim)
+	}
+	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedHTTP := httptest.NewServer(restarted.Handler())
+	defer restartedHTTP.Close()
+	if replayed := postJob(t, restartedHTTP.URL, request); replayed.State != providercontract.StatusSucceeded || speech.callCount() != 1 {
+		t.Fatalf("restart replay state = %s, calls = %d", replayed.State, speech.callCount())
+	}
+}
+
+func TestServer_SpeechRetryClaimSurvivesCrashBeforeRecordTransition(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := testSpeechJobRequest(t)
+	record := failedSpeechRecord(t, request)
+	seed, err := New(testLiveConfig(), &fakeProvider{}, store, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.createRecord(request.JobID, record); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := persistedRecordSHA256(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testLiveConfig()
+	cfg.SpeechModel = AgentPlanTTSModelID
+	cfg.SpeechRetryJobID = request.JobID
+	cfg.SpeechRetryRecord = digest
+	speech := &fakeSpeechSynthesizer{}
+	crashed, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := crashed.loadRecord(request.JobID); err != nil || !ok {
+		t.Fatalf("cache prime: ok=%v err=%v", ok, err)
+	}
+	claimed, err := crashed.createSpeechRetryClaim(request.JobID, digest)
+	if err != nil || !claimed {
+		t.Fatalf("claim: claimed=%v err=%v", claimed, err)
+	}
+
+	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedHTTP := httptest.NewServer(restarted.Handler())
+	defer restartedHTTP.Close()
+	replayed := postJob(t, restartedHTTP.URL, request)
+	if replayed.State != providercontract.StatusRequiresAction || speech.callCount() != 0 {
+		t.Fatalf("crash replay state = %s, calls = %d", replayed.State, speech.callCount())
+	}
+	persisted, ok, err := restarted.loadRecordFromDisk(request.JobID)
+	if err != nil || !ok || len(persisted.Reconciliations) != 0 {
+		t.Fatalf("record after crash replay = %#v, ok=%v err=%v", persisted, ok, err)
+	}
+}
+
 func TestServer_SpeechSecondReconciliationCommitFailurePreservesFirstHistory(t *testing.T) {
 	t.Parallel()
 	store, err := artifactstore.New(t.TempDir())
