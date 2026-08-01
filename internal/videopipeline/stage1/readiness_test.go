@@ -14,6 +14,20 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 )
 
+func assertForbiddenRevisionParent(t *testing.T, err error) {
+	t.Helper()
+	if got := providercontract.ErrorCodeOf(err); got != providercontract.CodeForbidden {
+		t.Fatalf("revision parent error = %v (code %q), want forbidden", err, got)
+	}
+	var contractError *providercontract.Error
+	if !errors.As(err, &contractError) {
+		t.Fatalf("revision parent error type = %T, want *providercontract.Error", err)
+	}
+	if contractError.Retryable {
+		t.Fatalf("revision parent error unexpectedly retryable: %#v", contractError)
+	}
+}
+
 func TestCommittedReadinessPlan(t *testing.T) {
 	t.Parallel()
 	data, err := os.ReadFile("../../../video-pipeline/config/flo104-stage1-readiness.json")
@@ -230,9 +244,8 @@ func TestGateRejectsSpeechV2RevisionWithoutCompleteParentArtifact(t *testing.T) 
 	child := testSpeechV2ExecutionPackage(t, parent)
 	gate := completePrimaryPackage(t, path, parent, RequiredPrimaryJobs, "TERMINAL_SUCCEEDED", true)
 
-	if err := gate.BindExecutionPackageRevision(child); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
-		t.Fatalf("missing parent artifact error = %v", err)
-	}
+	err := gate.BindExecutionPackageRevision(child)
+	assertForbiddenRevisionParent(t, err)
 	ledger := readTestLedger(t, path)
 	if ledger.ExecutionPackageHash != parent.ContentHash || ledger.SupersededExecutionPackageHash != "" {
 		t.Fatalf("missing parent artifact changed ledger: %#v", ledger)

@@ -88,28 +88,12 @@ func run(
 	if err := decodeOne(executionPackageFile, &executionPackage); err != nil {
 		return fmt.Errorf("decode immutable stage 1 execution package: %w", err)
 	}
-	if err := executionPackage.Validate(plan); err != nil {
-		return fmt.Errorf("validate immutable stage 1 execution package: %w", err)
+	if err := validateImmutableExecutionPackage(plan, executionPackage); err != nil {
+		return err
 	}
-	var parentExecutionPackage *stage1.ExecutionPackage
-	if executionPackage.ParentExecutionPackageHash != "" {
-		parentPath, parentPathErr := requiredEnv(lookup, "VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH")
-		if parentPathErr != nil {
-			return parentPathErr
-		}
-		parentFile, openErr := os.Open(parentPath)
-		if openErr != nil {
-			return fmt.Errorf("open immutable stage 1 parent execution package: %w", openErr)
-		}
-		defer parentFile.Close()
-		var parent stage1.ExecutionPackage
-		if decodeErr := decodeOne(parentFile, &parent); decodeErr != nil {
-			return fmt.Errorf("decode immutable stage 1 parent execution package: %w", decodeErr)
-		}
-		if validateErr := executionPackage.ValidateSpeechV2Revision(plan, parent); validateErr != nil {
-			return fmt.Errorf("validate immutable stage 1 execution package revision: %w", validateErr)
-		}
-		parentExecutionPackage = &parent
+	parentExecutionPackage, err := loadRevisionParent(plan, executionPackage, lookup)
+	if err != nil {
+		return err
 	}
 	gate, err := stage1.Open(plan, ledgerPath)
 	if err != nil {
@@ -278,6 +262,50 @@ func requireEmptyInput(reader io.Reader) error {
 		return errors.New("stage 1 finalize-input accepts no caller-supplied fields")
 	}
 	return nil
+}
+
+func validateImmutableExecutionPackage(plan stage1.Plan, package_ stage1.ExecutionPackage) error {
+	if err := package_.Validate(plan); err != nil {
+		cause := fmt.Errorf("validate immutable stage 1 execution package: %w", err)
+		if package_.RequiresRevisionParent() {
+			return stage1.UnverifiableRevisionParentError(cause)
+		}
+		return cause
+	}
+	return nil
+}
+
+func loadRevisionParent(
+	plan stage1.Plan,
+	child stage1.ExecutionPackage,
+	lookup func(string) (string, bool),
+) (*stage1.ExecutionPackage, error) {
+	if !child.RequiresRevisionParent() {
+		return nil, nil
+	}
+	parentPath, err := requiredEnv(lookup, "VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH")
+	if err != nil {
+		return nil, stage1.UnverifiableRevisionParentError(err)
+	}
+	parentFile, err := os.Open(parentPath)
+	if err != nil {
+		return nil, stage1.UnverifiableRevisionParentError(
+			fmt.Errorf("open immutable stage 1 parent execution package: %w", err),
+		)
+	}
+	defer parentFile.Close()
+	var parent stage1.ExecutionPackage
+	if err := decodeOne(parentFile, &parent); err != nil {
+		return nil, stage1.UnverifiableRevisionParentError(
+			fmt.Errorf("decode immutable stage 1 parent execution package: %w", err),
+		)
+	}
+	if err := child.ValidateSpeechV2Revision(plan, parent); err != nil {
+		return nil, stage1.UnverifiableRevisionParentError(
+			fmt.Errorf("validate immutable stage 1 execution package revision: %w", err),
+		)
+	}
+	return &parent, nil
 }
 
 func decodeOne(reader io.Reader, destination any) error {

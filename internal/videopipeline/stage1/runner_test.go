@@ -817,6 +817,8 @@ func TestRunnerUsesCompletedPrimaryLedgerForSpeechV2PackageRevision(t *testing.T
 		revised,
 	); err == nil {
 		t.Fatal("speech-v2 runner accepted only a parent hash without the parent artifact")
+	} else {
+		assertForbiddenRevisionParent(t, err)
 	}
 	runner, err := NewRunnerWithExecutionPackageRevision(
 		gate,

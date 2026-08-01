@@ -16,6 +16,8 @@ import (
 
 const ExecutionPackageSchemaVersion = "v1"
 
+const revisionParentSafeMessage = "stage 1 execution package revision parent is unverifiable"
+
 // ExecutionPackage is the prompt-free, secret-free identity bundle approved for
 // one formal Stage 1 run. Runtime product truth remains in PostgreSQL; this file
 // pins the exact records that the runner is allowed to resolve and revalidate.
@@ -51,6 +53,31 @@ type FrozenJob struct {
 	WorkflowID                         string                         `json:"workflowId"`
 	ActivityID                         string                         `json:"activityId"`
 	TraceID                            string                         `json:"traceId"`
+}
+
+// RequiresRevisionParent reports whether the package claims the speech-v2
+// revision contract, including malformed revisions that name a parent while
+// carrying another identity version. Callers use it to preserve one
+// non-retryable error contract before trusting the package.
+func (p ExecutionPackage) RequiresRevisionParent() bool {
+	return p.ParentExecutionPackageHash != "" ||
+		p.PostProduction.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2
+}
+
+// UnverifiableRevisionParentError normalizes every missing, unreadable,
+// malformed, mismatched, or otherwise unverifiable revision parent. The cause
+// remains visible to operators while provider-facing classification stays
+// forbidden and non-retryable.
+func UnverifiableRevisionParentError(cause error) error {
+	contract := &providercontract.Error{
+		Code:        providercontract.CodeForbidden,
+		Retryable:   false,
+		SafeMessage: revisionParentSafeMessage,
+	}
+	if cause == nil {
+		return contract
+	}
+	return fmt.Errorf("%w: %v", contract, cause)
 }
 
 func (p ExecutionPackage) Validate(plan Plan) error {

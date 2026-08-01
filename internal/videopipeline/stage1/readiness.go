@@ -248,7 +248,7 @@ func (g *Gate) BindExecutionPackage(contentHash string) error {
 // promotion fails closed unless exactly one complete parent package is given.
 func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArtifact ...ExecutionPackage) error {
 	if len(parentArtifact) != 1 {
-		return providerError(providercontract.CodeForbidden, "stage 1 package revision requires exactly one immutable parent artifact")
+		return UnverifiableRevisionParentError(errors.New("stage 1 package revision requires exactly one immutable parent artifact"))
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -267,10 +267,10 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArt
 	}
 	if ledger.ExecutionPackageHash == package_.ContentHash {
 		if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
-			return providerError(providercontract.CodeForbidden, "stage 1 package revision contains non-speech drift")
+			return UnverifiableRevisionParentError(err)
 		}
 		if ledger.SupersededExecutionPackageHash != package_.ParentExecutionPackageHash {
-			return errors.New("stage 1 ledger revision parent binding is invalid")
+			return UnverifiableRevisionParentError(errors.New("stage 1 ledger revision parent binding is invalid"))
 		}
 		g.executionPackageHash = package_.ContentHash
 		return nil
@@ -279,10 +279,10 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArt
 		return providerError(providercontract.CodeConflict, "stage 1 ledger already consumed its package revision")
 	}
 	if ledger.ExecutionPackageHash != package_.ParentExecutionPackageHash {
-		return errors.New("stage 1 ledger is not bound to the revision parent package")
+		return UnverifiableRevisionParentError(errors.New("stage 1 ledger is not bound to the revision parent package"))
 	}
 	if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
-		return providerError(providercontract.CodeForbidden, "stage 1 package revision contains non-speech drift")
+		return UnverifiableRevisionParentError(err)
 	}
 	if ledger.ControlledRetryPackageHash != "" {
 		return providerError(providercontract.CodeForbidden, "stage 1 package revision cannot replace a controlled retry binding")

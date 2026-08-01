@@ -131,6 +131,9 @@ func newRunner(
 		return nil, errors.New("stage 1 gate, authenticated adapter, CAS verifier, and product truth are required")
 	}
 	if err := executionPackage.Validate(gate.Plan()); err != nil {
+		if executionPackage.RequiresRevisionParent() {
+			return nil, UnverifiableRevisionParentError(err)
+		}
 		return nil, err
 	}
 	if executionPackage.ParentExecutionPackageHash != "" && controlledRetry != nil {
@@ -138,14 +141,14 @@ func newRunner(
 	}
 	if executionPackage.ParentExecutionPackageHash == "" {
 		if parentExecutionPackage != nil {
-			return nil, errors.New("an original execution package cannot name a revision parent artifact")
+			return nil, UnverifiableRevisionParentError(errors.New("an original execution package cannot name a revision parent artifact"))
 		}
 		if err := gate.BindExecutionPackage(executionPackage.ContentHash); err != nil {
 			return nil, err
 		}
 	} else {
 		if parentExecutionPackage == nil {
-			return nil, errors.New("speech-v2 package revision requires its immutable parent artifact")
+			return nil, UnverifiableRevisionParentError(errors.New("speech-v2 package revision requires its immutable parent artifact"))
 		}
 		if err := gate.BindExecutionPackageRevision(executionPackage, *parentExecutionPackage); err != nil {
 			return nil, err
