@@ -28,6 +28,55 @@ type SpeechProvider interface {
 	Synthesize(context.Context, SpeechRequest) (ProviderAttempt, error)
 }
 
+type SpeechJobIdentity struct {
+	JobID     string `json:"jobId"`
+	InputHash string `json:"inputHash"`
+}
+
+// DeriveSpeechJobIdentity keeps the legacy identity readable while assigning
+// speech-v2 a semantic identity that changes with every provider-facing voice
+// revision. The canonical v2 tuple deliberately excludes transient request and
+// trace identifiers.
+func DeriveSpeechJobIdentity(input SpeechRequest) (SpeechJobIdentity, error) {
+	if input.Config.IdentityVersion == SpeechIdentityV2 {
+		if input.Config.Voice == nil {
+			return SpeechJobIdentity{}, errors.New("speech-v2 requires an immutable VOICE binding")
+		}
+		inputHash, err := digestJSON(map[string]any{
+			"cueId":               input.Cue.ID,
+			"episodeRevisionId":   input.EpisodeRevisionID,
+			"resourceId":          input.Config.Voice.ResourceID,
+			"routeVersion":        input.Config.Route.RouteVersion,
+			"speaker":             input.Config.Voice.Speaker,
+			"subtitleContentHash": input.SubtitleRevision.ContentHash,
+			"voiceAssetVersionId": input.Config.Voice.AssetVersionID,
+		})
+		if err != nil {
+			return SpeechJobIdentity{}, err
+		}
+		return SpeechJobIdentity{
+			JobID: "speech-v2-" + inputHash[:32], InputHash: inputHash,
+		}, nil
+	}
+	inputHash, err := digestJSON(map[string]any{
+		"episodeRevisionId": input.EpisodeRevisionID,
+		"subtitleRevision":  input.SubtitleRevision.ID,
+		"subtitleHash":      input.SubtitleRevision.ContentHash,
+		"cue":               input.Cue,
+		"route":             input.Config.Route,
+	})
+	if err != nil {
+		return SpeechJobIdentity{}, err
+	}
+	jobDigest := sha256.Sum256([]byte(
+		"speech\x00" + input.EpisodeRevisionID + "\x00" +
+			input.SubtitleRevision.ContentHash + "\x00" + input.Cue.ID,
+	))
+	return SpeechJobIdentity{
+		JobID: "speech-" + hex.EncodeToString(jobDigest[:16]), InputHash: inputHash,
+	}, nil
+}
+
 type HTTPSpeechProvider struct {
 	Endpoint     string
 	Client       *http.Client
@@ -67,37 +116,54 @@ func (p *HTTPSpeechProvider) Synthesize(
 	if input.Evidence != EvidenceMockOnly && input.Evidence != EvidenceLive {
 		return ProviderAttempt{}, errors.New("speech submission requires mock_only or live_provider_call evidence")
 	}
-	inputHash, err := digestJSON(map[string]any{
-		"episodeRevisionId": input.EpisodeRevisionID,
-		"subtitleRevision":  input.SubtitleRevision.ID,
-		"subtitleHash":      input.SubtitleRevision.ContentHash,
-		"cue":               input.Cue,
-		"route":             input.Config.Route,
-	})
+	if input.Config.IdentityVersion == SpeechIdentityV2 && input.Cue.ID != input.Config.AuthorizedCueID {
+		return ProviderAttempt{}, errors.New("speech-v2 cue is outside the single authorized canary")
+	}
+	identity, err := DeriveSpeechJobIdentity(input)
 	if err != nil {
 		return ProviderAttempt{}, err
 	}
-	jobDigest := sha256.Sum256([]byte(
-		"speech\x00" + input.EpisodeRevisionID + "\x00" +
-			input.SubtitleRevision.ContentHash + "\x00" + input.Cue.ID,
-	))
-	jobID := "speech-" + hex.EncodeToString(jobDigest[:16])
+	jobID := identity.JobID
+	inputHash := identity.InputHash
 	runID := "episode-" + input.EpisodeRevisionID
+	modelHint := input.Cue.VoiceRef
+	maxAttempts := 2
+	format := "wav"
+	var assets []providercontract.AssetRef
+	if input.Config.IdentityVersion == SpeechIdentityV2 {
+		modelHint = input.Config.Voice.Speaker
+		maxAttempts = input.Config.MaxAttempts
+		format = "mp3"
+		predictedAFPMilli := int64(len([]rune(strings.TrimSpace(input.Cue.Text)))) * 135
+		if predictedAFPMilli <= 0 || predictedAFPMilli > input.Config.MaximumAFPMilli {
+			return ProviderAttempt{}, errors.New("speech-v2 cue exceeds the frozen AFP ceiling")
+		}
+		assets = []providercontract.AssetRef{{
+			ID: input.Config.Voice.AssetID, Revision: input.Config.Voice.AssetVersionID,
+			Kind: providercontract.ModalityAudio, Role: providercontract.AssetRoleReferenceAudio,
+			URI:    "cas://sha256/" + input.Config.Voice.AssetVersionHash,
+			SHA256: input.Config.Voice.AssetVersionHash,
+			LicenseReference: input.Config.Voice.LicenseSnapshotID + ":" +
+				input.Config.Voice.LicenseSnapshotHash,
+			MediaType: "audio/x-voice-profile+json",
+		}}
+	}
 	generationRequest := providercontract.GenerationRequest{
 		RequestID:        jobID,
 		IdempotencyKey:   jobID,
 		Modality:         providercontract.ModalityAudio,
 		Prompt:           input.Cue.Text,
 		PromptSnapshotID: input.SubtitleRevision.ID + ":" + input.Cue.ID,
-		ModelHint:        input.Cue.VoiceRef,
+		ModelHint:        modelHint,
+		Assets:           assets,
 		Output: providercontract.OutputSpec{
 			DurationMillis: int(input.Cue.EndMillis - input.Cue.StartMillis),
-			Format:         "wav",
+			Format:         format,
 		},
 		Budget: providercontract.BudgetEnvelope{
 			EstimatedCostMicros: input.BudgetMicros,
 			MaxCostMicros:       input.BudgetMicros,
-			MaxAttempts:         2,
+			MaxAttempts:         maxAttempts,
 		},
 	}
 	reservation, err := providercontract.BindBudgetReservation(
@@ -217,9 +283,19 @@ func (p *HTTPSpeechProvider) pollInterval() time.Duration {
 }
 
 func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error {
+	var expectedJobID string
+	if input.Config.IdentityVersion == SpeechIdentityV2 {
+		identity, err := DeriveSpeechJobIdentity(input)
+		if err != nil {
+			return err
+		}
+		expectedJobID = identity.JobID
+	}
 	switch {
 	case attempt.CueID != input.Cue.ID:
 		return errors.New("speech attempt cue does not match the requested cue")
+	case expectedJobID != "" && attempt.JobID != expectedJobID:
+		return errors.New("speech attempt job identity does not match the frozen voice input")
 	case strings.TrimSpace(attempt.JobID) == "" ||
 		strings.TrimSpace(attempt.RequestID) == "" ||
 		strings.TrimSpace(attempt.UpstreamTaskID) == "":
@@ -246,7 +322,7 @@ func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error
 	if err := attempt.Artifact.Validate(); err != nil {
 		return fmt.Errorf("speech attempt artifact: %w", err)
 	}
-	if input.Config.Route.Provider == "volcengine_ark" &&
+	if sameSpeechProvider(input.Config.Route.Provider, "volcengine_ark") &&
 		input.Config.Route.ModelID == "doubao-seed-tts-2.0" {
 		if strings.TrimSpace(attempt.ConnectID) == "" || strings.TrimSpace(attempt.LogID) == "" {
 			return errors.New("Agent Plan TTS attempt requires connect and X-Tt-Logid evidence")
@@ -255,6 +331,16 @@ func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error
 			attempt.Usage.Unit != "milli_afp" ||
 			attempt.Usage.OutputUnits != attempt.Usage.GeneratedChars*135 {
 			return errors.New("Agent Plan TTS attempt requires returned usage tokens and exact per-request AFP attribution")
+		}
+	}
+	if input.Config.IdentityVersion == SpeechIdentityV2 {
+		if attempt.Usage.OutputUnits > input.Config.MaximumAFPMilli {
+			return errors.New("speech-v2 attempt exceeds the frozen AFP ceiling")
+		}
+		if attempt.Cost.ActualMicros == nil || *attempt.Cost.ActualMicros != 0 ||
+			attempt.Cost.BillingMode != "subscription_included" ||
+			input.Config.MaximumNonSubscriptionCashMicros != 0 {
+			return errors.New("speech-v2 attempt lacks zero-cash Agent Plan evidence")
 		}
 	}
 	return nil

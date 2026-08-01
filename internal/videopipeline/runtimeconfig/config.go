@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // LookupEnv matches os.LookupEnv and makes configuration tests hermetic.
@@ -64,26 +66,37 @@ type MockProvider struct {
 // VolcengineProvider configures the credential-isolated Agent Plan adapter.
 // APIKey is retained only in memory and must never be logged or serialized.
 type VolcengineProvider struct {
-	HTTPAddress       string
-	ArtifactRoot      string
-	ProviderID        string
-	BaseURL           string
-	APIKey            string
-	ServiceAuthSecret string
-	Region            string
-	VideoModel        string
-	SpeechEndpoint    string
-	SpeechModel       string
-	SpeechSpeaker     string
-	SpeechRetryJobID  string
-	SpeechRetryRecord string
-	MaxSpeechBytes    int64
-	PlanName          string
-	PricingVersion    string
-	Currency          string
-	MaxDownloadBytes  int64
-	RequestTimeout    time.Duration
-	DownloadTimeout   time.Duration
+	HTTPAddress                    string
+	ArtifactRoot                   string
+	ProviderID                     string
+	BaseURL                        string
+	APIKey                         string
+	ServiceAuthSecret              string
+	Region                         string
+	VideoModel                     string
+	SpeechEndpoint                 string
+	SpeechModel                    string
+	SpeechSpeaker                  string
+	SpeechRetryJobID               string
+	SpeechRetryRecord              string
+	SpeechCanaryJobID              string
+	SpeechCanaryInputHash          string
+	SpeechCanaryCueID              string
+	SpeechCanaryVoiceAssetID       string
+	SpeechCanaryParentVoiceVersion string
+	SpeechCanaryVoiceVersion       string
+	SpeechCanaryVoiceHash          string
+	SpeechCanaryLicenseSnapshotID  string
+	SpeechCanaryLicenseHash        string
+	SpeechCanaryMaximumAFPMilli    int64
+	SpeechCanaryMaximumCashMicros  int64
+	MaxSpeechBytes                 int64
+	PlanName                       string
+	PricingVersion                 string
+	Currency                       string
+	MaxDownloadBytes               int64
+	RequestTimeout                 time.Duration
+	DownloadTimeout                time.Duration
 }
 
 // LoadControlPlane reads namespaced settings with safe local defaults.
@@ -220,32 +233,47 @@ func LoadVolcengineProvider() (VolcengineProvider, error) {
 
 func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	cfg := VolcengineProvider{
-		HTTPAddress:       value(lookup, "VIDEO_VOLCENGINE_PROVIDER_HTTP_ADDRESS", ":8091"),
-		ArtifactRoot:      value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
-		ProviderID:        value(lookup, "VIDEO_VOLCENGINE_PROVIDER_ID", "volcengine-agent-plan-large"),
-		BaseURL:           value(lookup, "VIDEO_VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3"),
-		APIKey:            value(lookup, "ARK_API_KEY", ""),
-		ServiceAuthSecret: value(lookup, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
-		Region:            value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
-		VideoModel:        value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
-		SpeechEndpoint:    value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", AgentPlanTTSEndpoint),
-		SpeechModel:       "doubao-seed-tts-2.0",
-		SpeechSpeaker:     value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", "zh_female_vv_uranus_bigtts"),
-		SpeechRetryJobID:  value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID", ""),
-		SpeechRetryRecord: value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256", ""),
-		PlanName:          value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),
-		PricingVersion:    value(lookup, "VIDEO_VOLCENGINE_PRICING_VERSION", "agent-plan-large-included-v1"),
-		Currency:          value(lookup, "VIDEO_VOLCENGINE_CURRENCY", "CNY"),
-		MaxDownloadBytes:  256 << 20,
-		MaxSpeechBytes:    32 << 20,
-		RequestTimeout:    2 * time.Minute,
-		DownloadTimeout:   2 * time.Minute,
+		HTTPAddress:                    value(lookup, "VIDEO_VOLCENGINE_PROVIDER_HTTP_ADDRESS", ":8091"),
+		ArtifactRoot:                   value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
+		ProviderID:                     value(lookup, "VIDEO_VOLCENGINE_PROVIDER_ID", "volcengine-agent-plan-large"),
+		BaseURL:                        value(lookup, "VIDEO_VOLCENGINE_BASE_URL", "https://ark.cn-beijing.volces.com/api/plan/v3"),
+		APIKey:                         value(lookup, "ARK_API_KEY", ""),
+		ServiceAuthSecret:              value(lookup, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
+		Region:                         value(lookup, "VIDEO_VOLCENGINE_REGION", "cn-beijing"),
+		VideoModel:                     value(lookup, "VIDEO_VOLCENGINE_VIDEO_MODEL", "doubao-seedance-2.0"),
+		SpeechEndpoint:                 value(lookup, "VIDEO_VOLCENGINE_TTS_ENDPOINT", AgentPlanTTSEndpoint),
+		SpeechModel:                    "doubao-seed-tts-2.0",
+		SpeechSpeaker:                  value(lookup, "VIDEO_VOLCENGINE_TTS_SPEAKER", "zh_female_tianmeitaozi_mars_bigtts"),
+		SpeechRetryJobID:               value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID", ""),
+		SpeechRetryRecord:              value(lookup, "VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256", ""),
+		SpeechCanaryJobID:              value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID", ""),
+		SpeechCanaryInputHash:          value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_INPUT_SHA256", ""),
+		SpeechCanaryCueID:              value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_CUE_ID", ""),
+		SpeechCanaryVoiceAssetID:       value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_VOICE_ASSET_ID", ""),
+		SpeechCanaryParentVoiceVersion: value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_PARENT_VOICE_VERSION_ID", ""),
+		SpeechCanaryVoiceVersion:       value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_VOICE_VERSION_ID", ""),
+		SpeechCanaryVoiceHash:          value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_VOICE_SHA256", ""),
+		SpeechCanaryLicenseSnapshotID:  value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SNAPSHOT_ID", ""),
+		SpeechCanaryLicenseHash:        value(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SHA256", ""),
+		PlanName:                       value(lookup, "VIDEO_VOLCENGINE_PLAN", "agent-plan-large"),
+		PricingVersion:                 value(lookup, "VIDEO_VOLCENGINE_PRICING_VERSION", "agent-plan-large-included-v1"),
+		Currency:                       value(lookup, "VIDEO_VOLCENGINE_CURRENCY", "CNY"),
+		MaxDownloadBytes:               256 << 20,
+		MaxSpeechBytes:                 32 << 20,
+		RequestTimeout:                 2 * time.Minute,
+		DownloadTimeout:                2 * time.Minute,
 	}
 	var err error
 	if cfg.MaxDownloadBytes, err = positiveInt64(lookup, "VIDEO_VOLCENGINE_MAX_DOWNLOAD_BYTES", cfg.MaxDownloadBytes); err != nil {
 		return VolcengineProvider{}, err
 	}
 	if cfg.MaxSpeechBytes, err = positiveInt64(lookup, "VIDEO_VOLCENGINE_MAX_SPEECH_BYTES", cfg.MaxSpeechBytes); err != nil {
+		return VolcengineProvider{}, err
+	}
+	if cfg.SpeechCanaryMaximumAFPMilli, err = nonNegativeInt64(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI", 0); err != nil {
+		return VolcengineProvider{}, err
+	}
+	if cfg.SpeechCanaryMaximumCashMicros, err = nonNegativeInt64(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS", 0); err != nil {
 		return VolcengineProvider{}, err
 	}
 	if cfg.RequestTimeout, err = duration(lookup, "VIDEO_VOLCENGINE_REQUEST_TIMEOUT", cfg.RequestTimeout); err != nil {
@@ -285,6 +313,43 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	if cfg.SpeechRetryJobID != "" {
 		if !strings.HasPrefix(cfg.SpeechRetryJobID, "speech-") || !lowercaseSHA256(cfg.SpeechRetryRecord) {
 			return VolcengineProvider{}, errors.New("TTS retry requires a speech job ID and lowercase provider record SHA-256")
+		}
+	}
+	canaryValues := []string{
+		cfg.SpeechCanaryJobID, cfg.SpeechCanaryInputHash, cfg.SpeechCanaryCueID,
+		cfg.SpeechCanaryVoiceAssetID, cfg.SpeechCanaryParentVoiceVersion,
+		cfg.SpeechCanaryVoiceVersion, cfg.SpeechCanaryVoiceHash,
+		cfg.SpeechCanaryLicenseSnapshotID, cfg.SpeechCanaryLicenseHash,
+	}
+	canaryConfigured := cfg.SpeechCanaryMaximumAFPMilli != 0 ||
+		cfg.SpeechCanaryMaximumCashMicros != 0
+	for _, candidate := range canaryValues {
+		canaryConfigured = canaryConfigured || candidate != ""
+	}
+	if canaryConfigured {
+		for _, candidate := range canaryValues {
+			if candidate == "" {
+				return VolcengineProvider{}, errors.New("TTS canary requires the complete frozen job, cue, voice, and license identity")
+			}
+		}
+		if !strings.HasPrefix(cfg.SpeechCanaryJobID, "speech-v2-") ||
+			!lowercaseSHA256(cfg.SpeechCanaryInputHash) ||
+			!lowercaseSHA256(cfg.SpeechCanaryVoiceHash) ||
+			!lowercaseSHA256(cfg.SpeechCanaryLicenseHash) ||
+			cfg.SpeechCanaryMaximumAFPMilli <= 0 ||
+			cfg.SpeechCanaryMaximumCashMicros != 0 {
+			return VolcengineProvider{}, errors.New("TTS canary identity or zero-cash budget is invalid")
+		}
+		for _, candidate := range []string{
+			cfg.SpeechCanaryVoiceAssetID, cfg.SpeechCanaryParentVoiceVersion,
+			cfg.SpeechCanaryVoiceVersion, cfg.SpeechCanaryLicenseSnapshotID,
+		} {
+			if _, err := uuid.Parse(candidate); err != nil {
+				return VolcengineProvider{}, errors.New("TTS canary asset and license identities must be UUIDs")
+			}
+		}
+		if cfg.SpeechRetryJobID != "" {
+			return VolcengineProvider{}, errors.New("TTS canary and legacy reconciliation cannot be enabled together")
 		}
 	}
 	return cfg, nil
@@ -341,6 +406,18 @@ func positiveInt64(lookup LookupEnv, name string, fallback int64) (int64, error)
 	parsed, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
 	if err != nil || parsed <= 0 {
 		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return parsed, nil
+}
+
+func nonNegativeInt64(lookup LookupEnv, name string, fallback int64) (int64, error) {
+	raw, ok := lookup(name)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return fallback, nil
+	}
+	parsed, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil || parsed < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", name)
 	}
 	return parsed, nil
 }

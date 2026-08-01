@@ -32,6 +32,8 @@ import (
 
 const maxResolvedProviderAssetBytes = 20 << 20
 
+var errProviderJobIntentExists = errors.New("provider job intent already exists")
+
 type jobRecord struct {
 	RequestHash     string                       `json:"request_hash"`
 	Expected        providercontract.OutputSpec  `json:"expected_output"`
@@ -171,11 +173,6 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 		SupportedInputs: []string{"text", "image-reference", "tail-frame"},
 	}}
 	if s.speech != nil {
-		speechMaterial := strings.Join([]string{
-			s.config.ProviderID, s.config.Region, AgentPlanTTSResourceID,
-			s.config.SpeechModel, s.config.PlanName, s.config.PricingVersion,
-		}, "\x00")
-		speechSum := sha256.Sum256([]byte(speechMaterial))
 		capabilities = append(capabilities, providercontract.CapabilitySnapshot{
 			Alias: providercontract.CapabilitySpeech,
 			Capability: providercontract.Capability{
@@ -185,8 +182,8 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 				Verification:    providercontract.PendingKey,
 			},
 			Configured: true, Enabled: true, Mode: "live",
-			RouteVersion: "agent-plan-large-tts-v1",
-			SnapshotHash: hex.EncodeToString(speechSum[:]),
+			RouteVersion: AgentPlanTTSRouteVersion,
+			SnapshotHash: AgentPlanTTSCapabilityHash(s.config),
 			EffectiveAt:  s.now().UTC(),
 			Limits: map[string]any{
 				"resourceId":           AgentPlanTTSResourceID,
@@ -313,6 +310,32 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			Response:    s.pendingResponse(request),
 		}
 		if err := s.createRecord(request.JobID, intent); err != nil {
+			if errors.Is(err, errProviderJobIntentExists) {
+				replayed, ok, loadErr := s.loadRecordFromDisk(request.JobID)
+				if loadErr != nil {
+					writeProviderError(w, loadErr)
+					return
+				}
+				if !ok {
+					writeProviderError(w, safeError(
+						providercontract.CodeUnavailable,
+						"live provider job intent is not yet durable",
+						true,
+					))
+					return
+				}
+				if replayed.RequestHash != requestHash {
+					writeError(w, http.StatusConflict, safeError(
+						providercontract.CodeConflict,
+						"jobId was already used for different input",
+						false,
+					))
+					return
+				}
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusOK, replayed.Response)
+				return
+			}
 			writeProviderError(w, err)
 			return
 		}
@@ -796,8 +819,14 @@ func (s *Server) createRecord(jobID string, record *jobRecord) error {
 	if err != nil {
 		return safeError(providercontract.CodeUnavailable, "live provider job intent could not be encoded", true)
 	}
-	file, err := os.OpenFile(s.recordPath(jobID), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	file, err := os.CreateTemp(s.stateDir, ".provider-job-intent-*.tmp")
 	if err != nil {
+		return safeError(providercontract.CodeUnavailable, "live provider job intent could not be committed", true)
+	}
+	temporaryPath := file.Name()
+	defer os.Remove(temporaryPath)
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
 		return safeError(providercontract.CodeUnavailable, "live provider job intent could not be committed", true)
 	}
 	if _, err := file.Write(append(data, '\n')); err != nil {
@@ -809,6 +838,13 @@ func (s *Server) createRecord(jobID string, record *jobRecord) error {
 		return safeError(providercontract.CodeUnavailable, "live provider job intent could not be committed", true)
 	}
 	if err := file.Close(); err != nil {
+		return safeError(providercontract.CodeUnavailable, "live provider job intent could not be committed", true)
+	}
+	// Linking a completely written inode publishes the intent atomically while
+	// preserving create-if-absent semantics across Adapter processes.
+	if err := os.Link(temporaryPath, s.recordPath(jobID)); errors.Is(err, os.ErrExist) {
+		return errProviderJobIntentExists
+	} else if err != nil {
 		return safeError(providercontract.CodeUnavailable, "live provider job intent could not be committed", true)
 	}
 	return s.syncStateDirectory()
@@ -898,11 +934,56 @@ func (s *Server) validateJob(request providercontract.JobRequest, idempotencyKey
 		if chars < 1 || chars > AgentPlanTTSMaxChars || strings.TrimSpace(request.Request.ModelHint) == "" {
 			return safeError(providercontract.CodeInvalidRequest, "speech.primary requires a speaker and at most 600 Unicode characters", false)
 		}
+		if request.Request.ModelHint != s.config.SpeechSpeaker ||
+			request.Model.RouteVersion != AgentPlanTTSRouteVersion ||
+			request.Model.CapabilityHash != AgentPlanTTSCapabilityHash(s.config) {
+			return safeError(providercontract.CodeModelUnavailable, "the frozen Agent Plan TTS voice route is not configured by this adapter", false)
+		}
+		if err := s.validateSpeechCanary(request); err != nil {
+			return err
+		}
 	} else if request.Request.ModelHint != s.config.VideoModel {
 		return safeError(providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false)
 	}
 	if !acceptedProviderIdentity(request.Model.Provider) || request.Model.ModelID != expectedModel {
 		return safeError(providercontract.CodeModelUnavailable, "the frozen model route is not configured by this adapter", false)
+	}
+	return nil
+}
+
+func (s *Server) validateSpeechCanary(request providercontract.JobRequest) error {
+	if s.config.SpeechCanaryJobID == "" {
+		return nil
+	}
+	if request.JobID != s.config.SpeechCanaryJobID ||
+		request.InputHash != s.config.SpeechCanaryInputHash ||
+		request.Request.RequestID != s.config.SpeechCanaryJobID ||
+		request.Request.IdempotencyKey != s.config.SpeechCanaryJobID ||
+		request.Request.PromptSnapshotID == "" ||
+		!strings.HasSuffix(request.Request.PromptSnapshotID, ":"+s.config.SpeechCanaryCueID) ||
+		request.Request.Budget.MaxAttempts != 1 ||
+		request.Request.Output.Format != "mp3" ||
+		s.config.SpeechCanaryMaximumCashMicros != 0 {
+		return safeError(providercontract.CodeInvalidRequest, "speech job is outside the frozen single-call canary", false)
+	}
+	predictedAFPMilli := int64(len([]rune(strings.TrimSpace(request.Request.Prompt)))) * ttsAFPMilliPerChar
+	if predictedAFPMilli <= 0 || predictedAFPMilli > s.config.SpeechCanaryMaximumAFPMilli {
+		return safeError(providercontract.CodeBudgetExceeded, "speech canary exceeds the frozen AFP ceiling", false)
+	}
+	if len(request.Request.Assets) != 1 {
+		return safeError(providercontract.CodeInvalidRequest, "speech canary requires one frozen VOICE descriptor", false)
+	}
+	voice := request.Request.Assets[0]
+	if voice.ID != s.config.SpeechCanaryVoiceAssetID ||
+		voice.Revision != s.config.SpeechCanaryVoiceVersion ||
+		voice.SHA256 != s.config.SpeechCanaryVoiceHash ||
+		voice.URI != "cas://sha256/"+s.config.SpeechCanaryVoiceHash ||
+		voice.Kind != providercontract.ModalityAudio ||
+		voice.Role != providercontract.AssetRoleReferenceAudio ||
+		voice.MediaType != "audio/x-voice-profile+json" ||
+		voice.LicenseReference != s.config.SpeechCanaryLicenseSnapshotID+":"+
+			s.config.SpeechCanaryLicenseHash {
+		return safeError(providercontract.CodeInvalidRequest, "speech canary VOICE or license binding drifted", false)
 	}
 	return nil
 }

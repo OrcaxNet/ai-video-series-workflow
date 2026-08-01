@@ -163,17 +163,23 @@ type QCResult struct {
 // PostProductionConfig freezes the independent speech route, budget, subtitle
 // behavior, and optional licensed background asset before Temporal starts.
 type PostProductionConfig struct {
-	Enabled                       bool                           `json:"enabled"`
-	Evidence                      string                         `json:"evidence"`
-	SpeechRoute                   providercontract.ModelSnapshot `json:"speechRoute"`
-	SpeechProviderProfileID       string                         `json:"speechProviderProfileId"`
-	SpeechBudgetApprovalID        string                         `json:"speechBudgetApprovalId"`
-	SpeechBudgetMaximumMicros     int64                          `json:"speechBudgetMaximumMicros"`
-	SpeechBudgetCurrency          string                         `json:"speechBudgetCurrency"`
-	SubtitleLanguage              string                         `json:"subtitleLanguage"`
-	BurnSubtitles                 bool                           `json:"burnSubtitles"`
-	BackgroundAudioAssetVersionID string                         `json:"backgroundAudioAssetVersionId,omitempty"`
-	EnforcePoCDuration            bool                           `json:"enforcePoCDuration"`
+	Enabled                       bool                               `json:"enabled"`
+	Evidence                      string                             `json:"evidence"`
+	SpeechRoute                   providercontract.ModelSnapshot     `json:"speechRoute"`
+	SpeechProviderProfileID       string                             `json:"speechProviderProfileId"`
+	SpeechBudgetApprovalID        string                             `json:"speechBudgetApprovalId"`
+	SpeechBudgetMaximumMicros     int64                              `json:"speechBudgetMaximumMicros"`
+	SpeechBudgetCurrency          string                             `json:"speechBudgetCurrency"`
+	SpeechIdentityVersion         string                             `json:"speechIdentityVersion,omitempty"`
+	SpeechVoice                   *postproduction.SpeechVoiceBinding `json:"speechVoice,omitempty"`
+	SpeechAuthorizedCueID         string                             `json:"speechAuthorizedCueId,omitempty"`
+	SpeechMaximumAFPMilli         int64                              `json:"speechMaximumAfpMilli,omitempty"`
+	SpeechMaximumCashMicros       int64                              `json:"speechMaximumNonSubscriptionCashMicros,omitempty"`
+	SpeechMaxAttempts             int                                `json:"speechMaxAttempts,omitempty"`
+	SubtitleLanguage              string                             `json:"subtitleLanguage"`
+	BurnSubtitles                 bool                               `json:"burnSubtitles"`
+	BackgroundAudioAssetVersionID string                             `json:"backgroundAudioAssetVersionId,omitempty"`
+	EnforcePoCDuration            bool                               `json:"enforcePoCDuration"`
 }
 
 func (c PostProductionConfig) Validate() error {
@@ -194,6 +200,19 @@ func (c PostProductionConfig) Validate() error {
 	}
 	if c.SubtitleLanguage == "" {
 		return errors.New("post-production subtitle language is required")
+	}
+	if err := (postproduction.SpeechConfig{
+		Route: c.SpeechRoute, ProviderProfileID: c.SpeechProviderProfileID,
+		BudgetApprovalID:    c.SpeechBudgetApprovalID,
+		BudgetMaximumMicros: c.SpeechBudgetMaximumMicros,
+		BudgetCurrency:      c.SpeechBudgetCurrency,
+		IdentityVersion:     c.SpeechIdentityVersion, Voice: c.SpeechVoice,
+		AuthorizedCueID:                  c.SpeechAuthorizedCueID,
+		MaximumAFPMilli:                  c.SpeechMaximumAFPMilli,
+		MaximumNonSubscriptionCashMicros: c.SpeechMaximumCashMicros,
+		MaxAttempts:                      c.SpeechMaxAttempts,
+	}).Validate(); err != nil {
+		return err
 	}
 	return nil
 }

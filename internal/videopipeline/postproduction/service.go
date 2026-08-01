@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 )
 
@@ -61,6 +62,15 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 			return Result{}, errors.New("speech budget cannot allocate a positive amount to every cue")
 		}
 		for index, cue := range request.Subtitle.Cues {
+			if request.Speech.IdentityVersion == SpeechIdentityV2 &&
+				cue.ID != request.Speech.AuthorizedCueID {
+				return Result{}, &providercontract.Error{
+					Code: providercontract.CodeConflict, Retryable: false,
+					SafeMessage:     "speech canary is limited to the frozen authorized cue",
+					RequiresAction:  true,
+					SuggestedAction: "authorize a new frozen speech package before another cue",
+				}
+			}
 			cueBudget := baseBudget
 			if int64(index) < remainder {
 				cueBudget++
@@ -96,6 +106,14 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 				return Result{}, fmt.Errorf("validate cue %q speech evidence: %w", cue.ID, err)
 			}
 			attempts = append(attempts, attempt)
+			if request.Speech.IdentityVersion == SpeechIdentityV2 {
+				return Result{}, &providercontract.Error{
+					Code: providercontract.CodeConflict, Retryable: false,
+					SafeMessage:     "speech canary completed and remaining cues are not authorized",
+					RequiresAction:  true,
+					SuggestedAction: "inspect canary evidence before authorizing additional speech jobs",
+				}
+			}
 		}
 	}
 	rendered, err := s.Media.Render(ctx, request, subtitleBytes, attempts)
@@ -132,6 +150,7 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		"runIds":              request.RunIDs,
 		"clips":               request.Clips,
 		"subtitleRevision":    request.Subtitle,
+		"speechConfig":        request.Speech,
 		"speechAttempts":      attempts,
 		"outputPolicy":        request.Output.withDefaults(),
 		"outputs": []Artifact{
@@ -194,10 +213,7 @@ func (s *Service) commitBytes(
 }
 
 func buildComponents(request Request, rendered RenderResult) ([]ServiceComponent, error) {
-	speechHash, err := digestJSON(map[string]any{
-		"providerProfileId": request.Speech.ProviderProfileID,
-		"route":             request.Speech.Route,
-	})
+	speechHash, err := digestJSON(request.Speech)
 	if err != nil {
 		return nil, err
 	}

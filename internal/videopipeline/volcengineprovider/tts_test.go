@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -195,6 +196,75 @@ func TestAgentPlanTTS_FailsClosedOnMissingEvidenceAndClassifiesErrors(t *testing
 				t.Fatalf("error leaked protected input: %v", err)
 			}
 		})
+	}
+}
+
+func TestAgentPlanTTSErrorMappingRetainsExactSanitizedStatusWithoutInferringUnknown55(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name         string
+		status       int
+		providerCode string
+		messageClass string
+		want         providercontract.ErrorCode
+	}{
+		{name: "authentication wins", status: http.StatusUnauthorized, providerCode: "55000000", messageClass: "authentication", want: providercontract.CodeUnauthenticated},
+		{name: "known unavailable voice", status: http.StatusOK, providerCode: "55000000", messageClass: "speaker", want: providercontract.CodeModelUnavailable},
+		{name: "unknown 55 remains unclassified", status: http.StatusUnprocessableEntity, providerCode: "55999999", messageClass: "speaker", want: providercontract.CodeUnavailable},
+		{name: "unknown 55 is not inferred from HTTP quota", status: http.StatusTooManyRequests, providerCode: "55999999", messageClass: "quota", want: providercontract.CodeUnavailable},
+		{name: "provider contract", status: http.StatusOK, providerCode: "45000001", messageClass: "request_contract", want: providercontract.CodeInvalidRequest},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := mapTTSError(tt.status, tt.providerCode, tt.messageClass)
+			var providerErr *providercontract.Error
+			if !errors.As(err, &providerErr) {
+				t.Fatalf("mapTTSError() = %T %v", err, err)
+			}
+			if providerErr.Code != tt.want || providerErr.HTTPStatus != tt.status ||
+				providerErr.ProviderCode != tt.providerCode ||
+				providerErr.ProviderMessageClass != tt.messageClass {
+				t.Fatalf("mapped error = %#v", providerErr)
+			}
+		})
+	}
+}
+
+func TestAgentPlanTTSRetainsSafeFailureHeadersAndLogID(t *testing.T) {
+	t.Parallel()
+	client, err := NewAgentPlanTTS(AgentPlanTTSConfig{
+		APIKey: "fixture-key",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusUnprocessableEntity,
+				Header: http.Header{
+					"X-Api-Status-Code": []string{"55999999"},
+					"X-Api-Message":     []string{"speaker unavailable for private tenant"},
+					"X-Tt-Logid":        []string{"tts-safe-log-id"},
+				},
+				Body: io.NopCloser(strings.NewReader(`{"code":55000000,"message":"raw body is ignored"}`)),
+			}, nil
+		})},
+		NewRequestID: func() string { return "request-uuid" },
+		NewConnectID: func() string { return "connect-uuid" },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Synthesize(t.Context(), SpeechSynthesisRequest{Text: "测试", Speaker: "speaker-v2"})
+	var providerErr *providercontract.Error
+	if !errors.As(err, &providerErr) {
+		t.Fatalf("Synthesize() error = %T %v", err, err)
+	}
+	if result.LogID != "tts-safe-log-id" || providerErr.HTTPStatus != http.StatusUnprocessableEntity ||
+		providerErr.ProviderCode != "55999999" ||
+		providerErr.ProviderMessageClass != "speaker" ||
+		providerErr.Code != providercontract.CodeUnavailable {
+		t.Fatalf("failure result = %#v, error = %#v", result, providerErr)
+	}
+	if strings.Contains(providerErr.SafeMessage, "private tenant") ||
+		strings.Contains(providerErr.SafeMessage, "raw body") {
+		t.Fatalf("failure leaked raw Provider text: %#v", providerErr)
 	}
 }
 
@@ -736,6 +806,93 @@ func TestQASecondReconciliationAcrossAdapterInstancesIsSingleCall(t *testing.T) 
 	}
 }
 
+func TestSpeechV2CanaryAcrossAdapterInstancesSubmitsExactlyOnceAndReplays(t *testing.T) {
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, request := testSpeechCanaryFixture(t)
+	speech := &fakeSpeechSynthesizer{}
+	first, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	drifted := request
+	drifted.Request.Assets = append([]providercontract.AssetRef(nil), request.Request.Assets...)
+	drifted.Request.Assets[0].Revision = "10400000-0000-4000-8000-000000000099"
+	driftHTTP := httptest.NewServer(first.Handler())
+	if status := submitSpeechJobStatus(t, driftHTTP.URL, drifted); status != http.StatusUnprocessableEntity {
+		driftHTTP.Close()
+		t.Fatalf("drifted canary status = %d, want 422", status)
+	}
+	driftHTTP.Close()
+	if speech.callCount() != 0 {
+		t.Fatalf("drifted canary made %d TTS calls", speech.callCount())
+	}
+
+	firstHTTP := httptest.NewServer(first.Handler())
+	defer firstHTTP.Close()
+	secondHTTP := httptest.NewServer(second.Handler())
+	defer secondHTTP.Close()
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type result struct {
+		status int
+		err    error
+	}
+	results := make(chan result, 2)
+	var wg sync.WaitGroup
+	for _, endpoint := range []string{firstHTTP.URL, secondHTTP.URL} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			httpRequest, requestErr := http.NewRequest(http.MethodPost, endpoint+"/v1/jobs", bytes.NewReader(body))
+			if requestErr != nil {
+				results <- result{err: requestErr}
+				return
+			}
+			httpRequest.Header.Set("Content-Type", "application/json")
+			httpRequest.Header.Set("Idempotency-Key", request.JobID)
+			response, requestErr := authenticatedTestClient(t).Do(httpRequest)
+			if requestErr != nil {
+				results <- result{err: requestErr}
+				return
+			}
+			response.Body.Close()
+			results <- result{status: response.StatusCode}
+		}()
+	}
+	wg.Wait()
+	close(results)
+	statuses := make(map[int]int)
+	for outcome := range results {
+		if outcome.err != nil {
+			t.Fatal(outcome.err)
+		}
+		statuses[outcome.status]++
+	}
+	if speech.callCount() != 1 || statuses[http.StatusCreated] != 1 || statuses[http.StatusOK] != 1 {
+		t.Fatalf("speech-v2 submit calls = %d, statuses = %#v", speech.callCount(), statuses)
+	}
+
+	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedHTTP := httptest.NewServer(restarted.Handler())
+	defer restartedHTTP.Close()
+	if replayed := postJob(t, restartedHTTP.URL, request); replayed.State != providercontract.StatusSucceeded || speech.callCount() != 1 {
+		t.Fatalf("restart replay = %#v, calls = %d", replayed, speech.callCount())
+	}
+}
+
 func TestServer_SpeechRetryClaimSurvivesCrashBeforeRecordTransition(t *testing.T) {
 	t.Parallel()
 	store, err := artifactstore.New(t.TempDir())
@@ -869,20 +1026,20 @@ func submitSpeechJobStatus(t *testing.T, endpoint string, request providercontra
 func testSpeechJobRequest(t *testing.T) providercontract.JobRequest {
 	t.Helper()
 	inputHash := sha256.Sum256([]byte("speech immutable input"))
-	capabilityHash := sha256.Sum256([]byte("agent-plan-tts-v1"))
+	cfg := testLiveConfig()
 	request := providercontract.JobRequest{
 		SchemaVersion: "v1", JobID: "speech-job-1", RunID: "episode-1",
 		Capability: providercontract.CapabilitySpeech,
 		InputHash:  hex.EncodeToString(inputHash[:]),
 		Model: providercontract.ModelSnapshot{
 			CapabilityAlias: string(providercontract.CapabilitySpeech), Provider: "volcengine_ark",
-			ModelID: AgentPlanTTSModelID, RouteVersion: "agent-plan-large-tts-v1",
-			CapabilityHash: hex.EncodeToString(capabilityHash[:]), Verification: providercontract.PendingKey,
+			ModelID: AgentPlanTTSModelID, RouteVersion: AgentPlanTTSRouteVersion,
+			CapabilityHash: AgentPlanTTSCapabilityHash(cfg), Verification: providercontract.PendingKey,
 		},
 		Request: providercontract.GenerationRequest{
 			RequestID: "speech-job-1", IdempotencyKey: "speech-job-1",
 			Modality: providercontract.ModalityAudio, Prompt: "你好，世界",
-			PromptSnapshotID: "subtitle-1:cue-1", ModelHint: "speaker-v2",
+			PromptSnapshotID: "subtitle-1:cue-1", ModelHint: cfg.SpeechSpeaker,
 			Output: providercontract.OutputSpec{DurationMillis: 2_000, Format: "mp3"},
 			Budget: providercontract.BudgetEnvelope{EstimatedCostMicros: 81, MaxCostMicros: 81, MaxAttempts: 2},
 		},
@@ -899,4 +1056,54 @@ func testSpeechJobRequest(t *testing.T) providercontract.JobRequest {
 	}
 	request.BudgetReservation = reservation
 	return request
+}
+
+func testSpeechCanaryFixture(t *testing.T) (runtimeconfig.VolcengineProvider, providercontract.JobRequest) {
+	t.Helper()
+	cfg := testLiveConfig()
+	cfg.SpeechCanaryJobID = "speech-v2-0123456789abcdef0123456789abcdef"
+	cfg.SpeechCanaryInputHash = strings.Repeat("4", 64)
+	cfg.SpeechCanaryCueID = "cue-001"
+	cfg.SpeechCanaryVoiceAssetID = "10400000-0000-4000-8000-00000000000f"
+	cfg.SpeechCanaryParentVoiceVersion = "10400000-0000-4000-8000-000000000010"
+	cfg.SpeechCanaryVoiceVersion = "10400000-0000-4000-8000-000000000011"
+	cfg.SpeechCanaryVoiceHash = strings.Repeat("5", 64)
+	cfg.SpeechCanaryLicenseSnapshotID = "10400000-0000-4000-8000-000000000012"
+	cfg.SpeechCanaryLicenseHash = strings.Repeat("6", 64)
+	cfg.SpeechCanaryMaximumAFPMilli = 2_228
+	cfg.SpeechCanaryMaximumCashMicros = 0
+
+	request := testSpeechJobRequest(t)
+	request.JobID = cfg.SpeechCanaryJobID
+	request.InputHash = cfg.SpeechCanaryInputHash
+	request.Request.RequestID = request.JobID
+	request.Request.IdempotencyKey = request.JobID
+	request.Request.Prompt = "青石门在晨雾中缓缓开启。"
+	request.Request.PromptSnapshotID = "subtitle-v2:" + cfg.SpeechCanaryCueID
+	request.Request.ModelHint = cfg.SpeechSpeaker
+	request.Request.Output.Format = "mp3"
+	request.Request.Budget.MaxAttempts = 1
+	request.Request.Assets = []providercontract.AssetRef{{
+		ID: cfg.SpeechCanaryVoiceAssetID, Revision: cfg.SpeechCanaryVoiceVersion,
+		Kind: providercontract.ModalityAudio, Role: providercontract.AssetRoleReferenceAudio,
+		URI:              "cas://sha256/" + cfg.SpeechCanaryVoiceHash,
+		SHA256:           cfg.SpeechCanaryVoiceHash,
+		LicenseReference: cfg.SpeechCanaryLicenseSnapshotID + ":" + cfg.SpeechCanaryLicenseHash,
+		MediaType:        "audio/x-voice-profile+json",
+	}}
+	reservation, err := providercontract.BindBudgetReservation(providercontract.BudgetReservation{
+		ReservationID:  request.BudgetReservation.ReservationID,
+		Currency:       request.BudgetReservation.Currency,
+		AmountMicros:   request.Request.Budget.MaxCostMicros,
+		PricingVersion: request.BudgetReservation.PricingVersion,
+		ConfirmedBy:    request.BudgetReservation.ConfirmedBy,
+	}, providercontract.BudgetBindingInput{
+		RunID: request.RunID, InputHash: request.InputHash,
+		Model: request.Model, Budget: request.Request.Budget,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.BudgetReservation = reservation
+	return cfg, request
 }

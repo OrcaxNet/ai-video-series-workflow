@@ -110,7 +110,8 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 | `VIDEO_VOLCENGINE_BASE_URL` | `https://ark.cn-beijing.volces.com/api/plan/v3` | Agent Plan 数据面；不得写入 Manifest/BOM |
 | `VIDEO_VOLCENGINE_VIDEO_MODEL` | `doubao-seedance-2.0` | 冻结真实视频模型 |
 | `VIDEO_VOLCENGINE_TTS_ENDPOINT` | Agent Plan HTTP TTS URL | 只接受套餐专属 V3 HTTP Chunked `/api/v3/plan/tts/unidirectional`；标准 `/api/v3/tts/...`、query、尾斜杠或 host 漂移均在网络调用前失败关闭；Resource ID 固定为 `seed-tts-2.0` |
-| `VIDEO_VOLCENGINE_TTS_SPEAKER` | `zh_female_vv_uranus_bigtts` | TTS 2.0 兼容音色；不是 Secret |
+| `VIDEO_VOLCENGINE_TTS_SPEAKER` | `zh_female_tianmeitaozi_mars_bigtts` | FLO-104 speech-v2 冻结音色；不是 Secret |
+| `VIDEO_VOLCENGINE_TTS_CANARY_*` | 未设置 | 单次 TTS canary 的 job/input/cue、VOICE/license hash、AFP/现金上限完整 allowlist；必须全量配置，`MAX_CASH_MICROS=0`，且不能与旧 job reconciliation 同时启用 |
 | `VIDEO_VOLCENGINE_PLAN` | `agent-plan-large` | 套餐计费模式标识 |
 | `ANTHROPIC_BASE_URL` | 未设置 | 预留 Claude adapter 的显式 endpoint；M0 不启用 |
 | `ANTHROPIC_API_KEY` | 未设置 | 文本备用 Secret |
@@ -148,6 +149,14 @@ Provider submit/poll/cancel 前返回 `401 unauthenticated`。该签名 Secret �
 `ARK_API_KEY` 分离，Worker/单次探针只持有前者，只有 Adapter 持有后者。
 nonce 会保留到签名时间戳加完整允许偏差的闭区间末端；客户端时钟领先时也不存在
 按首次接收时间提前释放的重放窗口。
+
+FLO-104 speech-v2 使用独立的新 VOICE 版本，不修改旧音色或旧
+`speech-b3f099e406a02073ed1ab94b2fe5bd94` 记录。新 job ID 绑定 episode revision、
+subtitle content hash、cue、VOICE version、route、resource 与 speaker；Adapter 还必须匹配
+完整 `VIDEO_VOLCENGINE_TTS_CANARY_*` allowlist，才会执行一个 `MaxAttempts=1` 请求。
+跨进程竞争先原子提交同一 job intent，只有一个进程能越过 TTS 边界；重放只读取持久记录。
+HTTP status、纯数字 Provider code、脱敏后的 `X-Api-Message` 分类及 `X-Tt-Logid` 会分别保存，
+未知 `55*` 只标为未分类 unavailable，不推断为 resource/speaker mismatch。
 
 `video-live-probe` 固定为一个 1280×720、24 fps、5 秒、无同步音频的原创抽象
 镜头，`maxAttempts=1`。输出目录带原子单次提交锁；即使任务失败，也不能在同一

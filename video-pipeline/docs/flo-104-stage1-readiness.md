@@ -45,6 +45,41 @@ Agent Plan TTS 由同一 Live Adapter 提供 `speech.primary`：只读取运行�
 tokens，并把唯一 request/connect ID 和 `X-Tt-Logid` 写入后期 Manifest 的 speech
 attempt。
 
+## speech-v2 单镜 canary 修订
+
+已成功的十个视频 Run、旧 VOICE 版本以及旧 speech job/reconciliation 永久只读。新的
+speech-v2 包通过 `video-stage1-revoice` 派生一个 APPROVED VOICE child version、对应
+ALLOWED license snapshot、`agent-plan-large-tts-v2` capability 与新的 execution package；
+命令不接收 Adapter URL、没有 Provider client，并断言运行前后 `provider_jobs` 数量不变。
+
+```bash
+make video-stage1-revoice-test
+
+VIDEO_POSTGRES_DSN=postgres://... VIDEO_ARTIFACT_ROOT=/var/lib/video-pipeline/artifacts \
+go run ./cmd/video-stage1-revoice \
+  --plan video-pipeline/config/flo104-stage1-readiness.json \
+  --parent flo104-sample1-execution-package.json \
+  --revision approved-speech-v2-revision.json \
+  --approval-comment <approval-comment-uuid> \
+  --approval-actor <approving-agent-uuid> \
+  --approval-valid-until <RFC3339> \
+  --output flo104-sample1-execution-package-speech-v2.json \
+  --report flo104-sample1-speech-v2-revoice-report.json
+```
+
+新 job 语义为
+`speech-v2-<sha256(canonical(episodeRevisionId, subtitleContentHash, cueId, voiceAssetVersionId, routeVersion, resourceId, speaker))[:32]>`。
+FLO-104 的包只授权 `cue-001`、`MaxAttempts=1`、10% hard cap `2228 milli-AFP`、
+非订阅现金 `0`。PostgreSQL 在 Prepare 与付费事务内重新锁定 VOICE parent/child、license、
+Provider profile/capability；Adapter 再匹配 job/input/cue/VOICE/license allowlist。成功生成
+一段 canary 后，Finalize 会在媒体合成、Manifest 与 G3 前返回需人工检查的非重试冲突，
+不会继续提交其余 cue。跨进程相同 job 通过原子 intent/replay 保证至多一次 Provider submit。
+
+Provider 失败证据保留精确 HTTP status、纯数字 Provider code、脱敏
+`X-Api-Message` 分类与 `X-Tt-Logid`。401/403、非 Plan endpoint、usage/log 缺失、AFP/现金
+越界均失败关闭；仅 `55000000` 分类为已知 resource-or-speaker unavailable，其他未知
+`55*` 不推断根因。真实 canary 只能在新 SHA 的无费用 QA 完成后单独授权。
+
 正式 Stage 1 视频 job 只能通过 `video-stage1-runner`：该命令固定构造
 `PostgreSQL product truth + Gate + AdapterSubmitter + Executor`，completion 会从内部 Adapter 重新读取 terminal
 task、request、用量、费用、错误分类与 CAS artifact 后再调用 `Gate.Complete`。它每次只

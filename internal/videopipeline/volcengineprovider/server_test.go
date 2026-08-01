@@ -734,6 +734,8 @@ func testLiveConfig() runtimeconfig.VolcengineProvider {
 		ProviderID: "volcengine-agent-plan-large", Region: "cn-beijing",
 		VideoModel: "doubao-seedance-2.0", PlanName: "agent-plan-large",
 		PricingVersion: "agent-plan-large-included-v1", Currency: "CNY",
+		SpeechEndpoint: AgentPlanTTSEndpoint, SpeechModel: AgentPlanTTSModelID,
+		SpeechSpeaker:    "zh_female_tianmeitaozi_mars_bigtts",
 		MaxDownloadBytes: 1 << 20, DownloadTimeout: 5 * time.Second,
 		ServiceAuthSecret: testServiceAuthSecret,
 	}

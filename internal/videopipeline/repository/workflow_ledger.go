@@ -2601,12 +2601,33 @@ func (p *Postgres) PrepareEpisodePostProduction(
 				"shot %s voice authorization: %w", clip.ShotSpecRevisionID, err,
 			)
 		}
+		if input.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2 {
+			if input.Config.SpeechVoice == nil {
+				return postproduction.Request{}, errors.New("speech-v2 requires an immutable VOICE binding")
+			}
+			for cueIndex := range shotCues {
+				if strings.TrimSpace(shotCues[cueIndex].VoiceRef) == "" {
+					continue
+				}
+				if shotCues[cueIndex].VoiceRef != input.Config.SpeechVoice.ParentAssetVersionID {
+					return postproduction.Request{}, controlplane.NewPolicyError(
+						controlplane.CodeLicenseBlocked,
+						"speech-v2 parent voice does not match the approved shot binding",
+						"create the voice revision from the exact approved parent asset",
+					)
+				}
+				shotCues[cueIndex].VoiceRef = input.Config.SpeechVoice.AssetVersionID
+			}
+		}
 		cues = append(cues, shotCues...)
 		clips = append(clips, clip)
 		sourceRevisionIDs = append(sourceRevisionIDs, clip.ShotSpecRevisionID)
 		timelineOffset += clip.DurationMillis
 	}
 	if err := p.validateVoiceAssets(ctx, episodeRevisionID, voiceAssetIDs); err != nil {
+		return postproduction.Request{}, err
+	}
+	if err := p.validateSpeechV2Configuration(ctx, p.pool, episodeRevisionID, input.Config); err != nil {
 		return postproduction.Request{}, err
 	}
 	cueHash, err := digestValue(map[string]any{
@@ -2648,11 +2669,17 @@ func (p *Postgres) PrepareEpisodePostProduction(
 		Subtitle:            subtitle,
 		BackgroundAudio:     background,
 		Speech: postproduction.SpeechConfig{
-			Route:               input.Config.SpeechRoute,
-			ProviderProfileID:   input.Config.SpeechProviderProfileID,
-			BudgetApprovalID:    input.Config.SpeechBudgetApprovalID,
-			BudgetMaximumMicros: input.Config.SpeechBudgetMaximumMicros,
-			BudgetCurrency:      input.Config.SpeechBudgetCurrency,
+			Route:                            input.Config.SpeechRoute,
+			ProviderProfileID:                input.Config.SpeechProviderProfileID,
+			BudgetApprovalID:                 input.Config.SpeechBudgetApprovalID,
+			BudgetMaximumMicros:              input.Config.SpeechBudgetMaximumMicros,
+			BudgetCurrency:                   input.Config.SpeechBudgetCurrency,
+			IdentityVersion:                  input.Config.SpeechIdentityVersion,
+			Voice:                            input.Config.SpeechVoice,
+			AuthorizedCueID:                  input.Config.SpeechAuthorizedCueID,
+			MaximumAFPMilli:                  input.Config.SpeechMaximumAFPMilli,
+			MaximumNonSubscriptionCashMicros: input.Config.SpeechMaximumCashMicros,
+			MaxAttempts:                      input.Config.SpeechMaxAttempts,
 		},
 		Output: postproduction.OutputPolicy{
 			Width: 1280, Height: 720, FPS: 24, Format: "mp4",
@@ -2698,6 +2725,9 @@ func (p *Postgres) AuthorizeEpisodePostProduction(
 		if err := p.requireCurrentPostProductionBudget(
 			ctx, tx, episodeRevisionID, input.GenerationPlanID, input.Config,
 		); err != nil {
+			return struct{}{}, err
+		}
+		if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
 			return struct{}{}, err
 		}
 		return struct{}{}, nil
@@ -2748,6 +2778,9 @@ func (p *Postgres) CommitEpisodePostProduction(
 		if err := p.requireCurrentPostProductionBudget(
 			ctx, tx, episodeRevisionID, input.GenerationPlanID, input.Config,
 		); err != nil {
+			return struct{}{}, err
+		}
+		if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
 			return struct{}{}, err
 		}
 		var eligibleRuns int
@@ -4539,6 +4572,131 @@ func collectVoiceAssetBindings(
 			)
 		}
 		result[voiceAssetID] = struct{}{}
+	}
+	return nil
+}
+
+type speechConfigurationQueryer interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// validateSpeechV2Configuration binds the frozen canary to one new VOICE
+// revision, its exact license snapshot, and one live provider capability. The
+// same query runs during prepare and again inside the paid-boundary transaction.
+func (p *Postgres) validateSpeechV2Configuration(
+	ctx context.Context,
+	queryer speechConfigurationQueryer,
+	episodeRevisionID uuid.UUID,
+	config orchestration.PostProductionConfig,
+) error {
+	if config.SpeechIdentityVersion == "" {
+		return nil
+	}
+	if config.SpeechIdentityVersion != postproduction.SpeechIdentityV2 {
+		return controlplane.NewPolicyError(
+			controlplane.CodeCapability,
+			"post-production speech identity version is unsupported",
+			"freeze a supported speech configuration revision",
+		)
+	}
+	if config.SpeechVoice == nil {
+		return errors.New("speech-v2 requires an immutable VOICE binding")
+	}
+	voice := *config.SpeechVoice
+	assetID, err := uuid.Parse(voice.AssetID)
+	if err != nil {
+		return errors.New("speech voice assetId must be a UUID")
+	}
+	parentVersionID, err := uuid.Parse(voice.ParentAssetVersionID)
+	if err != nil {
+		return errors.New("speech parent voice asset version must be a UUID")
+	}
+	versionID, err := uuid.Parse(voice.AssetVersionID)
+	if err != nil {
+		return errors.New("speech voice asset version must be a UUID")
+	}
+	licenseID, err := uuid.Parse(voice.LicenseSnapshotID)
+	if err != nil {
+		return errors.New("speech voice license snapshot must be a UUID")
+	}
+	profileID, err := uuid.Parse(config.SpeechProviderProfileID)
+	if err != nil {
+		return errors.New("speech provider profile must be a UUID")
+	}
+	var matched int
+	err = queryer.QueryRow(ctx, `
+		SELECT 1
+		FROM video_pipeline.episode_revisions er
+		JOIN video_pipeline.episodes ep ON ep.id = er.episode_id
+		JOIN video_pipeline.assets source_asset
+		  ON source_asset.id = $2
+		 AND source_asset.series_id = ep.series_id
+		 AND source_asset.asset_type = 'VOICE'
+		JOIN video_pipeline.asset_versions parent
+		  ON parent.id = $3
+		 AND parent.asset_id = source_asset.id
+		JOIN video_pipeline.asset_versions av
+		  ON av.id = $4
+		 AND av.asset_id = source_asset.id
+		 AND av.parent_revision_id = parent.id
+		JOIN video_pipeline.license_snapshots ls
+		  ON ls.id = $5
+		 AND ls.id = av.license_snapshot_id
+		JOIN video_pipeline.provider_profiles pp
+		  ON pp.id = $6
+		JOIN video_pipeline.provider_capability_snapshots pcs
+		  ON pcs.provider_profile_id = pp.id
+		 AND pcs.capability_alias = 'speech.primary'
+		WHERE er.id = $1
+		  AND parent.status = 'APPROVED'
+		  AND av.status = 'APPROVED'
+		  AND av.content_hash = $7
+		  AND av.artifact_uri = 'cas://sha256/' || $7
+		  AND av.media_type = 'audio/x-voice-profile+json'
+		  AND av.dimensions->>'provider' = $8
+		  AND av.dimensions->>'modelId' = $9
+		  AND av.dimensions->>'resourceId' = $10
+		  AND av.dimensions->>'speaker' = $11
+		  AND av.dimensions->>'routeVersion' = $12
+		  AND ls.license_hash = $13
+		  AND ls.subject_type = 'VOICE'
+		  AND ls.subject_ref = $8 || ':' || $10 || ':' || $11
+		  AND ls.policy_status = 'ALLOWED'
+		  AND ls.commercial_use
+		  AND (ls.expires_at IS NULL OR ls.expires_at > now())
+		  AND pp.provider = 'VOLCENGINE'
+		  AND pp.enabled
+		  AND pp.mode = 'LIVE'
+		  AND pp.health = 'READY'
+		  AND pp.config_hash = $14
+		  AND pcs.model_id = $9
+		  AND pcs.route_version = $12
+		  AND pcs.capability_hash = $14
+		  AND pcs.status = 'ACTIVE'
+		  AND (pcs.expires_at IS NULL OR pcs.expires_at > now())
+		  AND pcs.limits->>'resourceId' = $10
+		  AND pcs.limits->>'defaultSpeaker' = $11
+		  AND pcs.limits->>'authorizedCueId' = $15
+		  AND (pcs.limits->>'maximumAfpMilli')::bigint = $16
+		  AND (pcs.limits->>'maximumNonSubscriptionCashMicros')::bigint = $17
+		  AND (pcs.limits->>'maxAttempts')::integer = $18
+		FOR SHARE OF er, ep, source_asset, parent, av, ls, pp, pcs`,
+		episodeRevisionID, assetID, parentVersionID, versionID, licenseID,
+		profileID, voice.AssetVersionHash, voice.Provider, voice.ModelID,
+		voice.ResourceID, voice.Speaker, config.SpeechRoute.RouteVersion,
+		voice.LicenseSnapshotHash, config.SpeechRoute.CapabilityHash,
+		config.SpeechAuthorizedCueID, config.SpeechMaximumAFPMilli,
+		config.SpeechMaximumCashMicros, config.SpeechMaxAttempts,
+	).Scan(&matched)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"speech-v2 voice, license, or provider configuration is no longer current",
+			"re-freeze the exact approved VOICE revision and Agent Plan capability",
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("validate frozen speech-v2 configuration: %w", err)
 	}
 	return nil
 }

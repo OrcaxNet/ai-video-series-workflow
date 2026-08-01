@@ -136,7 +136,7 @@ func TestLoadVolcengineProviderRequiresExplicitKeyAndUsesAgentPlanDefaults(t *te
 	if cfg.BaseURL != "https://ark.cn-beijing.volces.com/api/plan/v3" ||
 		cfg.VideoModel != "doubao-seedance-2.0" || cfg.PlanName != "agent-plan-large" ||
 		cfg.SpeechEndpoint != AgentPlanTTSEndpoint ||
-		cfg.SpeechModel != "doubao-seed-tts-2.0" || cfg.SpeechSpeaker != "zh_female_vv_uranus_bigtts" ||
+		cfg.SpeechModel != "doubao-seed-tts-2.0" || cfg.SpeechSpeaker != "zh_female_tianmeitaozi_mars_bigtts" ||
 		cfg.APIKey != "test-runtime-credential" || cfg.ServiceAuthSecret != "test-service-auth-secret-32-bytes-long" ||
 		cfg.MaxDownloadBytes != 256<<20 || cfg.MaxSpeechBytes != 32<<20 {
 		t.Fatalf("unexpected live defaults: %#v", cfg)
@@ -221,6 +221,68 @@ func TestLoadVolcengineProviderRequiresExactSpeechRetryPair(t *testing.T) {
 			}
 			if err == nil && (cfg.SpeechRetryJobID != tt.jobID || cfg.SpeechRetryRecord != tt.record) {
 				t.Fatalf("retry config = %q/%q", cfg.SpeechRetryJobID, cfg.SpeechRetryRecord)
+			}
+		})
+	}
+}
+
+func TestLoadVolcengineProviderRequiresCompleteZeroCashSpeechCanary(t *testing.T) {
+	valid := map[string]string{
+		"ARK_API_KEY":                                         "test-runtime-credential",
+		"VIDEO_PROVIDER_SERVICE_AUTH_SECRET":                  "test-service-auth-secret-32-bytes-long",
+		"VIDEO_ARTIFACT_ROOT":                                 t.TempDir(),
+		"VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID":                  "speech-v2-0123456789abcdef0123456789abcdef",
+		"VIDEO_VOLCENGINE_TTS_CANARY_INPUT_SHA256":            strings.Repeat("1", 64),
+		"VIDEO_VOLCENGINE_TTS_CANARY_CUE_ID":                  "cue-001",
+		"VIDEO_VOLCENGINE_TTS_CANARY_VOICE_ASSET_ID":          "10400000-0000-4000-8000-00000000000f",
+		"VIDEO_VOLCENGINE_TTS_CANARY_PARENT_VOICE_VERSION_ID": "10400000-0000-4000-8000-000000000010",
+		"VIDEO_VOLCENGINE_TTS_CANARY_VOICE_VERSION_ID":        "10400000-0000-4000-8000-000000000011",
+		"VIDEO_VOLCENGINE_TTS_CANARY_VOICE_SHA256":            strings.Repeat("2", 64),
+		"VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SNAPSHOT_ID":     "10400000-0000-4000-8000-000000000012",
+		"VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SHA256":          strings.Repeat("3", 64),
+		"VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI":           "2228",
+		"VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS":         "0",
+	}
+	load := func(values map[string]string) (VolcengineProvider, error) {
+		return loadVolcengineProvider(func(name string) (string, bool) {
+			value, ok := values[name]
+			return value, ok
+		})
+	}
+	cfg, err := load(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpeechCanaryCueID != "cue-001" || cfg.SpeechCanaryMaximumAFPMilli != 2_228 ||
+		cfg.SpeechCanaryMaximumCashMicros != 0 {
+		t.Fatalf("speech canary config = %#v", cfg)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+	}{
+		{name: "missing frozen voice", mutate: func(values map[string]string) { delete(values, "VIDEO_VOLCENGINE_TTS_CANARY_VOICE_SHA256") }},
+		{name: "cash allowed", mutate: func(values map[string]string) { values["VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS"] = "1" }},
+		{name: "invalid job", mutate: func(values map[string]string) { values["VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID"] = "speech-old" }},
+		{name: "canary limit without identity", mutate: func(values map[string]string) {
+			for name := range values {
+				if strings.HasPrefix(name, "VIDEO_VOLCENGINE_TTS_CANARY_") {
+					delete(values, name)
+				}
+			}
+			values["VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI"] = "2228"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := make(map[string]string, len(valid))
+			for name, value := range valid {
+				values[name] = value
+			}
+			tt.mutate(values)
+			if _, err := load(values); err == nil {
+				t.Fatal("invalid speech canary config unexpectedly passed")
 			}
 		})
 	}

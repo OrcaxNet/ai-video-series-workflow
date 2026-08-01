@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,13 +20,26 @@ import (
 )
 
 const (
-	AgentPlanTTSResourceID = "seed-tts-2.0"
-	AgentPlanTTSModelID    = "doubao-seed-tts-2.0"
-	AgentPlanTTSEndpoint   = runtimeconfig.AgentPlanTTSEndpoint
-	AgentPlanTTSMaxChars   = 600
-	ttsAFPMilliPerChar     = 135
-	defaultMaxSpeechBytes  = 32 << 20
+	AgentPlanTTSResourceID   = "seed-tts-2.0"
+	AgentPlanTTSModelID      = "doubao-seed-tts-2.0"
+	AgentPlanTTSEndpoint     = runtimeconfig.AgentPlanTTSEndpoint
+	AgentPlanTTSRouteVersion = "agent-plan-large-tts-v2"
+	AgentPlanTTSMaxChars     = 600
+	ttsAFPMilliPerChar       = 135
+	defaultMaxSpeechBytes    = 32 << 20
 )
+
+// AgentPlanTTSCapabilityHash binds the public route identity, including the
+// exact Plan endpoint and speaker. It intentionally excludes credentials.
+func AgentPlanTTSCapabilityHash(config runtimeconfig.VolcengineProvider) string {
+	material := strings.Join([]string{
+		config.ProviderID, config.Region, AgentPlanTTSEndpoint,
+		AgentPlanTTSResourceID, config.SpeechModel, config.PlanName,
+		config.PricingVersion, config.SpeechSpeaker,
+	}, "\x00")
+	digest := sha256.Sum256([]byte(material))
+	return hex.EncodeToString(digest[:])
+}
 
 // SpeechSynthesisResult is the secret-free result of one Agent Plan TTS call.
 // RequestID, ConnectID, and LogID are all retained so manifests can be audited
@@ -164,8 +179,15 @@ func (p *AgentPlanTTS) Synthesize(
 		decoder := json.NewDecoder(io.LimitReader(response.Body, 64<<10))
 		decoder.UseNumber()
 		_ = decoder.Decode(&errorFrame)
+		providerCode := ttsProviderCode(
+			response.Header.Get("X-Api-Status-Code"), errorFrame["code"],
+		)
+		message := response.Header.Get("X-Api-Message")
+		if strings.TrimSpace(message) == "" {
+			message = fmt.Sprint(errorFrame["message"])
+		}
 		return result, mapTTSError(
-			response.StatusCode, fmt.Sprint(int64Value(errorFrame["code"])), result.LogID,
+			response.StatusCode, providerCode, classifyTTSAPIMessage(message),
 		)
 	}
 
@@ -185,7 +207,10 @@ func (p *AgentPlanTTS) Synthesize(
 		}
 		code := int64Value(frame["code"])
 		if code != 0 && code != 20_000_000 {
-			return result, mapTTSError(response.StatusCode, fmt.Sprint(code), result.LogID)
+			return result, mapTTSError(
+				response.StatusCode, fmt.Sprint(code),
+				classifyTTSAPIMessage(fmt.Sprint(frame["message"])),
+			)
 		}
 		if audio, _ := frame["data"].(string); audio != "" {
 			chunk, err := base64.StdEncoding.DecodeString(audio)
@@ -286,24 +311,92 @@ func int64Value(value any) int64 {
 	}
 }
 
-func mapTTSError(status int, providerCode, _ string) error {
+func mapTTSError(status int, providerCode, messageClass string) error {
+	providerError := func(
+		code providercontract.ErrorCode,
+		message string,
+		retryable bool,
+	) error {
+		return &providercontract.Error{
+			Code: code, HTTPStatus: status, ProviderCode: providerCode,
+			ProviderMessageClass: messageClass,
+			Retryable:            retryable, SafeMessage: message,
+			RequiresAction:  !retryable,
+			SuggestedAction: "inspect the sanitized TTS status before authorizing another job",
+		}
+	}
 	if status == http.StatusUnauthorized {
-		return safeError(providercontract.CodeUnauthenticated, "Agent Plan TTS authentication failed", false)
+		return providerError(providercontract.CodeUnauthenticated, "Agent Plan TTS authentication failed", false)
 	}
 	if status == http.StatusForbidden {
-		return safeError(providercontract.CodeForbidden, "Agent Plan TTS access is forbidden", false)
-	}
-	if status == http.StatusTooManyRequests {
-		return safeError(providercontract.CodeQuotaExceeded, "Agent Plan TTS quota is unavailable", false)
-	}
-	if status == http.StatusBadRequest || status == http.StatusUnprocessableEntity {
-		return safeError(providercontract.CodeInvalidRequest, "Agent Plan TTS rejected the request contract", false)
+		return providerError(providercontract.CodeForbidden, "Agent Plan TTS access is forbidden", false)
 	}
 	if strings.HasPrefix(providerCode, "45") {
-		return safeError(providercontract.CodeInvalidRequest, "Agent Plan TTS rejected the request contract", false)
+		return providerError(providercontract.CodeInvalidRequest, "Agent Plan TTS rejected the request contract", false)
+	}
+	if providerCode == "55000000" {
+		return providerError(providercontract.CodeModelUnavailable, "Agent Plan TTS resource or speaker is unavailable", false)
 	}
 	if strings.HasPrefix(providerCode, "55") {
-		return safeError(providercontract.CodeModelUnavailable, "Agent Plan TTS resource and speaker are incompatible", false)
+		return providerError(providercontract.CodeUnavailable, "Agent Plan TTS returned an unclassified 55-series status", false)
 	}
-	return safeError(providercontract.CodeUnavailable, "Agent Plan TTS is unavailable", status >= 500 || status == 0)
+	if status == http.StatusTooManyRequests {
+		return providerError(providercontract.CodeQuotaExceeded, "Agent Plan TTS quota is unavailable", false)
+	}
+	if status == http.StatusBadRequest || status == http.StatusUnprocessableEntity {
+		return providerError(providercontract.CodeInvalidRequest, "Agent Plan TTS rejected the request contract", false)
+	}
+	return providerError(providercontract.CodeUnavailable, "Agent Plan TTS is unavailable", status >= 500 || status == 0)
+}
+
+func ttsProviderCode(header string, body any) string {
+	for _, candidate := range []string{strings.TrimSpace(header), strings.TrimSpace(fmt.Sprint(body))} {
+		if candidate == "" || candidate == "<nil>" || candidate == "0" {
+			continue
+		}
+		valid := true
+		for _, character := range candidate {
+			if character < '0' || character > '9' {
+				valid = false
+				break
+			}
+		}
+		if valid && len(candidate) <= 32 {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func classifyTTSAPIMessage(message string) string {
+	lower := strings.ToLower(strings.TrimSpace(message))
+	if lower == "" || lower == "<nil>" {
+		return "not_returned"
+	}
+	containsAny := func(values ...string) bool {
+		for _, value := range values {
+			if strings.Contains(lower, value) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case containsAny("unauth", "authentication", "token", "api key", "鉴权", "认证"):
+		return "authentication"
+	case containsAny("forbidden", "permission", "denied", "权限"):
+		return "authorization"
+	case containsAny("quota", "limit", "额度", "配额"):
+		return "quota"
+	case containsAny("speaker", "voice", "音色", "声音"):
+		return "speaker"
+	case containsAny("resource", "model", "资源", "模型"):
+		return "resource_or_model"
+	case containsAny("parameter", "request", "invalid", "参数", "请求"):
+		return "request_contract"
+	case containsAny("content", "sensitive", "risk", "文本", "内容", "敏感"):
+		return "content_policy"
+	default:
+		return "unclassified"
+	}
 }
