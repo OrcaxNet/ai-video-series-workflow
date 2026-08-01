@@ -225,6 +225,95 @@ func TestEpisodeProductionWorkflow_FinalizesBeforeGate3(t *testing.T) {
 	}
 }
 
+func TestStage1FinalizationWorkflow_FinalizesThenCreatesGate3(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	manifestHash := strings.Repeat("b", 64)
+	var calls []string
+	env.RegisterActivityWithOptions(
+		func(_ context.Context, input FinalizeEpisodeInput) (postproduction.Result, error) {
+			calls = append(calls, "finalize")
+			return postproduction.Result{
+				SchemaVersion:     postproduction.SchemaVersion,
+				Evidence:          postproduction.EvidenceLive,
+				EpisodeRevisionID: input.EpisodeRevisionID,
+				ManifestHash:      manifestHash,
+			}, nil
+		},
+		activity.RegisterOptions{Name: ActivityFinalizeEpisode},
+	)
+	env.RegisterActivityWithOptions(
+		func(_ context.Context, input CreateGate3Input) error {
+			calls = append(calls, "gate3")
+			if input.PostProductionManifestHash != manifestHash ||
+				input.GenerationPlanID != "plan-stage1" || !input.PersistProductTruth ||
+				len(input.RunIDs) != 2 || input.RunIDs[0] != "run-1" || input.RunIDs[1] != "run-2" {
+				return fmt.Errorf("unexpected G3 input: %#v", input)
+			}
+			return nil
+		},
+		activity.RegisterOptions{Name: ActivityCreateGate3},
+	)
+
+	env.ExecuteWorkflow(Stage1FinalizationWorkflow, stage1FinalizationTestInput())
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow error = %v", err)
+	}
+	var result Stage1FinalizationResult
+	if err := env.GetWorkflowResult(&result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Gate3Created || result.PostProduction.ManifestHash != manifestHash {
+		t.Fatalf("result = %#v", result)
+	}
+	if got := strings.Join(calls, ","); got != "finalize,gate3" {
+		t.Fatalf("activity order = %q", got)
+	}
+}
+
+func TestStage1FinalizationWorkflow_DoesNotCreateGate3WhenFinalizationFails(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	var gateCalls int
+	env.RegisterActivityWithOptions(
+		func(context.Context, FinalizeEpisodeInput) (postproduction.Result, error) {
+			return postproduction.Result{}, fmt.Errorf("speech submission failed")
+		},
+		activity.RegisterOptions{Name: ActivityFinalizeEpisode},
+	)
+	env.RegisterActivityWithOptions(
+		func(context.Context, CreateGate3Input) error {
+			gateCalls++
+			return nil
+		},
+		activity.RegisterOptions{Name: ActivityCreateGate3},
+	)
+
+	env.ExecuteWorkflow(Stage1FinalizationWorkflow, stage1FinalizationTestInput())
+	if env.GetWorkflowError() == nil {
+		t.Fatal("workflow error = nil")
+	}
+	if gateCalls != 0 {
+		t.Fatalf("G3 calls = %d, want 0", gateCalls)
+	}
+}
+
+func stage1FinalizationTestInput() FinalizeEpisodeInput {
+	return FinalizeEpisodeInput{
+		EpisodeRevisionID:   "episode-stage1",
+		RunIDs:              []string{"run-1", "run-2"},
+		GenerationPlanID:    "plan-stage1",
+		TraceID:             "trace-stage1-finalization",
+		PersistProductTruth: true,
+		Config: PostProductionConfig{
+			Enabled: true, Evidence: postproduction.EvidenceLive,
+			SpeechRoute: testSpeechRoute(), SpeechProviderProfileID: "speech-profile",
+			SpeechBudgetApprovalID: "speech-budget", SpeechBudgetMaximumMicros: 100,
+			SpeechBudgetCurrency: "CNY", SubtitleLanguage: "zh-CN", BurnSubtitles: true,
+		},
+	}
+}
+
 func registerHappyPathActivities(env *testsuite.TestWorkflowEnvironment) {
 	env.RegisterActivityWithOptions(func(context.Context, EpisodeProductionInput) error {
 		return nil

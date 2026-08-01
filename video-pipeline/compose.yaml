@@ -204,6 +204,9 @@ services:
       VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
       VIDEO_POSTGRES_DSN: postgres://${VIDEO_POSTGRES_USER:-video}:${VIDEO_POSTGRES_PASSWORD:-video-local-only}@postgres:5432/${VIDEO_POSTGRES_DATABASE:-video_pipeline}?sslmode=disable
+      VIDEO_TEMPORAL_ADDRESS: temporal:7233
+      VIDEO_TEMPORAL_NAMESPACE: ${VIDEO_TEMPORAL_NAMESPACE:-default}
+      VIDEO_TEMPORAL_TASK_QUEUE: ${VIDEO_TEMPORAL_TASK_QUEUE:-video-production-v1}
     volumes:
       - video-artifacts:/var/lib/video-pipeline/artifacts
       - ./config/flo104-stage1-readiness.json:/etc/video-pipeline/flo104-stage1-plan.json:ro

@@ -16,9 +16,12 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
+	enumspb "go.temporal.io/api/enums/v1"
+	temporalclient "go.temporal.io/sdk/client"
 )
 
 func main() {
@@ -34,9 +37,9 @@ func run(
 	output io.Writer,
 	lookup func(string) (string, bool),
 ) error {
-	if len(args) != 1 || args[0] != "submit" && args[0] != "retry" &&
-		args[0] != "complete" && args[0] != "finalize-input" {
-		return errors.New("usage: video-stage1-runner <submit|retry|complete|finalize-input> < invocation.json")
+	if len(args) != 1 || args[0] != "submit" && args[0] != "retry" && args[0] != "poll" &&
+		args[0] != "complete" && args[0] != "finalize-input" && args[0] != "finalize" {
+		return errors.New("usage: video-stage1-runner <submit|retry|poll|complete|finalize-input|finalize> < invocation.json")
 	}
 	planPath, err := requiredEnv(lookup, "VIDEO_STAGE1_PLAN_PATH")
 	if err != nil {
@@ -157,6 +160,12 @@ func run(
 			return fmt.Errorf("decode stage 1 controlled retry invocation: %w", err)
 		}
 		result, err = runner.SubmitControlledRetry(ctx, request)
+	case "poll":
+		var request stage1.PollInput
+		if err := decodeOne(input, &request); err != nil {
+			return fmt.Errorf("decode stage 1 poll invocation: %w", err)
+		}
+		result, err = runner.Poll(ctx, request)
 	case "complete":
 		var request stage1.CompleteInput
 		if err := decodeOne(input, &request); err != nil {
@@ -168,6 +177,48 @@ func run(
 			return err
 		}
 		result, err = runner.FinalizationInput()
+	case "finalize":
+		if err := requireEmptyInput(input); err != nil {
+			return err
+		}
+		finalizationInput, inputErr := runner.FinalizationInput()
+		if inputErr != nil {
+			return inputErr
+		}
+		temporalAddress, envErr := requiredEnv(lookup, "VIDEO_TEMPORAL_ADDRESS")
+		if envErr != nil {
+			return envErr
+		}
+		temporalNamespace, envErr := requiredEnv(lookup, "VIDEO_TEMPORAL_NAMESPACE")
+		if envErr != nil {
+			return envErr
+		}
+		temporalTaskQueue, envErr := requiredEnv(lookup, "VIDEO_TEMPORAL_TASK_QUEUE")
+		if envErr != nil {
+			return envErr
+		}
+		temporalClient, dialErr := temporalclient.Dial(temporalclient.Options{
+			HostPort: temporalAddress, Namespace: temporalNamespace,
+		})
+		if dialErr != nil {
+			return fmt.Errorf("connect to Stage 1 finalization Temporal: %w", dialErr)
+		}
+		defer temporalClient.Close()
+		workflowID := "stage1-finalization-" + executionPackage.BatchID + "-" + executionPackage.ContentHash[:16]
+		workflowRun, startErr := temporalClient.ExecuteWorkflow(ctx, temporalclient.StartWorkflowOptions{
+			ID:                       workflowID,
+			TaskQueue:                temporalTaskQueue,
+			WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+			WorkflowIDReusePolicy:    enumspb.WORKFLOW_ID_REUSE_POLICY_REJECT_DUPLICATE,
+		}, orchestration.Stage1FinalizationWorkflowName, finalizationInput)
+		if startErr != nil {
+			return fmt.Errorf("start or recover Stage 1 finalization workflow: %w", startErr)
+		}
+		var finalization orchestration.Stage1FinalizationResult
+		if getErr := workflowRun.Get(ctx, &finalization); getErr != nil {
+			return fmt.Errorf("await Stage 1 finalization workflow: %w", getErr)
+		}
+		result = finalization
 	}
 	if err != nil {
 		return err

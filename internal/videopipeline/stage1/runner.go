@@ -22,6 +22,12 @@ type SubmitInput struct {
 	ShotID string `json:"shotId"`
 }
 
+// PollInput selects an already-prepared immutable attempt. It cannot create a
+// provider job or modify the Stage 1 ledger.
+type PollInput struct {
+	IdempotencyKey string `json:"idempotencyKey"`
+}
+
 // ProductTruthPreparer is the PostgreSQL boundary that resolves exact prompt
 // lineage and commits the durable paid-attempt identity before any Provider
 // POST. Both methods are revalidated for every new formal submit.
@@ -138,6 +144,44 @@ func (r *Runner) Submit(ctx context.Context, input SubmitInput) (SubmitResult, e
 		return SubmitResult{}, providerError(providercontract.CodeForbidden, "shot is outside the frozen stage 1 execution package")
 	}
 	return r.submitFrozen(ctx, frozen, nil)
+}
+
+// Poll advances and returns the authenticated Adapter view for an attempt that
+// is already present in the immutable package and durable Stage 1 ledger. This
+// gives operators a read-only terminal check before supplying independent AFP
+// evidence to Complete; using Complete as a poll could accidentally freeze an
+// evidence-incomplete terminal result.
+func (r *Runner) Poll(ctx context.Context, input PollInput) (providercontract.JobResponse, error) {
+	key := strings.TrimSpace(input.IdempotencyKey)
+	if key == "" {
+		return providercontract.JobResponse{}, providerError(
+			providercontract.CodeInvalidRequest, "stage 1 poll identity is required",
+		)
+	}
+	if _, ok := r.jobByIdempotencyKey(key); !ok {
+		return providercontract.JobResponse{}, providerError(
+			providercontract.CodeForbidden, "poll is outside the frozen stage 1 execution package",
+		)
+	}
+	ledger, err := r.gate.Snapshot()
+	if err != nil {
+		return providercontract.JobResponse{}, err
+	}
+	if ledger.Records[key] == nil {
+		return providercontract.JobResponse{}, providerError(
+			providercontract.CodeForbidden, "stage 1 attempt must be prepared before polling",
+		)
+	}
+	response, err := r.adapter.Lookup(ctx, key)
+	if err != nil {
+		return providercontract.JobResponse{}, err
+	}
+	if response.JobID != key {
+		return providercontract.JobResponse{}, providerError(
+			providercontract.CodeConflict, "polled provider job does not match the immutable attempt",
+		)
+	}
+	return response, nil
 }
 
 // SubmitControlledRetry is the only production path to the approved +1. The

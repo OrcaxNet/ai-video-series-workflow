@@ -276,6 +276,45 @@ func TestRunnerIsTheGatedSubmitAndImmutableCompletionPath(t *testing.T) {
 	}
 }
 
+func TestRunnerPollIsReadOnlyAndRequiresPreparedFrozenAttempt(t *testing.T) {
+	t.Parallel()
+	digest := strings.Repeat("a", 64)
+	fixture := &runnerAdapterFixture{job: successfulRunnerJob(digest)}
+	server := httptest.NewServer(http.HandlerFunc(fixture.handler))
+	defer server.Close()
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	runner := newTestRunner(t, path, server, digest)
+	key := testFrozenJob(1).IdempotencyKey
+
+	if _, err := runner.Poll(t.Context(), PollInput{IdempotencyKey: key}); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+		t.Fatalf("poll before prepare error = %v", err)
+	}
+	if gets, posts := fixture.counts(); gets != 0 || posts != 0 {
+		t.Fatalf("adapter calls before prepare = GET %d POST %d", gets, posts)
+	}
+	if _, err := runner.Submit(t.Context(), SubmitInput{ShotID: "shot-01"}); err != nil {
+		t.Fatal(err)
+	}
+	response, err := runner.Poll(t.Context(), PollInput{IdempotencyKey: key})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.State != providercontract.StatusSucceeded || response.JobID != key {
+		t.Fatalf("poll response = %#v", response)
+	}
+	if _, posts := fixture.counts(); posts != 1 {
+		t.Fatalf("provider POSTs after repeated GET = %d, want 1", posts)
+	}
+	ledger := readTestLedger(t, path)
+	if record := ledger.Records[key]; record == nil || record.State != "PREPARED" ||
+		ledger.NextTerminalSequence != 0 {
+		t.Fatalf("poll mutated ledger = %#v", ledger)
+	}
+	if _, err := runner.Poll(t.Context(), PollInput{IdempotencyKey: "provider-job-outside"}); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+		t.Fatalf("outside poll error = %v", err)
+	}
+}
+
 func TestRunnerRejectsBeforeSubmitAndFreezesIncompleteEvidence(t *testing.T) {
 	t.Parallel()
 	digest := strings.Repeat("a", 64)

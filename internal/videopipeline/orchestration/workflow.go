@@ -15,12 +15,13 @@ import (
 )
 
 const (
-	WorkflowName        = "video.production.episode.v1"
-	DefaultTaskQueue    = "video-production-v1"
-	Gate3DecisionSignal = "video.production.gate3-decision.v1"
-	ShotDecisionSignal  = "video.production.shot-decision.v1"
-	ControlSignal       = "video.production.control.v1"
-	StatusQuery         = "video.production.status.v1"
+	WorkflowName                   = "video.production.episode.v1"
+	Stage1FinalizationWorkflowName = "video.production.stage1-finalization.v1"
+	DefaultTaskQueue               = "video-production-v1"
+	Gate3DecisionSignal            = "video.production.gate3-decision.v1"
+	ShotDecisionSignal             = "video.production.shot-decision.v1"
+	ControlSignal                  = "video.production.control.v1"
+	StatusQuery                    = "video.production.status.v1"
 
 	ActivityValidateBatch      = "video.activity.validate-batch.v1"
 	ActivityCompilePrompt      = "video.activity.compile-prompt.v1"
@@ -61,6 +62,15 @@ type EpisodeProductionResult struct {
 	PostProduction *postproduction.Result `json:"postProduction,omitempty"`
 	Gate3Decision  *Gate3Decision         `json:"gate3Decision,omitempty"`
 	Shots          map[string]ShotState   `json:"shots"`
+}
+
+// Stage1FinalizationResult is the durable result of the formal Stage 1
+// post-production-only workflow. Video submission remains exclusively owned by
+// video-stage1-runner; this workflow consumes only its evidence-gated immutable
+// FinalizeEpisodeInput and opens G3 after the committed post-production result.
+type Stage1FinalizationResult struct {
+	PostProduction postproduction.Result `json:"postProduction"`
+	Gate3Created   bool                  `json:"gate3Created"`
 }
 
 // ShotState is exposed through the workflow query handler.
@@ -186,6 +196,83 @@ func (c PostProductionConfig) Validate() error {
 		return errors.New("post-production subtitle language is required")
 	}
 	return nil
+}
+
+// Stage1FinalizationWorkflow completes the already-generated formal Stage 1
+// batch without recompiling prompts, creating Runs, or submitting video jobs.
+// The caller cannot select Runs: video-stage1-runner derives this input from its
+// immutable execution package and evidence-complete terminal ledger.
+func Stage1FinalizationWorkflow(
+	ctx workflow.Context,
+	input FinalizeEpisodeInput,
+) (Stage1FinalizationResult, error) {
+	if input.EpisodeRevisionID == "" || len(input.RunIDs) == 0 ||
+		input.GenerationPlanID == "" || input.TraceID == "" || !input.PersistProductTruth {
+		err := errors.New("formal Stage 1 finalization requires persisted episode, Run, Plan, and trace identity")
+		return Stage1FinalizationResult{}, temporal.NewNonRetryableApplicationError(
+			err.Error(), "VALIDATION_ERROR", err,
+		)
+	}
+	if err := input.Config.Validate(); err != nil {
+		return Stage1FinalizationResult{}, temporal.NewNonRetryableApplicationError(
+			err.Error(), "VALIDATION_ERROR", err,
+		)
+	}
+	if !input.Config.Enabled || input.Config.Evidence != postproduction.EvidenceLive {
+		err := errors.New("formal Stage 1 finalization requires live post-production evidence")
+		return Stage1FinalizationResult{}, temporal.NewNonRetryableApplicationError(
+			err.Error(), "VALIDATION_ERROR", err,
+		)
+	}
+
+	options := workflow.ActivityOptions{
+		StartToCloseTimeout: 45 * time.Minute,
+		HeartbeatTimeout:    30 * time.Second,
+		WaitForCancellation: true,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Second,
+			BackoffCoefficient: 2,
+			MaximumInterval:    30 * time.Second,
+			MaximumAttempts:    3,
+			NonRetryableErrorTypes: []string{
+				"VALIDATION_ERROR", "LICENSE_BLOCKED", "CONSENT_REQUIRED",
+				string(providercontract.CodeBudgetExceeded),
+				string(providercontract.CodeUnauthenticated),
+				string(providercontract.CodeForbidden),
+				string(providercontract.CodeQuotaExceeded),
+				string(providercontract.CodeContentBlocked),
+				string(providercontract.CodeRegionUnavailable),
+				string(providercontract.CodeModelUnavailable),
+			},
+		},
+	}
+	var finalized postproduction.Result
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, options),
+		ActivityFinalizeEpisode,
+		input,
+	).Get(ctx, &finalized); err != nil {
+		return Stage1FinalizationResult{}, err
+	}
+
+	gateOptions := options
+	gateOptions.StartToCloseTimeout = 2 * time.Minute
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, gateOptions),
+		ActivityCreateGate3,
+		CreateGate3Input{
+			EpisodeRevisionID:             input.EpisodeRevisionID,
+			RunIDs:                        input.RunIDs,
+			GenerationPlanID:              input.GenerationPlanID,
+			PostProductionManifestHash:    finalized.ManifestHash,
+			BackgroundAudioAssetVersionID: input.Config.BackgroundAudioAssetVersionID,
+			TraceID:                       input.TraceID,
+			PersistProductTruth:           true,
+		},
+	).Get(ctx, nil); err != nil {
+		return Stage1FinalizationResult{}, err
+	}
+	return Stage1FinalizationResult{PostProduction: finalized, Gate3Created: true}, nil
 }
 
 // EpisodeProductionWorkflow runs a G2-approved production batch.

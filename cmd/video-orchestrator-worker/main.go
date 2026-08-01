@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"log"
+	"net/http"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
@@ -58,20 +59,21 @@ func main() {
 		orchestration.ShotReconciliationWorkflow,
 		workflow.RegisterOptions{Name: orchestration.ShotReconciliationWorkflowName},
 	)
+	temporalWorker.RegisterWorkflowWithOptions(
+		orchestration.Stage1FinalizationWorkflow,
+		workflow.RegisterOptions{Name: orchestration.Stage1FinalizationWorkflowName},
+	)
 	activities := orchestration.NewProductionActivities(cfg.ProviderAdapterURL, store, store, artifacts)
-	if cfg.ProviderServiceAuthSecret != "" {
-		authenticatedClient, err := volcengineprovider.AuthenticatedHTTPClient(
-			mockprovider.DefaultHTTPClient(),
-			cfg.ProviderServiceAuthSecret,
-		)
-		if err != nil {
-			log.Fatalf("configure video provider service authentication: %v", err)
-		}
-		activities.HTTPClient = authenticatedClient
+	providerClient, err := workerProviderHTTPClient(
+		mockprovider.DefaultHTTPClient(), cfg.ProviderServiceAuthSecret,
+	)
+	if err != nil {
+		log.Fatalf("configure provider service authentication: %v", err)
 	}
+	activities.HTTPClient = providerClient
 	speech, err := postproduction.NewHTTPSpeechProvider(
 		cfg.SpeechProviderAdapterURL,
-		mockprovider.DefaultHTTPClient(),
+		providerClient,
 	)
 	if err != nil {
 		log.Fatalf("configure speech provider adapter: %v", err)
@@ -101,4 +103,15 @@ func main() {
 	if err := temporalWorker.Run(worker.InterruptCh()); err != nil {
 		log.Fatalf("run video Temporal worker: %v", err)
 	}
+}
+
+// workerProviderHTTPClient returns the one adapter client shared by video
+// Activities and the post-production speech provider. A Live Adapter protects
+// submit, poll, and cancel uniformly, so using an unsigned speech client would
+// fail only after all paid Stage 1 videos had completed.
+func workerProviderHTTPClient(base *http.Client, serviceAuthSecret string) (*http.Client, error) {
+	if serviceAuthSecret == "" {
+		return base, nil
+	}
+	return volcengineprovider.AuthenticatedHTTPClient(base, serviceAuthSecret)
 }

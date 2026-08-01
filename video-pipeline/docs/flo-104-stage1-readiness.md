@@ -144,6 +144,9 @@ docker compose --env-file video-pipeline/.env.video -f video-pipeline/compose.ya
   --profile live --profile stage1 run --build --rm -T stage1-runner submit \
   < approved-shot-selection.json
 docker compose --env-file video-pipeline/.env.video -f video-pipeline/compose.yaml \
+  --profile live --profile stage1 run --rm -T stage1-runner poll \
+  < approved-poll-selection.json
+docker compose --env-file video-pipeline/.env.video -f video-pipeline/compose.yaml \
   --profile live --profile stage1 run --rm -T stage1-runner complete \
   < approved-completion.json
 VIDEO_STAGE1_RETRY_PACKAGE_PATH=/var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-retry-package.json \
@@ -153,13 +156,36 @@ docker compose --env-file video-pipeline/.env.video -f video-pipeline/compose.ya
 VIDEO_STAGE1_RETRY_PACKAGE_PATH=/var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-retry-package.json \
 docker compose --env-file video-pipeline/.env.video -f video-pipeline/compose.yaml \
   --profile live --profile stage1 run --rm -T stage1-runner finalize-input
+docker compose --env-file video-pipeline/.env.video -f video-pipeline/compose.yaml \
+  --profile live --profile stage1 run --rm -T stage1-runner finalize </dev/null
 ```
 
-`complete` 的 AFP 增量必须来自本次 job 的独立套餐用量证据；video tokens、现金、task/
+`finalize` 与 submit 使用相同冻结包和 ledger；只有十个主 Run（或唯一受控重试替换）
+均为证据完整的成功终态后，才以绑定 package hash 的稳定 Workflow ID 启动或恢复
+`video.production.stage1-finalization.v1`。该 Workflow 只执行 `FinalizeEpisode → CreateGate3`，
+不会重新编译 Prompt、创建 Run 或提交视频 job。Live Worker 的视频与 TTS 客户端共享同一
+短期签名服务认证，submit/poll/cancel 均不能绕过 Adapter 信任边界。
+
+`poll` 只接受已进入冻结 ledger 的 idempotency key，只执行带服务认证的 Adapter GET，
+不会创建 Provider job 或写 terminal ledger。确认 Adapter 已返回终态并取得独立套餐增量后
+才调用 `complete`。`complete` 的 AFP 增量必须来自本次 job 的独立套餐用量证据；video tokens、现金、task/
 request ID、内容安全分类和 artifact 不接受 stdin 覆盖，只从已认证 Adapter 回读。现有
 通用 Temporal worker 不属于本批正式提交入口，不能替代上述 runner。TTS 则仍由后期
 worker 的 `VIDEO_SPEECH_PROVIDER_ADAPTER_URL` 显式指向内部 Live Adapter；默认值保持
 Mock。
+
+调用 `finalize` 前必须以同一个内存注入的 service-auth secret 启动 Live Adapter 与
+后期 Worker，并显式选择内部 TTS 路由；不得把 Adapter 的 8091 端口发布到宿主机：
+
+```bash
+VIDEO_SPEECH_PROVIDER_ADAPTER_URL=http://volcengine-provider:8091 \
+docker compose --env-file video-pipeline/.env.video -f video-pipeline/compose.yaml \
+  --profile live up --build --wait \
+  postgres migrate temporal volcengine-provider orchestrator-worker
+```
+
+未设置该路由时 Worker 保持 Mock，Live `FinalizeEpisode` 会因冻结 route/证据不匹配
+失败关闭，不会把 Mock 结果提升为正式证据。
 
 回滚只需停止阶段 1 runner 并恢复上一镜像。无数据库迁移；本轮复用既有 PostgreSQL
 Run/Prompt/Plan/approval/reservation/provider_job 表，v1/v2 readiness ledger 不会被
