@@ -12,6 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	_ "image/jpeg"
+	_ "image/png"
 	"io"
 	"mime"
 	"net/http"
@@ -355,11 +358,18 @@ func (s *Server) resolveProviderAssets(
 	resolved := request
 	resolved.Assets = make([]providercontract.AssetRef, 0, len(request.Assets))
 	for _, asset := range request.Assets {
-		if asset.MediaType == "audio/x-voice-profile+json" {
-			continue
+		mediaType, _, err := mime.ParseMediaType(asset.MediaType)
+		if err != nil {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeInvalidRequest, SafeMessage: "provider input asset has an invalid media type",
+			}
 		}
-		if !strings.HasPrefix(asset.URI, "cas://sha256/") {
-			resolved.Assets = append(resolved.Assets, asset)
+		if mediaType == "audio/x-voice-profile+json" {
+			if asset.Kind != providercontract.ModalityAudio || asset.Role != providercontract.AssetRoleReferenceAudio {
+				return providercontract.GenerationRequest{}, &providercontract.Error{
+					Code: providercontract.CodeInvalidRequest, SafeMessage: "provider voice descriptor has an invalid kind or role",
+				}
+			}
 			continue
 		}
 		if asset.URI != "cas://sha256/"+asset.SHA256 {
@@ -367,8 +377,7 @@ func (s *Server) resolveProviderAssets(
 				Code: providercontract.CodeConflict, SafeMessage: "provider input CAS identity does not match its immutable digest",
 			}
 		}
-		mediaType, _, err := mime.ParseMediaType(asset.MediaType)
-		if err != nil || !providerInputMediaType(mediaType, asset.Kind) {
+		if !providerInputMediaType(mediaType, asset.Kind, asset.Role) {
 			return providercontract.GenerationRequest{}, &providercontract.Error{
 				Code: providercontract.CodeInvalidRequest, SafeMessage: "provider input CAS object has an unsupported media type",
 			}
@@ -391,11 +400,19 @@ func (s *Server) resolveProviderAssets(
 				Code: providercontract.CodeInvalidRequest, SafeMessage: "provider input CAS object exceeds the supported size",
 			}
 		}
+		if asset.SizeBytes <= 0 || asset.SizeBytes != int64(len(content)) {
+			return providercontract.GenerationRequest{}, &providercontract.Error{
+				Code: providercontract.CodeConflict, SafeMessage: "provider input CAS object size differs from its frozen metadata",
+			}
+		}
 		digest := sha256.Sum256(content)
 		if hex.EncodeToString(digest[:]) != asset.SHA256 {
 			return providercontract.GenerationRequest{}, &providercontract.Error{
 				Code: providercontract.CodeConflict, SafeMessage: "provider input CAS object failed its immutable digest check",
 			}
+		}
+		if err := validateProviderInputMedia(content, mediaType); err != nil {
+			return providercontract.GenerationRequest{}, err
 		}
 		asset.URI = "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(content)
 		resolved.Assets = append(resolved.Assets, asset)
@@ -403,17 +420,42 @@ func (s *Server) resolveProviderAssets(
 	return resolved, nil
 }
 
-func providerInputMediaType(mediaType string, kind providercontract.Modality) bool {
-	switch kind {
-	case providercontract.ModalityImage:
-		return strings.HasPrefix(mediaType, "image/")
-	case providercontract.ModalityVideo:
-		return strings.HasPrefix(mediaType, "video/")
-	case providercontract.ModalityAudio:
-		return strings.HasPrefix(mediaType, "audio/")
-	default:
+func providerInputMediaType(
+	mediaType string,
+	kind providercontract.Modality,
+	role providercontract.AssetRole,
+) bool {
+	if kind != providercontract.ModalityImage {
 		return false
 	}
+	if role != providercontract.AssetRoleReferenceImage &&
+		role != providercontract.AssetRoleFirstFrame &&
+		role != providercontract.AssetRoleLastFrame {
+		return false
+	}
+	return mediaType == "image/png" || mediaType == "image/jpeg"
+}
+
+func validateProviderInputMedia(content []byte, declaredMediaType string) error {
+	_, format, err := image.DecodeConfig(bytes.NewReader(content))
+	if err != nil {
+		return &providercontract.Error{
+			Code: providercontract.CodeInvalidRequest, SafeMessage: "provider input CAS object is not a decodable supported image",
+		}
+	}
+	actualMediaType := ""
+	switch format {
+	case "png":
+		actualMediaType = "image/png"
+	case "jpeg":
+		actualMediaType = "image/jpeg"
+	}
+	if actualMediaType == "" || actualMediaType != declaredMediaType {
+		return &providercontract.Error{
+			Code: providercontract.CodeConflict, SafeMessage: "provider input CAS object media bytes differ from its frozen metadata",
+		}
+	}
+	return nil
 }
 
 func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {

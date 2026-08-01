@@ -9,9 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -89,7 +93,7 @@ func TestServer_ResolvesCASVisualInputAndOmitsVoiceDescriptorBeforeSubmit(t *tes
 	server := httptest.NewServer(adapter.Handler())
 	defer server.Close()
 
-	imageBytes := []byte("immutable-reference-image")
+	imageBytes := testPNG(t)
 	image, err := store.Put(t.Context(), bytes.NewReader(imageBytes))
 	if err != nil {
 		t.Fatal(err)
@@ -135,6 +139,142 @@ func TestServer_ResolvesCASVisualInputAndOmitsVoiceDescriptorBeforeSubmit(t *tes
 	if submits, _, _ := provider.counts(); submits != 1 {
 		t.Fatalf("upstream submits = %d, want one", submits)
 	}
+}
+
+func TestServer_RejectsInvalidProviderAssetsBeforeUpstreamSubmit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		asset func(*testing.T, *artifactstore.Store) providercontract.AssetRef
+	}{
+		{
+			name: "non-CAS URI",
+			asset: func(_ *testing.T, _ *artifactstore.Store) providercontract.AssetRef {
+				return providercontract.AssetRef{
+					ID: "visual-asset", Revision: "visual-version", Kind: providercontract.ModalityImage,
+					Role: providercontract.AssetRoleReferenceImage, URI: "https://invalid.example/reference.png",
+					SHA256: strings.Repeat("a", 64), LicenseReference: "license:visual",
+					MediaType: "image/png", SizeBytes: 123,
+				}
+			},
+		},
+		{
+			name: "declared size mismatch",
+			asset: func(t *testing.T, store *artifactstore.Store) providercontract.AssetRef {
+				object, err := store.Put(t.Context(), bytes.NewReader(testPNG(t)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return providercontract.AssetRef{
+					ID: "visual-asset", Revision: "visual-version", Kind: providercontract.ModalityImage,
+					Role: providercontract.AssetRoleReferenceImage, URI: object.URI, SHA256: object.Digest,
+					LicenseReference: "license:visual", MediaType: "image/png", SizeBytes: object.Size + 1,
+				}
+			},
+		},
+		{
+			name: "CAS URI digest mismatch",
+			asset: func(t *testing.T, store *artifactstore.Store) providercontract.AssetRef {
+				object, err := store.Put(t.Context(), bytes.NewReader(testPNG(t)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return providercontract.AssetRef{
+					ID: "visual-asset", Revision: "visual-version", Kind: providercontract.ModalityImage,
+					Role: providercontract.AssetRoleReferenceImage, URI: object.URI,
+					SHA256: strings.Repeat("b", 64), LicenseReference: "license:visual",
+					MediaType: "image/png", SizeBytes: object.Size,
+				}
+			},
+		},
+		{
+			name: "CAS bytes changed after commit",
+			asset: func(t *testing.T, store *artifactstore.Store) providercontract.AssetRef {
+				object, err := store.Put(t.Context(), bytes.NewReader(testPNG(t)))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(object.Path, 0o640); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(object.Path, bytes.Repeat([]byte{0}, int(object.Size)), 0o440); err != nil {
+					t.Fatal(err)
+				}
+				return providercontract.AssetRef{
+					ID: "visual-asset", Revision: "visual-version", Kind: providercontract.ModalityImage,
+					Role: providercontract.AssetRoleReferenceImage, URI: object.URI, SHA256: object.Digest,
+					LicenseReference: "license:visual", MediaType: "image/png", SizeBytes: object.Size,
+				}
+			},
+		},
+		{
+			name: "declared media does not match bytes",
+			asset: func(t *testing.T, store *artifactstore.Store) providercontract.AssetRef {
+				object, err := store.Put(t.Context(), strings.NewReader("this is not a PNG image"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				return providercontract.AssetRef{
+					ID: "visual-asset", Revision: "visual-version", Kind: providercontract.ModalityImage,
+					Role: providercontract.AssetRoleReferenceImage, URI: object.URI, SHA256: object.Digest,
+					LicenseReference: "license:visual", MediaType: "image/png", SizeBytes: object.Size,
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			provider := &fakeProvider{}
+			adapter, store := testAdapter(t, provider, fixedInspector{})
+			server := httptest.NewServer(adapter.Handler())
+			defer server.Close()
+
+			request := testJobRequest(t)
+			request.Request.Assets = []providercontract.AssetRef{test.asset(t, store)}
+			body, err := json.Marshal(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			httpRequest, err := http.NewRequest(http.MethodPost, server.URL+"/v1/jobs", bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			httpRequest.Header.Set("Content-Type", "application/json")
+			httpRequest.Header.Set("Idempotency-Key", request.JobID)
+			response, err := authenticatedTestClient(t).Do(httpRequest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer response.Body.Close()
+			if response.StatusCode >= 200 && response.StatusCode < 300 {
+				encoded, _ := io.ReadAll(response.Body)
+				t.Fatalf("invalid asset accepted: HTTP %d: %s", response.StatusCode, encoded)
+			}
+			if submits, _, _ := provider.counts(); submits != 0 {
+				t.Fatalf("invalid asset reached upstream: submits=%d", submits)
+			}
+			entries, err := os.ReadDir(adapter.stateDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("invalid asset left %d adapter job record(s)", len(entries))
+			}
+		})
+	}
+}
+
+func testPNG(t *testing.T) []byte {
+	t.Helper()
+	imageData := image.NewRGBA(image.Rect(0, 0, 2, 2))
+	imageData.Set(0, 0, color.RGBA{R: 0xff, A: 0xff})
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, imageData); err != nil {
+		t.Fatal(err)
+	}
+	return encoded.Bytes()
 }
 
 func TestServer_MissingCASInputFailsBeforeUpstreamSubmit(t *testing.T) {
