@@ -591,6 +591,10 @@ type fakeAudioAnalyzer struct {
 
 func (f *fakeAudioAnalyzer) Analyze(_ context.Context, input AudioAnalysisRequest) (AudioAnalysis, error) {
 	f.calls++
+	lipExpectations, err := deriveLipSyncExpectations(input.Request)
+	if err != nil {
+		return AudioAnalysis{}, err
+	}
 	sources := []string{input.FinalMix.Digest, input.FinalVideo.Digest}
 	for _, mix := range input.NativeMixes {
 		sources = append(sources, mix.Digest)
@@ -601,16 +605,20 @@ func (f *fakeAudioAnalyzer) Analyze(_ context.Context, input AudioAnalysisReques
 	timings := make([]CueTimingMeasurement, 0, len(input.Request.Subtitle.Cues))
 	lip := make([]LipSyncMeasurement, 0, len(input.Request.Subtitle.Cues))
 	transcript := ""
-	for index, cue := range input.Request.Subtitle.Cues {
-		runID := input.Request.RunIDs[min(index, len(input.Request.RunIDs)-1)]
+	for _, cue := range input.Request.Subtitle.Cues {
+		expected := lipExpectations[cue.ID]
+		if f.lipOffsetMillis < 0 || f.lipOffsetMillis >= expected.EndMillis-expected.StartMillis {
+			return AudioAnalysis{}, errors.New("fixture lip-sync offset is outside the authoritative cue/run window")
+		}
 		timings = append(timings, CueTimingMeasurement{
 			CueID: cue.ID, SpeechStartMillis: cue.StartMillis, SpeechEndMillis: cue.EndMillis,
 		})
 		lip = append(lip, LipSyncMeasurement{
-			RunID: runID, CueID: cue.ID, Required: true,
-			AudioStartMillis: cue.StartMillis, AudioEndMillis: cue.EndMillis,
-			MouthStartMillis: cue.StartMillis + f.lipOffsetMillis,
-			MouthEndMillis:   cue.EndMillis + f.lipOffsetMillis,
+			RunID: expected.RunID, CueID: cue.ID, Required: expected.Required,
+			AudioStartMillis: expected.StartMillis,
+			AudioEndMillis:   expected.EndMillis - f.lipOffsetMillis,
+			MouthStartMillis: expected.StartMillis + f.lipOffsetMillis,
+			MouthEndMillis:   expected.EndMillis,
 		})
 		transcript += cue.Text
 	}

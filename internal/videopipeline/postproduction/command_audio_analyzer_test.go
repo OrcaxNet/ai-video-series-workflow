@@ -21,7 +21,7 @@ func TestCommandAudioAnalyzerBindsStrictOutputWithoutLeakingReferenceText(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	runner := &analyzerFixtureRunner{request: request}
+	runner := &analyzerFixtureRunner{}
 	analyzer := &CommandAudioAnalyzer{Program: "fixture-analyzer", Store: store, Runner: runner}
 	analysis, err := analyzer.Analyze(t.Context(), AudioAnalysisRequest{
 		Request: request, NativeMixes: rendered.NativeMixes,
@@ -37,14 +37,14 @@ func TestCommandAudioAnalyzerBindsStrictOutputWithoutLeakingReferenceText(t *tes
 		t.Fatal("analyzer command input leaked the reference subtitle text")
 	}
 	if !strings.Contains(string(runner.input), "contextSnapshotHash") ||
-		!strings.Contains(string(runner.input), "faster-whisper-large-v3-turbo") {
+		!strings.Contains(string(runner.input), "faster-whisper-large-v3-turbo") ||
+		!strings.Contains(string(runner.input), "lipSyncRunId") {
 		t.Fatal("analyzer command input omitted frozen context or ASR provenance")
 	}
 }
 
 type analyzerFixtureRunner struct {
-	request Request
-	input   []byte
+	input []byte
 }
 
 func (r *analyzerFixtureRunner) Run(
@@ -73,15 +73,14 @@ func (r *analyzerFixtureRunner) Run(
 		SourceHashes: sources, AudioVideoStartMillis: make([]int64, len(payload.RunWindows)),
 		IntegratedLUFS: -16, TruePeakDBTP: -1.2,
 	}
-	for index, cue := range payload.CueWindows {
+	for _, cue := range payload.CueWindows {
 		analysis.CueTimings = append(analysis.CueTimings, CueTimingMeasurement{
 			CueID: cue.CueID, SpeechStartMillis: cue.StartMillis, SpeechEndMillis: cue.EndMillis,
 		})
 		analysis.LipSync = append(analysis.LipSync, LipSyncMeasurement{
-			RunID: r.request.RunIDs[min(index, len(r.request.RunIDs)-1)],
-			CueID: cue.CueID, Required: true,
-			AudioStartMillis: cue.StartMillis, AudioEndMillis: cue.EndMillis,
-			MouthStartMillis: cue.StartMillis, MouthEndMillis: cue.EndMillis,
+			RunID: cue.LipSyncRunID, CueID: cue.CueID, Required: cue.LipSyncRequired,
+			AudioStartMillis: cue.LipSyncStartMillis, AudioEndMillis: cue.LipSyncEndMillis,
+			MouthStartMillis: cue.LipSyncStartMillis, MouthEndMillis: cue.LipSyncEndMillis,
 		})
 	}
 	encoded, err := json.Marshal(analysis)

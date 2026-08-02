@@ -45,7 +45,9 @@ ASR 配置，不提供参考字幕正文，避免 ASR
 
 G3 前必须满足：标准 CER ≤2%、字幕边界 p95 ≤250 ms、音画起点 p95 ≤120 ms、
 正面近景/特写是否需要口型由冻结的 `cinematography.lipSyncRequired` 明示，或由
-front/frontal + close-up/近景/特写组合推导；分析器不得自行把它降级为 `false`。门禁要求
+front/frontal + close-up/近景/特写组合推导；分析器不得自行把它降级为 `false`。
+按字幕 cue 与逐镜时间窗的最大唯一重叠冻结 cue→run，分析器输入携带该绑定与有效交集；
+跨 run 重绑、required cue 遗漏、重复 cue 或超出 cue/run 交集的时间戳均失败关闭。门禁要求
 口型 p95 ≤80 ms、连续环境声硬静音 ≤250 ms 且响度差 ≤1 LUFS、成片
 -16±1 LUFS、True Peak ≤-1 dBTP。口型失败返回精确 `blockedRunIds`，建议只重生成受影响
 镜头或使用已审批 audio-driven video；不会整集重新 TTS。

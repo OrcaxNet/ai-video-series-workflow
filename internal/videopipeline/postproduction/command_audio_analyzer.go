@@ -35,9 +35,13 @@ type analyzerMediaInput struct {
 }
 
 type analyzerCueWindow struct {
-	CueID       string `json:"cueId"`
-	StartMillis int64  `json:"startMillis"`
-	EndMillis   int64  `json:"endMillis"`
+	CueID              string `json:"cueId"`
+	StartMillis        int64  `json:"startMillis"`
+	EndMillis          int64  `json:"endMillis"`
+	LipSyncRunID       string `json:"lipSyncRunId"`
+	LipSyncStartMillis int64  `json:"lipSyncStartMillis"`
+	LipSyncEndMillis   int64  `json:"lipSyncEndMillis"`
+	LipSyncRequired    bool   `json:"lipSyncRequired"`
 }
 
 type analyzerRunWindow struct {
@@ -87,6 +91,10 @@ func (a *CommandAudioAnalyzer) Analyze(
 	if err := validateAnalyzerArtifacts(request); err != nil {
 		return AudioAnalysis{}, err
 	}
+	lipExpectations, err := deriveLipSyncExpectations(request.Request)
+	if err != nil {
+		return AudioAnalysis{}, fmt.Errorf("derive audio analyzer lip-sync bindings: %w", err)
+	}
 	workdir, err := os.MkdirTemp("", "video-audio-analysis-*")
 	if err != nil {
 		return AudioAnalysis{}, fmt.Errorf("create audio-analysis workspace: %w", err)
@@ -123,8 +131,11 @@ func (a *CommandAudioAnalyzer) Analyze(
 		payload.Dialogue = &materialized
 	}
 	for _, cue := range request.Request.Subtitle.Cues {
+		expected := lipExpectations[cue.ID]
 		payload.CueWindows = append(payload.CueWindows, analyzerCueWindow{
 			CueID: cue.ID, StartMillis: cue.StartMillis, EndMillis: cue.EndMillis,
+			LipSyncRunID: expected.RunID, LipSyncStartMillis: expected.StartMillis,
+			LipSyncEndMillis: expected.EndMillis, LipSyncRequired: expected.Required,
 		})
 	}
 	var offset int64

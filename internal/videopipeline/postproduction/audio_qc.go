@@ -107,6 +107,74 @@ type AudioAnalysis struct {
 	ContentHash           string                          `json:"contentHash"`
 }
 
+type lipSyncExpectation struct {
+	RunID       string
+	StartMillis int64
+	EndMillis   int64
+	Required    bool
+}
+
+// deriveLipSyncExpectations freezes one authoritative cue/run pair from the
+// immutable subtitle and clip timeline. A cue belongs to the run with the
+// largest positive overlap; equal overlaps are ambiguous and fail closed.
+func deriveLipSyncExpectations(request Request) (map[string]lipSyncExpectation, error) {
+	type runWindow struct {
+		runID       string
+		startMillis int64
+		endMillis   int64
+		required    bool
+	}
+	windows := make([]runWindow, 0, len(request.Clips))
+	var offset int64
+	for index, clip := range request.Clips {
+		if clip.DurationMillis <= 0 || offset > (1<<63-1)-clip.DurationMillis {
+			return nil, fmt.Errorf("clip %d has an invalid lip-sync timeline", index)
+		}
+		end := offset + clip.DurationMillis
+		windows = append(windows, runWindow{
+			runID: clip.RunID, startMillis: offset, endMillis: end,
+			required: clip.LipSyncRequired,
+		})
+		offset = end
+	}
+	expectations := make(map[string]lipSyncExpectation, len(request.Subtitle.Cues))
+	for _, cue := range request.Subtitle.Cues {
+		if strings.TrimSpace(cue.ID) == "" || cue.StartMillis < 0 ||
+			cue.EndMillis <= cue.StartMillis || cue.EndMillis > offset {
+			return nil, fmt.Errorf("subtitle cue %q has an invalid lip-sync timeline", cue.ID)
+		}
+		if _, duplicate := expectations[cue.ID]; duplicate {
+			return nil, fmt.Errorf("duplicate subtitle cue %q in lip-sync timeline", cue.ID)
+		}
+		bestIndex := -1
+		var bestOverlap int64
+		ambiguous := false
+		for index, window := range windows {
+			start := max(cue.StartMillis, window.startMillis)
+			end := min(cue.EndMillis, window.endMillis)
+			overlap := end - start
+			if overlap <= 0 {
+				continue
+			}
+			switch {
+			case overlap > bestOverlap:
+				bestIndex, bestOverlap, ambiguous = index, overlap, false
+			case overlap == bestOverlap:
+				ambiguous = true
+			}
+		}
+		if bestIndex < 0 || ambiguous {
+			return nil, fmt.Errorf("subtitle cue %q has no unique authoritative lip-sync run", cue.ID)
+		}
+		window := windows[bestIndex]
+		expectations[cue.ID] = lipSyncExpectation{
+			RunID: window.runID, StartMillis: max(cue.StartMillis, window.startMillis),
+			EndMillis: min(cue.EndMillis, window.endMillis), Required: window.required,
+		}
+	}
+	return expectations, nil
+}
+
 func (a AudioAnalysis) digestInput() AudioAnalysis {
 	a.ContentHash = ""
 	return a
@@ -215,33 +283,39 @@ func EvaluateAudioQuality(
 		return QCReport{}, errors.New("audio analysis must measure every subtitle cue")
 	}
 
+	lipExpectations, err := deriveLipSyncExpectations(request)
+	if err != nil {
+		return QCReport{}, fmt.Errorf("derive authoritative lip-sync cue/run bindings: %w", err)
+	}
 	lipOffsets := make([]int64, 0, len(analysis.LipSync)*2)
 	blockedRuns := make([]string, 0)
-	lipPolicy := make(map[string]bool, len(request.Clips))
-	for _, clip := range request.Clips {
-		lipPolicy[clip.RunID] = clip.LipSyncRequired
-	}
-	seenRequiredRuns := make(map[string]struct{})
 	seenLipMeasurements := make(map[string]struct{}, len(analysis.LipSync))
 	for _, measurement := range analysis.LipSync {
-		required, knownRun := lipPolicy[measurement.RunID]
-		if _, ok := knownCues[measurement.CueID]; !ok || !knownRun ||
-			measurement.AudioEndMillis <= measurement.AudioStartMillis ||
-			measurement.MouthEndMillis <= measurement.MouthStartMillis {
+		expected, knownCue := lipExpectations[measurement.CueID]
+		if !knownCue {
 			return QCReport{}, errors.New("audio analysis contains an invalid lip-sync measurement")
 		}
-		key := measurement.RunID + "\x00" + measurement.CueID
-		if _, duplicate := seenLipMeasurements[key]; duplicate {
+		if measurement.RunID != expected.RunID {
+			return QCReport{}, errors.New("audio analysis lip-sync cue/run binding drifted from the frozen timeline")
+		}
+		if measurement.AudioStartMillis < expected.StartMillis ||
+			measurement.AudioEndMillis <= measurement.AudioStartMillis ||
+			measurement.AudioEndMillis > expected.EndMillis ||
+			measurement.MouthStartMillis < expected.StartMillis ||
+			measurement.MouthEndMillis <= measurement.MouthStartMillis ||
+			measurement.MouthEndMillis > expected.EndMillis {
+			return QCReport{}, errors.New("audio analysis contains an invalid lip-sync measurement")
+		}
+		if _, duplicate := seenLipMeasurements[measurement.CueID]; duplicate {
 			return QCReport{}, errors.New("audio analysis contains a duplicate lip-sync measurement")
 		}
-		seenLipMeasurements[key] = struct{}{}
-		if measurement.Required != required {
+		seenLipMeasurements[measurement.CueID] = struct{}{}
+		if measurement.Required != expected.Required {
 			return QCReport{}, errors.New("audio analysis lip-sync requirement drifted from shot cinematography")
 		}
 		if !measurement.Required {
 			continue
 		}
-		seenRequiredRuns[measurement.RunID] = struct{}{}
 		offset := max(
 			absolute(measurement.AudioStartMillis-measurement.MouthStartMillis),
 			absolute(measurement.AudioEndMillis-measurement.MouthEndMillis),
@@ -251,10 +325,13 @@ func EvaluateAudioQuality(
 			blockedRuns = append(blockedRuns, measurement.RunID)
 		}
 	}
-	for runID, required := range lipPolicy {
-		if required {
-			if _, measured := seenRequiredRuns[runID]; !measured {
-				return QCReport{}, fmt.Errorf("audio analysis omitted required lip-sync run %q", runID)
+	for cueID, expected := range lipExpectations {
+		if expected.Required {
+			if _, measured := seenLipMeasurements[cueID]; !measured {
+				return QCReport{}, fmt.Errorf(
+					"audio analysis omitted required lip-sync cue/run %q/%q",
+					cueID, expected.RunID,
+				)
 			}
 		}
 	}
