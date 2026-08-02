@@ -38,6 +38,7 @@ type AudioAnalyzer interface {
 type sealedAudioAnalyzer interface {
 	AudioAnalyzer
 	AnalyzerSealSHA256() string
+	VerifyAnalyzerSeal(string) error
 }
 
 // AudioQualityError keeps the failed metrics and their immutable CAS evidence

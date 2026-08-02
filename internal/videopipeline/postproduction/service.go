@@ -190,12 +190,15 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		}
 		if request.AnalyzerSealSHA256 != "" {
 			sealed, ok := s.Analyzer.(sealedAudioAnalyzer)
-			if !ok || sealed.AnalyzerSealSHA256() != request.AnalyzerSealSHA256 {
+			if !ok {
 				return Result{}, &providercontract.Error{
 					Code: providercontract.CodeUnavailable, Retryable: false, RequiresAction: true,
 					SafeMessage:     "native audio analyzer differs from the frozen execution package",
 					SuggestedAction: "configure the exact sealed analyzer before opening G3",
 				}
+			}
+			if err := sealed.VerifyAnalyzerSeal(request.AnalyzerSealSHA256); err != nil {
+				return Result{}, analyzerIntegrityError()
 			}
 		}
 		analysisRequest := AudioAnalysisRequest{

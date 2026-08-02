@@ -629,6 +629,13 @@ type fakeAudioAnalyzer struct {
 
 func (f *fakeAudioAnalyzer) AnalyzerSealSHA256() string { return f.sealSHA256 }
 
+func (f *fakeAudioAnalyzer) VerifyAnalyzerSeal(expected string) error {
+	if f.sealSHA256 != expected {
+		return errors.New("analyzer seal drifted")
+	}
+	return nil
+}
+
 func (f *fakeAudioAnalyzer) Analyze(_ context.Context, input AudioAnalysisRequest) (AudioAnalysis, error) {
 	f.calls++
 	lipExpectations, err := deriveLipSyncExpectations(input.Request)

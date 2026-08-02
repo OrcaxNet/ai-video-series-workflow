@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/analyzerseal"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/cerevaluation"
@@ -28,6 +29,7 @@ type CommandAudioAnalyzer struct {
 	Store                       *artifactstore.Store
 	Runner                      CommandRunner
 	sealSHA256, analyzerVersion string
+	sealedRoot, sealPath        string
 }
 
 // NewSealedCommandAudioAnalyzer accepts only the executable named by the
@@ -37,11 +39,19 @@ func NewSealedCommandAudioAnalyzer(
 	program, root, seal string,
 	store *artifactstore.Store,
 ) (*CommandAudioAnalyzer, error) {
-	manifest, evidence, err := analyzerseal.Verify(root, seal)
+	sealedRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	sealPath, err := filepath.Abs(seal)
+	if err != nil {
+		return nil, err
+	}
+	manifest, evidence, err := analyzerseal.Verify(sealedRoot, sealPath)
 	if err != nil {
 		return nil, fmt.Errorf("verify audio analyzer seal: %w", err)
 	}
-	wantProgram, err := filepath.Abs(filepath.Join(root, manifest.Analyzer.Path))
+	wantProgram, err := filepath.Abs(filepath.Join(sealedRoot, manifest.Analyzer.Path))
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +68,8 @@ func NewSealedCommandAudioAnalyzer(
 	}
 	analyzer.sealSHA256 = evidence.SealSHA256
 	analyzer.analyzerVersion = manifest.Analyzer.Version
+	analyzer.sealedRoot = sealedRoot
+	analyzer.sealPath = sealPath
 	return analyzer, nil
 }
 
@@ -65,7 +77,46 @@ func (a *CommandAudioAnalyzer) AnalyzerSealSHA256() string {
 	if a == nil {
 		return ""
 	}
+	if err := a.VerifyAnalyzerSeal(a.sealSHA256); err != nil {
+		return ""
+	}
 	return a.sealSHA256
+}
+
+// VerifyAnalyzerSeal recomputes the complete analyzer installation instead of
+// trusting the evidence cached at worker construction. The execution package
+// digest also prevents an attacker or deployment error from replacing both a
+// component and the seal with a different internally-consistent installation.
+func (a *CommandAudioAnalyzer) VerifyAnalyzerSeal(expected string) error {
+	if a == nil || a.sealedRoot == "" || a.sealPath == "" || expected == "" ||
+		a.sealSHA256 == "" || expected != a.sealSHA256 {
+		return errors.New("audio analyzer seal differs from the approved execution package")
+	}
+	manifest, evidence, err := analyzerseal.Verify(a.sealedRoot, a.sealPath)
+	if err != nil {
+		return fmt.Errorf("verify current audio analyzer seal: %w", err)
+	}
+	wantProgram, err := filepath.Abs(filepath.Join(a.sealedRoot, manifest.Analyzer.Path))
+	if err != nil {
+		return err
+	}
+	gotProgram, err := filepath.Abs(a.Program)
+	if err != nil {
+		return err
+	}
+	if evidence.SealSHA256 != expected || gotProgram != wantProgram ||
+		manifest.Analyzer.Version != a.analyzerVersion {
+		return errors.New("audio analyzer installation differs from the approved execution package")
+	}
+	return nil
+}
+
+func analyzerIntegrityError() *providercontract.Error {
+	return &providercontract.Error{
+		Code: providercontract.CodeUnavailable, Retryable: false, RequiresAction: true,
+		SafeMessage:     "native audio analyzer integrity verification failed",
+		SuggestedAction: "restore the exact sealed analyzer before opening G3",
+	}
 }
 
 type analyzerMediaInput struct {
@@ -198,8 +249,23 @@ func (a *CommandAudioAnalyzer) Analyze(
 	if err := os.WriteFile(inputPath, inputBytes, 0o600); err != nil {
 		return AudioAnalysis{}, fmt.Errorf("write audio analyzer input: %w", err)
 	}
+	// Re-hash the executable, config, models, tools, license, and environment
+	// inventory immediately before every process launch. This closes the long
+	// construction-to-use window and keeps a drifted analyzer from executing.
+	if a.sealSHA256 != "" {
+		if err := a.VerifyAnalyzerSeal(a.sealSHA256); err != nil {
+			return AudioAnalysis{}, analyzerIntegrityError()
+		}
+	}
 	if _, err := a.Runner.Run(ctx, workdir, a.Program, inputPath, outputPath); err != nil {
 		return AudioAnalysis{}, fmt.Errorf("run approved audio analyzer: %w", err)
+	}
+	// A second verification prevents a component changed while the command was
+	// running from producing trusted QC or G3 evidence.
+	if a.sealSHA256 != "" {
+		if err := a.VerifyAnalyzerSeal(a.sealSHA256); err != nil {
+			return AudioAnalysis{}, analyzerIntegrityError()
+		}
 	}
 	output, err := os.ReadFile(outputPath)
 	if err != nil {
