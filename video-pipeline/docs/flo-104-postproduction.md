@@ -231,7 +231,11 @@ Provider 的 `pending_key` 状态。
 3. 以 `live_provider_call` 运行同一代表性授权输入三次，不挑选最好一次。
 4. 每次导出 MP4、SRT、Dialogue、输入配置、日志、G1/G2/G3、QC、Manifest、Service BOM、usage/cost 和复现说明。
 5. 汇总 Provider queue/poll/callback/generation/E2E p50/p95、成功率、错误分类、重试、存储量与人工分钟。
-6. 使用金标测量 CER ≤2%、字幕边界 p95 ≤250 ms、音画起点 p95 ≤120 ms；不达标则通过新的字幕 revision 人工校时并重跑后期，原 revision 不变。
+6. 按 `flo-104-cer-evaluation.md` 的冻结双轨协议报告标准 CER，并以
+   `mandarin_tone_aware_cer ≤2%` 作为音频可懂度发布门禁；同时测量字幕边界
+   p95 ≤250 ms、音画起点 p95 ≤120 ms。标准 CER 与 tone-aware CER 不得混写，
+   标准 CER 超限时不得宣称其已通过；时间边界不达标则通过新的字幕 revision
+   人工校时并重跑后期，原 revision 不变。
 7. 演练 401/403、429、5xx、timeout、quota、content/region/model 阻断、响应丢失、乱序/重复 callback、取消竞态和 Worker 重启；确认重复付费任务和重复最终资产均为 0。
 
 三次真实运行与完整统计完成前，FLO-104 不能置为 `done`。

@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-stage1-readiness video-stage1-materialize-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-cer-test video-stage1-readiness video-stage1-materialize-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -39,6 +39,10 @@ video-migration-v7-rollback-guard-test:
 
 video-flo104-mock-evidence:
 	./video-pipeline/scripts/flo104-mock-evidence.sh artifacts/flo104-mock
+
+# Provider-free dual CER evaluator and frozen Unicode 17.0.0 data contract.
+video-cer-test:
+	go test -race ./cmd/video-cer-evidence ./internal/videopipeline/cerevaluation
 
 # Pure validation: this command has no Provider client and cannot incur cost.
 video-stage1-readiness:
