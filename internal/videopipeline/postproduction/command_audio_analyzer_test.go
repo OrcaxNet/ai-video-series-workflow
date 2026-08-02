@@ -62,7 +62,7 @@ func (r *analyzerFixtureRunner) Run(
 	if err := json.Unmarshal(input, &payload); err != nil {
 		return nil, err
 	}
-	sources := []string{payload.FinalMix.SHA256}
+	sources := []string{payload.FinalMix.SHA256, payload.FinalVideo.SHA256}
 	for _, mix := range payload.NativeMixes {
 		sources = append(sources, mix.SHA256)
 	}
@@ -70,7 +70,7 @@ func (r *analyzerFixtureRunner) Run(
 		SchemaVersion: AudioAnalysisSchemaVersion,
 		AnalysisID:    "command-analysis-v1", Analyzer: "fixture", AnalyzerVersion: "v1",
 		Evidence: payload.Evidence, ASR: payload.ASR, Transcript: "第一句第二句",
-		SourceHashes: sources, AudioVideoStartMillis: []int64{0},
+		SourceHashes: sources, AudioVideoStartMillis: make([]int64, len(payload.RunWindows)),
 		IntegratedLUFS: -16, TruePeakDBTP: -1.2,
 	}
 	for index, cue := range payload.CueWindows {

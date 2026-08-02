@@ -118,7 +118,7 @@ func (a AudioAnalysis) Validate(request AudioAnalysisRequest) error {
 		strings.TrimSpace(a.Transcript) == "" || a.Evidence != request.Request.Evidence {
 		return errors.New("audio analysis identity, transcript, or evidence is incomplete")
 	}
-	wantSources := []string{request.FinalMix.Digest}
+	wantSources := []string{request.FinalMix.Digest, request.FinalVideo.Digest}
 	for _, mix := range request.NativeMixes {
 		wantSources = append(wantSources, mix.Digest)
 	}
@@ -134,6 +134,14 @@ func (a AudioAnalysis) Validate(request AudioAnalysisRequest) error {
 	for _, digest := range a.SourceHashes {
 		if !validDigest(digest) {
 			return errors.New("audio analysis contains an invalid source hash")
+		}
+	}
+	if len(a.AudioVideoStartMillis) != len(request.Request.Clips) {
+		return errors.New("audio analysis must measure audio/video start for every Provider clip")
+	}
+	for _, offset := range a.AudioVideoStartMillis {
+		if offset == -1<<63 {
+			return errors.New("audio analysis contains an invalid audio/video start offset")
 		}
 	}
 	if math.IsNaN(a.IntegratedLUFS) || math.IsInf(a.IntegratedLUFS, 0) ||
@@ -304,7 +312,11 @@ func EvaluateAudioQuality(
 
 	boundaryP95 := percentileLinearMillis(boundaryOffsets, 0.95)
 	lipP95 := percentileLinearMillis(lipOffsets, 0.95)
-	avP95 := percentileLinearMillis(analysis.AudioVideoStartMillis, 0.95)
+	avOffsets := make([]int64, 0, len(analysis.AudioVideoStartMillis))
+	for _, offset := range analysis.AudioVideoStartMillis {
+		avOffsets = append(avOffsets, absolute(offset))
+	}
+	avP95 := percentileLinearMillis(avOffsets, 0.95)
 	cerPercent := cer.StandardCER.Percent
 	qc := QCReport{
 		State: "AUDIO_QC_PASSED", SubtitleCERPercent: &cerPercent,

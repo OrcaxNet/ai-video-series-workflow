@@ -591,7 +591,7 @@ type fakeAudioAnalyzer struct {
 
 func (f *fakeAudioAnalyzer) Analyze(_ context.Context, input AudioAnalysisRequest) (AudioAnalysis, error) {
 	f.calls++
-	sources := []string{input.FinalMix.Digest}
+	sources := []string{input.FinalMix.Digest, input.FinalVideo.Digest}
 	for _, mix := range input.NativeMixes {
 		sources = append(sources, mix.Digest)
 	}
@@ -635,8 +635,9 @@ func (f *fakeAudioAnalyzer) Analyze(_ context.Context, input AudioAnalysisReques
 		Analyzer: "fixture-audio-analyzer", AnalyzerVersion: "fixture-v1",
 		Evidence: input.Request.Evidence, ASR: cerevaluation.FrozenASRConfig(),
 		Transcript: transcript, SourceHashes: sources, CueTimings: timings,
-		LipSync: lip, AmbienceTransitions: transitions, AudioVideoStartMillis: []int64{0},
-		IntegratedLUFS: -16, TruePeakDBTP: -1.2,
+		LipSync: lip, AmbienceTransitions: transitions,
+		AudioVideoStartMillis: make([]int64, len(input.Request.Clips)),
+		IntegratedLUFS:        -16, TruePeakDBTP: -1.2,
 	}
 	analysis.ContentHash, _ = digestJSON(analysis.digestInput())
 	return analysis, nil

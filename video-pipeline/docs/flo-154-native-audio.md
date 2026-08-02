@@ -40,7 +40,8 @@ Worker 可通过 `VIDEO_AUDIO_ANALYZER_COMMAND` 配置本地、已冻结的分�
 时间窗、Scene Context ambience identity/version/continuity、镜头口型要求和 FLO-104 frozen
 ASR 配置，不提供参考字幕正文，避免 ASR
 “照抄答案”。输出是严格 JSON，未知字段、多 JSON、来源 hash 漂移或超限大小均失败关闭；
-Adapter 负责生成最终 evidence hash。
+来源 hash 同时绑定 Final Video、Final Mix、逐镜 Native Mix 和可选 Dialogue，音画起点
+测量必须逐镜完整覆盖并以绝对偏移参与 p95。Adapter 负责生成最终 evidence hash。
 
 G3 前必须满足：标准 CER ≤2%、字幕边界 p95 ≤250 ms、音画起点 p95 ≤120 ms、
 正面近景/特写是否需要口型由冻结的 `cinematography.lipSyncRequired` 明示，或由
