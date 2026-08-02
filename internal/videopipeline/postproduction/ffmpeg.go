@@ -155,12 +155,39 @@ func (p *FFmpegProcessor) Render(
 			return RenderResult{}, err
 		}
 	}
+	policy := request.Output.withDefaults()
+	expectedDuration := request.DurationMillis()
+	dialogueProbeOutput, err := p.Runner.Run(
+		ctx,
+		workdir,
+		p.FFprobe,
+		"-v", "error",
+		"-show_entries", "format=duration:stream=codec_type,duration,sample_rate,channels",
+		"-of", "json",
+		"dialogue.wav",
+	)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	dialogueProbe, err := parseAudioProbe(dialogueProbeOutput)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	if dialogueProbe.SampleRate != policy.AudioSampleRate ||
+		dialogueProbe.Channels != policy.AudioChannels ||
+		dialogueProbe.DurationMillis != expectedDuration {
+		return RenderResult{}, fmt.Errorf(
+			"FFmpeg dialogue output is %dms at %d Hz/%d channels, expected %dms at %d Hz/%d channels",
+			dialogueProbe.DurationMillis, dialogueProbe.SampleRate, dialogueProbe.Channels,
+			expectedDuration, policy.AudioSampleRate, policy.AudioChannels,
+		)
+	}
 	probeOutput, err := p.Runner.Run(
 		ctx,
 		workdir,
 		p.FFprobe,
 		"-v", "error",
-		"-show_entries", "format=duration:stream=codec_type,width,height,r_frame_rate,start_time,sample_rate,channels",
+		"-show_entries", "format=duration:stream=codec_type,width,height,r_frame_rate,start_time,duration,sample_rate,channels",
 		"-of", "json",
 		"episode.mp4",
 	)
@@ -171,7 +198,6 @@ func (p *FFmpegProcessor) Render(
 	if err != nil {
 		return RenderResult{}, err
 	}
-	policy := request.Output.withDefaults()
 	if probe.Width != policy.Width || probe.Height != policy.Height || probe.FPS != policy.FPS {
 		return RenderResult{}, fmt.Errorf(
 			"FFmpeg output is %dx%d@%dfps, expected %dx%d@%dfps",
@@ -193,16 +219,21 @@ func (p *FFmpegProcessor) Render(
 			probe.AudioVideoStartDeltaMillis,
 		)
 	}
-	expectedDuration := request.DurationMillis()
 	if absolute(probe.DurationMillis-expectedDuration) > 40 {
 		return RenderResult{}, fmt.Errorf(
 			"FFmpeg output duration %dms differs from expected %dms",
 			probe.DurationMillis, expectedDuration,
 		)
 	}
+	if absolute(probe.AudioDurationMillis-expectedDuration) > 1 {
+		return RenderResult{}, fmt.Errorf(
+			"FFmpeg output audio duration %dms differs from expected %dms",
+			probe.AudioDurationMillis, expectedDuration,
+		)
+	}
 	dialogue, err := p.commitFile(ctx, filepath.Join(workdir, "dialogue.wav"), Artifact{
 		Kind: "dialogue_audio", MediaType: "audio/wav",
-		DurationMillis: probe.DurationMillis,
+		DurationMillis: dialogueProbe.DurationMillis,
 	})
 	if err != nil {
 		return RenderResult{}, err
@@ -381,8 +412,12 @@ func dialogueCommand(
 	}
 	filterParts = append(filterParts, fmt.Sprintf(
 		"%samix=inputs=%d:normalize=0:duration=longest,"+
-			"loudnorm=I=-16:LRA=11:TP=-1.5,apad=whole_dur=%s[dialogue]",
-		strings.Join(mixInputs, ""), len(mixInputs), duration,
+			"loudnorm=I=-16:LRA=11:TP=-1.5,aresample=%d,"+
+			"aformat=sample_fmts=s16:sample_rates=%d:channel_layouts=stereo,"+
+			"asetpts=N/SR/TB,apad=whole_len=%d,atrim=end_sample=%d[dialogue]",
+		strings.Join(mixInputs, ""), len(mixInputs), policy.AudioSampleRate,
+		policy.AudioSampleRate, exactAudioSamples(request.DurationMillis(), policy.AudioSampleRate),
+		exactAudioSamples(request.DurationMillis(), policy.AudioSampleRate),
 	))
 	args = append(args,
 		"-filter_complex", strings.Join(filterParts, ";"),
@@ -618,7 +653,14 @@ type probeResult struct {
 	AudioStreams               int
 	AudioSampleRate            int
 	AudioChannels              int
+	AudioDurationMillis        int64
 	AudioVideoStartDeltaMillis int64
+}
+
+type audioProbeResult struct {
+	DurationMillis int64
+	SampleRate     int
+	Channels       int
 }
 
 func parseProbe(data []byte) (probeResult, error) {
@@ -629,6 +671,7 @@ func parseProbe(data []byte) (probeResult, error) {
 			Height     int    `json:"height"`
 			FrameRate  string `json:"r_frame_rate"`
 			StartTime  string `json:"start_time"`
+			Duration   string `json:"duration"`
 			SampleRate string `json:"sample_rate"`
 			Channels   int    `json:"channels"`
 		} `json:"streams"`
@@ -685,6 +728,17 @@ func parseProbe(data []byte) (probeResult, error) {
 				return probeResult{}, errors.New("ffprobe audio streams have inconsistent specifications")
 			}
 			result.AudioStreams++
+			audioDurationMillis, durationErr := parseDurationMillis(
+				stream.Duration, payload.Format.Duration,
+			)
+			if durationErr != nil {
+				return probeResult{}, durationErr
+			}
+			if result.AudioDurationMillis == 0 {
+				result.AudioDurationMillis = audioDurationMillis
+			} else if absolute(result.AudioDurationMillis-audioDurationMillis) > 1 {
+				return probeResult{}, errors.New("ffprobe audio streams have inconsistent durations")
+			}
 			audioStarts = append(audioStarts, startMillis)
 		}
 	}
@@ -701,6 +755,61 @@ func parseProbe(data []byte) (probeResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func parseAudioProbe(data []byte) (audioProbeResult, error) {
+	var payload struct {
+		Streams []struct {
+			CodecType  string `json:"codec_type"`
+			Duration   string `json:"duration"`
+			SampleRate string `json:"sample_rate"`
+			Channels   int    `json:"channels"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&payload); err != nil {
+		return audioProbeResult{}, fmt.Errorf("decode dialogue ffprobe output: %w", err)
+	}
+	var result audioProbeResult
+	for _, stream := range payload.Streams {
+		if stream.CodecType != "audio" {
+			continue
+		}
+		if result.SampleRate != 0 {
+			return audioProbeResult{}, errors.New("dialogue artifact must contain exactly one audio stream")
+		}
+		sampleRate, err := strconv.Atoi(stream.SampleRate)
+		if err != nil || sampleRate <= 0 || stream.Channels <= 0 {
+			return audioProbeResult{}, errors.New("dialogue audio stream specification is invalid")
+		}
+		durationMillis, err := parseDurationMillis(stream.Duration, payload.Format.Duration)
+		if err != nil {
+			return audioProbeResult{}, err
+		}
+		result = audioProbeResult{
+			DurationMillis: durationMillis,
+			SampleRate:     sampleRate,
+			Channels:       stream.Channels,
+		}
+	}
+	if result.SampleRate == 0 {
+		return audioProbeResult{}, errors.New("dialogue artifact does not contain an audio stream")
+	}
+	return result, nil
+}
+
+func parseDurationMillis(streamDuration, formatDuration string) (int64, error) {
+	value := strings.TrimSpace(streamDuration)
+	if value == "" || value == "N/A" {
+		value = strings.TrimSpace(formatDuration)
+	}
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || seconds <= 0 {
+		return 0, errors.New("ffprobe media duration is invalid")
+	}
+	return int64(seconds*1_000 + 0.5), nil
 }
 
 func parseStartMillis(value string) (int64, error) {
@@ -727,6 +836,10 @@ func writeConcatList(workdir string, clips int) error {
 
 func seconds(milliseconds int64) string {
 	return strconv.FormatFloat(float64(milliseconds)/1000, 'f', 3, 64)
+}
+
+func exactAudioSamples(durationMillis int64, sampleRate int) int64 {
+	return durationMillis * int64(sampleRate) / 1_000
 }
 
 func extensionFor(mediaType string) string {

@@ -447,6 +447,9 @@ func (r Result) Validate() error {
 		r.FinalVideo.Width <= 0 || r.FinalVideo.Height <= 0 || r.FinalVideo.FPS <= 0 {
 		return errors.New("post-production final video media specification is incomplete")
 	}
+	if r.Dialogue.DurationMillis <= 0 || r.Dialogue.DurationMillis != r.FinalVideo.DurationMillis {
+		return errors.New("dialogue duration must match the final video duration")
+	}
 	if !validDigest(r.CommandPlanHash) || !validDigest(r.ManifestHash) ||
 		!validDigest(r.ServiceBOMHash) {
 		return errors.New("post-production command, manifest, and service BOM hashes are required")
