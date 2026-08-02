@@ -798,6 +798,21 @@ type PreparedProductTruth struct {
 	SemanticInputHash          string                         `json:"semanticInputHash,omitempty"`
 }
 
+// Equal compares immutable product truth by value. DurationPricing is a
+// pointer only so it can be omitted outside FLO-167; pointer identity is not
+// part of the signed product-truth contract.
+func (p PreparedProductTruth) Equal(other PreparedProductTruth) bool {
+	if (p.DurationPricing == nil) != (other.DurationPricing == nil) {
+		return false
+	}
+	if p.DurationPricing != nil && *p.DurationPricing != *other.DurationPricing {
+		return false
+	}
+	p.DurationPricing = nil
+	other.DurationPricing = nil
+	return p == other
+}
+
 type RunQCInput struct {
 	Run                 GenerationRunRef `json:"run"`
 	Provider            ProviderResult   `json:"provider"`

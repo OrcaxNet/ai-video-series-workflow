@@ -1701,7 +1701,7 @@ func (p *Postgres) PrepareProviderJob(
 		// comparison after this transaction commits is too late: it would leave
 		// a reservation/job/cost row for a package that was never authorized.
 		if input.ExpectedProductTruth != nil &&
-			*input.ExpectedProductTruth != prepared.ProductTruth {
+			!input.ExpectedProductTruth.Equal(prepared.ProductTruth) {
 			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
 				controlplane.CodeRevisionConflict,
 				"stage 1 frozen product truth differs from the locked PostgreSQL run",

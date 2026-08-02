@@ -42,7 +42,7 @@ temporal_port="${VIDEO_TEMPORAL_PORT:-7233}"
 VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
   go test -count=1 -tags=integration ./internal/videopipeline/repository
 VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
-  go test -count=1 -tags=integration -run 'TestFLO167(MaterializesIdenticallyAcrossFreshPostgresAndReplay|RunnerRejectsPostgresPrepareBeforeProviderHTTP)' \
+  go test -count=1 -tags=integration -run 'TestFLO167(MaterializesIdenticallyAcrossFreshPostgresAndReplay|RunnerPaidBoundary)' \
     ./internal/videopipeline/stage1materialize
 VIDEO_TEST_POSTGRES_DSN="postgres://${postgres_user}:${postgres_password}@127.0.0.1:${postgres_port}/${postgres_database}?sslmode=disable" \
 VIDEO_TEST_TEMPORAL_ADDRESS="127.0.0.1:${temporal_port}" \

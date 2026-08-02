@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
@@ -115,7 +116,7 @@ func TestFLO167MaterializesIdenticallyAcrossFreshPostgresAndReplay(t *testing.T)
 	}
 }
 
-func TestFLO167RunnerRejectsPostgresPrepareBeforeProviderHTTP(t *testing.T) {
+func TestFLO167RunnerPaidBoundary(t *testing.T) {
 	primaryDSN := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
 	if primaryDSN == "" {
 		t.Skip("VIDEO_TEST_POSTGRES_DSN is required")
@@ -124,11 +125,32 @@ func TestFLO167RunnerRejectsPostgresPrepareBeforeProviderHTTP(t *testing.T) {
 	package_, projection, legacy, plan := loadFLO167RunnerFixtures(t)
 
 	for index, test := range []struct {
-		name   string
-		mutate func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot)
+		name        string
+		wantSuccess bool
+		mutate      func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot)
 	}{
+		{name: "valid A02", wantSuccess: true, mutate: func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot) {}},
 		{name: "stale quota", mutate: func(_ *testing.T, _ *pgxpool.Pool, quota *orchestration.SubscriptionQuotaSnapshot) {
-			quota.CapturedAt = time.Now().UTC().Add(-10 * time.Minute)
+			quota.CapturedAt = quota.CapturedAt.Add(-10 * time.Minute)
+		}},
+		{name: "quota exceeded", mutate: func(_ *testing.T, _ *pgxpool.Pool, quota *orchestration.SubscriptionQuotaSnapshot) {
+			quota.FiveHourUsedAFPMilli = quota.FiveHourTotalAFPMilli - 1
+		}},
+		{name: "duration pricing drift", mutate: func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
+			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersession_shots DISABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersession_shots
+				DROP CONSTRAINT stage1_live_supersession_shots_check`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE video_pipeline.stage1_live_supersession_shots
+				SET expected_afp_milli=expected_afp_milli+1 WHERE shot_id='GOLD-A02'`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersession_shots ENABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
 		}},
 		{name: "supersession hash drift", mutate: func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
 			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersessions DISABLE TRIGGER USER`); err != nil {
@@ -181,8 +203,8 @@ func TestFLO167RunnerRejectsPostgresPrepareBeforeProviderHTTP(t *testing.T) {
 			}
 
 			quota := orchestration.SubscriptionQuotaSnapshot{
-				SchemaVersion: "agent-plan.quota-snapshot.v1", Source: "integration-test",
-				CapturedAt: now, AccountID: "flo167-test-account", Profile: "agent-plan-large",
+				SchemaVersion: "ark.agent-plan-quota.v1", Source: "integration-test",
+				CapturedAt: now, AccountID: "flo167-test-account", Profile: "agent-plan_cn-beijing_personal",
 				Region: "cn-beijing", BillingMode: "subscription_included_only",
 				FiveHourTotalAFPMilli: 135_000_000, WeeklyTotalAFPMilli: 135_000_000,
 				MonthlyTotalAFPMilli: 135_000_000,
@@ -210,10 +232,40 @@ func TestFLO167RunnerRejectsPostgresPrepareBeforeProviderHTTP(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			var calls atomic.Int64
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-				calls.Add(1)
-				http.Error(w, "provider must not be called", http.StatusInternalServerError)
+			var gets, posts atomic.Int64
+			var providerSubmitted atomic.Bool
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch request.Method {
+				case http.MethodGet:
+					gets.Add(1)
+					if providerSubmitted.Load() {
+						_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+							JobID: legacy.PrimaryJobs[1].IdempotencyKey, RunID: legacy.PrimaryJobs[1].Run.RunID,
+							UpstreamTaskID: "provider-a02", State: providercontract.StatusQueued,
+							Model: legacy.PrimaryJobs[1].Route,
+						})
+						return
+					}
+					w.WriteHeader(http.StatusNotFound)
+					_ = json.NewEncoder(w).Encode(map[string]any{"error": &providercontract.Error{
+						Code: providercontract.CodeNotFound, SafeMessage: "job not found",
+					}})
+				case http.MethodPost:
+					posts.Add(1)
+					var job providercontract.JobRequest
+					if err := json.NewDecoder(request.Body).Decode(&job); err != nil {
+						http.Error(w, err.Error(), http.StatusBadRequest)
+						return
+					}
+					providerSubmitted.Store(true)
+					_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+						JobID: job.JobID, RunID: job.RunID, UpstreamTaskID: "provider-a02",
+						State: providercontract.StatusQueued, Model: job.Model,
+					})
+				default:
+					http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+				}
 			}))
 			defer server.Close()
 			adapter, err := stage1.NewAdapterSubmitter(server.URL, server.Client())
@@ -226,21 +278,82 @@ func TestFLO167RunnerRejectsPostgresPrepareBeforeProviderHTTP(t *testing.T) {
 				t.Fatal(err)
 			}
 			before := flo167PaidBoundaryCounts(t, ctx, pool)
-			if _, err := runner.Submit(ctx, stage1.SubmitInput{ShotID: "GOLD-A02", QuotaSnapshot: &quota}); err == nil {
-				t.Fatal("Runner accepted rejected PostgreSQL preparation")
+			beforeFLO167 := flo167ProjectionState(t, ctx, pool, materialization.LegacyActivationID)
+			if test.wantSuccess {
+				for _, forbiddenShot := range []string{"GOLD-A01", "GOLD-B01"} {
+					if _, err := runner.Submit(ctx, stage1.SubmitInput{ShotID: forbiddenShot, QuotaSnapshot: &quota}); err == nil {
+						t.Fatalf("Runner accepted forbidden %s submission", forbiddenShot)
+					}
+				}
+				if gets.Load() != 0 || posts.Load() != 0 || flo167PaidBoundaryCounts(t, ctx, pool) != before ||
+					flo167ProjectionState(t, ctx, pool, materialization.LegacyActivationID) != beforeFLO167 {
+					t.Fatal("A01/B01 rejection crossed a paid boundary")
+				}
 			}
-			if got := calls.Load(); got != 0 {
-				t.Fatalf("provider HTTP calls=%d, want 0", got)
-			}
-			if after := flo167PaidBoundaryCounts(t, ctx, pool); after != before {
-				t.Fatalf("paid-boundary rows changed: before=%v after=%v", before, after)
+			result, submitErr := runner.Submit(ctx, stage1.SubmitInput{ShotID: "GOLD-A02", QuotaSnapshot: &quota})
+			after := flo167PaidBoundaryCounts(t, ctx, pool)
+			afterFLO167 := flo167ProjectionState(t, ctx, pool, materialization.LegacyActivationID)
+			if test.wantSuccess {
+				if submitErr != nil {
+					t.Fatal(submitErr)
+				}
+				if result.ProviderTaskID != "provider-a02" || gets.Load() != 1 || posts.Load() != 1 {
+					t.Fatalf("result=%#v HTTP GET/POST=%d/%d, want provider-a02 and 1/1", result, gets.Load(), posts.Load())
+				}
+				wantCounts := [3]int64{before[0] + 1, before[1] + 1, before[2] + 1}
+				if after != wantCounts {
+					t.Fatalf("paid-boundary rows=%v, want %v", after, wantCounts)
+				}
+				wantFLO167 := beforeFLO167
+				wantFLO167.State = "A02_submitted"
+				wantFLO167.QuotaSnapshots++
+				wantFLO167.AFPReservations++
+				wantFLO167.Submissions++
+				if afterFLO167 != wantFLO167 {
+					t.Fatalf("FLO-167 projection=%#v, want %#v", afterFLO167, wantFLO167)
+				}
+				replayErrors := make(chan error, 2)
+				for range 2 {
+					go func() {
+						_, err := runner.Submit(ctx, stage1.SubmitInput{ShotID: "GOLD-A02", QuotaSnapshot: &quota})
+						replayErrors <- err
+					}()
+				}
+				for range 2 {
+					if err := <-replayErrors; err != nil {
+						t.Fatalf("concurrent A02 replay: %v", err)
+					}
+				}
+				if gets.Load() != 3 || posts.Load() != 1 || flo167PaidBoundaryCounts(t, ctx, pool) != after ||
+					flo167ProjectionState(t, ctx, pool, materialization.LegacyActivationID) != afterFLO167 {
+					t.Fatalf("concurrent replay GET/POST=%d/%d or durable state changed", gets.Load(), posts.Load())
+				}
+			} else {
+				if submitErr == nil {
+					t.Fatal("Runner accepted rejected PostgreSQL preparation")
+				}
+				if gets.Load() != 0 || posts.Load() != 0 {
+					t.Fatalf("provider HTTP GET/POST=%d/%d, want 0/0", gets.Load(), posts.Load())
+				}
+				if after != before {
+					t.Fatalf("paid-boundary rows changed: before=%v after=%v", before, after)
+				}
+				if afterFLO167 != beforeFLO167 {
+					t.Fatalf("FLO-167 projection changed: before=%#v after=%#v", beforeFLO167, afterFLO167)
+				}
 			}
 			ledger, err := gate.Snapshot()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if ledger.Records[legacy.PrimaryJobs[1].IdempotencyKey] != nil {
+			if !test.wantSuccess && ledger.Records[legacy.PrimaryJobs[1].IdempotencyKey] != nil {
 				t.Fatal("rejected prepare reserved A02 in the local ledger")
+			}
+			if test.wantSuccess {
+				record := ledger.Records[legacy.PrimaryJobs[1].IdempotencyKey]
+				if record == nil || record.State != "PREPARED" {
+					t.Fatalf("successful A02 local ledger record=%#v, want PREPARED", record)
+				}
 			}
 		})
 	}
@@ -282,6 +395,27 @@ func flo167PaidBoundaryCounts(t *testing.T, ctx context.Context, pool *pgxpool.P
 		}
 	}
 	return counts
+}
+
+type flo167ProjectionSnapshot struct {
+	State           string
+	QuotaSnapshots  int64
+	AFPReservations int64
+	Submissions     int64
+}
+
+func flo167ProjectionState(t *testing.T, ctx context.Context, pool *pgxpool.Pool, activationID string) flo167ProjectionSnapshot {
+	t.Helper()
+	var snapshot flo167ProjectionSnapshot
+	if err := pool.QueryRow(ctx, `SELECT state,
+		(SELECT count(*) FROM video_pipeline.stage1_agent_plan_quota_snapshots q WHERE q.activation_id=s.legacy_activation_id),
+		(SELECT count(*) FROM video_pipeline.stage1_live_supersession_afp_reservations r WHERE r.supersession_id=s.id),
+		(SELECT count(*) FROM video_pipeline.stage1_live_supersession_submissions sub WHERE sub.supersession_id=s.id)
+		FROM video_pipeline.stage1_live_supersessions s WHERE legacy_activation_id=$1`, activationID).Scan(
+		&snapshot.State, &snapshot.QuotaSnapshots, &snapshot.AFPReservations, &snapshot.Submissions); err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
 }
 
 func newFLO167FixtureDatabase(t *testing.T, ctx context.Context, sourceDSN string, index int) string {

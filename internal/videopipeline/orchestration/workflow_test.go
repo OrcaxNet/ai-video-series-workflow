@@ -15,6 +15,39 @@ import (
 	"go.temporal.io/sdk/testsuite"
 )
 
+func TestPreparedProductTruthEqualComparesDurationPricingByValue(t *testing.T) {
+	pricing := DurationPricingBinding{DurationMS: 4_500, ExpectedAFPMilli: 2_254_230,
+		PricingSnapshotID: "agent-plan-large-v1", NormalizationVersion: "duration-normalized-afp/v1"}
+	base := PreparedProductTruth{GenerationPlanID: "plan-1", DurationPricing: &pricing}
+	samePricing := pricing
+	differentPointer := base
+	differentPointer.DurationPricing = &samePricing
+	differentValue := base
+	driftedPricing := pricing
+	driftedPricing.ExpectedAFPMilli++
+	differentValue.DurationPricing = &driftedPricing
+	differentScalar := base
+	differentScalar.GenerationPlanID = "plan-2"
+
+	for _, test := range []struct {
+		name  string
+		other PreparedProductTruth
+		want  bool
+	}{
+		{name: "same pointer", other: base, want: true},
+		{name: "same pricing value at another address", other: differentPointer, want: true},
+		{name: "pricing value drift", other: differentValue, want: false},
+		{name: "nil pricing mismatch", other: PreparedProductTruth{GenerationPlanID: "plan-1"}, want: false},
+		{name: "scalar drift", other: differentScalar, want: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := base.Equal(test.other); got != test.want {
+				t.Fatalf("Equal()=%t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestEpisodeProductionWorkflow_LocksAfterG3(t *testing.T) {
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestWorkflowEnvironment()

@@ -283,9 +283,10 @@ func reserveFLO167AFP(
 	if _, err := tx.Exec(ctx, `INSERT INTO video_pipeline.stage1_live_supersession_afp_reservations
 		(supersession_id,quota_snapshot_id,account_id,profile,region,a01_settled_afp_milli,
 		 remaining_video_afp_milli,speech_afp_milli,total_afp_milli,status,reserved_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$7+$8,'RESERVED',$9) ON CONFLICT (supersession_id) DO NOTHING`,
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'RESERVED',$10) ON CONFLICT (supersession_id) DO NOTHING`,
 		boundary.SupersessionID, snapshotID, snapshot.AccountID, snapshot.Profile, snapshot.Region,
-		flo167A01ActualAFPMilli, flo167RemainingVideoAFPMilli, flo100SpeechAFPMilli, now); err != nil {
+		flo167A01ActualAFPMilli, flo167RemainingVideoAFPMilli, flo100SpeechAFPMilli,
+		flo167RemainingVideoAFPMilli+flo100SpeechAFPMilli, now); err != nil {
 		return fmt.Errorf("reserve FLO-167 inherited AFP: %w", err)
 	}
 	var storedSnapshotID uuid.UUID

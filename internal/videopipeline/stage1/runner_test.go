@@ -146,7 +146,7 @@ func (s *runnerTruthFixture) PrepareProviderJob(
 	if s.shotTruthDrift {
 		truth.ShotSpecRevisionID = uuid.NewString()
 	}
-	if input.ExpectedProductTruth != nil && *input.ExpectedProductTruth != truth {
+	if input.ExpectedProductTruth != nil && !input.ExpectedProductTruth.Equal(truth) {
 		return orchestration.PreparedProviderJob{}, providerError(
 			providercontract.CodeConflict,
 			"stage 1 frozen product truth differs from the locked PostgreSQL run",

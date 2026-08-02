@@ -394,7 +394,7 @@ func (r *Runner) prepareProductTruth(
 	if err != nil {
 		return providercontract.JobRequest{}, err
 	}
-	if prepared.ProductTruth != expectedTruth {
+	if !prepared.ProductTruth.Equal(expectedTruth) {
 		return providercontract.JobRequest{}, providerError(
 			providercontract.CodeConflict,
 			"PostgreSQL product truth differs from the frozen stage 1 package",
