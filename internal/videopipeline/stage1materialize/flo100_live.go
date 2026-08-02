@@ -455,6 +455,10 @@ func materializeFLO100LiveDB(
 		job.BudgetCurrency = "CNY"
 		job.ProviderProfileID = videoProfileID.String()
 		job.Route = videoRoute
+		// Reserve the 1.2M-token envelope across all eleven authorized jobs,
+		// including the separately approved controlled retry. The offline package
+		// used 120k per primary and therefore left no executable +1 capacity.
+		job.EstimatedVideoTokens = stage1.MaximumVideoTokens / 11
 		job.EstimatedNonSubscriptionCashMicros = 0
 		job.WorkflowID = "flo100-live-a-" + liveRunID.String()
 		job.ActivityID = "submit-" + offlineJob.ShotID

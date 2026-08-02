@@ -31,26 +31,33 @@ const (
 )
 
 type stage1LiveAuthority struct {
-	ActivationID              uuid.UUID
-	ControlSeriesID           uuid.UUID
-	SourceSeriesID            uuid.UUID
-	SourceEpisodeID           uuid.UUID
-	SourceEpisodeRevisionID   uuid.UUID
-	LiveGenerationPlanID      uuid.UUID
-	VideoProviderProfileID    uuid.UUID
-	VideoCapabilitySnapshotID uuid.UUID
-	VideoBudgetApprovalID     uuid.UUID
-	G1DecisionID              uuid.UUID
-	G2DecisionID              uuid.UUID
-	SafetyDecisionID          uuid.UUID
-	OfflineExecutionHash      string
-	SourceAuthorizationHash   string
-	SourceAuthorization       json.RawMessage
-	SourceCodeCommit          string
-	ExecutionPackageHash      string
-	AuthorizationValidUntil   time.Time
-	ProjectionHash            string
-	Run                       stage1LiveRun
+	ActivationID               uuid.UUID
+	ControlSeriesID            uuid.UUID
+	SourceSeriesID             uuid.UUID
+	SourceEpisodeID            uuid.UUID
+	SourceEpisodeRevisionID    uuid.UUID
+	LiveGenerationPlanID       uuid.UUID
+	VideoProviderProfileID     uuid.UUID
+	VideoCapabilitySnapshotID  uuid.UUID
+	VideoBudgetApprovalID      uuid.UUID
+	G1DecisionID               uuid.UUID
+	G2DecisionID               uuid.UUID
+	SafetyDecisionID           uuid.UUID
+	OfflineExecutionHash       string
+	SourceAuthorizationHash    string
+	SourceAuthorization        json.RawMessage
+	SourceCodeCommit           string
+	ExecutionPackageHash       string
+	AuthorizationValidUntil    time.Time
+	ProjectionHash             string
+	ControlledRetryPackageHash string
+	RetryApprovalID            uuid.UUID
+	DuplicateTaskEvidenceID    uuid.UUID
+	PrimaryFailureClass        string
+	PrimaryFailureEvidenceHash string
+	PrimaryRunID               uuid.UUID
+	IsControlledRetry          bool
+	Run                        stage1LiveRun
 }
 
 type stage1LiveRun struct {
@@ -95,8 +102,14 @@ func readFLO100LiveFinalizationAuthority(
 		SELECT a.id,a.control_series_id,a.source_series_id,a.speech_budget_approval_id,
 		  ((SELECT COUNT(*) FROM video_pipeline.stage1_live_activation_runs ar
 		    WHERE ar.activation_id=a.id)=10
-		   AND (SELECT COUNT(*) FROM video_pipeline.stage1_live_activation_runs ar
-		        WHERE ar.activation_id=a.id AND ar.run_id=ANY($3::uuid[]))=10),
+		   AND ((SELECT COUNT(*) FROM video_pipeline.stage1_live_activation_runs ar
+		         WHERE ar.activation_id=a.id AND ar.run_id=ANY($3::uuid[]))=10
+		        OR EXISTS (
+		          SELECT 1 FROM video_pipeline.stage1_live_controlled_retries cr
+		          WHERE cr.activation_id=a.id AND cr.retry_run_id=ANY($3::uuid[])
+		            AND NOT (cr.primary_run_id=ANY($3::uuid[]))
+		            AND (SELECT COUNT(*) FROM video_pipeline.stage1_live_activation_runs ar
+		                 WHERE ar.activation_id=a.id AND ar.run_id=ANY($3::uuid[]))=9))),
 		  EXISTS (SELECT 1 FROM video_pipeline.stage1_live_submit_authorizations sa
 		          JOIN video_pipeline.stage1_live_projection_seals ps ON ps.activation_id=a.id
 		          WHERE sa.activation_id=a.id AND sa.source_code_commit=a.source_code_commit
@@ -254,11 +267,71 @@ func readStage1LiveAuthority(
 		&authority.Run.PredictedAFPMilli,
 	)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
+		return readStage1ControlledRetryAuthority(ctx, tx, runID)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("read FLO-100 live authority: %w", err)
 	}
+	if submitValidUntil != nil {
+		authority.AuthorizationValidUntil = *submitValidUntil
+	}
+	return &authority, nil
+}
+
+func readStage1ControlledRetryAuthority(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+) (*stage1LiveAuthority, error) {
+	var authority stage1LiveAuthority
+	var submitValidUntil *time.Time
+	err := tx.QueryRow(ctx, `
+		SELECT a.id,a.control_series_id,a.source_series_id,a.source_episode_id,
+		       a.source_episode_revision_id,a.live_generation_plan_id,
+		       a.video_provider_profile_id,a.video_capability_snapshot_id,
+		       a.video_budget_approval_id,a.g1_decision_id,a.g2_decision_id,a.safety_decision_id,
+		       a.offline_execution_package_hash,a.source_authorization_hash,a.source_authorization,
+		       a.source_code_commit,a.live_execution_package_hash,
+		       sa.valid_until,COALESCE(ps.projection_hash,''),
+		       ar.ordinal,cr.retry_run_id,ar.offline_run_id,gr.shot_spec_revision_id,
+		       gr.prompt_snapshot_id,p.content_hash,ar.authorized_prompt_hash,ar.intent_input_hash,
+		       ar.estimated_video_tokens,ar.predicted_afp_milli,
+		       cr.controlled_retry_package_hash,cr.retry_approval_id,cr.duplicate_task_evidence_id,
+		       cr.primary_failure_class,cr.primary_failure_evidence_hash,cr.primary_run_id
+		FROM video_pipeline.stage1_live_controlled_retries cr
+		JOIN video_pipeline.stage1_live_activations a ON a.id=cr.activation_id
+		JOIN video_pipeline.stage1_live_activation_runs ar
+		  ON ar.activation_id=a.id AND ar.run_id=cr.primary_run_id
+		JOIN video_pipeline.generation_runs gr ON gr.id=cr.retry_run_id
+		JOIN video_pipeline.prompt_snapshots p ON p.id=gr.prompt_snapshot_id
+		LEFT JOIN video_pipeline.stage1_live_submit_authorizations sa ON sa.activation_id=a.id
+		LEFT JOIN video_pipeline.stage1_live_projection_seals ps ON ps.activation_id=a.id
+		WHERE cr.retry_run_id=$1
+		FOR SHARE OF a,ar,cr,gr,p`, runID).Scan(
+		&authority.ActivationID, &authority.ControlSeriesID, &authority.SourceSeriesID,
+		&authority.SourceEpisodeID, &authority.SourceEpisodeRevisionID,
+		&authority.LiveGenerationPlanID, &authority.VideoProviderProfileID,
+		&authority.VideoCapabilitySnapshotID, &authority.VideoBudgetApprovalID,
+		&authority.G1DecisionID, &authority.G2DecisionID, &authority.SafetyDecisionID,
+		&authority.OfflineExecutionHash, &authority.SourceAuthorizationHash,
+		&authority.SourceAuthorization, &authority.SourceCodeCommit,
+		&authority.ExecutionPackageHash, &submitValidUntil,
+		&authority.ProjectionHash, &authority.Run.Ordinal, &authority.Run.RunID,
+		&authority.Run.OfflineRunID, &authority.Run.ShotSpecRevisionID,
+		&authority.Run.PromptSnapshotID, &authority.Run.PromptSnapshotHash,
+		&authority.Run.AuthorizedPromptHash, &authority.Run.IntentInputHash,
+		&authority.Run.EstimatedVideoTokens, &authority.Run.PredictedAFPMilli,
+		&authority.ControlledRetryPackageHash, &authority.RetryApprovalID,
+		&authority.DuplicateTaskEvidenceID, &authority.PrimaryFailureClass,
+		&authority.PrimaryFailureEvidenceHash, &authority.PrimaryRunID,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read FLO-100 controlled retry authority: %w", err)
+	}
+	authority.IsControlledRetry = true
 	if submitValidUntil != nil {
 		authority.AuthorizationValidUntil = *submitValidUntil
 	}
@@ -295,6 +368,8 @@ func requireStage1LiveAuthority(
 		authority.OfflineExecutionHash != flo100OfflineExecutionHash ||
 		input.ExpectedLiveActivationID != authority.ActivationID.String() ||
 		input.ExpectedExecutionPackageHash != authority.ExecutionPackageHash ||
+		(authority.IsControlledRetry && input.ExpectedControlledRetryPackageHash != authority.ControlledRetryPackageHash) ||
+		(!authority.IsControlledRetry && input.ExpectedControlledRetryPackageHash != "") ||
 		input.ExpectedSourceCodeCommit != authority.SourceCodeCommit ||
 		input.BillingMode != providercontract.BillingModeSubscriptionIncludedOnly ||
 		!authority.AuthorizationValidUntil.After(now) || authority.ProjectionHash == "" {
@@ -302,6 +377,11 @@ func requireStage1LiveAuthority(
 			controlplane.CodeRevisionConflict,
 			"FLO-100 live dispatch differs from its exact A-only authority",
 		)
+	}
+	if authority.IsControlledRetry {
+		if err := requireStage1ControlledRetryAuthority(ctx, tx, authority); err != nil {
+			return err
+		}
 	}
 	var authorization stage1LiveAuthorizationEnvelope
 	if err := json.Unmarshal(authority.SourceAuthorization, &authorization); err != nil {
@@ -432,6 +512,99 @@ func requireStage1LiveAuthority(
 		)
 	}
 	return nil
+}
+
+type stage1ControlledRetryTerminalEvidence struct {
+	GenerationRunState string          `json:"generationRunState"`
+	RunFailureClass    string          `json:"runFailureClass"`
+	AttemptState       string          `json:"attemptState"`
+	ProviderJobID      string          `json:"providerJobId"`
+	ProviderJobState   string          `json:"providerJobState"`
+	UpstreamTaskID     string          `json:"upstreamTaskId"`
+	UpstreamRequestID  string          `json:"upstreamRequestId"`
+	ErrorCode          string          `json:"errorCode"`
+	ErrorSnapshot      json.RawMessage `json:"errorSnapshot"`
+	TerminalAt         time.Time       `json:"terminalAt"`
+	ReservationStatus  string          `json:"reservationStatus"`
+	CostEvidenceCount  int64           `json:"costEvidenceCount"`
+}
+
+func requireStage1ControlledRetryAuthority(
+	ctx context.Context,
+	tx pgx.Tx,
+	authority *stage1LiveAuthority,
+) error {
+	var packageExact bool
+	var providerJobID uuid.UUID
+	var evidence stage1ControlledRetryTerminalEvidence
+	if err := tx.QueryRow(ctx, `
+		SELECT cr.controlled_retry_package->>'contentHash'=cr.controlled_retry_package_hash
+		   AND cr.controlled_retry_package->>'parentExecutionPackageHash'=cr.source_execution_package_hash
+		   AND cr.controlled_retry_package->'job'->'run'->>'runId'=cr.retry_run_id::text
+		   AND cr.controlled_retry_package->'approval'->>'approvalId'=cr.retry_approval_id::text
+		   AND cr.controlled_retry_package->'approval'->>'originalAttemptId'=cr.primary_attempt_identity
+		   AND cr.controlled_retry_package->'approval'->>'failureClass'=cr.primary_failure_class
+		   AND cr.controlled_retry_package->'approval'->>'duplicateTaskEvidenceId'=cr.duplicate_task_evidence_id::text,
+		       gr.state,COALESCE(gr.failure_class,''),ga.state,pj.id,pj.state,
+		       COALESCE(pj.upstream_task_id,''),COALESCE(pj.upstream_request_id,''),
+		       COALESCE(pj.error_code,''),COALESCE(pj.error_snapshot,'{}'::jsonb),pj.terminal_at,
+		       br.status,(SELECT COUNT(*) FROM video_pipeline.cost_ledger cl
+		                  WHERE cl.provider_job_id=pj.id AND cl.budget_reservation_id=br.id)
+		FROM video_pipeline.stage1_live_controlled_retries cr
+		JOIN video_pipeline.generation_runs gr ON gr.id=cr.primary_run_id
+		JOIN video_pipeline.generation_attempts ga ON ga.id=cr.primary_attempt_id
+		JOIN video_pipeline.provider_jobs pj ON pj.id=cr.primary_provider_job_id
+		JOIN video_pipeline.budget_reservations br ON br.id=pj.budget_reservation_id
+		WHERE cr.activation_id=$1 AND cr.retry_run_id=$2
+		  AND cr.controlled_retry_package_hash=$3 AND cr.retry_approval_id=$4
+		  AND cr.duplicate_task_evidence_id=$5 AND cr.primary_run_id=$6
+		FOR SHARE OF cr,gr,ga,pj`, authority.ActivationID, authority.Run.RunID,
+		authority.ControlledRetryPackageHash, authority.RetryApprovalID,
+		authority.DuplicateTaskEvidenceID, authority.PrimaryRunID).Scan(
+		&packageExact, &evidence.GenerationRunState, &evidence.RunFailureClass,
+		&evidence.AttemptState, &providerJobID, &evidence.ProviderJobState,
+		&evidence.UpstreamTaskID, &evidence.UpstreamRequestID, &evidence.ErrorCode,
+		&evidence.ErrorSnapshot, &evidence.TerminalAt,
+		&evidence.ReservationStatus, &evidence.CostEvidenceCount,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewPolicyError(
+				controlplane.CodeForbidden,
+				"controlled retry has no immutable approval and terminal-failure binding",
+				"bind the exact manual +1 package after an evidence-complete primary failure",
+			)
+		}
+		return fmt.Errorf("verify FLO-100 controlled retry authority: %w", err)
+	}
+	evidence.ProviderJobID = providerJobID.String()
+	evidenceHash, err := digestValue(evidence)
+	if err != nil {
+		return err
+	}
+	wantDuplicateEvidenceID := uuid.NewSHA1(providerJobID, []byte("duplicate-task-evidence:"+evidenceHash))
+	if !packageExact || evidence.GenerationRunState != "FAILED" || evidence.RunFailureClass == "" ||
+		evidence.AttemptState != "FAILED" || evidence.ProviderJobState != "FAILED" ||
+		evidence.UpstreamTaskID == "" || evidence.UpstreamRequestID == "" ||
+		evidence.ErrorCode != authority.PrimaryFailureClass || evidence.TerminalAt.IsZero() ||
+		evidence.ReservationStatus != "SETTLED" || evidence.CostEvidenceCount < 1 ||
+		!stage1TerminalFailureSnapshotExact(evidence.ErrorSnapshot, evidence.ErrorCode) ||
+		evidenceHash != authority.PrimaryFailureEvidenceHash || wantDuplicateEvidenceID != authority.DuplicateTaskEvidenceID {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"controlled retry package, approval, or primary terminal evidence drifted",
+		)
+	}
+	return nil
+}
+
+func stage1TerminalFailureSnapshotExact(snapshot json.RawMessage, errorCode string) bool {
+	var evidence struct {
+		Code          string         `json:"code"`
+		ProviderCost  map[string]any `json:"providerCost"`
+		ProviderUsage map[string]any `json:"providerUsage"`
+	}
+	return json.Unmarshal(snapshot, &evidence) == nil && evidence.Code == errorCode &&
+		evidence.ProviderCost != nil && evidence.ProviderUsage != nil
 }
 
 func reserveStage1LiveAFP(

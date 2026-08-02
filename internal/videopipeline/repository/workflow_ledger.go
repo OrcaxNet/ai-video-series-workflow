@@ -1650,6 +1650,7 @@ func (p *Postgres) PrepareProviderJob(
 				productTruth.EstimatedVideoTokens = input.EstimatedVideoTokens
 				productTruth.PredictedAFPMilli = input.PredictedAFPMilli
 				productTruth.BillingMode = input.BillingMode
+				productTruth.ControlledRetryPackageHash = liveAuthority.ControlledRetryPackageHash
 			}
 			return orchestration.PreparedProviderJob{
 				Budget: budget, BudgetReservation: reservation,
@@ -4297,8 +4298,12 @@ func (p *Postgres) CommitEpisodePostProduction(
 			WHERE gr.id = ANY($1::uuid[])
 			  AND (er.status = 'G2_APPROVED' OR EXISTS (
 			    SELECT 1 FROM video_pipeline.stage1_live_activations live
-			    JOIN video_pipeline.stage1_live_activation_runs lar ON lar.activation_id=live.id
-			    WHERE live.live_generation_plan_id=$3 AND lar.run_id=gr.id
+			    WHERE live.live_generation_plan_id=$3 AND (
+			      EXISTS (SELECT 1 FROM video_pipeline.stage1_live_activation_runs lar
+			              WHERE lar.activation_id=live.id AND lar.run_id=gr.id)
+			      OR EXISTS (SELECT 1 FROM video_pipeline.stage1_live_controlled_retries retry
+			                 WHERE retry.activation_id=live.id AND retry.retry_run_id=gr.id)
+			    )
 			  ))
 			  AND gr.state = 'SUCCEEDED'
 			  AND EXISTS (

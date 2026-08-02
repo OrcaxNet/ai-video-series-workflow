@@ -687,13 +687,14 @@ type ExecuteProviderJobInput struct {
 	// SubscriptionQuotaSnapshot is fresh external usage evidence consumed only
 	// by the PostgreSQL prepare transaction. It is persisted in the dedicated
 	// AFP ledger and deliberately excluded from the immutable Provider request.
-	SubscriptionQuotaSnapshot    *SubscriptionQuotaSnapshot `json:"subscriptionQuotaSnapshot,omitempty"`
-	ExpectedExecutionPackageHash string                     `json:"expectedExecutionPackageHash,omitempty"`
-	ExpectedLiveActivationID     string                     `json:"expectedLiveActivationId,omitempty"`
-	ExpectedSourceCodeCommit     string                     `json:"expectedSourceCodeCommit,omitempty"`
-	EstimatedVideoTokens         int64                      `json:"estimatedVideoTokens,omitempty"`
-	PredictedAFPMilli            int64                      `json:"predictedAfpMilli,omitempty"`
-	BillingMode                  string                     `json:"billingMode,omitempty"`
+	SubscriptionQuotaSnapshot          *SubscriptionQuotaSnapshot `json:"subscriptionQuotaSnapshot,omitempty"`
+	ExpectedExecutionPackageHash       string                     `json:"expectedExecutionPackageHash,omitempty"`
+	ExpectedControlledRetryPackageHash string                     `json:"expectedControlledRetryPackageHash,omitempty"`
+	ExpectedLiveActivationID           string                     `json:"expectedLiveActivationId,omitempty"`
+	ExpectedSourceCodeCommit           string                     `json:"expectedSourceCodeCommit,omitempty"`
+	EstimatedVideoTokens               int64                      `json:"estimatedVideoTokens,omitempty"`
+	PredictedAFPMilli                  int64                      `json:"predictedAfpMilli,omitempty"`
+	BillingMode                        string                     `json:"billingMode,omitempty"`
 }
 
 // SubscriptionQuotaSnapshot records an authenticated Agent Plan read in AFP
@@ -745,22 +746,23 @@ type ProviderJobObservation struct {
 // reservation. A narrow runner can compare it with its signed-off package
 // without accepting any caller-reported authorization state.
 type PreparedProductTruth struct {
-	ShotSpecRevisionID   string                         `json:"shotSpecRevisionId"`
-	Run                  GenerationRunRef               `json:"run"`
-	PromptSnapshotID     string                         `json:"promptSnapshotId"`
-	PromptSnapshotHash   string                         `json:"promptSnapshotHash"`
-	GenerationPlanID     string                         `json:"generationPlanId"`
-	BudgetApprovalID     string                         `json:"budgetApprovalId"`
-	BudgetMaximumMicros  int64                          `json:"budgetMaximumMicros"`
-	BudgetCurrency       string                         `json:"budgetCurrency"`
-	ProviderProfileID    string                         `json:"providerProfileId"`
-	Route                providercontract.ModelSnapshot `json:"route"`
-	LiveActivationID     string                         `json:"liveActivationId,omitempty"`
-	ExecutionPackageHash string                         `json:"executionPackageHash,omitempty"`
-	SourceCodeCommit     string                         `json:"sourceCodeCommit,omitempty"`
-	EstimatedVideoTokens int64                          `json:"estimatedVideoTokens,omitempty"`
-	PredictedAFPMilli    int64                          `json:"predictedAfpMilli,omitempty"`
-	BillingMode          string                         `json:"billingMode,omitempty"`
+	ShotSpecRevisionID         string                         `json:"shotSpecRevisionId"`
+	Run                        GenerationRunRef               `json:"run"`
+	PromptSnapshotID           string                         `json:"promptSnapshotId"`
+	PromptSnapshotHash         string                         `json:"promptSnapshotHash"`
+	GenerationPlanID           string                         `json:"generationPlanId"`
+	BudgetApprovalID           string                         `json:"budgetApprovalId"`
+	BudgetMaximumMicros        int64                          `json:"budgetMaximumMicros"`
+	BudgetCurrency             string                         `json:"budgetCurrency"`
+	ProviderProfileID          string                         `json:"providerProfileId"`
+	Route                      providercontract.ModelSnapshot `json:"route"`
+	LiveActivationID           string                         `json:"liveActivationId,omitempty"`
+	ExecutionPackageHash       string                         `json:"executionPackageHash,omitempty"`
+	ControlledRetryPackageHash string                         `json:"controlledRetryPackageHash,omitempty"`
+	SourceCodeCommit           string                         `json:"sourceCodeCommit,omitempty"`
+	EstimatedVideoTokens       int64                          `json:"estimatedVideoTokens,omitempty"`
+	PredictedAFPMilli          int64                          `json:"predictedAfpMilli,omitempty"`
+	BillingMode                string                         `json:"billingMode,omitempty"`
 }
 
 type RunQCInput struct {

@@ -286,6 +286,9 @@ func (r *Runner) prepareProductTruth(
 		expectedTruth.EstimatedVideoTokens = frozen.EstimatedVideoTokens
 		expectedTruth.PredictedAFPMilli = frozen.PredictedAFPMilli
 		expectedTruth.BillingMode = frozen.BillingMode
+		if r.controlledRetry != nil && r.controlledRetry.Job.Run.RunID == frozen.Run.RunID {
+			expectedTruth.ControlledRetryPackageHash = r.controlledRetry.ContentHash
+		}
 	}
 	preparation := orchestration.ExecuteProviderJobInput{
 		Run: frozen.Run, Prompt: prompt, Route: frozen.Route,
@@ -304,6 +307,9 @@ func (r *Runner) prepareProductTruth(
 		preparation.ExpectedExecutionPackageHash = r.executionPackage.ContentHash
 		preparation.ExpectedLiveActivationID = activation.ActivationID
 		preparation.ExpectedSourceCodeCommit = activation.SourceCodeCommit
+		if r.controlledRetry != nil && r.controlledRetry.Job.Run.RunID == frozen.Run.RunID {
+			preparation.ExpectedControlledRetryPackageHash = r.controlledRetry.ContentHash
+		}
 	}
 	prepared, err := r.truth.PrepareProviderJob(ctx, orchestration.WorkflowStep{
 		WorkflowID: frozen.WorkflowID, ActivityID: frozen.ActivityID,

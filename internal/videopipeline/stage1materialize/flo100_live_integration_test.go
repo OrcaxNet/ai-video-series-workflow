@@ -16,6 +16,8 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -293,6 +295,143 @@ func TestFLO100LiveActivationQuotaAndReplayAreFailClosed(t *testing.T) {
 	}
 	assertLiveBoundaryCounts(t, pool, 1, 1, 1, 1)
 
+	// A retry package cannot create its new Run until the primary has complete,
+	// settled terminal-failure evidence in PostgreSQL.
+	unboundRetry := testFLO100LiveControlledRetry(t, pool, plan, authorizedPackage, job, uuid.New())
+	if err := BindFLO100LiveControlledRetry(ctx, pool, plan, authorizedPackage, unboundRetry); err == nil {
+		t.Fatal("controlled retry bound before the primary terminal failure")
+	}
+	assertLiveBoundaryCounts(t, pool, 1, 1, 1, 1)
+
+	primaryRunID := mustUUID(job.Run.RunID)
+	primaryProviderJobID := uuid.NewSHA1(primaryRunID, []byte("provider-job"))
+	failureSnapshot := map[string]any{
+		"code": "TRANSIENT",
+		"providerCost": map[string]any{
+			"estimatedMicros": 0, "currency": "CNY",
+			"pricingVersion": "agent-plan-subscription-v1", "verified": false,
+		},
+		"providerUsage":          map[string]any{"videoTokens": 0, "unit": "video_tokens"},
+		"actualTrustedForBudget": false,
+	}
+	terminalAt := time.Now().UTC()
+	if _, err := pool.Exec(ctx, `UPDATE video_pipeline.generation_runs
+		SET state='FAILED',failure_class='TRANSIENT',failure_code='TRANSIENT',finished_at=$2 WHERE id=$1`,
+		primaryRunID, terminalAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE video_pipeline.generation_attempts
+		SET state='FAILED',failure_code='TRANSIENT',finished_at=$2 WHERE generation_run_id=$1`,
+		primaryRunID, terminalAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE video_pipeline.provider_jobs
+		SET state='FAILED',upstream_task_id='task-controlled-retry-primary',
+		    upstream_request_id='request-controlled-retry-primary',error_code='TRANSIENT',
+		    error_snapshot=$2,terminal_at=$3,updated_at=$3 WHERE id=$1`,
+		primaryProviderJobID, failureSnapshot, terminalAt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE video_pipeline.budget_reservations
+		SET status='SETTLED' WHERE generation_run_id=$1`, primaryRunID); err != nil {
+		t.Fatal(err)
+	}
+	terminalEvidence := controlledRetryTerminalEvidence{
+		GenerationRunState: "FAILED", RunFailureClass: "TRANSIENT", AttemptState: "FAILED",
+		ProviderJobID: primaryProviderJobID.String(), ProviderJobState: "FAILED",
+		UpstreamTaskID: "task-controlled-retry-primary", UpstreamRequestID: "request-controlled-retry-primary",
+		ErrorCode: "TRANSIENT", TerminalAt: terminalAt, ReservationStatus: "SETTLED", CostEvidenceCount: 1,
+	}
+	if err := pool.QueryRow(ctx, `SELECT error_snapshot,terminal_at
+		FROM video_pipeline.provider_jobs WHERE id=$1`, primaryProviderJobID).
+		Scan(&terminalEvidence.ErrorSnapshot, &terminalEvidence.TerminalAt); err != nil {
+		t.Fatal(err)
+	}
+	evidenceHash, err := digest(terminalEvidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateEvidenceID := uuid.NewSHA1(primaryProviderJobID, []byte("duplicate-task-evidence:"+evidenceHash))
+	retryPackage := testFLO100LiveControlledRetry(t, pool, plan, authorizedPackage, job, duplicateEvidenceID)
+	if err := BindFLO100LiveControlledRetry(ctx, pool, plan, authorizedPackage, retryPackage); err != nil {
+		t.Fatalf("bind controlled retry: %v", err)
+	}
+	if err := BindFLO100LiveControlledRetry(ctx, pool, plan, authorizedPackage, retryPackage); err != nil {
+		t.Fatalf("exact controlled retry binding replay: %v", err)
+	}
+	competing := retryPackage
+	competing.Approval.ApprovalID = uuid.New().String()
+	competing, err = stage1.SealControlledRetryPackage(competing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := BindFLO100LiveControlledRetry(ctx, pool, plan, authorizedPackage, competing); err == nil {
+		t.Fatal("competing or second controlled retry package unexpectedly bound")
+	}
+	if err := BindFLO100LiveControlledRetry(ctx, pool, plan, offline[1], retryPackage); err == nil {
+		t.Fatal("Batch B controlled retry unexpectedly bound")
+	}
+	assertLiveBoundaryCounts(t, pool, 1, 1, 1, 1)
+
+	retryJob := retryPackage.Job
+	retryPrompt, err := store.ResolvePromptSnapshot(ctx, retryJob.PromptSnapshotID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retryExpected := orchestration.PreparedProductTruth{
+		ShotSpecRevisionID: retryJob.ShotSpecRevisionID, Run: retryJob.Run,
+		PromptSnapshotID: retryJob.PromptSnapshotID, PromptSnapshotHash: retryJob.PromptSnapshotHash,
+		GenerationPlanID: retryJob.GenerationPlanID, BudgetApprovalID: retryJob.BudgetApprovalID,
+		BudgetMaximumMicros: retryJob.BudgetMaximumMicros, BudgetCurrency: retryJob.BudgetCurrency,
+		ProviderProfileID: retryJob.ProviderProfileID, Route: retryJob.Route,
+		LiveActivationID:     authorizedPackage.LiveActivation.ActivationID,
+		ExecutionPackageHash: authorizedPackage.ContentHash, ControlledRetryPackageHash: retryPackage.ContentHash,
+		SourceCodeCommit: candidateCommit, EstimatedVideoTokens: retryJob.EstimatedVideoTokens,
+		PredictedAFPMilli: retryJob.PredictedAFPMilli, BillingMode: retryJob.BillingMode,
+	}
+	retryInput := orchestration.ExecuteProviderJobInput{
+		Run: retryJob.Run, Prompt: retryPrompt, Route: retryJob.Route,
+		BudgetApprovalID: retryJob.BudgetApprovalID, BudgetMaximumMicros: 0,
+		BudgetCurrency: "CNY", ProviderProfileID: retryJob.ProviderProfileID,
+		TraceID: retryJob.TraceID, PersistProductTruth: true, ExpectedProductTruth: &retryExpected,
+		SubscriptionQuotaSnapshot: quota, ExpectedExecutionPackageHash: authorizedPackage.ContentHash,
+		ExpectedControlledRetryPackageHash: retryPackage.ContentHash,
+		ExpectedLiveActivationID:           authorizedPackage.LiveActivation.ActivationID,
+		ExpectedSourceCodeCommit:           candidateCommit, EstimatedVideoTokens: retryJob.EstimatedVideoTokens,
+		PredictedAFPMilli: retryJob.PredictedAFPMilli, BillingMode: retryJob.BillingMode,
+	}
+	retryStep := orchestration.WorkflowStep{
+		WorkflowID: retryJob.WorkflowID, ActivityID: retryJob.ActivityID, TraceID: retryJob.TraceID,
+	}
+	for name, mutate := range map[string]func(*orchestration.ExecuteProviderJobInput){
+		"package": func(in *orchestration.ExecuteProviderJobInput) {
+			in.ExpectedControlledRetryPackageHash = strings.Repeat("0", 64)
+		},
+		"approval": func(in *orchestration.ExecuteProviderJobInput) { in.BudgetApprovalID = uuid.New().String() },
+		"run":      func(in *orchestration.ExecuteProviderJobInput) { in.Run.RunSpecDigest = strings.Repeat("0", 64) },
+		"route":    func(in *orchestration.ExecuteProviderJobInput) { in.Route.ModelID = "drifted-model" },
+		"hash":     func(in *orchestration.ExecuteProviderJobInput) { in.Prompt.Digest = strings.Repeat("0", 64) },
+	} {
+		drifted := retryInput
+		mutate(&drifted)
+		if _, err := store.PrepareProviderJob(ctx, retryStep, drifted); err == nil {
+			t.Fatalf("controlled retry %s drift unexpectedly prepared", name)
+		}
+	}
+	assertLiveBoundaryCounts(t, pool, 1, 1, 1, 1)
+	retryPrepared, err := store.PrepareProviderJob(ctx, retryStep, retryInput)
+	if err != nil {
+		t.Fatalf("prepare controlled retry: %v", err)
+	}
+	if retryPrepared.Budget.MaxCostMicros != 0 ||
+		retryPrepared.ProductTruth.ControlledRetryPackageHash != retryPackage.ContentHash {
+		t.Fatalf("unexpected controlled retry product truth: %+v", retryPrepared)
+	}
+	if _, err := store.PrepareProviderJob(ctx, retryStep, retryInput); err != nil {
+		t.Fatalf("exact controlled retry prepare replay: %v", err)
+	}
+	assertLiveBoundaryCounts(t, pool, 2, 2, 2, 1)
+
 	offlineReplay, _, err := MaterializeFLO100(ctx, pool, cas, formal)
 	if err != nil {
 		t.Fatal(err)
@@ -308,6 +447,62 @@ func TestFLO100LiveActivationQuotaAndReplayAreFailClosed(t *testing.T) {
 		postBoundaryReport.BudgetReservations != 1 || postBoundaryReport.CostLedgerEntries != 1 {
 		t.Fatalf("post-boundary live replay drifted: %+v", postBoundaryReport)
 	}
+}
+
+func testFLO100LiveControlledRetry(
+	t *testing.T,
+	pool *pgxpool.Pool,
+	plan stage1.Plan,
+	primary stage1.ExecutionPackage,
+	original stage1.FrozenJob,
+	duplicateEvidenceID uuid.UUID,
+) stage1.ControlledRetryPackage {
+	t.Helper()
+	retry := original
+	retryRunID := uuid.NewSHA1(mustUUID(primary.LiveActivation.ActivationID), []byte("controlled-retry:"+original.Run.RunID))
+	var generationProfileID string
+	if err := pool.QueryRow(t.Context(), `SELECT generation_profile_id
+		FROM video_pipeline.generation_runs WHERE id=$1`, mustUUID(original.Run.RunID)).
+		Scan(&generationProfileID); err != nil {
+		t.Fatal(err)
+	}
+	runDigest, err := repository.GenerationRunSpecDigest(
+		original.ShotSpecRevisionID, original.PromptSnapshotID, original.PromptSnapshotHash,
+		generationProfileID, original.GenerationPlanID, original.Route, 2,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry.AttemptID = uuid.NewSHA1(retryRunID, []byte("controlled-retry-identity")).String()
+	retry.IdempotencyKey = "provider-job-" + retryRunID.String()
+	retry.Run = orchestration.GenerationRunRef{RunID: retryRunID.String(), RunSpecDigest: runDigest, Attempt: 2}
+	retry.WorkflowID = "flo100-live-controlled-retry-" + retryRunID.String()
+	retry.ActivityID = "submit-controlled-retry-" + retry.ShotID
+	retry.TraceID += "-controlled-retry"
+	post := primary.PostProduction
+	post.RunIDs = append([]string(nil), post.RunIDs...)
+	for index, runID := range post.RunIDs {
+		if runID == original.Run.RunID {
+			post.RunIDs[index] = retryRunID.String()
+		}
+	}
+	package_, err := stage1.SealControlledRetryPackage(stage1.ControlledRetryPackage{
+		SchemaVersion: stage1.ControlledRetryPackageSchemaVersion, BatchID: primary.BatchID,
+		ParentExecutionPackageHash: primary.ContentHash, Job: retry,
+		Approval: stage1.RetryApproval{
+			ApprovalID:        uuid.NewSHA1(retryRunID, []byte("manual-approval")).String(),
+			OriginalAttemptID: original.AttemptID, FailureClass: "TRANSIENT",
+			DuplicateTaskEvidenceID: duplicateEvidenceID.String(),
+		},
+		PostProduction: post,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := package_.Validate(plan, primary); err != nil {
+		t.Fatal(err)
+	}
+	return package_
 }
 
 func assertLiveBoundaryCounts(
