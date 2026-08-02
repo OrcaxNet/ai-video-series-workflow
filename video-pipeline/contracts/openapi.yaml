@@ -18,6 +18,7 @@ servers:
 tags:
   - name: System
   - name: Providers
+  - name: Creator
   - name: Series
   - name: Production
   - name: Approvals
@@ -97,7 +98,7 @@ paths:
                   schemaVersion:
                     const: v1
                   mode:
-                    enum: [dry-run, live]
+                    enum: [disabled, live]
                   capabilities:
                     type: array
                     items:
@@ -105,6 +106,133 @@ paths:
                   secretPolicy:
                     type: object
                     additionalProperties: true
+  /api/v1/creator/live-shot-plans:
+    post:
+      tags: [Creator]
+      operationId: createCreatorLiveShotPlan
+      description: Creates a 15-minute immutable plan and all server-derived bindings without submitting a Provider job.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCreatorLiveShotPlanRequest"
+      responses:
+        "201":
+          description: Zero-submit plan ready for exact-hash confirmation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreatorLiveShotPlan"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/PolicyBlocked"
+  /api/v1/creator/live-shot-plans/{planId}/confirm:
+    post:
+      tags: [Creator]
+      operationId: confirmCreatorLiveShotPlan
+      parameters:
+        - name: planId
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - name: If-Match
+          in: header
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [schemaVersion, confirmed, planHash]
+              properties:
+                schemaVersion: {const: v1}
+                confirmed: {type: boolean, const: true}
+                planHash: {$ref: "#/components/schemas/SHA256"}
+      responses:
+        "202":
+          description: Durable Provider intent accepted before Temporal starts
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CreatorLiveShotRun"}
+        "409": {$ref: "#/components/responses/Conflict"}
+        "422": {$ref: "#/components/responses/PolicyBlocked"}
+  /api/v1/creator/live-shots/{seriesId}:
+    get:
+      tags: [Creator]
+      operationId: listCreatorLiveShots
+      parameters:
+        - $ref: "#/components/parameters/SeriesID"
+      responses:
+        "200":
+          description: Actor-scoped live-shot runs for the project
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [schemaVersion, seriesId, plan, runs]
+                properties:
+                  schemaVersion: {const: v1}
+                  seriesId: {type: string, format: uuid}
+                  plan: {$ref: "#/components/schemas/CreatorLiveShotPlan"}
+                  runs:
+                    type: array
+                    items: {$ref: "#/components/schemas/CreatorLiveShotRun"}
+  /api/v1/creator/live-shot-runs/{runId}:
+    get:
+      tags: [Creator]
+      operationId: getCreatorLiveShotRun
+      parameters:
+        - $ref: "#/components/parameters/RunID"
+      responses:
+        "200":
+          description: Monotonic provider/CAS/Manifest projection; ETag supports polling
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CreatorLiveShotRun"}
+        "304": {description: Projection has not changed}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/creator/live-shot-runs/{runId}/artifact:
+    get:
+      tags: [Creator]
+      operationId: downloadCreatorLiveShotArtifact
+      parameters:
+        - $ref: "#/components/parameters/RunID"
+        - name: Range
+          in: header
+          schema: {type: string}
+      responses:
+        "200": {description: Same-origin MP4 artifact}
+        "206": {description: Requested MP4 byte range}
+        "404": {$ref: "#/components/responses/NotFound"}
+    head:
+      tags: [Creator]
+      operationId: headCreatorLiveShotArtifact
+      parameters:
+        - $ref: "#/components/parameters/RunID"
+      responses:
+        "200": {description: MP4 metadata and Range support}
+        "404": {$ref: "#/components/responses/NotFound"}
+  /api/v1/creator/live-shot-runs/{runId}/manifest:
+    get:
+      tags: [Creator]
+      operationId: getCreatorLiveShotManifest
+      parameters:
+        - $ref: "#/components/parameters/RunID"
+      responses:
+        "200":
+          description: Secret-free live Provider provenance and subscription usage evidence
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CreatorLiveShotManifest"}
+        "404": {$ref: "#/components/responses/NotFound"}
   /api/v1/generation-plans:
     post:
       tags: [Production]
@@ -647,6 +775,135 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    CreateCreatorLiveShotPlanRequest:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, title, sceneText, aspectRatio, rightsAccepted]
+      properties:
+        schemaVersion: {const: v1}
+        title: {type: string, minLength: 1, maxLength: 80}
+        sceneText: {type: string, minLength: 1, maxLength: 800}
+        aspectRatio: {type: string, enum: ['16:9', '9:16']}
+        rightsAccepted: {type: boolean, const: true}
+    CreatorLiveShotPlan:
+      type: object
+      additionalProperties: true
+      required: [schemaVersion, planId, seriesId, state, confirmable, blockers, spec, route, budget, bindings, executionPolicy, providerCallCount, providerSubmitCount, planHash, traceId, expiresAt]
+      properties:
+        schemaVersion: {const: v1}
+        planId: {type: string, format: uuid}
+        seriesId: {type: string, format: uuid}
+        state: {const: AWAITING_CONFIRMATION}
+        confirmable: {type: boolean}
+        blockers: {type: array, items: {type: string}}
+        spec:
+          type: object
+          additionalProperties: false
+          required: [candidates, durationSeconds, resolution, audio, aspectRatio]
+          properties:
+            candidates: {type: integer, const: 1}
+            durationSeconds: {type: integer, const: 5}
+            resolution: {const: 720p}
+            audio: {type: boolean, const: false}
+            aspectRatio: {enum: ['16:9', '9:16']}
+        route: {$ref: "#/components/schemas/CreatorRoute"}
+        budget: {$ref: "#/components/schemas/CreatorLiveShotBudget"}
+        bindings: {type: object, additionalProperties: false}
+        executionPolicy: {type: object, additionalProperties: true}
+        providerCallCount: {type: integer, const: 1}
+        providerSubmitCount: {type: integer, const: 0}
+        planHash: {$ref: "#/components/schemas/SHA256"}
+        traceId: {type: string}
+        expiresAt: {type: string, format: date-time}
+    CreatorLiveShotRun:
+      type: object
+      additionalProperties: true
+      required: [schemaVersion, operationId, runId, planId, seriesId, providerJobId, state, progress, planHash, route, submitCount, replayed, usage, cost, failure, traceId, createdAt, updatedAt]
+      properties:
+        schemaVersion: {const: v1}
+        operationId: {type: string, format: uuid}
+        runId: {type: string, format: uuid}
+        planId: {type: string, format: uuid}
+        seriesId: {type: string, format: uuid}
+        providerJobId: {type: string, format: uuid}
+        state: {type: string, enum: [QUEUED, RUNNING, UNKNOWN, RECONCILING, SUCCEEDED, FAILED, CANCELLED, REQUIRES_ACTION]}
+        progress: {type: [integer, 'null'], minimum: 0, maximum: 100}
+        route: {$ref: "#/components/schemas/CreatorRoute"}
+        providerTaskId: {type: string}
+        providerRequestId: {type: string}
+        submitCount: {type: integer, minimum: 0, maximum: 1}
+        replayed: {type: boolean}
+        failure: {type: [object, 'null'], additionalProperties: true}
+        artifact: {type: [object, 'null'], additionalProperties: true}
+        manifest: {type: [object, 'null'], additionalProperties: true}
+        cost:
+          type: object
+          required: [amountMicros, currency, verified, billingMode]
+          properties:
+            amountMicros: {type: [integer, 'null']}
+            currency: {type: [string, 'null']}
+            verified: {type: boolean, const: false}
+            billingMode: {const: subscription}
+    CreatorLiveShotManifest:
+      type: object
+      additionalProperties: false
+      required: [schemaVersion, manifestId, evidence, runId, planId, planHash, provider, providerRegion, providerJobId, upstreamTaskId, requestId, inputHash, outputHash, media, usage, budget, cost, createdAt]
+      properties:
+        schemaVersion: {const: creator-live-shot-manifest.v1}
+        manifestId: {type: string, format: uuid}
+        evidence: {const: live_provider_call}
+        runId: {type: string, format: uuid}
+        planId: {type: string, format: uuid}
+        planHash: {$ref: "#/components/schemas/SHA256"}
+        provider: {$ref: "#/components/schemas/CreatorRoute"}
+        providerRegion: {type: [string, 'null']}
+        providerJobId: {type: string, format: uuid}
+        upstreamTaskId: {type: string}
+        requestId: {type: string}
+        inputHash: {$ref: "#/components/schemas/SHA256"}
+        outputHash: {$ref: "#/components/schemas/SHA256"}
+        media: {type: object, additionalProperties: true}
+        usage: {type: object, additionalProperties: true}
+        budget:
+          type: object
+          additionalProperties: false
+          required: [budgetApprovalId, reservationId, reservedTasks, reservedVideoTokens, settledVideoTokens, settlement]
+          properties:
+            budgetApprovalId: {type: string, format: uuid}
+            reservationId: {type: string, format: uuid}
+            reservedTasks: {type: integer, const: 1}
+            reservedVideoTokens: {type: integer, const: 1000000}
+            settledVideoTokens: {type: [integer, 'null']}
+            settlement: {const: CONSERVATIVE_SUBSCRIPTION_RESERVATION}
+        cost: {type: object, additionalProperties: true}
+        createdAt: {type: string, format: date-time}
+    CreatorRoute:
+      type: object
+      additionalProperties: false
+      required: [capabilityAlias, provider, modelId, routeVersion, capabilityHash, verification, billingMode]
+      properties:
+        capabilityAlias: {const: video.primary}
+        provider: {type: string}
+        modelId: {type: string}
+        endpointId: {type: string}
+        routeVersion: {type: string}
+        capabilityHash: {$ref: "#/components/schemas/SHA256"}
+        verification: {type: string}
+        billingMode: {const: subscription}
+    CreatorLiveShotBudget:
+      type: object
+      additionalProperties: false
+      required: [maxTasksThisConfirmation, maxVideoTokensThisConfirmation, projectTaskLimit, projectTokenLimit, projectTasksUsed, projectTokensUsed, cashAmountMaximum, currency, verified]
+      properties:
+        maxTasksThisConfirmation: {type: integer, const: 1}
+        maxVideoTokensThisConfirmation: {type: integer, const: 1000000}
+        projectTaskLimit: {type: integer, const: 3}
+        projectTokenLimit: {type: integer, const: 3000000}
+        projectTasksUsed: {type: integer, minimum: 0, maximum: 3}
+        projectTokensUsed: {type: integer, minimum: 0, maximum: 3000000}
+        cashAmountMaximum: {type: 'null'}
+        currency: {type: 'null'}
+        verified: {type: boolean, const: false}
     ProviderCapabilityStatus:
       type: object
       additionalProperties: false
@@ -665,13 +922,22 @@ components:
         defaultProvider:
           type: string
         liveEvidence:
-          enum: [not_configured, pending_key_validation, live_provider_call]
+          enum: [not_configured, pending_key_validation, not_enabled_for_creator_v1, authenticated_adapter_snapshot, live_provider_call]
         mockEvidence:
           const: mock_only
         missingSecretRefs:
           type: array
           items:
             type: string
+        modelId:
+          type: string
+        routeVersion:
+          type: string
+        capabilityHash:
+          $ref: "#/components/schemas/SHA256"
+        billingMode:
+          type: string
+          enum: [subscription]
     ModelRouteSnapshot:
       type: object
       additionalProperties: false
@@ -1443,6 +1709,18 @@ components:
             - ATTEMPT_LIMIT_REACHED
             - CANCEL_NOT_CONFIRMED
             - INTERNAL_ERROR
+            - LIVE_CALLS_DISABLED
+            - PLAN_EXPIRED
+            - PLAN_STALE
+            - PLAN_HASH_MISMATCH
+            - SUBSCRIPTION_ROUTE_REQUIRED
+            - CASH_CHARGE_NOT_ALLOWED
+            - SHOT_BUDGET_EXCEEDED
+            - PROJECT_BUDGET_EXCEEDED
+            - CONCURRENCY_LIMIT
+            - IDEMPOTENCY_CONFLICT
+            - ARTIFACT_COMMIT_FAILED
+            - MANIFEST_INVALID
         retryable:
           type: boolean
         affectedObjects:

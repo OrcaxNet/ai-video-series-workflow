@@ -250,6 +250,11 @@ func (p *Postgres) ResolvePromptSnapshot(
 	if err != nil {
 		return orchestration.PromptSnapshotRef{}, errors.New("prompt snapshot ID must be a UUID")
 	}
+	if snapshot, creatorErr := p.creatorPromptSnapshot(ctx, promptID); creatorErr == nil {
+		return snapshot, nil
+	} else if !errors.Is(creatorErr, pgx.ErrNoRows) {
+		return orchestration.PromptSnapshotRef{}, creatorErr
+	}
 	return withSerializable(ctx, p.pool, func(tx pgx.Tx) (orchestration.PromptSnapshotRef, error) {
 		return loadExactPromptSnapshot(ctx, tx, promptID)
 	})
@@ -1248,6 +1253,9 @@ func (p *Postgres) PrepareProviderJob(
 	if err != nil {
 		return orchestration.PreparedProviderJob{}, errors.New("runId must be a UUID")
 	}
+	if prepared, creator, creatorErr := p.prepareCreatorProviderJob(ctx, runID, input); creator {
+		return prepared, creatorErr
+	}
 	providerProfileID, err := uuid.Parse(input.ProviderProfileID)
 	if err != nil {
 		return orchestration.PreparedProviderJob{}, errors.New("providerProfileId must be a UUID")
@@ -1832,6 +1840,12 @@ func (p *Postgres) RecordProviderJobObservation(
 	input orchestration.ExecuteProviderJobInput,
 	observation orchestration.ProviderJobObservation,
 ) error {
+	runID, parseErr := uuid.Parse(input.Run.RunID)
+	if parseErr == nil {
+		if creator, err := p.recordCreatorProviderObservation(ctx, runID, observation); creator {
+			return err
+		}
+	}
 	runID, err := uuid.Parse(input.Run.RunID)
 	if err != nil {
 		return errors.New("runId must be a UUID")
@@ -2065,6 +2079,9 @@ func (p *Postgres) CompleteProviderJob(
 	if err != nil {
 		return errors.New("runId must be a UUID")
 	}
+	if creator, creatorErr := p.completeCreatorProviderJob(ctx, runID, input, result); creator {
+		return creatorErr
+	}
 	budgetApprovalID, err := uuid.Parse(input.BudgetApprovalID)
 	if err != nil {
 		return errors.New("budgetApprovalId must be a UUID")
@@ -2234,6 +2251,7 @@ func (p *Postgres) CompleteProviderJob(
 			)
 		}
 		hasActual := result.Cost.ActualMicros != nil
+		subscriptionUnpriced := unpricedSubscriptionCost(result.Cost, reservedPricing)
 		var actualMicros int64
 		if hasActual {
 			actualMicros = *result.Cost.ActualMicros
@@ -2243,16 +2261,22 @@ func (p *Postgres) CompleteProviderJob(
 			actualMicros >= 0 &&
 			result.Cost.Currency == reservedCurrency &&
 			result.Cost.PricingVersion == reservedPricing
-		budgetExceeded := result.Cost.ActualMicros == nil ||
+		budgetExceeded := !subscriptionUnpriced && (result.Cost.ActualMicros == nil ||
 			!result.Cost.Verified ||
 			result.Cost.EstimatedMicros < 0 ||
 			actualMicros < 0 ||
 			result.Cost.EstimatedMicros > reservedMicros ||
 			actualMicros > reservedMicros ||
 			result.Cost.Currency != reservedCurrency ||
-			result.Cost.PricingVersion != reservedPricing
+			result.Cost.PricingVersion != reservedPricing)
 		ledgerID := uuid.NewSHA1(jobID, []byte("actual-cost"))
-		if hasActual {
+		if hasActual || subscriptionUnpriced {
+			var actualValue any
+			var currencyValue any
+			if hasActual {
+				actualValue = actualMicros
+				currencyValue = result.Cost.Currency
+			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO video_pipeline.cost_ledger
 					(id, provider_job_id, budget_reservation_id, entry_type,
@@ -2260,7 +2284,7 @@ func (p *Postgres) CompleteProviderJob(
 					 pricing_rule_version, verified)
 				VALUES ($1, $2, $3, 'ACTUAL', $4, $5, $6, $7, $8, $9)
 				ON CONFLICT (id) DO NOTHING`,
-				ledgerID, jobID, reservationID, actualMicros, result.Cost.Currency,
+				ledgerID, jobID, reservationID, actualValue, currencyValue,
 				usageUnits, result.Usage.Unit,
 				result.Cost.PricingVersion, actualTrustedForAllocation,
 			); err != nil {
@@ -2268,23 +2292,23 @@ func (p *Postgres) CompleteProviderJob(
 			}
 			var storedJobID, storedReservationID uuid.UUID
 			var storedEntryType string
-			var storedActual int64
-			var storedCurrency, storedPricing string
+			var storedPricing string
 			var storedVerified bool
-			var storedUnitsMatch, storedUnitNameMatch bool
+			var storedAmountMatch, storedCurrencyMatch, storedUnitsMatch, storedUnitNameMatch bool
 			if err := tx.QueryRow(ctx, `
 				SELECT provider_job_id, budget_reservation_id, entry_type,
-				       amount_micros, currency, pricing_rule_version, verified,
-				       units IS NOT DISTINCT FROM $2,
-				       unit_name IS NOT DISTINCT FROM $3
+				       amount_micros IS NOT DISTINCT FROM $2,
+				       currency IS NOT DISTINCT FROM $3,
+				       pricing_rule_version, verified,
+				       units IS NOT DISTINCT FROM $4,
+				       unit_name IS NOT DISTINCT FROM $5
 				FROM video_pipeline.cost_ledger
 				WHERE id = $1
 				FOR SHARE`,
-				ledgerID, usageUnits,
-				result.Usage.Unit,
+				ledgerID, actualValue, currencyValue, usageUnits, result.Usage.Unit,
 			).Scan(
 				&storedJobID, &storedReservationID, &storedEntryType,
-				&storedActual, &storedCurrency, &storedPricing, &storedVerified,
+				&storedAmountMatch, &storedCurrencyMatch, &storedPricing, &storedVerified,
 				&storedUnitsMatch, &storedUnitNameMatch,
 			); err != nil {
 				return completionOutcome{}, fmt.Errorf(
@@ -2292,8 +2316,7 @@ func (p *Postgres) CompleteProviderJob(
 				)
 			}
 			if storedJobID != jobID || storedReservationID != reservationID ||
-				storedEntryType != "ACTUAL" || storedActual != actualMicros ||
-				storedCurrency != result.Cost.Currency ||
+				storedEntryType != "ACTUAL" || !storedAmountMatch || !storedCurrencyMatch ||
 				storedPricing != result.Cost.PricingVersion ||
 				storedVerified != actualTrustedForAllocation ||
 				!storedUnitsMatch || !storedUnitNameMatch {
@@ -2988,6 +3011,11 @@ func verifyProviderAllocatedCostProjection(
 		); err != nil {
 			return 0, err
 		}
+		if storedResult.Cost.ActualMicros == nil {
+			// Subscription usage has no trustworthy cash conversion. Keep the
+			// full approved allocation consumed for conservative admission.
+			return expected.AmountMicros, nil
+		}
 		return *storedResult.Cost.ActualMicros, nil
 	}
 	if jobState != "FAILED" && jobState != "CANCELLED" {
@@ -3546,14 +3574,21 @@ func verifySucceededProviderCostProjection(
 	usageUnits int64,
 	result orchestration.ProviderResult,
 ) error {
-	if result.Cost.ActualMicros == nil || !result.Cost.Verified ||
-		*result.Cost.ActualMicros < 0 || *result.Cost.ActualMicros > reservedMicros ||
-		result.Cost.Currency != reservedCurrency ||
-		result.Cost.PricingVersion != reservedPricing {
+	subscriptionUnpriced := unpricedSubscriptionCost(result.Cost, reservedPricing)
+	trustedCash := result.Cost.ActualMicros != nil && result.Cost.Verified &&
+		*result.Cost.ActualMicros >= 0 && *result.Cost.ActualMicros <= reservedMicros &&
+		result.Cost.Currency == reservedCurrency && result.Cost.PricingVersion == reservedPricing
+	if !subscriptionUnpriced && !trustedCash {
 		return controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"the succeeded Provider job has an invalid immutable cost result",
 		)
+	}
+	var expectedAmount any
+	var expectedCurrency any
+	if trustedCash {
+		expectedAmount = *result.Cost.ActualMicros
+		expectedCurrency = result.Cost.Currency
 	}
 
 	actualID := uuid.NewSHA1(jobID, []byte("actual-cost"))
@@ -3587,7 +3622,7 @@ func verifySucceededProviderCostProjection(
 		FOR SHARE`,
 		actualID, jobID,
 		usageUnits, result.Usage.Unit,
-		*result.Cost.ActualMicros, result.Cost.Currency,
+		expectedAmount, expectedCurrency,
 		result.Cost.PricingVersion, result.Cost.Verified, reservationID,
 	).Scan(
 		&storedJobID, &storedReservationID, &storedEntryType,
@@ -3626,7 +3661,7 @@ func verifySucceededProviderCostProjection(
 	).Scan(&releaseCount); err != nil {
 		return fmt.Errorf("count succeeded Provider RELEASE costs: %w", err)
 	}
-	releaseExpected := *result.Cost.ActualMicros < reservedMicros
+	releaseExpected := trustedCash && *result.Cost.ActualMicros < reservedMicros
 	if !releaseExpected {
 		if releaseCount != 0 {
 			return controlplane.NewConflictError(
@@ -3676,6 +3711,12 @@ func verifySucceededProviderCostProjection(
 	return nil
 }
 
+func unpricedSubscriptionCost(cost providercontract.Cost, pricingVersion string) bool {
+	return cost.ActualMicros == nil && !cost.Verified && !cost.ProviderReported &&
+		cost.EstimatedMicros == 0 && cost.Currency == "" &&
+		cost.BillingMode == "subscription" && cost.PricingVersion == pricingVersion
+}
+
 func (p *Postgres) RecordAutomaticQC(
 	ctx context.Context,
 	step orchestration.WorkflowStep,
@@ -3685,6 +3726,9 @@ func (p *Postgres) RecordAutomaticQC(
 	runID, err := uuid.Parse(input.Run.RunID)
 	if err != nil {
 		return errors.New("runId must be a UUID")
+	}
+	if creator, creatorErr := p.recordCreatorQC(ctx, runID, input, result); creator {
+		return creatorErr
 	}
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
 		var runState, runDigest string
@@ -5585,6 +5629,9 @@ func (p *Postgres) RecordProviderCancellation(
 	if err != nil {
 		return errors.New("runId must be a UUID")
 	}
+	if creator, creatorErr := p.cancelCreatorProviderJob(ctx, runID, result); creator {
+		return creatorErr
+	}
 	requestedResult := result
 	cancellationUnconfirmed := false
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
@@ -6134,6 +6181,9 @@ func (p *Postgres) ProviderJobPrepared(ctx context.Context, runIDRaw string) (bo
 	if err != nil {
 		return false, errors.New("runId must be a UUID")
 	}
+	if prepared, creator, creatorErr := p.creatorProviderJobPrepared(ctx, runID); creator {
+		return prepared, creatorErr
+	}
 	var prepared bool
 	if err := p.pool.QueryRow(ctx, `
 		SELECT EXISTS (
@@ -6161,6 +6211,9 @@ func (p *Postgres) FinalizeShotRun(
 	operationID, err := uuid.Parse(input.OperationID)
 	if err != nil {
 		return errors.New("operationId must be a UUID")
+	}
+	if creator, creatorErr := p.finalizeCreatorRun(ctx, runID, operationID, input); creator {
+		return creatorErr
 	}
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
 		var currentState string

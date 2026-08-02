@@ -132,7 +132,7 @@ func TestServer_ProviderStatusSupportsNoKeyDryRun(t *testing.T) {
 	if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil {
 		t.Fatal(err)
 	}
-	if body.Mode != "dry-run" || len(body.Capabilities) != 4 {
+	if body.Mode != "disabled" || len(body.Capabilities) != 4 {
 		t.Fatalf("provider status = %#v", body)
 	}
 	for _, capability := range body.Capabilities {
@@ -164,12 +164,12 @@ func TestServer_ProviderStatusSupportsCredentialIsolatedLiveAdapter(t *testing.T
 		t.Fatal(err)
 	}
 	for _, capability := range body.Capabilities {
-		if !capability.LiveConfigured || capability.LiveCallsEnabled || capability.LiveEvidence != "pending_key_validation" {
+		if capability.LiveConfigured || capability.LiveCallsEnabled || capability.LiveEvidence != "not_configured" {
 			t.Fatalf("credential-isolated capability = %#v", capability)
 		}
 	}
-	if body.Mode != "dry-run" {
-		t.Fatalf("mode = %q, want dry-run until provider readiness is validated", body.Mode)
+	if body.Mode != "disabled" {
+		t.Fatalf("mode = %q, want disabled until provider readiness is validated", body.Mode)
 	}
 }
 
@@ -196,11 +196,11 @@ func TestServer_ProviderStatusNeverEchoesSecrets(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, capability := range body.Capabilities {
-		if !capability.LiveConfigured || capability.LiveCallsEnabled || capability.LiveEvidence != "pending_key_validation" {
+		if capability.LiveConfigured || capability.LiveCallsEnabled || capability.LiveEvidence != "not_configured" {
 			t.Fatalf("configured capability = %#v", capability)
 		}
 	}
-	if body.Mode != "dry-run" {
-		t.Fatalf("mode = %q, want dry-run until provider readiness is validated", body.Mode)
+	if body.Mode != "disabled" {
+		t.Fatalf("mode = %q, want disabled until provider readiness is validated", body.Mode)
 	}
 }

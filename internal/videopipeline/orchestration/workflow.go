@@ -143,6 +143,7 @@ type GenerationRunRef struct {
 type ProviderResult struct {
 	UpstreamTaskID string                         `json:"upstreamTaskId"`
 	RequestID      string                         `json:"requestId"`
+	ProviderRegion string                         `json:"providerRegion,omitempty"`
 	ArtifactDigest string                         `json:"artifactDigest"`
 	ArtifactURI    string                         `json:"artifactUri"`
 	MediaType      string                         `json:"mediaType,omitempty"`
@@ -700,6 +701,7 @@ type ProviderJobObservation struct {
 	State          string `json:"state"`
 	UpstreamTaskID string `json:"upstreamTaskId,omitempty"`
 	RequestID      string `json:"requestId,omitempty"`
+	Progress       *int   `json:"progress,omitempty"`
 	ErrorCode      string `json:"errorCode,omitempty"`
 }
 

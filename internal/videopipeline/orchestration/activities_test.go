@@ -972,8 +972,8 @@ func TestActivities_ExecuteProviderJobUsesLiveAdapterAndReturnsMeasuredCASArtifa
 		result.RequestID != "activity-submit-request-1" || result.Width != 1280 ||
 		result.Height != 720 || result.DurationMillis != 5_062 ||
 		result.ArtifactURI != "cas://sha256/"+result.ArtifactDigest ||
-		result.Usage.VideoTokens != 250_000 || result.Cost.ActualMicros == nil ||
-		*result.Cost.ActualMicros != 0 || result.Cost.BillingMode != "subscription_included" {
+		result.Usage.VideoTokens != 250_000 || result.Cost.ActualMicros != nil ||
+		result.Cost.Verified || result.Cost.Currency != "" || result.Cost.BillingMode != "subscription" {
 		t.Fatalf("live Activity result = %#v, submits = %d", result, provider.submits.Load())
 	}
 	encoded, _ := json.Marshal(result)

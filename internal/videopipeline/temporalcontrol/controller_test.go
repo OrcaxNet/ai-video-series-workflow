@@ -127,6 +127,29 @@ func TestControllerStartShotUsesStablePersistedWorkflowAndDispatch(t *testing.T)
 	}
 }
 
+func TestControllerStartCreatorLiveShotSkipsManualQ1(t *testing.T) {
+	t.Parallel()
+	temporalClient := &clientFixture{}
+	store := &storeFixture{shot: controlplane.ShotWorkflowRecord{
+		Run:              controlplane.GenerationRun{RunID: "creator-run", ShotSpecRevisionID: "creator-shot", RunSpecDigest: "digest", CreativeAttempt: 1, TraceID: "trace"},
+		PromptSnapshotID: "prompt", PromptHash: "prompt-hash",
+		RouteSnapshot:    controlplane.ModelRouteSnapshot{CapabilityAlias: "video.primary", ProviderProfileID: "profile", Provider: "volcengine_ark", ModelID: "model", RouteVersion: "agent-plan-large-v1", CapabilityHash: "hash"},
+		BudgetApprovalID: "reservation", BudgetLimit: controlplane.BudgetLimit{AmountMicros: 1_000_000, Currency: "VTC"},
+	}}
+	controller, err := New(temporalClient, "queue", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = controller.StartShot(t.Context(), controlplane.Operation{OperationID: "operation", OperationType: "CONFIRM_CREATOR_LIVE_SHOT", AggregateID: "creator-run", TemporalWorkflowID: "creator-live-shot-creator-run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := temporalClient.executions[0].input.(orchestration.ShotProductionInput)
+	if input.RequireShotApproval {
+		t.Fatal("creator live shot unexpectedly waits for Q1")
+	}
+}
+
 func TestControllerSignalsPauseResumeAndCancel(t *testing.T) {
 	t.Parallel()
 	temporalClient := &clientFixture{}

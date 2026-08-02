@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 )
 
 // Actor is the authenticated product identity copied into immutable audit
@@ -277,6 +279,230 @@ type Idempotency struct {
 type Stored[T any] struct {
 	Value    T
 	Replayed bool
+}
+
+// CreatorLiveShot is the narrow Studio facade over the durable shot workflow.
+// Every identifier and hash is server-derived; browsers never provide product
+// truth identifiers or provider routing data.
+type CreatorLiveShotPlanCommand struct {
+	Title              string                              `json:"title"`
+	SceneText          string                              `json:"sceneText"`
+	AspectRatio        string                              `json:"aspectRatio"`
+	RightsAccepted     bool                                `json:"rightsAccepted"`
+	SourceArtifactHash string                              `json:"sourceArtifactHash"`
+	SourceArtifactURI  string                              `json:"sourceArtifactUri"`
+	Route              providercontract.CapabilitySnapshot `json:"route"`
+	Actor              Actor                               `json:"actor"`
+}
+
+type CreatorLiveShotPlan struct {
+	SchemaVersion               string                      `json:"schemaVersion"`
+	PlanID                      string                      `json:"planId"`
+	SeriesID                    string                      `json:"seriesId"`
+	SourceRevisionID            string                      `json:"sourceRevisionId"`
+	EpisodeRevisionID           string                      `json:"episodeRevisionId"`
+	SceneRevisionID             string                      `json:"sceneRevisionId"`
+	ShotSpecRevisionID          string                      `json:"shotSpecRevisionId"`
+	PromptSnapshotID            string                      `json:"promptSnapshotId"`
+	GenerationProfileRevisionID string                      `json:"generationProfileRevisionId"`
+	BudgetApprovalID            string                      `json:"budgetApprovalId"`
+	SafetyDecisionID            string                      `json:"safetyDecisionId"`
+	State                       string                      `json:"state"`
+	Confirmable                 bool                        `json:"confirmable"`
+	Blockers                    []string                    `json:"blockers"`
+	Title                       string                      `json:"title"`
+	SceneTextHash               string                      `json:"sceneTextHash"`
+	AspectRatio                 string                      `json:"aspectRatio"`
+	Output                      providercontract.OutputSpec `json:"output"`
+	Route                       CreatorRoute                `json:"route"`
+	ProviderProfileID           string                      `json:"providerProfileId"`
+	BillingMode                 string                      `json:"billingMode"`
+	TaskLimit                   int                         `json:"taskLimit"`
+	VideoTokenLimit             int64                       `json:"videoTokenLimit"`
+	ProjectTaskLimit            int                         `json:"projectTaskLimit"`
+	ProjectVideoTokenLimit      int64                       `json:"projectVideoTokenLimit"`
+	ProjectTasksUsed            int                         `json:"projectTasksUsed"`
+	ProjectVideoTokensUsed      int64                       `json:"projectVideoTokensUsed"`
+	ProjectActiveRuns           int                         `json:"projectActiveRuns"`
+	ProviderCallCount           int                         `json:"providerCallCount"`
+	ProviderSubmitCount         int                         `json:"providerSubmitCount"`
+	PlanHash                    string                      `json:"planHash"`
+	Spec                        CreatorLiveShotSpec         `json:"spec"`
+	Budget                      CreatorLiveShotBudget       `json:"budget"`
+	Bindings                    CreatorLiveShotBindings     `json:"bindings"`
+	ExecutionPolicy             map[string]any              `json:"executionPolicy"`
+	TraceID                     string                      `json:"traceId"`
+	ExpiresAt                   time.Time                   `json:"expiresAt"`
+	CreatedAt                   time.Time                   `json:"createdAt"`
+}
+
+type CreatorLiveShotSpec struct {
+	Candidates      int    `json:"candidates"`
+	DurationSeconds int    `json:"durationSeconds"`
+	Resolution      string `json:"resolution"`
+	Audio           bool   `json:"audio"`
+	AspectRatio     string `json:"aspectRatio"`
+}
+
+type CreatorLiveShotBudget struct {
+	MaxTasksThisConfirmation       int     `json:"maxTasksThisConfirmation"`
+	MaxVideoTokensThisConfirmation int64   `json:"maxVideoTokensThisConfirmation"`
+	ProjectTaskLimit               int     `json:"projectTaskLimit"`
+	ProjectTokenLimit              int64   `json:"projectTokenLimit"`
+	ProjectTasksUsed               int     `json:"projectTasksUsed"`
+	ProjectTokensUsed              int64   `json:"projectTokensUsed"`
+	CashAmountMaximum              *int64  `json:"cashAmountMaximum"`
+	Currency                       *string `json:"currency"`
+	Verified                       bool    `json:"verified"`
+}
+
+type CreatorLiveShotBindings struct {
+	SourceRevisionID            string `json:"sourceRevisionId"`
+	EpisodeRevisionID           string `json:"episodeRevisionId"`
+	SceneRevisionID             string `json:"sceneRevisionId"`
+	ShotSpecRevisionID          string `json:"shotSpecRevisionId"`
+	PromptSnapshotID            string `json:"promptSnapshotId"`
+	GenerationProfileRevisionID string `json:"generationProfileRevisionId"`
+	GenerationPlanID            string `json:"generationPlanId"`
+	BudgetApprovalID            string `json:"budgetApprovalId"`
+	SafetyDecisionID            string `json:"safetyDecisionId"`
+}
+
+type CreatorRoute struct {
+	CapabilityAlias string `json:"capabilityAlias"`
+	Provider        string `json:"provider"`
+	ModelID         string `json:"modelId"`
+	EndpointID      string `json:"endpointId,omitempty"`
+	RouteVersion    string `json:"routeVersion"`
+	CapabilityHash  string `json:"capabilityHash"`
+	Verification    string `json:"verification"`
+	BillingMode     string `json:"billingMode"`
+}
+
+type ConfirmCreatorLiveShotCommand struct {
+	Confirmed        bool                                `json:"confirmed"`
+	PlanHash         string                              `json:"planHash"`
+	LiveCallsEnabled bool                                `json:"-"`
+	Route            providercontract.CapabilitySnapshot `json:"-"`
+	Actor            Actor                               `json:"-"`
+}
+
+type CreatorLiveShotRun struct {
+	SchemaVersion     string                   `json:"schemaVersion"`
+	RunID             string                   `json:"runId"`
+	PlanID            string                   `json:"planId"`
+	SeriesID          string                   `json:"seriesId"`
+	OperationID       string                   `json:"operationId"`
+	ProviderJobID     string                   `json:"providerJobId"`
+	State             string                   `json:"state"`
+	Progress          *int                     `json:"progress"`
+	PlanHash          string                   `json:"planHash"`
+	Route             CreatorRoute             `json:"route"`
+	UpstreamTaskID    *string                  `json:"providerTaskId"`
+	ProviderRequestID *string                  `json:"providerRequestId"`
+	SubmitCount       int                      `json:"submitCount"`
+	Replayed          bool                     `json:"replayed"`
+	ErrorCode         string                   `json:"errorCode,omitempty"`
+	Failure           *CreatorFailure          `json:"failure"`
+	Artifact          *CreatorLiveShotArtifact `json:"artifact"`
+	Usage             CreatorUsage             `json:"usage"`
+	CashCost          CreatorCashCost          `json:"cost"`
+	ManifestHash      string                   `json:"manifestHash,omitempty"`
+	Manifest          *CreatorManifestSummary  `json:"manifest"`
+	TraceID           string                   `json:"traceId"`
+	CreatedAt         time.Time                `json:"createdAt"`
+	UpdatedAt         time.Time                `json:"updatedAt"`
+}
+
+type CreatorFailure struct {
+	ErrorCode       string `json:"errorCode"`
+	Retryable       bool   `json:"retryable"`
+	SuggestedAction string `json:"suggestedAction"`
+}
+
+type CreatorManifestSummary struct {
+	ID       string `json:"id"`
+	Hash     string `json:"hash"`
+	URL      string `json:"url"`
+	Evidence string `json:"evidence"`
+}
+
+type CreatorCashCost struct {
+	AmountMicros *int64  `json:"amountMicros"`
+	Currency     *string `json:"currency"`
+	Verified     bool    `json:"verified"`
+	BillingMode  string  `json:"billingMode"`
+}
+
+type CreatorUsage struct {
+	PromptVideoTokens     *int64 `json:"promptVideoTokens"`
+	CompletionVideoTokens *int64 `json:"completionVideoTokens"`
+	TotalVideoTokens      *int64 `json:"totalVideoTokens"`
+	GeneratedDurationMS   *int64 `json:"generatedDurationMs"`
+}
+
+type CreatorLiveShotArtifact struct {
+	Digest         string `json:"sha256"`
+	MediaType      string `json:"mediaType"`
+	SizeBytes      int64  `json:"sizeBytes"`
+	Width          int    `json:"width,omitempty"`
+	Height         int    `json:"height,omitempty"`
+	DurationMillis int64  `json:"durationMs,omitempty"`
+	DownloadURL    string `json:"downloadUrl"`
+}
+
+type CreatorLiveShotManifest struct {
+	SchemaVersion  string                  `json:"schemaVersion"`
+	ManifestID     string                  `json:"manifestId"`
+	Evidence       string                  `json:"evidence"`
+	RunID          string                  `json:"runId"`
+	PlanID         string                  `json:"planId"`
+	PlanHash       string                  `json:"planHash"`
+	Provider       CreatorRoute            `json:"provider"`
+	ProviderRegion *string                 `json:"providerRegion"`
+	ProviderJobID  string                  `json:"providerJobId"`
+	UpstreamTaskID string                  `json:"upstreamTaskId"`
+	RequestID      string                  `json:"requestId"`
+	InputHash      string                  `json:"inputHash"`
+	OutputHash     string                  `json:"outputHash"`
+	Media          CreatorLiveShotArtifact `json:"media"`
+	Usage          CreatorUsage            `json:"usage"`
+	Budget         CreatorBudgetEvidence   `json:"budget"`
+	CashCost       CreatorCashCost         `json:"cost"`
+	CreatedAt      time.Time               `json:"createdAt"`
+}
+
+type CreatorBudgetEvidence struct {
+	BudgetApprovalID    string `json:"budgetApprovalId"`
+	ReservationID       string `json:"reservationId"`
+	ReservedTasks       int    `json:"reservedTasks"`
+	ReservedVideoTokens int64  `json:"reservedVideoTokens"`
+	SettledVideoTokens  *int64 `json:"settledVideoTokens"`
+	Settlement          string `json:"settlement"`
+}
+
+type CreatorArtifactRecord struct {
+	Digest    string
+	MediaType string
+	SizeBytes int64
+}
+
+type CreatorLiveShotProject struct {
+	SchemaVersion string               `json:"schemaVersion"`
+	SeriesID      string               `json:"seriesId"`
+	Plan          CreatorLiveShotPlan  `json:"plan"`
+	Runs          []CreatorLiveShotRun `json:"runs"`
+}
+
+// CreatorStore is separate from Store to avoid widening every existing test
+// fixture while keeping the production repository implementation explicit.
+type CreatorStore interface {
+	CreateCreatorLiveShotPlan(context.Context, CreatorLiveShotPlanCommand, Idempotency, string) (Stored[CreatorLiveShotPlan], error)
+	ConfirmCreatorLiveShotPlan(context.Context, string, ConfirmCreatorLiveShotCommand, Idempotency, string) (Stored[CreatorLiveShotRun], error)
+	ListCreatorLiveShots(context.Context, string, Actor) (CreatorLiveShotProject, error)
+	GetCreatorLiveShotRun(context.Context, string, Actor) (CreatorLiveShotRun, error)
+	GetCreatorLiveShotArtifact(context.Context, string, Actor) (CreatorArtifactRecord, error)
+	GetCreatorLiveShotManifest(context.Context, string, Actor) (CreatorLiveShotManifest, error)
 }
 
 // Store is the PostgreSQL product-truth boundary. Each mutation guarantees

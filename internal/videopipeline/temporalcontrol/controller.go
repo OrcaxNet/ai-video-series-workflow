@@ -119,6 +119,9 @@ func (c *Controller) StartShot(
 		return controlplane.WorkflowStart{}, errors.New("shot generation plan has no positive approved budget limit")
 	}
 	input := shotProductionInput(operation.OperationID, record)
+	if operation.OperationType == "CONFIRM_CREATOR_LIVE_SHOT" {
+		input.RequireShotApproval = false
+	}
 	workflowID := operation.TemporalWorkflowID
 	if workflowID == "" {
 		workflowID = "shot-generation-" + operation.AggregateID

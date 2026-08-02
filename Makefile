@@ -33,6 +33,7 @@ video-orbstack-up: video-bootstrap
 	VIDEO_PROVIDER_ADAPTER_URL="http://volcengine-provider:8091" \
 	VIDEO_SPEECH_PROVIDER_ADAPTER_URL="http://volcengine-provider:8091" \
 	VIDEO_LIVE_PROVIDER_CONFIGURED="true" \
+	VIDEO_LIVE_CALLS_ENABLED="true" \
 	VIDEO_POSTGRES_VOLUME="ai-video-series-postgres-orbstack" \
 	VIDEO_ARTIFACT_VOLUME="ai-video-series-artifacts-orbstack" \
 	$(VIDEO_COMPOSE) up --build --wait --force-recreate \

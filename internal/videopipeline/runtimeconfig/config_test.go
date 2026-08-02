@@ -57,6 +57,23 @@ func TestLoadControlPlane(t *testing.T) {
 			wantErr: true,
 		},
 		{
+			name:    "rejects armed live calls without service authentication",
+			values:  map[string]string{"VIDEO_LIVE_CALLS_ENABLED": "true"},
+			wantErr: true,
+		},
+		{
+			name: "accepts explicitly armed authenticated live calls",
+			values: map[string]string{
+				"VIDEO_LIVE_CALLS_ENABLED":           "true",
+				"VIDEO_PROVIDER_SERVICE_AUTH_SECRET": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+			},
+			check: func(t *testing.T, cfg ControlPlane) {
+				if !cfg.LiveCallsEnabled || len(cfg.ProviderServiceAuthSecret) != 32 {
+					t.Fatalf("unexpected live config: %#v", cfg)
+				}
+			},
+		},
+		{
 			name: "requires authentication secret in production",
 			values: map[string]string{
 				"VIDEO_ENVIRONMENT": "production",

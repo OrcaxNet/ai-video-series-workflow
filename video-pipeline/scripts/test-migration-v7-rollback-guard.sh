@@ -28,8 +28,13 @@ run_migrate() {
 
 version_before="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_before="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_before}" = "7"
+test "${version_before}" = "8"
 test "${dirty_before}" = "f"
+
+# v8 owns creator data that this guard must not delete. Temporarily point only
+# golang-migrate's version marker at v7; the v8 schema remains untouched while
+# we exercise v7's first-statement rollback guard below.
+run_migrate force 7 >/dev/null
 
 lineage_before="$(psql_value "
   SELECT COUNT(*)
@@ -88,15 +93,13 @@ test "${lineage_after}" = "${lineage_before}"
 test "${prompt_constraint_after}" = "${prompt_constraint_before}"
 test "${manifest_unique_after}" = "${manifest_unique_before}"
 
-# The failed statement was the first guarded statement and both v7 schema
-# invariants are unchanged, so clearing only golang-migrate's dirty marker is
-# safe in this disposable regression database.
-run_migrate force 7 >/dev/null
-run_migrate up >/dev/null 2>&1
+# The failed statement was the first guarded statement: v7 and v8 schema/data
+# are unchanged, so restore only golang-migrate's v8 version marker.
+run_migrate force 8 >/dev/null
 
 version_recovered="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_recovered="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_recovered}" = "7"
+test "${version_recovered}" = "8"
 test "${dirty_recovered}" = "f"
 test "$(psql_value "
   SELECT COUNT(*)

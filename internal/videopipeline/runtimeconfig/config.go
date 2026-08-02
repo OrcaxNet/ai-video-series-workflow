@@ -35,21 +35,23 @@ const (
 
 // ControlPlane configures the video control-plane health/API process.
 type ControlPlane struct {
-	Environment        string
-	HTTPAddress        string
-	PostgresAddress    string
-	PostgresDSN        string
-	TemporalAddress    string
-	TemporalNamespace  string
-	TemporalTaskQueue  string
-	AuthHMACSecret     string
-	AuthAudience       string
-	ArtifactRoot       string
-	ProviderAdapterURL string
-	DependencyTimeout  time.Duration
-	ShutdownTimeout    time.Duration
-	RequireDeps        bool
-	Version            string
+	Environment               string
+	HTTPAddress               string
+	PostgresAddress           string
+	PostgresDSN               string
+	TemporalAddress           string
+	TemporalNamespace         string
+	TemporalTaskQueue         string
+	AuthHMACSecret            string
+	AuthAudience              string
+	ArtifactRoot              string
+	ProviderAdapterURL        string
+	ProviderServiceAuthSecret string
+	LiveCallsEnabled          bool
+	DependencyTimeout         time.Duration
+	ShutdownTimeout           time.Duration
+	RequireDeps               bool
+	Version                   string
 }
 
 // OrchestratorWorker configures the Temporal workflow worker.
@@ -116,19 +118,20 @@ func LoadControlPlane() (ControlPlane, error) {
 
 func loadControlPlane(lookup LookupEnv) (ControlPlane, error) {
 	cfg := ControlPlane{
-		Environment:        value(lookup, "VIDEO_ENVIRONMENT", "development"),
-		HTTPAddress:        value(lookup, "VIDEO_CONTROL_PLANE_HTTP_ADDRESS", ":8080"),
-		PostgresAddress:    value(lookup, "VIDEO_POSTGRES_ADDRESS", "postgres:5432"),
-		TemporalAddress:    value(lookup, "VIDEO_TEMPORAL_ADDRESS", "temporal:7233"),
-		TemporalNamespace:  value(lookup, "VIDEO_TEMPORAL_NAMESPACE", "default"),
-		TemporalTaskQueue:  value(lookup, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
-		AuthAudience:       value(lookup, "VIDEO_AUTH_AUDIENCE", "video-control-plane"),
-		ArtifactRoot:       value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
-		ProviderAdapterURL: value(lookup, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
-		Version:            value(lookup, "VIDEO_BUILD_VERSION", "development"),
-		DependencyTimeout:  2 * time.Second,
-		ShutdownTimeout:    10 * time.Second,
-		RequireDeps:        true,
+		Environment:               value(lookup, "VIDEO_ENVIRONMENT", "development"),
+		HTTPAddress:               value(lookup, "VIDEO_CONTROL_PLANE_HTTP_ADDRESS", ":8080"),
+		PostgresAddress:           value(lookup, "VIDEO_POSTGRES_ADDRESS", "postgres:5432"),
+		TemporalAddress:           value(lookup, "VIDEO_TEMPORAL_ADDRESS", "temporal:7233"),
+		TemporalNamespace:         value(lookup, "VIDEO_TEMPORAL_NAMESPACE", "default"),
+		TemporalTaskQueue:         value(lookup, "VIDEO_TEMPORAL_TASK_QUEUE", "video-production-v1"),
+		AuthAudience:              value(lookup, "VIDEO_AUTH_AUDIENCE", "video-control-plane"),
+		ArtifactRoot:              value(lookup, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
+		ProviderAdapterURL:        value(lookup, "VIDEO_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
+		ProviderServiceAuthSecret: value(lookup, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
+		Version:                   value(lookup, "VIDEO_BUILD_VERSION", "development"),
+		DependencyTimeout:         2 * time.Second,
+		ShutdownTimeout:           10 * time.Second,
+		RequireDeps:               true,
 	}
 
 	var err error
@@ -140,6 +143,12 @@ func loadControlPlane(lookup LookupEnv) (ControlPlane, error) {
 	}
 	if cfg.RequireDeps, err = boolean(lookup, "VIDEO_REQUIRE_DEPENDENCIES", cfg.RequireDeps); err != nil {
 		return ControlPlane{}, err
+	}
+	if cfg.LiveCallsEnabled, err = boolean(lookup, "VIDEO_LIVE_CALLS_ENABLED", false); err != nil {
+		return ControlPlane{}, err
+	}
+	if cfg.LiveCallsEnabled && len(cfg.ProviderServiceAuthSecret) < 32 {
+		return ControlPlane{}, errors.New("VIDEO_PROVIDER_SERVICE_AUTH_SECRET must contain at least 32 bytes when live calls are enabled")
 	}
 	if err := validateListenAddress(cfg.HTTPAddress); err != nil {
 		return ControlPlane{}, fmt.Errorf("VIDEO_CONTROL_PLANE_HTTP_ADDRESS: %w", err)

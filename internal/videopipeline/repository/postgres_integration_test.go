@@ -6621,6 +6621,151 @@ func TestPostgres_CreateSeriesRollsBackIdempotencyOnPolicyFailure(t *testing.T) 
 	}
 }
 
+func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
+	dsn := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("VIDEO_TEST_POSTGRES_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	store := NewForPool(pool)
+	actor := controlplane.Actor{ActorID: "creator-integration-" + uuid.NewString(), Role: "CREATOR"}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_idempotency WHERE scope LIKE $1`, "creator-integration:"+actor.ActorID+"%")
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_runs WHERE actor_id=$1`, actor.ActorID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_plans WHERE actor_id=$1`, actor.ActorID)
+	})
+	capability := providercontract.CapabilitySnapshot{
+		Alias: providercontract.CapabilityVideo,
+		Capability: providercontract.Capability{Provider: "volcengine_ark", ModelFamily: "doubao-seedance-2.0", OutputModality: providercontract.ModalityVideo,
+			Resolutions: []string{"720p"}, AspectRatios: []string{"16:9", "9:16"}, MinDurationMillis: 4000, MaxDurationMillis: 15000, NativeFPS: []int{24}},
+		Configured: true, Enabled: true, Mode: "live", RouteVersion: "agent-plan-large-v1", SnapshotHash: strings.Repeat("a", 64),
+		Limits:          map[string]any{"billingMode": "subscription", "maximumConcurrency": float64(1)},
+		SupportedInputs: []string{"text"},
+	}
+	createPlan := func(index int) (controlplane.CreatorLiveShotPlan, controlplane.Idempotency) {
+		command := controlplane.CreatorLiveShotPlanCommand{Title: fmt.Sprintf("shot-%d", index), SceneText: "雨夜车站", AspectRatio: "16:9", RightsAccepted: true, SourceArtifactHash: strings.Repeat(fmt.Sprint(index%9+1), 64), SourceArtifactURI: "cas://sha256/" + strings.Repeat(fmt.Sprint(index%9+1), 64), Route: capability, Actor: actor}
+		idem := controlplane.Idempotency{Scope: "creator-integration:" + actor.ActorID + ":plan", Key: uuid.NewString(), RequestHash: strings.Repeat(fmt.Sprint((index+3)%9+1), 64)}
+		stored, err := store.CreateCreatorLiveShotPlan(ctx, command, idem, "creator-live-integration")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stored.Value, idem
+	}
+	plan1, idem1 := createPlan(1)
+	if plan1.State != "AWAITING_CONFIRMATION" || !plan1.Confirmable || plan1.ProviderCallCount != 1 || plan1.ProviderSubmitCount != 0 || plan1.BudgetApprovalID == "" || plan1.SafetyDecisionID == "" {
+		t.Fatalf("creator plan contract=%#v", plan1)
+	}
+	project, err := store.ListCreatorLiveShots(ctx, plan1.SeriesID, actor)
+	if err != nil || project.Plan.PlanID != plan1.PlanID || len(project.Runs) != 0 {
+		t.Fatalf("pre-confirm recovery projection=%#v err=%v", project, err)
+	}
+	var normalizedBindings int
+	if err := pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM video_pipeline.operation_requests WHERE id=$1 AND operation_type='CREATE_CREATOR_LIVE_SHOT_PLAN') +
+		       (SELECT count(*) FROM video_pipeline.review_tasks WHERE id=$2 AND state='APPROVED' AND generation_plan_id=$1) +
+		       (SELECT count(*) FROM video_pipeline.prompt_snapshot_inputs WHERE prompt_snapshot_id=$3)`,
+		plan1.PlanID, plan1.BudgetApprovalID, plan1.PromptSnapshotID).Scan(&normalizedBindings); err != nil || normalizedBindings != 11 {
+		t.Fatalf("normalized creator bindings=%d err=%v", normalizedBindings, err)
+	}
+	replayed, err := store.CreateCreatorLiveShotPlan(ctx, controlplane.CreatorLiveShotPlanCommand{Title: "shot-1", SceneText: "雨夜车站", AspectRatio: "16:9", RightsAccepted: true, SourceArtifactHash: strings.Repeat("2", 64), SourceArtifactURI: "cas://sha256/" + strings.Repeat("2", 64), Route: capability, Actor: actor}, idem1, "creator-live-integration")
+	if err != nil || !replayed.Replayed || replayed.Value.PlanID != plan1.PlanID {
+		t.Fatalf("plan replay=%#v err=%v", replayed, err)
+	}
+	rejectConfirm := func(command controlplane.ConfirmCreatorLiveShotCommand) error {
+		_, err := store.ConfirmCreatorLiveShotPlan(ctx, plan1.PlanID, command, controlplane.Idempotency{Scope: "creator-integration:" + actor.ActorID + ":confirm:" + plan1.PlanID, Key: uuid.NewString(), RequestHash: strings.Repeat("e", 64)}, "creator-live-integration")
+		return err
+	}
+	if err := rejectConfirm(controlplane.ConfirmCreatorLiveShotCommand{Confirmed: false, PlanHash: plan1.PlanHash, LiveCallsEnabled: true, Route: capability, Actor: actor}); asCode(err) != controlplane.CodeValidation {
+		t.Fatalf("unconfirmed error=%v", err)
+	}
+	if err := rejectConfirm(controlplane.ConfirmCreatorLiveShotCommand{Confirmed: true, PlanHash: strings.Repeat("f", 64), LiveCallsEnabled: true, Route: capability, Actor: actor}); asCode(err) != controlplane.CodePlanHashMismatch {
+		t.Fatalf("plan hash drift error=%v", err)
+	}
+	paygo := capability
+	paygo.Limits = map[string]any{"billingMode": "paygo", "maximumConcurrency": float64(1)}
+	if err := rejectConfirm(controlplane.ConfirmCreatorLiveShotCommand{Confirmed: true, PlanHash: plan1.PlanHash, LiveCallsEnabled: true, Route: paygo, Actor: actor}); asCode(err) != controlplane.CodeSubscriptionRouteRequired {
+		t.Fatalf("paygo error=%v", err)
+	}
+	confirm := func(plan controlplane.CreatorLiveShotPlan, key string) (controlplane.Stored[controlplane.CreatorLiveShotRun], error) {
+		return store.ConfirmCreatorLiveShotPlan(ctx, plan.PlanID, controlplane.ConfirmCreatorLiveShotCommand{Confirmed: true, PlanHash: plan.PlanHash, LiveCallsEnabled: true, Route: capability, Actor: actor}, controlplane.Idempotency{Scope: "creator-integration:" + actor.ActorID + ":confirm:" + plan.PlanID, Key: key, RequestHash: strings.Repeat("c", 64)}, "creator-live-integration")
+	}
+	key1 := uuid.NewString()
+	run1, err := confirm(plan1, key1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runReplay, err := confirm(plan1, key1)
+	if err != nil || !runReplay.Replayed || runReplay.Value.RunID != run1.Value.RunID {
+		t.Fatalf("confirm replay=%#v err=%v", runReplay, err)
+	}
+	plan2, _ := createPlan(2)
+	if _, err := confirm(plan2, uuid.NewString()); err == nil || asCode(err) != controlplane.CodeConcurrencyLimit {
+		t.Fatalf("concurrency error=%v", err)
+	}
+
+	var prepared creatorPreparedRequest
+	if err := pool.QueryRow(ctx, `SELECT request_snapshot FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, run1.Value.RunID).Scan(&prepared); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderJobObservation(ctx, orchestration.WorkflowStep{}, prepared.Input, orchestration.ProviderJobObservation{State: "RUNNING", UpstreamTaskID: "task-1", RequestID: "request-1"}); err != nil {
+		t.Fatal(err)
+	}
+	result := orchestration.ProviderResult{UpstreamTaskID: "task-1", RequestID: "request-1", ProviderRegion: "cn-beijing", ArtifactDigest: strings.Repeat("d", 64), ArtifactURI: "cas://sha256/" + strings.Repeat("d", 64), MediaType: "video/mp4", ArtifactSize: 10, Width: 1280, Height: 720, DurationMillis: 5000, Model: prepared.Input.Route, Usage: providercontract.Usage{VideoTokens: 250000, GeneratedMillis: 5000}, Cost: providercontract.Cost{PricingVersion: "agent-plan-video-token-v1", BillingMode: "subscription", Verified: false}}
+	if err := store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, prepared.Input, result); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := store.GetCreatorLiveShotRun(ctx, run1.Value.RunID, actor)
+	if err != nil || completed.State != "SUCCEEDED" || completed.ManifestHash == "" || completed.Manifest == nil || completed.SubmitCount != 1 || completed.Progress == nil || *completed.Progress != 100 || completed.CashCost.AmountMicros != nil || completed.CashCost.Verified {
+		t.Fatalf("completed=%#v err=%v", completed, err)
+	}
+	manifest, err := store.GetCreatorLiveShotManifest(ctx, run1.Value.RunID, actor)
+	if err != nil || manifest.Evidence != "live_provider_call" || manifest.OutputHash != result.ArtifactDigest || manifest.ProviderRegion == nil || *manifest.ProviderRegion != "cn-beijing" || manifest.ProviderJobID == "" || manifest.Budget.ReservedTasks != 1 || manifest.Budget.ReservedVideoTokens != creatorVideoTokenLimit || manifest.Budget.SettledVideoTokens == nil || *manifest.Budget.SettledVideoTokens != 250000 || manifest.CashCost.AmountMicros != nil {
+		t.Fatalf("manifest=%#v err=%v", manifest, err)
+	}
+	if _, err := confirm(plan2, uuid.NewString()); err == nil || asCode(err) != controlplane.CodePlanStale {
+		t.Fatalf("plan created under prior concurrency snapshot error=%v", err)
+	}
+	plan3, _ := createPlan(3)
+	third, err := confirm(plan3, uuid.NewString())
+	if err != nil {
+		t.Fatalf("fresh second confirm after terminal: %v", err)
+	}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, orchestration.CancelProviderJobInput{Dispatch: orchestration.ExecuteProviderJobInput{Run: orchestration.GenerationRunRef{RunID: third.Value.RunID}}}, orchestration.CancelProviderResult{State: "CANCELLED"}); err != nil {
+		t.Fatal(err)
+	}
+	plan4, _ := createPlan(4)
+	fourth, err := confirm(plan4, uuid.NewString())
+	if err != nil {
+		t.Fatalf("third project task: %v", err)
+	}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, orchestration.CancelProviderJobInput{Dispatch: orchestration.ExecuteProviderJobInput{Run: orchestration.GenerationRunRef{RunID: fourth.Value.RunID}}}, orchestration.CancelProviderResult{State: "CANCELLED"}); err != nil {
+		t.Fatal(err)
+	}
+	plan5, _ := createPlan(5)
+	if plan5.Confirmable || len(plan5.Blockers) != 1 || plan5.Blockers[0] != string(controlplane.CodeProjectBudgetExceeded) {
+		t.Fatalf("exhausted plan=%#v", plan5)
+	}
+	if _, err := confirm(plan5, uuid.NewString()); asCode(err) != controlplane.CodeProjectBudgetExceeded {
+		t.Fatalf("project budget error=%v", err)
+	}
+}
+
+func asCode(err error) controlplane.ErrorCode {
+	var domain *controlplane.DomainError
+	if errors.As(err, &domain) {
+		return domain.Code
+	}
+	return ""
+}
+
 func TestPostgres_MigrationV2EnforcesImmutableAndRetentionGuards(t *testing.T) {
 	dsn := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
 	if dsn == "" {

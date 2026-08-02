@@ -484,7 +484,8 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	response := providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		UpstreamTaskID: upstream.ID, RequestID: upstream.ProviderRequestID,
-		State: upstream.Status, Model: request.Model,
+		ProviderRegion: s.config.Region,
+		State:          upstream.Status, Model: request.Model,
 		Cost: s.subscriptionCost(request),
 	}
 	if response.State == "" {
@@ -629,7 +630,8 @@ func (s *Server) beginSpeechRetry(
 func (s *Server) pendingResponse(request providercontract.JobRequest) providercontract.JobResponse {
 	return providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
-		State: providercontract.StatusUnknown, Model: request.Model,
+		ProviderRegion: s.config.Region,
+		State:          providercontract.StatusUnknown, Model: request.Model,
 		Cost: s.subscriptionCost(request),
 	}
 }
@@ -1249,7 +1251,8 @@ func (s *Server) validateSpeechBatchSequence(request providercontract.JobRequest
 			strings.TrimSpace(record.Response.LogID) == "" ||
 			record.Response.Usage.OutputUnits <= 0 ||
 			record.Response.Usage.OutputUnits > prior.MaximumAFPMilli ||
-			record.Response.Cost.ActualMicros == nil || *record.Response.Cost.ActualMicros != 0 {
+			record.Response.Cost.ActualMicros != nil || record.Response.Cost.Verified ||
+			record.Response.Cost.BillingMode != "subscription" {
 			return safeError(providercontract.CodeConflict, "speech batch is not ready for this ordered cue", false)
 		}
 		consumed += record.Response.Usage.OutputUnits
@@ -1506,14 +1509,13 @@ func validateMeasuredSpeech(measured MediaSpec, expected providercontract.Output
 }
 
 func (s *Server) subscriptionCost(request providercontract.JobRequest) providercontract.Cost {
-	zero := int64(0)
 	return providercontract.Cost{
-		EstimatedMicros:  request.BudgetReservation.AmountMicros,
-		ActualMicros:     &zero,
-		Currency:         request.BudgetReservation.Currency,
+		EstimatedMicros:  0,
+		ActualMicros:     nil,
+		Currency:         "",
 		PricingVersion:   request.BudgetReservation.PricingVersion,
-		Verified:         true,
-		BillingMode:      "subscription_included",
+		Verified:         false,
+		BillingMode:      "subscription",
 		ProviderReported: false,
 	}
 }

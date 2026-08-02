@@ -68,6 +68,10 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 保留数据库证据并以前向修复恢复。`000007` down 只用于没有这些数据的可丢弃测试
 环境，并会在不安全时主动失败。
 
+`000008_creator_live_shot` 增加 Studio 单镜的短期计划、精确确认、订阅
+task/token reservation、Provider intent、CAS/Manifest 投影和独立幂等表。
+操作与故障恢复见 [creator-live-shot.md](creator-live-shot.md)。
+
 `golang-migrate` 会在执行 down SQL 前先把目标版本写为 dirty。因此，如果上述安全
 闸门拒绝 `000007 down`，即使第一条保护检查已在任何 DDL 前失败，迁移状态也会显示
 为 `6/dirty`，后续 migration 会被阻断。误触后的恢复流程如下：

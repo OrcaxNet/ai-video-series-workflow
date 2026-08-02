@@ -515,6 +515,7 @@ func (a *Activities) executeProviderJob(
 	return ProviderResult{
 		UpstreamTaskID: result.UpstreamTaskID,
 		RequestID:      result.RequestID,
+		ProviderRegion: result.ProviderRegion,
 		ArtifactDigest: output.SHA256,
 		ArtifactURI:    output.URI,
 		MediaType:      output.MediaType,
@@ -573,9 +574,14 @@ func providerObservation(response providercontract.JobResponse) ProviderJobObser
 	if response.Error != nil {
 		errorCode = string(response.Error.Code)
 	}
+	var progress *int
+	if response.Progress > 0 {
+		value := response.Progress
+		progress = &value
+	}
 	return ProviderJobObservation{
 		State: state, UpstreamTaskID: response.UpstreamTaskID,
-		RequestID: response.RequestID, ErrorCode: errorCode,
+		RequestID: response.RequestID, Progress: progress, ErrorCode: errorCode,
 	}
 }
 
