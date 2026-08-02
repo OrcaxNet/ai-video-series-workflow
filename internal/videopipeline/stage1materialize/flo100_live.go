@@ -26,7 +26,7 @@ import (
 
 const (
 	liveAuthorizationSchema   = "flo100.batch-a-live-authorization.v1"
-	liveProjectionSchema      = "flo100.batch-a-live-projection.v1"
+	liveProjectionSchema      = "flo100.batch-a-live-projection.v2"
 	formalBatchAExecutionHash = "56d21bcec47934b11290f9760c0650e5c37e244ee756b4c76056240fdeebf260"
 	liveAuthorizationOutcome  = "AUTHORIZE_BATCH_A_ONLY_WHEN_ALL_PRE_SUBMIT_GATES_PASS"
 	liveBillingMode           = providercontract.BillingModeSubscriptionIncludedOnly
@@ -584,7 +584,7 @@ func materializeFLO100LiveDB(
 			 pricing_rule_version,capability_hash,status,effective_at,expires_at)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,'agent-plan-subscription-v1',$8,'ACTIVE',$9,$10)`,
 			capability.id, capability.profile, capability.alias, capability.model, capability.version,
-			capability.inputs, limits, capability.hash, now, authorization.Authority.ValidUntil); err != nil {
+			capability.inputs, limits, capability.hash, authorization.Authority.IssuedAt, authorization.Authority.ValidUntil); err != nil {
 			return stage1.ExecutionPackage{}, "", time.Time{}, false, err
 		}
 	}
@@ -599,7 +599,7 @@ func materializeFLO100LiveDB(
 		if err := exec("live approval decision", `INSERT INTO video_pipeline.approval_decisions
 			(id,series_id,episode_id,gate,decision,reason_code,explanation,actor_id,actor_role,decided_at,trace_id)
 			VALUES ($1,$2,NULL,$3,'APPROVED',$4,$5,$6,'ADMIN',$7,$8)`, decision.id, controlSeriesID,
-			decision.gate, liveSourceReason, decision.explanation, authorization.Authority.ActorID, now, traceID); err != nil {
+			decision.gate, liveSourceReason, decision.explanation, authorization.Authority.ActorID, authorization.Authority.IssuedAt, traceID); err != nil {
 			return stage1.ExecutionPackage{}, "", time.Time{}, false, err
 		}
 	}
@@ -686,7 +686,7 @@ func materializeFLO100LiveDB(
 			(id,series_id,episode_id,review_type,state,reason_codes,assigned_role,decided_at,
 			 generation_plan_id,budget_scope,budget_limit_micros,budget_currency)
 			VALUES ($1,$2,NULL,'BUDGET','APPROVED',ARRAY[$3],'ADMIN',$4,$5,$6,0,'CNY')`,
-			review.id, controlSeriesID, liveSourceReason, now, livePlanID, review.scope); err != nil {
+			review.id, controlSeriesID, liveSourceReason, authorization.Authority.IssuedAt, livePlanID, review.scope); err != nil {
 			return stage1.ExecutionPackage{}, "", time.Time{}, false, err
 		}
 	}
@@ -907,17 +907,76 @@ func flo100LiveProjectionHash(
 		query    string
 		args     []any
 	}{
-		{"activation", 1, `SELECT to_jsonb(a) FROM video_pipeline.stage1_live_activations a WHERE id=$1`, []any{activationID}},
-		{"activation_runs", 10, `SELECT to_jsonb(r) FROM video_pipeline.stage1_live_activation_runs r WHERE activation_id=$1 ORDER BY ordinal`, []any{activationID}},
-		{"control_series", 1, `SELECT to_jsonb(s) FROM video_pipeline.series s WHERE id=$1`, []any{controlSeriesID}},
-		{"approval_decisions", 3, `SELECT to_jsonb(d) FROM video_pipeline.approval_decisions d WHERE id=ANY($1) ORDER BY id`, []any{decisionIDs}},
-		{"approval_bindings", 44, `SELECT to_jsonb(b) FROM video_pipeline.approval_bindings b WHERE decision_id=ANY($1) ORDER BY decision_id,object_type,revision_id`, []any{decisionIDs}},
-		{"provider_profiles", 2, `SELECT to_jsonb(p) FROM video_pipeline.provider_profiles p WHERE id=ANY($1) ORDER BY id`, []any{[]uuid.UUID{videoProfileID, speechProfileID}}},
-		{"provider_capabilities", 2, `SELECT to_jsonb(c) FROM video_pipeline.provider_capability_snapshots c WHERE id=ANY($1) ORDER BY id`, []any{[]uuid.UUID{videoCapabilityID, speechCapabilityID}}},
-		{"plan_operation", 1, `SELECT to_jsonb(o) FROM video_pipeline.operation_requests o WHERE id=$1`, []any{planID}},
-		{"plan_idempotency", 1, `SELECT to_jsonb(i) FROM video_pipeline.idempotency_records i WHERE scope='flo100-live-activate' AND operation_id=$1`, []any{planID}},
-		{"plan_audit", 1, `SELECT to_jsonb(a) FROM video_pipeline.audit_events a WHERE aggregate_type='GENERATION_PLAN' AND aggregate_id=$1 AND reason_code=$2 ORDER BY id`, []any{planID, liveSourceReason}},
-		{"budget_reviews", 2, `SELECT to_jsonb(r) FROM video_pipeline.review_tasks r WHERE generation_plan_id=$1 AND review_type='BUDGET' ORDER BY id`, []any{planID}},
+		// Canonical v2 uses explicit allowlists. Wall-clock bookkeeping remains
+		// truthful in PostgreSQL but cannot perturb the seal, while authoritative
+		// validity/effective timestamps remain covered because they come from the
+		// immutable external authorization.
+		{"activation", 1, `SELECT jsonb_build_object(
+			'id',a.id,'batch_id',a.batch_id,'control_series_id',a.control_series_id,
+			'source_series_id',a.source_series_id,'source_episode_id',a.source_episode_id,
+			'source_episode_revision_id',a.source_episode_revision_id,
+			'source_generation_plan_id',a.source_generation_plan_id,'live_generation_plan_id',a.live_generation_plan_id,
+			'video_provider_profile_id',a.video_provider_profile_id,'video_capability_snapshot_id',a.video_capability_snapshot_id,
+			'speech_provider_profile_id',a.speech_provider_profile_id,'speech_capability_snapshot_id',a.speech_capability_snapshot_id,
+			'video_budget_approval_id',a.video_budget_approval_id,'speech_budget_approval_id',a.speech_budget_approval_id,
+			'g1_decision_id',a.g1_decision_id,'g2_decision_id',a.g2_decision_id,'safety_decision_id',a.safety_decision_id,
+			'offline_package_hash',a.offline_package_hash,'offline_execution_package_hash',a.offline_execution_package_hash,
+			'source_authorization_hash',a.source_authorization_hash,'source_authorization',a.source_authorization,
+			'source_authorized_commit',a.source_authorized_commit,'source_code_commit',a.source_code_commit,
+			'source_authorization_valid_until',a.source_authorization_valid_until,
+			'live_plan_hash',a.live_plan_hash,'live_execution_package_hash',a.live_execution_package_hash)
+			FROM video_pipeline.stage1_live_activations a WHERE id=$1`, []any{activationID}},
+		{"activation_runs", 10, `SELECT jsonb_build_object(
+			'activation_id',r.activation_id,'ordinal',r.ordinal,'run_id',r.run_id,'offline_run_id',r.offline_run_id,
+			'shot_spec_revision_id',r.shot_spec_revision_id,'prompt_snapshot_id',r.prompt_snapshot_id,
+			'prompt_snapshot_hash',r.prompt_snapshot_hash,'authorized_prompt_hash',r.authorized_prompt_hash,
+			'intent_input_hash',r.intent_input_hash,'estimated_video_tokens',r.estimated_video_tokens,
+			'predicted_afp_milli',r.predicted_afp_milli)
+			FROM video_pipeline.stage1_live_activation_runs r WHERE activation_id=$1 ORDER BY ordinal`, []any{activationID}},
+		{"control_series", 1, `SELECT jsonb_build_object(
+			'id',s.id,'schema_version',s.schema_version,'title',s.title,'status',s.status,
+			'default_profile_id',s.default_profile_id,'rights_declaration',s.rights_declaration,'created_by',s.created_by)
+			FROM video_pipeline.series s WHERE id=$1`, []any{controlSeriesID}},
+		{"approval_decisions", 3, `SELECT jsonb_build_object(
+			'id',d.id,'series_id',d.series_id,'episode_id',d.episode_id,'gate',d.gate,'decision',d.decision,
+			'reason_code',d.reason_code,'explanation',d.explanation,'actor_id',d.actor_id,'actor_role',d.actor_role,
+			'decided_at',d.decided_at,'trace_id',d.trace_id)
+			FROM video_pipeline.approval_decisions d WHERE id=ANY($1) ORDER BY id`, []any{decisionIDs}},
+		{"approval_bindings", 44, `SELECT jsonb_build_object(
+			'decision_id',b.decision_id,'object_type',b.object_type,'revision_id',b.revision_id,'content_hash',b.content_hash)
+			FROM video_pipeline.approval_bindings b WHERE decision_id=ANY($1) ORDER BY decision_id,object_type,revision_id`, []any{decisionIDs}},
+		{"provider_profiles", 2, `SELECT jsonb_build_object(
+			'id',p.id,'provider',p.provider,'display_name',p.display_name,'base_url_ref',p.base_url_ref,
+			'credential_ref',p.credential_ref,'enabled',p.enabled,'mode',p.mode,'health',p.health,
+			'credential_fingerprint',p.credential_fingerprint,'config_hash',p.config_hash)
+			FROM video_pipeline.provider_profiles p WHERE id=ANY($1) ORDER BY id`, []any{[]uuid.UUID{videoProfileID, speechProfileID}}},
+		{"provider_capabilities", 2, `SELECT jsonb_build_object(
+			'id',c.id,'provider_profile_id',c.provider_profile_id,'capability_alias',c.capability_alias,
+			'model_id',c.model_id,'endpoint_id',c.endpoint_id,'route_version',c.route_version,
+			'supported_inputs',c.supported_inputs,'limits',c.limits,'pricing_rule_version',c.pricing_rule_version,
+			'capability_hash',c.capability_hash,'status',c.status,'effective_at',c.effective_at,'expires_at',c.expires_at)
+			FROM video_pipeline.provider_capability_snapshots c WHERE id=ANY($1) ORDER BY id`, []any{[]uuid.UUID{videoCapabilityID, speechCapabilityID}}},
+		{"plan_operation", 1, `SELECT jsonb_build_object(
+			'id',o.id,'operation_type',o.operation_type,'aggregate_type',o.aggregate_type,'aggregate_id',o.aggregate_id,
+			'expected_revision',o.expected_revision,'state',o.state,'temporal_workflow_id',o.temporal_workflow_id,
+			'temporal_run_id',o.temporal_run_id,'trace_id',o.trace_id,'requested_by',o.requested_by)
+			FROM video_pipeline.operation_requests o WHERE id=$1`, []any{planID}},
+		{"plan_idempotency", 1, `SELECT jsonb_build_object(
+			'scope',i.scope,'idempotency_key',i.idempotency_key,'request_hash',i.request_hash,
+			'operation_id',i.operation_id,'response_status',i.response_status,'response_body',i.response_body,'expires_at',i.expires_at)
+			FROM video_pipeline.idempotency_records i WHERE scope='flo100-live-activate' AND operation_id=$1`, []any{planID}},
+		{"plan_audit", 1, `SELECT jsonb_build_object(
+			'id',a.id,'actor_id',a.actor_id,'actor_role',a.actor_role,'action',a.action,
+			'aggregate_type',a.aggregate_type,'aggregate_id',a.aggregate_id,'before_revision',a.before_revision,
+			'after_revision',a.after_revision,'reason_code',a.reason_code,'trace_id',a.trace_id,'payload',a.payload)
+			FROM video_pipeline.audit_events a WHERE aggregate_type='GENERATION_PLAN' AND aggregate_id=$1 AND reason_code=$2 ORDER BY id`, []any{planID, liveSourceReason}},
+		{"budget_reviews", 2, `SELECT jsonb_build_object(
+			'id',r.id,'series_id',r.series_id,'episode_id',r.episode_id,'shot_id',r.shot_id,
+			'generation_run_id',r.generation_run_id,'review_type',r.review_type,'state',r.state,
+			'reason_codes',r.reason_codes,'assigned_role',r.assigned_role,'decided_at',r.decided_at,
+			'generation_plan_id',r.generation_plan_id,'budget_scope',r.budget_scope,
+			'budget_limit_micros',r.budget_limit_micros,'budget_currency',r.budget_currency)
+			FROM video_pipeline.review_tasks r WHERE generation_plan_id=$1 AND review_type='BUDGET' ORDER BY id`, []any{planID}},
 		{"runs", 10, `SELECT jsonb_build_object(
 			'id',r.id,'shot_spec_revision_id',r.shot_spec_revision_id,'prompt_snapshot_id',r.prompt_snapshot_id,
 			'generation_profile_id',r.generation_profile_id,'temporal_workflow_id',r.temporal_workflow_id,
@@ -928,8 +987,16 @@ func flo100LiveProjectionHash(
 			'id',a.id,'generation_run_id',a.generation_run_id,'sequence',a.sequence,'attempt_kind',a.attempt_kind,
 			'input_hash',a.input_hash,'model_snapshot',a.model_snapshot,'parameter_diff',a.parameter_diff)
 			FROM video_pipeline.generation_attempts a WHERE generation_run_id=ANY($1) ORDER BY id`, []any{runIDs}},
-		{"run_audits", 10, `SELECT to_jsonb(a) FROM video_pipeline.audit_events a WHERE aggregate_type='GENERATION_RUN' AND aggregate_id=ANY($1) AND reason_code=$2 ORDER BY id`, []any{runIDs, liveSourceReason}},
-		{"materialization_audit", 1, `SELECT to_jsonb(a) FROM video_pipeline.audit_events a WHERE aggregate_type='STAGE1_LIVE_ACTIVATION' AND aggregate_id=$1 AND action='flo100.live_execution_package.materialized' ORDER BY id`, []any{activationID}},
+		{"run_audits", 10, `SELECT jsonb_build_object(
+			'id',a.id,'actor_id',a.actor_id,'actor_role',a.actor_role,'action',a.action,
+			'aggregate_type',a.aggregate_type,'aggregate_id',a.aggregate_id,'before_revision',a.before_revision,
+			'after_revision',a.after_revision,'reason_code',a.reason_code,'trace_id',a.trace_id,'payload',a.payload)
+			FROM video_pipeline.audit_events a WHERE aggregate_type='GENERATION_RUN' AND aggregate_id=ANY($1) AND reason_code=$2 ORDER BY id`, []any{runIDs, liveSourceReason}},
+		{"materialization_audit", 1, `SELECT jsonb_build_object(
+			'id',a.id,'actor_id',a.actor_id,'actor_role',a.actor_role,'action',a.action,
+			'aggregate_type',a.aggregate_type,'aggregate_id',a.aggregate_id,'before_revision',a.before_revision,
+			'after_revision',a.after_revision,'reason_code',a.reason_code,'trace_id',a.trace_id,'payload',a.payload)
+			FROM video_pipeline.audit_events a WHERE aggregate_type='STAGE1_LIVE_ACTIVATION' AND aggregate_id=$1 AND action='flo100.live_execution_package.materialized' ORDER BY id`, []any{activationID}},
 	}
 	snapshot := liveProjectionSnapshot{SchemaVersion: liveProjectionSchema, ActivationID: activationID.String()}
 	for _, section := range sections {

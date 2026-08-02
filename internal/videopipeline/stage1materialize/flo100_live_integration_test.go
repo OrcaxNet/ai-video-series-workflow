@@ -21,10 +21,11 @@ import (
 
 func TestFLO100LiveActivationQuotaAndReplayAreFailClosed(t *testing.T) {
 	dsn := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
+	secondaryDSN := os.Getenv("VIDEO_TEST_POSTGRES_DSN_SECONDARY")
 	root := os.Getenv("VIDEO_TEST_FLO100_PACK_PATH")
 	authorizationPath := os.Getenv("VIDEO_TEST_FLO100_LIVE_AUTHORIZATION_PATH")
-	if dsn == "" || root == "" || authorizationPath == "" {
-		t.Skip("disposable PostgreSQL, FLO-100 pack, and live authorization are required")
+	if dsn == "" || secondaryDSN == "" || root == "" || authorizationPath == "" {
+		t.Skip("two disposable PostgreSQL databases, FLO-100 pack, and live authorization are required")
 	}
 	ctx := t.Context()
 	pool, err := pgxpool.New(ctx, dsn)
@@ -71,6 +72,56 @@ func TestFLO100LiveActivationQuotaAndReplayAreFailClosed(t *testing.T) {
 		package_.LiveActivation.OfflineExecutionPackageHash != offline[0].ContentHash {
 		t.Fatalf("unexpected code-drift activation report: %+v", report)
 	}
+	secondaryPool, err := pgxpool.New(ctx, secondaryDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer secondaryPool.Close()
+	secondaryCAS, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryOffline, _, err := MaterializeFLO100(ctx, secondaryPool, secondaryCAS, formal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryPlan, secondaryPackage, secondaryReport, err := MaterializeFLO100Live(
+		ctx, secondaryPool, secondaryCAS, options,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	primaryPlanHash, err := digest(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondaryPlanHash, err := digest(secondaryPlan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secondaryOffline[0].ContentHash != offline[0].ContentHash ||
+		secondaryPlanHash != primaryPlanHash || secondaryPackage.ContentHash != package_.ContentHash ||
+		secondaryReport.LiveProjectionHash != report.LiveProjectionHash {
+		t.Fatalf("fresh database hashes differ: plan %s/%s package %s/%s projection %s/%s",
+			primaryPlanHash, secondaryPlanHash, package_.ContentHash, secondaryPackage.ContentHash,
+			report.LiveProjectionHash, secondaryReport.LiveProjectionHash)
+	}
+	if secondaryReport.SubmitAuthorized {
+		t.Fatal("code-drift authorization unexpectedly enabled submit in the secondary database")
+	}
+	var primaryCreatedAt, secondaryCreatedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT created_at FROM video_pipeline.stage1_live_activations WHERE id=$1`,
+		mustUUID(package_.LiveActivation.ActivationID)).Scan(&primaryCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := secondaryPool.QueryRow(ctx, `SELECT created_at FROM video_pipeline.stage1_live_activations WHERE id=$1`,
+		mustUUID(secondaryPackage.LiveActivation.ActivationID)).Scan(&secondaryCreatedAt); err != nil {
+		t.Fatal(err)
+	}
+	if primaryCreatedAt.Equal(secondaryCreatedAt) {
+		t.Fatal("independent databases unexpectedly share the same runtime creation timestamp")
+	}
+	assertLiveBoundaryCounts(t, secondaryPool, 0, 0, 0, 0)
 	_, replayed, replayReport, err := MaterializeFLO100Live(ctx, pool, cas, options)
 	if err != nil {
 		t.Fatal(err)

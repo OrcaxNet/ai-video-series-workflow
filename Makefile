@@ -91,6 +91,7 @@ video-flo100-materialize-integration-test:
 # external authorization is read-only input; the test never contacts a Provider.
 video-flo100-live-activation-integration-test:
 	@test -n "$(VIDEO_TEST_POSTGRES_DSN)" || (echo "VIDEO_TEST_POSTGRES_DSN is required" && exit 1)
+	@test -n "$(VIDEO_TEST_POSTGRES_DSN_SECONDARY)" || (echo "VIDEO_TEST_POSTGRES_DSN_SECONDARY is required" && exit 1)
 	@test -n "$(VIDEO_TEST_FLO100_PACK_PATH)" || (echo "VIDEO_TEST_FLO100_PACK_PATH is required" && exit 1)
 	@test -n "$(VIDEO_TEST_FLO100_LIVE_AUTHORIZATION_PATH)" || (echo "VIDEO_TEST_FLO100_LIVE_AUTHORIZATION_PATH is required" && exit 1)
 	go test -tags=integration -run TestFLO100LiveActivationQuotaAndReplayAreFailClosed -count=1 -v ./internal/videopipeline/stage1materialize

@@ -91,11 +91,15 @@ Provider-free integration coverage:
 
 ```sh
 VIDEO_TEST_POSTGRES_DSN='postgres://…' \
+VIDEO_TEST_POSTGRES_DSN_SECONDARY='postgres://…' \
 VIDEO_TEST_FLO100_PACK_PATH='./FLO-100-stage3-offline-pack-v1' \
 VIDEO_TEST_FLO100_LIVE_AUTHORIZATION_PATH='./FLO-100-batch-a-live-authorization-v1.json' \
 make video-flo100-live-activation-integration-test
 ```
 
-The test covers fresh/replay stability and fail-closed rejection of code,
+Both DSNs must point to independently migrated, otherwise empty PostgreSQL v8
+databases. The test requires their readiness-plan, execution-package and live
+projection hashes to match before it continues with same-database replay and
+the fail-closed rejection of code,
 authorization, package, projection, route, scope, cash and quota drift before
 any provider job, cash reservation, cost row or external request is created.
