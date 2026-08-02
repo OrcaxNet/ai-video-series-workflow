@@ -55,15 +55,16 @@ const (
 // Error intentionally stores only a safe summary. Raw provider response bodies
 // may contain prompts, URLs, or credentials and must not cross this boundary.
 type Error struct {
-	Code            ErrorCode     `json:"code"`
-	HTTPStatus      int           `json:"http_status,omitempty"`
-	ProviderCode    string        `json:"provider_code,omitempty"`
-	ProviderReqID   string        `json:"provider_request_id,omitempty"`
-	Retryable       bool          `json:"retryable"`
-	RetryAfter      time.Duration `json:"retry_after,omitempty"`
-	SafeMessage     string        `json:"message"`
-	RequiresAction  bool          `json:"requires_action,omitempty"`
-	SuggestedAction string        `json:"suggested_action,omitempty"`
+	Code                 ErrorCode     `json:"code"`
+	HTTPStatus           int           `json:"http_status,omitempty"`
+	ProviderCode         string        `json:"provider_code,omitempty"`
+	ProviderReqID        string        `json:"provider_request_id,omitempty"`
+	ProviderMessageClass string        `json:"provider_message_class,omitempty"`
+	Retryable            bool          `json:"retryable"`
+	RetryAfter           time.Duration `json:"retry_after,omitempty"`
+	SafeMessage          string        `json:"message"`
+	RequiresAction       bool          `json:"requires_action,omitempty"`
+	SuggestedAction      string        `json:"suggested_action,omitempty"`
 }
 
 func (e *Error) Error() string {

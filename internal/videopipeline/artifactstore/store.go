@@ -117,6 +117,47 @@ func (s *Store) Open(digest string) (io.ReadCloser, error) {
 	return file, nil
 }
 
+// Resolve verifies an immutable object against its content-addressed identity
+// and returns the local path required by offline media inspectors. Callers must
+// not trust a path derived from a digest without re-hashing the stored bytes:
+// this method deliberately detects missing or externally corrupted objects.
+func (s *Store) Resolve(ctx context.Context, digest string) (Artifact, error) {
+	if !validDigest(digest) {
+		return Artifact{}, errors.New("artifact digest must be 64 lowercase hexadecimal characters")
+	}
+	if err := ctx.Err(); err != nil {
+		return Artifact{}, err
+	}
+	path := s.pathFor(digest)
+	file, err := os.Open(path)
+	if err != nil {
+		return Artifact{}, fmt.Errorf("open artifact %s: %w", digest, err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return Artifact{}, fmt.Errorf("inspect artifact %s: %w", digest, err)
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return Artifact{}, fmt.Errorf("artifact %s is not a regular file", digest)
+	}
+	hash := sha256.New()
+	size, copyErr := copyWithContext(ctx, hash, file)
+	closeErr := file.Close()
+	if copyErr != nil {
+		return Artifact{}, fmt.Errorf("verify artifact %s: %w", digest, copyErr)
+	}
+	if closeErr != nil {
+		return Artifact{}, fmt.Errorf("close artifact %s: %w", digest, closeErr)
+	}
+	actual := hex.EncodeToString(hash.Sum(nil))
+	if actual != digest {
+		return Artifact{}, fmt.Errorf("artifact %s content digest mismatch", digest)
+	}
+	return artifactFor(path, digest, size), nil
+}
+
 // Exists reports whether a validated digest is present.
 func (s *Store) Exists(digest string) (bool, error) {
 	if !validDigest(digest) {

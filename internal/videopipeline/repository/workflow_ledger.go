@@ -25,6 +25,32 @@ type immutableProviderRequest struct {
 	Prepared orchestration.PreparedProviderJob     `json:"prepared"`
 }
 
+type providerReservationEstimatePayload struct {
+	GenerationPlanID  string                         `json:"generationPlanId"`
+	BudgetApprovalID  string                         `json:"budgetApprovalId"`
+	EstimatedMicros   int64                          `json:"estimatedMicros"`
+	PlanMaximumMicros int64                          `json:"planMaximumMicros"`
+	PromptSnapshotID  string                         `json:"promptSnapshotId"`
+	RunSpecDigest     string                         `json:"runSpecDigest"`
+	ModelSnapshot     providercontract.ModelSnapshot `json:"modelSnapshot"`
+}
+
+type providerReservationExpectation struct {
+	RunID           uuid.UUID
+	JobID           uuid.UUID
+	ReservationID   uuid.UUID
+	AmountMicros    int64
+	Currency        string
+	PricingVersion  string
+	ConfirmedBy     string
+	EstimatePayload providerReservationEstimatePayload
+}
+
+const (
+	providerCancelledReleaseReason = "provider-cancelled"
+	workflowFailedReleaseReason    = "workflow-failed-before-settlement"
+)
+
 // CompilePromptSnapshot materializes the exact four-level context resolution
 // and immutable prompt used by a workflow Activity.
 func (p *Postgres) CompilePromptSnapshot(
@@ -275,7 +301,8 @@ func loadExactPromptSnapshot(
 		}
 		return orchestration.PromptSnapshotRef{}, fmt.Errorf("read immutable prompt snapshot: %w", err)
 	}
-	if schemaVersion != "v1" || compilerVersion != "control-plane-compiler-v1" {
+	if schemaVersion != "v1" ||
+		compilerVersion != "control-plane-compiler-v1" && compilerVersion != "stage1-product-input-v1" {
 		return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"prompt snapshot compiler identity is not executable",
@@ -313,20 +340,64 @@ func loadExactPromptSnapshot(
 			"prompt snapshot input hashes differ from their immutable producers",
 		)
 	}
-	expectedHash, err := workflowPromptHash(
-		shotID.String(),
-		profileID.String(),
-		effectiveHash,
-		assetIDs,
-		json.RawMessage(positivePrompt),
-		output,
-		expectedInputRevisionHashes,
-	)
+	var expectedHash string
+	if compilerVersion == "stage1-product-input-v1" {
+		var imported struct {
+			InputPackageHash   string `json:"inputPackageHash"`
+			OriginalPromptHash string `json:"originalPromptHash"`
+			DerivedPromptHash  string `json:"derivedPromptHash"`
+		}
+		if err := tx.QueryRow(ctx, `
+			SELECT payload
+			FROM video_pipeline.audit_events
+			WHERE action = 'prompt_snapshot.imported'
+			  AND aggregate_type = 'PROMPT_SNAPSHOT'
+			  AND aggregate_id = $1
+			ORDER BY occurred_at DESC
+			LIMIT 1
+			FOR SHARE`, promptID).Scan(&imported); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"imported prompt snapshot has no immutable package evidence",
+				)
+			}
+			return orchestration.PromptSnapshotRef{}, fmt.Errorf("read imported prompt evidence: %w", err)
+		}
+		if !validImportedDigest(imported.InputPackageHash) || !validImportedDigest(imported.OriginalPromptHash) {
+			return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"imported prompt package evidence is incomplete",
+			)
+		}
+		expectedHash, err = ImportedPromptHash(
+			shotID.String(), profileID.String(), effectiveHash, assetIDs,
+			positivePrompt, negativePrompt, output, expectedInputRevisionHashes,
+			imported.InputPackageHash,
+		)
+		if err == nil && imported.DerivedPromptHash != expectedHash {
+			return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"imported prompt audit digest differs from its database content",
+			)
+		}
+	} else {
+		expectedHash, err = workflowPromptHash(
+			shotID.String(),
+			profileID.String(),
+			effectiveHash,
+			assetIDs,
+			json.RawMessage(positivePrompt),
+			output,
+			expectedInputRevisionHashes,
+		)
+	}
 	if err != nil {
 		return orchestration.PromptSnapshotRef{}, err
 	}
 	expectedID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("prompt:"+expectedHash))
-	if contentHash != expectedHash || normalizedHash != expectedHash || promptID != expectedID {
+	if contentHash != expectedHash || normalizedHash != expectedHash ||
+		compilerVersion == "control-plane-compiler-v1" && promptID != expectedID {
 		return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"prompt snapshot hash or ID differs from its immutable content",
@@ -351,6 +422,65 @@ func loadExactPromptSnapshot(
 		Context: contextRefs, Assets: assets, Output: output,
 		InputRevisionHashes: storedInputRevisionHashes,
 	}, nil
+}
+
+func validImportedDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ImportedPromptHash binds a product-approved prompt to its exact imported
+// package without weakening the derived-ID contract used by normal compiler
+// output. The importing transaction records the original external digest and
+// this database-derived digest in an immutable audit event.
+func ImportedPromptHash(
+	shotSpecRevisionID string,
+	generationProfileRevisionID string,
+	effectiveContextHash string,
+	assetVersionIDs []uuid.UUID,
+	positivePrompt string,
+	negativePrompt string,
+	output providercontract.OutputSpec,
+	inputRevisionHashes map[string]string,
+	inputPackageHash string,
+) (string, error) {
+	return digestValue(map[string]any{
+		"schemaVersion":             "v1",
+		"compilerVersion":           "stage1-product-input-v1",
+		"shotSpecRevisionId":        shotSpecRevisionID,
+		"generationProfileRevision": generationProfileRevisionID,
+		"effectiveContextHash":      effectiveContextHash,
+		"assetVersionRefs":          uuidStrings(assetVersionIDs),
+		"positivePrompt":            positivePrompt,
+		"negativePrompt":            negativePrompt,
+		"output":                    output,
+		"inputRevisionHashes":       inputRevisionHashes,
+		"inputPackageHash":          inputPackageHash,
+	})
+}
+
+// GenerationRunSpecDigest exposes the repository's canonical run identity to
+// the offline Stage 1 materializer. Paid submission recomputes the same value.
+func GenerationRunSpecDigest(
+	shotSpecRevisionID string,
+	promptSnapshotID string,
+	promptHash string,
+	generationProfileID string,
+	generationPlanID string,
+	route providercontract.ModelSnapshot,
+	creativeAttempt int,
+) (string, error) {
+	return generationRunSpecDigest(
+		shotSpecRevisionID, promptSnapshotID, promptHash, generationProfileID,
+		generationPlanID, route, creativeAttempt,
+	)
 }
 
 func persistPromptLineage(
@@ -691,15 +821,22 @@ func loadPromptAssetEvidence(
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT av.id, av.asset_id, av.content_hash, av.artifact_uri,
-		       av.media_type, av.dimensions, ls.license_id, ls.license_hash
+		       av.media_type, a.size_bytes, av.dimensions,
+		       ls.license_id, ls.license_hash
 		FROM video_pipeline.asset_versions av
 		JOIN video_pipeline.license_snapshots ls
 		  ON ls.id = av.license_snapshot_id
+		JOIN video_pipeline.artifacts a
+		  ON a.content_hash = av.content_hash
+		 AND a.artifact_uri = av.artifact_uri
+		 AND a.media_type = av.media_type
 		WHERE av.id = ANY($1::uuid[])
 		  AND av.status = 'APPROVED'
+		  AND a.status = 'ACTIVE'
+		  AND a.size_bytes > 0
 		  AND ls.policy_status = 'ALLOWED'
 		  AND (ls.expires_at IS NULL OR ls.expires_at > now())
-		FOR SHARE OF av, ls`,
+		FOR SHARE OF av, ls, a`,
 		assetVersionIDs,
 	)
 	if err != nil {
@@ -716,12 +853,13 @@ func loadPromptAssetEvidence(
 			versionID, assetID uuid.UUID
 			contentHash, uri   string
 			mediaType          string
+			sizeBytes          int64
 			dimensions         []byte
 			licenseID          string
 			licenseHash        string
 		)
 		if err := rows.Scan(
-			&versionID, &assetID, &contentHash, &uri, &mediaType, &dimensions,
+			&versionID, &assetID, &contentHash, &uri, &mediaType, &sizeBytes, &dimensions,
 			&licenseID, &licenseHash,
 		); err != nil {
 			return nil, nil, fmt.Errorf("scan prompt asset: %w", err)
@@ -746,7 +884,8 @@ func loadPromptAssetEvidence(
 				ID: assetID.String(), Revision: versionID.String(), Kind: modality,
 				Role: role, URI: uri, SHA256: contentHash,
 				LicenseReference: licenseID + ":" + licenseHash,
-				MediaType:        mediaType, Width: mediaSpec.Width, Height: mediaSpec.Height,
+				MediaType:        mediaType, SizeBytes: sizeBytes,
+				Width: mediaSpec.Width, Height: mediaSpec.Height,
 				DurationMillis: mediaSpec.DurationMillis,
 			},
 		}
@@ -769,6 +908,121 @@ func loadPromptAssetEvidence(
 		hashes["asset:"+id.String()] = evidence.hash
 	}
 	return refs, hashes, nil
+}
+
+func loadShotAssetIDs(
+	ctx context.Context,
+	tx pgx.Tx,
+	shotIDs []uuid.UUID,
+) ([]uuid.UUID, error) {
+	rows, err := tx.Query(ctx, `
+		SELECT asset_version_refs
+		FROM video_pipeline.shot_spec_revisions
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id
+		FOR SHARE`,
+		shotIDs,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("read frozen shot asset references: %w", err)
+	}
+	defer rows.Close()
+	seen := make(map[uuid.UUID]struct{})
+	for rows.Next() {
+		var refs []uuid.UUID
+		if err := rows.Scan(&refs); err != nil {
+			return nil, fmt.Errorf("scan frozen shot asset references: %w", err)
+		}
+		for _, id := range refs {
+			seen[id] = struct{}{}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate frozen shot asset references: %w", err)
+	}
+	if len(seen) == 0 {
+		return nil, nil
+	}
+	assetIDs := make([]uuid.UUID, 0, len(seen))
+	for id := range seen {
+		assetIDs = append(assetIDs, id)
+	}
+	sort.Slice(assetIDs, func(left, right int) bool {
+		return assetIDs[left].String() < assetIDs[right].String()
+	})
+	return assetIDs, nil
+}
+
+// requireFrozenPlanShots locks and revalidates the complete shot set before a
+// paid submission. One valid current shot cannot mask drift elsewhere in the
+// execution package.
+func requireFrozenPlanShots(
+	ctx context.Context,
+	tx pgx.Tx,
+	shotIDs []uuid.UUID,
+	profileID uuid.UUID,
+	seriesID uuid.UUID,
+	episodeID uuid.UUID,
+) error {
+	rows, err := tx.Query(ctx, `
+		SELECT ssr.id, ssr.generation_profile_id, ssr.freshness,
+		       ssr.gate2_decision_id
+		FROM video_pipeline.shot_spec_revisions ssr
+		JOIN video_pipeline.shots sh ON sh.id = ssr.shot_id
+		JOIN video_pipeline.scenes sc ON sc.id = sh.scene_id
+		JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
+		WHERE ssr.id = ANY($1::uuid[])
+		  AND ep.id = $2
+		  AND ep.series_id = $3
+		ORDER BY ssr.id
+		FOR SHARE OF ssr`,
+		shotIDs, episodeID, seriesID,
+	)
+	if err != nil {
+		return fmt.Errorf("lock frozen generation-plan shots: %w", err)
+	}
+	defer rows.Close()
+	type frozenShot struct {
+		id, generationProfileID, gate2DecisionID uuid.UUID
+		freshness                                string
+	}
+	shots := make([]frozenShot, 0, len(shotIDs))
+	for rows.Next() {
+		var shot frozenShot
+		if err := rows.Scan(
+			&shot.id, &shot.generationProfileID, &shot.freshness, &shot.gate2DecisionID,
+		); err != nil {
+			return fmt.Errorf("scan frozen generation-plan shot: %w", err)
+		}
+		shots = append(shots, shot)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate frozen generation-plan shots: %w", err)
+	}
+	if len(shots) != len(shotIDs) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeGateRequired,
+			"generation plan no longer resolves its complete frozen shot set",
+			"freeze a new plan for the exact approved shots",
+		)
+	}
+	for _, shot := range shots {
+		if shot.generationProfileID != profileID ||
+			shot.freshness != "FRESH" && shot.freshness != "REVALIDATED" {
+			return controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"a frozen generation-plan shot has drifted before paid submission",
+				"revalidate the complete shot set and freeze a new execution package",
+			)
+		}
+		if err := requireApprovedDecision(
+			ctx, tx, shot.gate2DecisionID.String(), "G2", seriesID, episodeID,
+			"SHOT_SPEC_REVISION", shot.id,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func promptAssetType(mediaType string) (providercontract.Modality, providercontract.AssetRole, error) {
@@ -829,6 +1083,11 @@ func (p *Postgres) CreateWorkflowRun(
 	if input.CreativeAttempt < 1 || input.CreativeAttempt > 2 {
 		return orchestration.GenerationRunRef{}, errors.New("creativeAttempt must be 1 or 2")
 	}
+	budgetApprovalID, err := uuid.Parse(input.BudgetApprovalID)
+	if err != nil {
+		return orchestration.GenerationRunRef{}, errors.New("budgetApprovalId must be a UUID")
+	}
+	canonicalBudgetApprovalID := budgetApprovalID.String()
 	return withSerializable(ctx, p.pool, func(tx pgx.Tx) (orchestration.GenerationRunRef, error) {
 		var seriesID, episodeID, shotProfileID uuid.UUID
 		var freshness, lifecycle, promptHash string
@@ -895,7 +1154,7 @@ func (p *Postgres) CreateWorkflowRun(
 			)
 		}
 		if err := requireBudgetApproval(
-			ctx, tx, input.BudgetApprovalID, seriesID, episodeID,
+			ctx, tx, canonicalBudgetApprovalID, seriesID, episodeID,
 			input.GenerationPlanID, "VIDEO", plan.BudgetLimit,
 		); err != nil {
 			return orchestration.GenerationRunRef{}, err
@@ -922,7 +1181,7 @@ func (p *Postgres) CreateWorkflowRun(
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'VALIDATED', false, $9, $10, 'temporal-worker')
 			ON CONFLICT (id) DO NOTHING`,
 			runID, shotID, promptID, profileID, step.WorkflowID, temporalRunID(step),
-			runDigest, input.CreativeAttempt, input.BudgetApprovalID, step.TraceID,
+			runDigest, input.CreativeAttempt, canonicalBudgetApprovalID, step.TraceID,
 		)
 		if err != nil {
 			return orchestration.GenerationRunRef{}, translateWriteError("insert workflow generation run", err)
@@ -993,21 +1252,30 @@ func (p *Postgres) PrepareProviderJob(
 	if err != nil {
 		return orchestration.PreparedProviderJob{}, errors.New("providerProfileId must be a UUID")
 	}
+	budgetApprovalID, err := uuid.Parse(input.BudgetApprovalID)
+	if err != nil {
+		return orchestration.PreparedProviderJob{}, errors.New("budgetApprovalId must be a UUID")
+	}
+	input.BudgetApprovalID = budgetApprovalID.String()
 	prepared, err := withSerializable(ctx, p.pool, func(
 		tx pgx.Tx,
 	) (orchestration.PreparedProviderJob, error) {
-		var attemptID, promptID, shotID, profileID uuid.UUID
+		var attemptID, promptID, shotID, profileID, gate2DecisionID uuid.UUID
 		var seriesID, episodeID uuid.UUID
 		var runDigest, runState, persistedBudgetApprovalID, generationPlanID string
+		var attemptKind, attemptState, attemptInputHash string
 		var promptHash string
-		var creativeAttempt int
+		var creativeAttempt, attemptSequence int
 		var persistedRouteJSON []byte
 		if err := tx.QueryRow(ctx, `
 			SELECT ga.id, gr.prompt_snapshot_id, gr.shot_spec_revision_id,
 			       gr.generation_profile_id, gr.creative_attempt,
 			       gr.run_spec_digest, gr.state, gr.budget_approval_id,
 			       COALESCE(audit.payload->>'generationPlanId', ''),
-			       ep.series_id, ep.id, ps.content_hash, ga.model_snapshot
+			       ep.series_id, ep.id, ps.content_hash,
+			       ga.sequence, ga.attempt_kind, ga.state, ga.input_hash,
+			       ga.model_snapshot,
+			       ssr.gate2_decision_id
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.generation_attempts ga
 			  ON ga.generation_run_id = gr.id AND ga.sequence = 1
@@ -1033,8 +1301,15 @@ func (p *Postgres) PrepareProviderJob(
 			&attemptID, &promptID, &shotID, &profileID, &creativeAttempt,
 			&runDigest, &runState, &persistedBudgetApprovalID,
 			&generationPlanID, &seriesID, &episodeID, &promptHash,
-			&persistedRouteJSON,
+			&attemptSequence, &attemptKind, &attemptState, &attemptInputHash,
+			&persistedRouteJSON, &gate2DecisionID,
 		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"generation run has no exact sequence-one Provider attempt",
+				)
+			}
 			return orchestration.PreparedProviderJob{}, fmt.Errorf("lock provider run: %w", err)
 		}
 		if runDigest != input.Run.RunSpecDigest {
@@ -1043,10 +1318,15 @@ func (p *Postgres) PrepareProviderJob(
 				"provider dispatch digest differs from the persisted run",
 			)
 		}
-		if runState == "CANCELLED" || runState == "FAILED" {
+		expectedAttemptKind := "PROVIDER_REQUEST"
+		if creativeAttempt > 1 {
+			expectedAttemptKind = "CREATIVE_REVISION"
+		}
+		if attemptSequence != 1 || attemptKind != expectedAttemptKind ||
+			attemptInputHash != runDigest {
 			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
-				controlplane.CodeConflict,
-				"a terminal generation run cannot create or replay a paid Provider job",
+				controlplane.CodeRevisionConflict,
+				"provider attempt identity differs from the immutable generation run",
 			)
 		}
 		if generationPlanID == "" {
@@ -1056,7 +1336,9 @@ func (p *Postgres) PrepareProviderJob(
 				"create a new run from the exact approved plan",
 			)
 		}
-		if input.BudgetApprovalID != persistedBudgetApprovalID {
+		persistedBudgetApprovalUUID, parseErr := uuid.Parse(persistedBudgetApprovalID)
+		if parseErr != nil || persistedBudgetApprovalID != persistedBudgetApprovalUUID.String() ||
+			budgetApprovalID != persistedBudgetApprovalUUID {
 			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
 				controlplane.CodeBudgetExceeded,
 				"provider dispatch budget approval differs from the persisted run",
@@ -1089,6 +1371,77 @@ func (p *Postgres) PrepareProviderJob(
 		}
 		plan, err := readPlan(ctx, tx, generationPlanID)
 		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if plan.SeriesID != seriesID.String() || plan.Plan.State == "BLOCKED" ||
+			plan.EpisodeRevisionID == "" ||
+			!containsString(plan.ShotSpecRevisionIDs, shotID.String()) {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"provider run is outside the current immutable generation plan",
+				"create a new run from the exact approved episode and shot set",
+			)
+		}
+		episodeRevisionID, err := uuid.Parse(plan.EpisodeRevisionID)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"generation plan episode revision is invalid",
+				"create a new plan for the exact approved episode revision",
+			)
+		}
+		planShotIDs, err := parseUUIDs(plan.ShotSpecRevisionIDs)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeStaleDependency,
+				"generation plan shot revisions are invalid",
+				"create a new plan for the exact approved shot set",
+			)
+		}
+		var episodeStatus string
+		if err := tx.QueryRow(ctx, `
+			SELECT status
+			FROM video_pipeline.episode_revisions
+			WHERE id = $1 AND episode_id = $2
+			FOR SHARE`,
+			episodeRevisionID, episodeID,
+		).Scan(&episodeStatus); err != nil {
+			return orchestration.PreparedProviderJob{}, fmt.Errorf("read provider episode gate: %w", err)
+		}
+		if episodeStatus != "G2_APPROVED" && episodeStatus != "G3_LOCKED" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+				controlplane.CodeGateRequired,
+				"provider episode revision is no longer approved for generation",
+				"approve the exact episode revision before paid submission",
+			)
+		}
+		if err := requireFrozenPlanShots(
+			ctx, tx, planShotIDs, profileID, seriesID, episodeID,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := requireApprovedDecision(
+			ctx, tx, gate2DecisionID.String(), "G2", seriesID, episodeID,
+			"SHOT_SPEC_REVISION", shotID,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		assetIDs, err := loadShotAssetIDs(ctx, tx, planShotIDs)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := lockPostProductionRights(ctx, tx, assetIDs); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := requireAssetLicenses(
+			ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := requireContentSafetyDecision(
+			ctx, tx, plan.ExecutionPolicy, seriesID, episodeRevisionID,
+			planShotIDs, p.now().UTC(),
+		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
 		if input.BudgetMaximumMicros != plan.BudgetLimit.AmountMicros ||
@@ -1130,41 +1483,14 @@ func (p *Postgres) PrepareProviderJob(
 				"persisted generation run digest no longer matches its frozen inputs",
 			)
 		}
-		if err := requireBudgetApproval(
+		if err := requireBudgetApprovalForUpdate(
 			ctx, tx, persistedBudgetApprovalID, seriesID, episodeID,
 			generationPlanID, "VIDEO", plan.BudgetLimit,
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
-		approvalID, err := uuid.Parse(persistedBudgetApprovalID)
-		if err != nil {
-			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
-				controlplane.CodeBudgetExceeded,
-				"budget approval identifier is invalid",
-				"approve the exact immutable generation plan budget",
-			)
-		}
-		var approvedMicros int64
-		var approvedCurrency string
-		if err := tx.QueryRow(ctx, `
-			SELECT budget_limit_micros, budget_currency
-			FROM video_pipeline.review_tasks
-			WHERE id = $1 AND state = 'APPROVED'
-			FOR UPDATE`,
-			approvalID,
-		).Scan(&approvedMicros, &approvedCurrency); err != nil {
-			return orchestration.PreparedProviderJob{}, fmt.Errorf(
-				"lock cumulative budget approval: %w", err,
-			)
-		}
-		if approvedMicros != plan.BudgetLimit.AmountMicros ||
-			approvedCurrency != plan.BudgetLimit.Currency {
-			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
-				controlplane.CodeBudgetExceeded,
-				"locked budget approval differs from the immutable generation plan",
-				"approve the exact plan amount and currency",
-			)
-		}
+		approvedMicros := plan.BudgetLimit.AmountMicros
+		approvedCurrency := plan.BudgetLimit.Currency
 		var capabilityID uuid.UUID
 		var pricingVersion string
 		var capabilityLimitsJSON []byte
@@ -1211,6 +1537,11 @@ func (p *Postgres) PrepareProviderJob(
 				"decode Provider capability pricing limits: %w", err,
 			)
 		}
+		if err := requireExecutionPolicy(
+			capabilityLimits, plan.ExecutionPolicy, plan.Plan.ProviderCallCount,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
 		unitPrice, priced := numericLimit(capabilityLimits, "unitPriceMicros")
 		if !priced || unitPrice <= 0 || pricingVersion == "" {
 			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
@@ -1256,11 +1587,52 @@ func (p *Postgres) PrepareProviderJob(
 			}
 			return orchestration.PreparedProviderJob{
 				Budget: budget, BudgetReservation: reservation,
+				ProductTruth: orchestration.PreparedProductTruth{
+					ShotSpecRevisionID: shotID.String(),
+					Run: orchestration.GenerationRunRef{
+						RunID: input.Run.RunID, RunSpecDigest: runDigest,
+						Attempt: creativeAttempt,
+					},
+					PromptSnapshotID: promptID.String(), PromptSnapshotHash: promptHash,
+					GenerationPlanID:    generationPlanID,
+					BudgetApprovalID:    persistedBudgetApprovalID,
+					BudgetMaximumMicros: approvedMicros, BudgetCurrency: approvedCurrency,
+					ProviderProfileID: providerProfileID.String(), Route: persistedRoute,
+				},
 			}, nil
 		}
 		prepared, err := bindReservation()
 		if err != nil {
 			return orchestration.PreparedProviderJob{}, err
+		}
+		// The formal Stage 1 package is an additional immutable envelope over
+		// PostgreSQL product truth. It must be compared while all relevant rows
+		// are locked and before the first paid-boundary insert. A caller-side
+		// comparison after this transaction commits is too late: it would leave
+		// a reservation/job/cost row for a package that was never authorized.
+		if input.ExpectedProductTruth != nil &&
+			*input.ExpectedProductTruth != prepared.ProductTruth {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"stage 1 frozen product truth differs from the locked PostgreSQL run",
+			)
+		}
+		if input.ExpectedProductTruth != nil {
+			request, requestErr := orchestration.BuildProviderJobRequest(input, prepared)
+			if requestErr != nil {
+				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"stage 1 frozen envelope cannot produce the locked Provider request",
+				)
+			}
+			if request.JobID != "provider-job-"+input.Run.RunID ||
+				request.RunID != input.Run.RunID ||
+				request.Model != prepared.ProductTruth.Route {
+				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"stage 1 frozen envelope differs from the locked Provider request",
+				)
+			}
 		}
 		jobID := uuid.NewSHA1(runID, []byte("provider-job"))
 		jobKey := "provider-job-" + input.Run.RunID
@@ -1277,13 +1649,21 @@ func (p *Postgres) PrepareProviderJob(
 				"encode provider request snapshot: %w", err,
 			)
 		}
-		verifyPreparedJob := func() error {
+		reservationExpectation, err := newProviderReservationExpectation(
+			runID, jobID, reservationID, prepared,
+		)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		verifyPreparedJob := func() (string, bool, error) {
 			var storedJobID, storedAttemptID, storedCapabilityID, storedReservationID uuid.UUID
-			var storedRequestHash string
+			var storedRequestHash, storedJobState string
+			var storedUpstreamTaskID *string
 			var storedRequestSnapshot []byte
 			if err := tx.QueryRow(ctx, `
 				SELECT id, generation_attempt_id, capability_snapshot_id,
-				       budget_reservation_id, request_hash, request_snapshot
+				       budget_reservation_id, request_hash, request_snapshot,
+				       state, upstream_task_id
 				FROM video_pipeline.provider_jobs
 				WHERE provider_profile_id = $1 AND idempotency_key = $2
 				FOR SHARE`,
@@ -1291,12 +1671,13 @@ func (p *Postgres) PrepareProviderJob(
 			).Scan(
 				&storedJobID, &storedAttemptID, &storedCapabilityID,
 				&storedReservationID, &storedRequestHash, &storedRequestSnapshot,
+				&storedJobState, &storedUpstreamTaskID,
 			); err != nil {
-				return fmt.Errorf("read prepared immutable Provider job: %w", err)
+				return "", false, fmt.Errorf("read prepared immutable Provider job: %w", err)
 			}
 			var storedEnvelope immutableProviderRequest
 			if err := json.Unmarshal(storedRequestSnapshot, &storedEnvelope); err != nil {
-				return fmt.Errorf("decode prepared immutable Provider job: %w", err)
+				return "", false, fmt.Errorf("decode prepared immutable Provider job: %w", err)
 			}
 			if storedJobID != jobID ||
 				storedAttemptID != attemptID ||
@@ -1304,37 +1685,38 @@ func (p *Postgres) PrepareProviderJob(
 				storedReservationID != reservationID ||
 				storedRequestHash != requestHash ||
 				!reflect.DeepEqual(storedEnvelope, requestEnvelope) {
-				return controlplane.NewConflictError(
+				return "", false, controlplane.NewConflictError(
 					controlplane.CodeRevisionConflict,
 					"existing Provider job differs from the exact frozen Run request",
 				)
 			}
-			return nil
+			return storedJobState, storedUpstreamTaskID != nil, nil
 		}
-		var existingAmount int64
-		var existingCurrency, existingPricing, existingStatus string
+		var existingReservationID uuid.UUID
 		existingErr := tx.QueryRow(ctx, `
-			SELECT amount_micros, currency, pricing_rule_version, status
+			SELECT id
 			FROM video_pipeline.budget_reservations
 			WHERE id = $1
 			FOR UPDATE`,
 			reservationID,
-		).Scan(
-			&existingAmount, &existingCurrency, &existingPricing, &existingStatus,
-		)
+		).Scan(&existingReservationID)
 		if existingErr == nil {
-			if existingAmount != estimatedMicros ||
-				existingCurrency != approvedCurrency ||
-				existingPricing != pricingVersion ||
-				(existingStatus != "RESERVED" && existingStatus != "SETTLED") {
+			if existingReservationID != reservationID {
 				return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
 					controlplane.CodeRevisionConflict,
-					"existing Provider reservation differs from the frozen run allocation",
+					"existing Provider reservation has a non-deterministic identity",
 				)
 			}
-			if err := verifyPreparedJob(); err != nil {
+			storedJobState, hasUpstreamTask, err := verifyPreparedJob()
+			if err != nil {
 				return orchestration.PreparedProviderJob{}, err
 			}
+			if _, err := verifyProviderDurableCostProjection(
+				ctx, tx, reservationExpectation,
+			); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+			prepared.ReconcileOnly = storedJobState != "QUEUED" || hasUpstreamTask
 			return prepared, nil
 		}
 		if !errors.Is(existingErr, pgx.ErrNoRows) {
@@ -1342,36 +1724,29 @@ func (p *Postgres) PrepareProviderJob(
 				"read durable Provider reservation: %w", existingErr,
 			)
 		}
-		var allocatedMicros int64
-		if err := tx.QueryRow(ctx, `
-			SELECT COALESCE(SUM(
-			  CASE br.status
-			    WHEN 'RESERVED' THEN br.amount_micros
-			    WHEN 'SETTLED' THEN COALESCE(actual.amount_micros, br.amount_micros)
-			    ELSE 0
-			  END
-			), 0)
-			FROM video_pipeline.budget_reservations br
-			JOIN video_pipeline.generation_runs gr ON gr.id = br.generation_run_id
-			LEFT JOIN LATERAL (
-			  SELECT cl.amount_micros
-			  FROM video_pipeline.cost_ledger cl
-			  WHERE cl.budget_reservation_id = br.id
-			    AND cl.entry_type = 'ACTUAL'
-			    AND cl.amount_micros >= 0
-			    AND cl.verified = true
-			    AND cl.currency = br.currency
-			    AND cl.pricing_rule_version = br.pricing_rule_version
-			  ORDER BY cl.created_at DESC
-			  LIMIT 1
-			) actual ON true
-			WHERE gr.budget_approval_id = $1
-			  AND br.status IN ('RESERVED', 'SETTLED')`,
-			persistedBudgetApprovalID,
-		).Scan(&allocatedMicros); err != nil {
-			return orchestration.PreparedProviderJob{}, fmt.Errorf(
-				"read cumulative Provider budget allocation: %w", err,
+		// Terminal product state forbids a new paid-boundary allocation, but it
+		// must not hide an exact durable job above. Temporal may replay the
+		// Activity after the job and run have already reached terminal state;
+		// that path is recover-only and is safe only after every immutable
+		// reservation and request field has matched.
+		if runState == "CANCELLED" || runState == "FAILED" || runState == "SUCCEEDED" ||
+			attemptState == "CANCELLED" || attemptState == "FAILED" || attemptState == "SUCCEEDED" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a terminal generation run or attempt cannot create a paid Provider job",
 			)
+		}
+		if attemptState != "VALIDATED" {
+			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a non-validated generation attempt has no exact prepared Provider job to recover",
+			)
+		}
+		allocatedMicros, err := readCumulativeProviderBudgetAllocation(
+			ctx, tx, persistedBudgetApprovalID,
+		)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
 		}
 		if estimatedMicros > approvedMicros ||
 			allocatedMicros > approvedMicros-estimatedMicros {
@@ -1388,16 +1763,8 @@ func (p *Postgres) PrepareProviderJob(
 			VALUES ($1, $2, $3, $4, $5, $6, 'RESERVED', $7, now())
 			ON CONFLICT (id) DO NOTHING`,
 			reservationID, runID, estimatedMicros, approvedCurrency,
-			pricingVersion, map[string]any{
-				"generationPlanId":  generationPlanID,
-				"budgetApprovalId":  persistedBudgetApprovalID,
-				"estimatedMicros":   estimatedMicros,
-				"planMaximumMicros": approvedMicros,
-				"promptSnapshotId":  promptID.String(),
-				"runSpecDigest":     runDigest,
-				"modelSnapshot":     persistedRoute,
-			},
-			input.BudgetApprovalID,
+			pricingVersion, reservationExpectation.EstimatePayload,
+			persistedBudgetApprovalID,
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, fmt.Errorf("reserve workflow budget: %w", err)
 		}
@@ -1413,7 +1780,7 @@ func (p *Postgres) PrepareProviderJob(
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, fmt.Errorf("insert provider job: %w", err)
 		}
-		if err := verifyPreparedJob(); err != nil {
+		if _, _, err := verifyPreparedJob(); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -1428,6 +1795,11 @@ func (p *Postgres) PrepareProviderJob(
 			return orchestration.PreparedProviderJob{}, fmt.Errorf(
 				"insert Provider reservation ledger entry: %w", err,
 			)
+		}
+		if _, err := verifyProviderDurableCostProjection(
+			ctx, tx, reservationExpectation,
+		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
 		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE video_pipeline.generation_runs
@@ -1450,8 +1822,239 @@ func (p *Postgres) PrepareProviderJob(
 	return prepared, err
 }
 
+// RecordProviderJobObservation freezes the fact that a paid submit may have
+// crossed the Provider boundary. Once an upstream task is known, or an outcome
+// is ambiguous, Activity retries must reconcile the stable JobID and may not
+// issue another submit.
+func (p *Postgres) RecordProviderJobObservation(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	input orchestration.ExecuteProviderJobInput,
+	observation orchestration.ProviderJobObservation,
+) error {
+	runID, err := uuid.Parse(input.Run.RunID)
+	if err != nil {
+		return errors.New("runId must be a UUID")
+	}
+	budgetApprovalID, err := uuid.Parse(input.BudgetApprovalID)
+	if err != nil {
+		return errors.New("budgetApprovalId must be a UUID")
+	}
+	input.BudgetApprovalID = budgetApprovalID.String()
+	switch observation.State {
+	case "QUEUED", "RUNNING", "UNKNOWN", "REQUIRES_ACTION":
+	default:
+		return errors.New("provider observation state is invalid")
+	}
+	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		var runState string
+		if err := tx.QueryRow(ctx, `
+			SELECT state
+			FROM video_pipeline.generation_runs
+			WHERE id = $1
+			FOR UPDATE`,
+			runID,
+		).Scan(&runState); err != nil {
+			return struct{}{}, fmt.Errorf("lock observed Provider run: %w", err)
+		}
+		expected, exists, err := readProviderReservationExpectation(ctx, tx, runID, "")
+		if err != nil {
+			return struct{}{}, err
+		}
+		if !exists {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the observed Provider job has no durable paid-boundary projection",
+			)
+		}
+		if _, err := verifyProviderDurableCostProjection(ctx, tx, expected); err != nil {
+			return struct{}{}, err
+		}
+		var (
+			jobState                          string
+			storedUpstreamTask, storedRequest *string
+			requestSnapshot                   []byte
+		)
+		if err := tx.QueryRow(ctx, `
+			SELECT state, upstream_task_id, upstream_request_id, request_snapshot
+			FROM video_pipeline.provider_jobs
+			WHERE id = $1
+			FOR UPDATE`,
+			expected.JobID,
+		).Scan(
+			&jobState, &storedUpstreamTask, &storedRequest, &requestSnapshot,
+		); err != nil {
+			return struct{}{}, fmt.Errorf("lock observed Provider job: %w", err)
+		}
+		var frozen immutableProviderRequest
+		if err := json.Unmarshal(requestSnapshot, &frozen); err != nil ||
+			!reflect.DeepEqual(frozen.Input, input) {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider observation differs from its immutable dispatch",
+			)
+		}
+		if jobState == "SUCCEEDED" {
+			return struct{}{}, nil
+		}
+		if jobState == "FAILED" || jobState == "CANCELLED" ||
+			runState == "FAILED" || runState == "CANCELLED" {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a terminal Provider projection cannot accept a non-terminal observation",
+			)
+		}
+		if storedUpstreamTask != nil && observation.UpstreamTaskID != "" &&
+			*storedUpstreamTask != observation.UpstreamTaskID {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider upstream task identity changed during reconciliation",
+			)
+		}
+		if storedRequest != nil && observation.RequestID != "" &&
+			*storedRequest != observation.RequestID {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider request identity changed during reconciliation",
+			)
+		}
+
+		attemptState := observation.State
+		runProjectionState := observation.State
+		if observation.State == "UNKNOWN" {
+			attemptState = "RECONCILING"
+			runProjectionState = "RECONCILING"
+		} else if observation.UpstreamTaskID != "" && observation.State == "QUEUED" {
+			attemptState = "RUNNING"
+			runProjectionState = "RUNNING"
+		}
+		var errorCode any
+		var errorSnapshot any
+		if observation.State == "UNKNOWN" {
+			errorCode = observation.ErrorCode
+			errorSnapshot = map[string]any{
+				"code": observation.ErrorCode, "requiresReconciliation": true,
+			}
+		}
+		jobTag, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.provider_jobs
+			SET upstream_task_id = COALESCE(upstream_task_id, NULLIF($2, '')),
+			    upstream_request_id = COALESCE(upstream_request_id, NULLIF($3, '')),
+			    state = $4, error_code = $5, error_snapshot = $6,
+			    next_poll_at = now(), updated_at = now()
+			WHERE id = $1 AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+			expected.JobID, observation.UpstreamTaskID, observation.RequestID,
+			observation.State, errorCode, errorSnapshot,
+		)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("record Provider reconciliation observation: %w", err)
+		}
+		if jobTag.RowsAffected() != 1 {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"the Provider job changed before its observation was frozen",
+			)
+		}
+		attemptTag, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.generation_attempts
+			SET state = $2, failure_code = $3, heartbeat_at = now()
+			WHERE generation_run_id = $1
+			  AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+			runID, attemptState, errorCode,
+		)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("record Provider attempt reconciliation: %w", err)
+		}
+		if attemptTag.RowsAffected() != 1 {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider attempt projection is missing or non-unique",
+			)
+		}
+		runTag, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.generation_runs
+			SET state = $2, failure_class = CASE WHEN $2 = 'RECONCILING' THEN 'INFRASTRUCTURE' ELSE NULL END,
+			    failure_code = $3, started_at = COALESCE(started_at, now())
+			WHERE id = $1 AND state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')`,
+			runID, runProjectionState, errorCode,
+		)
+		if err != nil {
+			return struct{}{}, fmt.Errorf("record Provider run reconciliation: %w", err)
+		}
+		if runTag.RowsAffected() != 1 {
+			return struct{}{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"the Provider run changed before its observation was frozen",
+			)
+		}
+		_ = step
+		return struct{}{}, nil
+	})
+	return err
+}
+
 // CompleteProviderJob atomically commits provider provenance, CAS metadata,
 // cost, and terminal run state.
+// CompletePreparedProviderJob reloads the exact prompt-bearing dispatch from
+// PostgreSQL so a separate completion process never needs prompt text or asset
+// transport locations in its invocation or local ledger.
+func (p *Postgres) CompletePreparedProviderJob(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	runIDRaw string,
+	result orchestration.ProviderResult,
+) error {
+	runID, err := uuid.Parse(runIDRaw)
+	if err != nil {
+		return errors.New("runId must be a UUID")
+	}
+	expectedJobID := uuid.NewSHA1(runID, []byte("provider-job"))
+	var requestSnapshot []byte
+	if err := p.pool.QueryRow(ctx, `
+		SELECT pj.request_snapshot
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+		WHERE ga.generation_run_id = $1 AND pj.id = $2
+		ORDER BY ga.sequence, pj.created_at
+		LIMIT 1`,
+		runID, expectedJobID,
+	).Scan(&requestSnapshot); err != nil {
+		return fmt.Errorf("read prepared Provider completion input: %w", err)
+	}
+	var prepared immutableProviderRequest
+	if err := json.Unmarshal(requestSnapshot, &prepared); err != nil {
+		return fmt.Errorf("decode prepared Provider completion input: %w", err)
+	}
+	if prepared.Input.Run.RunID != runIDRaw || !prepared.Input.PersistProductTruth {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"prepared Provider completion input is not bound to the exact product-truth run",
+		)
+	}
+	if err := p.CompleteProviderJob(ctx, step, prepared.Input, result); err != nil {
+		return err
+	}
+
+	// Formal Stage 1 completes video jobs outside ShotProductionWorkflow, so it
+	// must persist the same structural QC evidence before its local terminal
+	// ledger can make the Run eligible for post-production. Both operations are
+	// idempotent: a crash between them leaves finalization closed, and replaying
+	// the exact completion repairs only the missing QC projection without
+	// submitting another Provider job.
+	qcStep := step
+	qcStep.ActivityID = step.ActivityID + ":automatic-qc"
+	qcStep.ActivityType = orchestration.ActivityRunAutomaticQC
+	return p.RecordAutomaticQC(
+		ctx,
+		qcStep,
+		orchestration.RunQCInput{
+			Run: prepared.Input.Run, Provider: result, TraceID: step.TraceID,
+			PersistProductTruth: true,
+		},
+		orchestration.QCResult{Passed: true},
+	)
+}
+
 func (p *Postgres) CompleteProviderJob(
 	ctx context.Context,
 	step orchestration.WorkflowStep,
@@ -1462,9 +2065,20 @@ func (p *Postgres) CompleteProviderJob(
 	if err != nil {
 		return errors.New("runId must be a UUID")
 	}
+	budgetApprovalID, err := uuid.Parse(input.BudgetApprovalID)
+	if err != nil {
+		return errors.New("budgetApprovalId must be a UUID")
+	}
+	input.BudgetApprovalID = budgetApprovalID.String()
 	if result.ArtifactURI != "cas://sha256/"+result.ArtifactDigest {
 		return errors.New("provider artifact URI does not match its content hash")
 	}
+	result = normalizedProviderResult(result)
+	usageUnits, err := providerUsageUnits(result.Usage)
+	if err != nil {
+		return err
+	}
+	expectedJobID := uuid.NewSHA1(runID, []byte("provider-job"))
 	type completionOutcome struct {
 		budgetExceeded bool
 	}
@@ -1486,9 +2100,9 @@ func (p *Postgres) CompleteProviderJob(
 			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
 			JOIN video_pipeline.generation_runs gr ON gr.id = ga.generation_run_id
 			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
-			WHERE gr.id = $1
+			WHERE gr.id = $1 AND pj.id = $2
 			FOR UPDATE OF pj, ga, gr, br`,
-			runID,
+			runID, expectedJobID,
 		).Scan(
 			&jobID, &attemptID, &reservationID,
 			&runState, &attemptState, &jobState,
@@ -1531,10 +2145,78 @@ func (p *Postgres) CompleteProviderJob(
 				"provider completion reservation differs from the prepared immutable request",
 			)
 		}
+		reservationExpectation, err := newProviderReservationExpectation(
+			runID, jobID, reservationID, preparedSnapshot.Prepared,
+		)
+		if err != nil {
+			return completionOutcome{}, err
+		}
+		if jobState != "FAILED" && jobState != "CANCELLED" {
+			if _, err := verifyProviderDurableCostProjection(
+				ctx, tx, reservationExpectation,
+			); err != nil {
+				return completionOutcome{}, err
+			}
+		}
 		if result.Model != preparedSnapshot.Input.Route {
 			return completionOutcome{}, controlplane.NewConflictError(
 				controlplane.CodeRevisionConflict,
 				"provider completion model differs from the prepared immutable route",
+			)
+		}
+		if jobState == "SUCCEEDED" {
+			if attemptState != "SUCCEEDED" || reservationStatus != "SETTLED" {
+				return completionOutcome{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"the succeeded Provider completion has inconsistent terminal projections",
+				)
+			}
+			if err := verifySucceededProviderCompletion(
+				ctx, tx, runID, jobID, reservationID,
+				reservedMicros, reservedCurrency, reservedPricing,
+				usageUnits, result,
+			); err != nil {
+				return completionOutcome{}, err
+			}
+			switch runState {
+			case "SUCCEEDED", "PAUSED":
+				return completionOutcome{}, nil
+			case "RUNNING":
+				// A Provider may finish while the run is PAUSED. RESUME_PAUSED
+				// intentionally restores RUNNING; the exact completion replay then
+				// repairs only the run/shot projection without touching the frozen
+				// job identity, artifact, ledger, or terminal timestamps.
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_runs
+					SET state = 'SUCCEEDED', failure_class = NULL, failure_code = NULL,
+					    started_at = COALESCE(started_at, now()), finished_at = now()
+					WHERE id = $1 AND state = 'RUNNING'`,
+					runID,
+				); err != nil {
+					return completionOutcome{}, fmt.Errorf("repair succeeded generation run: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.shot_spec_revisions ssr
+					SET lifecycle_state = 'QC_PENDING'
+					FROM video_pipeline.generation_runs gr
+					WHERE gr.id = $1 AND gr.state = 'SUCCEEDED'
+					  AND ssr.id = gr.shot_spec_revision_id`,
+					runID,
+				); err != nil {
+					return completionOutcome{}, fmt.Errorf("repair shot after succeeded Provider job: %w", err)
+				}
+				return completionOutcome{}, nil
+			default:
+				return completionOutcome{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"the succeeded Provider completion has an unrecoverable run projection",
+				)
+			}
+		}
+		if runState == "SUCCEEDED" || attemptState == "SUCCEEDED" {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a succeeded generation projection has no immutable succeeded Provider job",
 			)
 		}
 		if runState == "CANCELLED" || runState == "FAILED" ||
@@ -1579,31 +2261,42 @@ func (p *Postgres) CompleteProviderJob(
 				VALUES ($1, $2, $3, 'ACTUAL', $4, $5, $6, $7, $8, $9)
 				ON CONFLICT (id) DO NOTHING`,
 				ledgerID, jobID, reservationID, actualMicros, result.Cost.Currency,
-				result.Usage.InputUnits+result.Usage.OutputUnits, result.Usage.Unit,
+				usageUnits, result.Usage.Unit,
 				result.Cost.PricingVersion, actualTrustedForAllocation,
 			); err != nil {
 				return completionOutcome{}, fmt.Errorf("insert actual provider cost: %w", err)
 			}
+			var storedJobID, storedReservationID uuid.UUID
+			var storedEntryType string
 			var storedActual int64
 			var storedCurrency, storedPricing string
 			var storedVerified bool
+			var storedUnitsMatch, storedUnitNameMatch bool
 			if err := tx.QueryRow(ctx, `
-				SELECT amount_micros, currency, pricing_rule_version, verified
+				SELECT provider_job_id, budget_reservation_id, entry_type,
+				       amount_micros, currency, pricing_rule_version, verified,
+				       units IS NOT DISTINCT FROM $2,
+				       unit_name IS NOT DISTINCT FROM $3
 				FROM video_pipeline.cost_ledger
 				WHERE id = $1
 				FOR SHARE`,
-				ledgerID,
+				ledgerID, usageUnits,
+				result.Usage.Unit,
 			).Scan(
+				&storedJobID, &storedReservationID, &storedEntryType,
 				&storedActual, &storedCurrency, &storedPricing, &storedVerified,
+				&storedUnitsMatch, &storedUnitNameMatch,
 			); err != nil {
 				return completionOutcome{}, fmt.Errorf(
 					"read actual provider cost: %w", err,
 				)
 			}
-			if storedActual != actualMicros ||
+			if storedJobID != jobID || storedReservationID != reservationID ||
+				storedEntryType != "ACTUAL" || storedActual != actualMicros ||
 				storedCurrency != result.Cost.Currency ||
 				storedPricing != result.Cost.PricingVersion ||
-				storedVerified != actualTrustedForAllocation {
+				storedVerified != actualTrustedForAllocation ||
+				!storedUnitsMatch || !storedUnitNameMatch {
 				return completionOutcome{}, controlplane.NewConflictError(
 					controlplane.CodeRevisionConflict,
 					"Provider completion cost differs from its immutable ledger entry",
@@ -1634,6 +2327,15 @@ func (p *Postgres) CompleteProviderJob(
 				)
 			}
 		}
+		if !budgetExceeded {
+			if err := verifySucceededProviderCostProjection(
+				ctx, tx, jobID, reservationID,
+				reservedMicros, reservedCurrency, reservedPricing,
+				usageUnits, result,
+			); err != nil {
+				return completionOutcome{}, err
+			}
+		}
 		if budgetExceeded {
 			errorSnapshot, encodeErr := json.Marshal(map[string]any{
 				"code":                   "BUDGET_EXCEEDED",
@@ -1641,6 +2343,7 @@ func (p *Postgres) CompleteProviderJob(
 				"reservedCurrency":       reservedCurrency,
 				"reservedPricingVersion": reservedPricing,
 				"providerCost":           result.Cost,
+				"providerUsage":          result.Usage,
 				"actualTrustedForBudget": actualTrustedForAllocation,
 			})
 			if encodeErr != nil {
@@ -1832,6 +2535,1147 @@ func (p *Postgres) CompleteProviderJob(
 	return nil
 }
 
+type providerCompletionMediaSpec struct {
+	Width          int                            `json:"width"`
+	Height         int                            `json:"height"`
+	DurationMillis int64                          `json:"durationMillis"`
+	Model          providercontract.ModelSnapshot `json:"modelSnapshot"`
+	Usage          providercontract.Usage         `json:"usage"`
+	Cost           providercontract.Cost          `json:"cost"`
+}
+
+func normalizedProviderResult(result orchestration.ProviderResult) orchestration.ProviderResult {
+	if result.MediaType == "" {
+		result.MediaType = "video/mp4"
+	}
+	return result
+}
+
+func providerUsageUnits(usage providercontract.Usage) (int64, error) {
+	if usage.InputUnits < 0 || usage.OutputUnits < 0 {
+		return 0, errors.New("provider usage units must be non-negative")
+	}
+	if usage.InputUnits > math.MaxInt64-usage.OutputUnits {
+		return 0, errors.New("provider usage units exceed int64")
+	}
+	return usage.InputUnits + usage.OutputUnits, nil
+}
+
+func newProviderReservationExpectation(
+	runID uuid.UUID,
+	jobID uuid.UUID,
+	reservationID uuid.UUID,
+	prepared orchestration.PreparedProviderJob,
+) (providerReservationExpectation, error) {
+	if jobID != uuid.NewSHA1(runID, []byte("provider-job")) ||
+		reservationID != uuid.NewSHA1(runID, []byte("budget-reservation")) ||
+		prepared.ProductTruth.Run.RunID != runID.String() ||
+		prepared.BudgetReservation.ReservationID != reservationID.String() ||
+		prepared.BudgetReservation.AmountMicros != prepared.Budget.MaxCostMicros ||
+		prepared.Budget.EstimatedCostMicros != prepared.Budget.MaxCostMicros ||
+		prepared.BudgetReservation.ConfirmedBy != prepared.ProductTruth.BudgetApprovalID ||
+		prepared.BudgetReservation.ValidateFor(providercontract.BudgetBindingInput{
+			RunID: runID.String(), InputHash: prepared.ProductTruth.Run.RunSpecDigest,
+			Model: prepared.ProductTruth.Route, Budget: prepared.Budget,
+		}) != nil {
+		return providerReservationExpectation{}, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"Provider reservation expectation is not bound to the exact immutable run",
+		)
+	}
+	return providerReservationExpectation{
+		RunID:          runID,
+		JobID:          jobID,
+		ReservationID:  reservationID,
+		AmountMicros:   prepared.BudgetReservation.AmountMicros,
+		Currency:       prepared.BudgetReservation.Currency,
+		PricingVersion: prepared.BudgetReservation.PricingVersion,
+		ConfirmedBy:    prepared.BudgetReservation.ConfirmedBy,
+		EstimatePayload: providerReservationEstimatePayload{
+			GenerationPlanID:  prepared.ProductTruth.GenerationPlanID,
+			BudgetApprovalID:  prepared.ProductTruth.BudgetApprovalID,
+			EstimatedMicros:   prepared.Budget.EstimatedCostMicros,
+			PlanMaximumMicros: prepared.ProductTruth.BudgetMaximumMicros,
+			PromptSnapshotID:  prepared.ProductTruth.PromptSnapshotID,
+			RunSpecDigest:     prepared.ProductTruth.Run.RunSpecDigest,
+			ModelSnapshot:     prepared.ProductTruth.Route,
+		},
+	}, nil
+}
+
+func readProviderReservationExpectation(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	requiredBudgetApprovalID string,
+) (providerReservationExpectation, bool, error) {
+	jobID := uuid.NewSHA1(runID, []byte("provider-job"))
+	reservationID := uuid.NewSHA1(runID, []byte("budget-reservation"))
+	var persistedBudgetApprovalID string
+	var reservationCount, jobCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT gr.budget_approval_id,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.budget_reservations br
+		        WHERE br.id = $2 OR br.generation_run_id = gr.id),
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.provider_jobs pj
+		        LEFT JOIN video_pipeline.generation_attempts ga
+		          ON ga.id = pj.generation_attempt_id
+		        WHERE pj.id = $3 OR pj.budget_reservation_id = $2
+		           OR ga.generation_run_id = gr.id)
+		FROM video_pipeline.generation_runs gr
+		WHERE gr.id = $1`,
+		runID, reservationID, jobID,
+	).Scan(&persistedBudgetApprovalID, &reservationCount, &jobCount); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return providerReservationExpectation{}, false,
+				controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"the Provider allocation has no immutable generation run",
+				)
+		}
+		return providerReservationExpectation{}, false,
+			fmt.Errorf("count deterministic Provider allocation: %w", err)
+	}
+	persistedBudgetApprovalUUID, err := uuid.Parse(persistedBudgetApprovalID)
+	if err != nil || persistedBudgetApprovalID != persistedBudgetApprovalUUID.String() {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider run has a non-canonical budget approval binding",
+			)
+	}
+	if requiredBudgetApprovalID != "" {
+		requiredBudgetApprovalUUID, parseErr := uuid.Parse(requiredBudgetApprovalID)
+		if parseErr != nil || requiredBudgetApprovalUUID != persistedBudgetApprovalUUID {
+			return providerReservationExpectation{}, false,
+				controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"the Provider run belongs to a different budget approval",
+				)
+		}
+	}
+	if reservationCount == 0 && jobCount == 0 {
+		return providerReservationExpectation{}, false, nil
+	}
+	if reservationCount != 1 || jobCount != 1 {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider allocation has partial or non-unique durable projections",
+			)
+	}
+
+	var requestHash string
+	var requestSnapshot []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT request_hash, request_snapshot
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		jobID,
+	).Scan(&requestHash, &requestSnapshot); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return providerReservationExpectation{}, false,
+				controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"the Provider allocation has no deterministic job",
+				)
+		}
+		return providerReservationExpectation{}, false,
+			fmt.Errorf("read deterministic Provider request snapshot: %w", err)
+	}
+	var request immutableProviderRequest
+	if err := json.Unmarshal(requestSnapshot, &request); err != nil {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider request snapshot is invalid",
+			)
+	}
+	recomputedHash, err := digestValue(request)
+	if err != nil {
+		return providerReservationExpectation{}, false, err
+	}
+	requestBudgetApprovalUUID, inputApprovalErr := uuid.Parse(request.Input.BudgetApprovalID)
+	productBudgetApprovalUUID, productApprovalErr := uuid.Parse(
+		request.Prepared.ProductTruth.BudgetApprovalID,
+	)
+	if recomputedHash != requestHash ||
+		request.Input.Run != request.Prepared.ProductTruth.Run ||
+		request.Input.Run.RunID != runID.String() ||
+		inputApprovalErr != nil || productApprovalErr != nil ||
+		request.Input.BudgetApprovalID != requestBudgetApprovalUUID.String() ||
+		request.Prepared.ProductTruth.BudgetApprovalID != productBudgetApprovalUUID.String() ||
+		requestBudgetApprovalUUID != persistedBudgetApprovalUUID ||
+		productBudgetApprovalUUID != persistedBudgetApprovalUUID {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider request differs from its immutable run approval",
+			)
+	}
+	expected, err := newProviderReservationExpectation(
+		runID, jobID, reservationID, request.Prepared,
+	)
+	if err != nil {
+		return providerReservationExpectation{}, false, err
+	}
+	return expected, true, nil
+}
+
+func verifyProviderDurableCostProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+) (int64, error) {
+	jobState, reservationStatus, err := verifyProviderReservationProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return verifyProviderAllocatedCostProjection(
+		ctx, tx, expected, jobState, reservationStatus,
+	)
+}
+
+func verifyProviderReservationIdentityProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+) (string, string, error) {
+	estimatePayload, err := json.Marshal(expected.EstimatePayload)
+	if err != nil {
+		return "", "", fmt.Errorf("encode expected Provider reservation estimate: %w", err)
+	}
+	var (
+		storedRunID                                 uuid.UUID
+		storedAmount                                int64
+		storedCurrency, storedPricing, storedStatus string
+		estimateMatches, confirmedByMatches         bool
+		confirmationFrozen                          bool
+		reservationCount                            int64
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT generation_run_id, amount_micros, currency,
+		       pricing_rule_version, status,
+		       estimate_payload = $2::jsonb,
+		       confirmed_by IS NOT DISTINCT FROM $3,
+		       confirmed_at IS NOT NULL AND confirmed_at = created_at,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.budget_reservations candidate
+		        WHERE candidate.id = $1 OR candidate.generation_run_id = $4)
+		FROM video_pipeline.budget_reservations
+		WHERE id = $1
+		FOR SHARE`,
+		expected.ReservationID, estimatePayload, expected.ConfirmedBy, expected.RunID,
+	).Scan(
+		&storedRunID, &storedAmount, &storedCurrency,
+		&storedPricing, &storedStatus,
+		&estimateMatches, &confirmedByMatches, &confirmationFrozen,
+		&reservationCount,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider reservation projection is missing",
+			)
+		}
+		return "", "", fmt.Errorf("read Provider reservation projection: %w", err)
+	}
+	if storedRunID != expected.RunID || storedAmount != expected.AmountMicros ||
+		storedCurrency != expected.Currency || storedPricing != expected.PricingVersion ||
+		!estimateMatches || !confirmedByMatches || !confirmationFrozen ||
+		reservationCount != 1 {
+		return "", "", controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider reservation row has drifted from its immutable run approval",
+		)
+	}
+
+	var (
+		jobRunID, storedReservationID uuid.UUID
+		jobState                      string
+		jobBindingCount               int64
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT ga.generation_run_id, pj.budget_reservation_id, pj.state,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.provider_jobs bound_job
+		        WHERE bound_job.id = $1 OR bound_job.budget_reservation_id = $2)
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.id = pj.generation_attempt_id
+		WHERE pj.id = $1
+		FOR SHARE OF pj`,
+		expected.JobID, expected.ReservationID,
+	).Scan(
+		&jobRunID, &storedReservationID, &jobState, &jobBindingCount,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider reservation has no deterministic bound job",
+			)
+		}
+		return "", "", fmt.Errorf("read Provider reservation job binding: %w", err)
+	}
+	if jobBindingCount != 1 || jobRunID != expected.RunID ||
+		storedReservationID != expected.ReservationID {
+		return "", "", controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider job and reservation cross-binding has drifted",
+		)
+	}
+
+	reservationLedgerID := uuid.NewSHA1(expected.JobID, []byte("reservation-cost"))
+	var (
+		ledgerJobID, ledgerReservationID uuid.UUID
+		ledgerType                       string
+		amountMatches, currencyMatches   bool
+		pricingMatches, verifiedMatches  bool
+		unitsNull, unitNameNull          bool
+		reservationLedgerCount           int64
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id, budget_reservation_id, entry_type,
+		       amount_micros IS NOT DISTINCT FROM $4,
+		       currency IS NOT DISTINCT FROM $5,
+		       pricing_rule_version = $6, verified = true,
+		       units IS NULL, unit_name IS NULL,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.cost_ledger reservation_count
+		        WHERE ((reservation_count.provider_job_id = $2
+		                OR reservation_count.budget_reservation_id = $3)
+		               AND reservation_count.entry_type = 'RESERVATION')
+		           OR reservation_count.id = $1)
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		reservationLedgerID, expected.JobID, expected.ReservationID,
+		expected.AmountMicros, expected.Currency, expected.PricingVersion,
+	).Scan(
+		&ledgerJobID, &ledgerReservationID, &ledgerType,
+		&amountMatches, &currencyMatches, &pricingMatches, &verifiedMatches,
+		&unitsNull, &unitNameNull, &reservationLedgerCount,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the deterministic Provider RESERVATION ledger entry is missing",
+			)
+		}
+		return "", "", fmt.Errorf("read Provider RESERVATION ledger projection: %w", err)
+	}
+	if reservationLedgerCount != 1 || ledgerJobID != expected.JobID ||
+		ledgerReservationID != expected.ReservationID || ledgerType != "RESERVATION" ||
+		!amountMatches || !currencyMatches || !pricingMatches || !verifiedMatches ||
+		!unitsNull || !unitNameNull {
+		return "", "", controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider RESERVATION ledger projection has drifted",
+		)
+	}
+	return jobState, storedStatus, nil
+}
+
+func verifyProviderReservationProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+) (string, string, error) {
+	jobState, storedStatus, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return "", "", err
+	}
+	switch jobState {
+	case "DRAFT", "VALIDATED", "QUEUED", "RUNNING", "UNKNOWN", "REQUIRES_ACTION":
+		if storedStatus != "RESERVED" {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a non-terminal Provider job requires an exact RESERVED allocation",
+			)
+		}
+	case "SUCCEEDED", "FAILED", "CANCELLED":
+		if storedStatus != "SETTLED" {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a terminal Provider job requires an exact SETTLED allocation",
+			)
+		}
+	default:
+		return "", "", controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider job has no replayable reservation state",
+		)
+	}
+	return jobState, storedStatus, nil
+}
+
+func verifyProviderAllocatedCostProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+	jobState string,
+	reservationStatus string,
+) (int64, error) {
+	reservationLedgerID := uuid.NewSHA1(expected.JobID, []byte("reservation-cost"))
+	actualID := uuid.NewSHA1(expected.JobID, []byte("actual-cost"))
+	releaseID := uuid.NewSHA1(expected.JobID, []byte("unused-reservation-release"))
+	var actualCount, releaseCount, unexpectedCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT
+		  COUNT(*) FILTER (WHERE entry_type = 'ACTUAL' OR id = $3),
+		  COUNT(*) FILTER (WHERE entry_type = 'RELEASE' OR id = $4),
+		  COUNT(*) FILTER (WHERE id NOT IN ($3, $4, $5))
+		FROM video_pipeline.cost_ledger
+		WHERE provider_job_id = $1 OR budget_reservation_id = $2
+		   OR id IN ($3, $4, $5)`,
+		expected.JobID, expected.ReservationID, actualID, releaseID, reservationLedgerID,
+	).Scan(&actualCount, &releaseCount, &unexpectedCount); err != nil {
+		return 0, fmt.Errorf("count Provider allocated-cost projections: %w", err)
+	}
+	if unexpectedCount != 0 {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider allocation has unexpected ledger entries",
+		)
+	}
+	if reservationStatus == "RESERVED" {
+		if actualCount != 0 || releaseCount != 0 {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a RESERVED Provider allocation has terminal cost entries",
+			)
+		}
+		return expected.AmountMicros, nil
+	}
+	if reservationStatus != "SETTLED" {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider allocation has an invalid durable status",
+		)
+	}
+
+	if jobState == "SUCCEEDED" {
+		if actualCount != 1 {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a succeeded Provider allocation requires one deterministic ACTUAL entry",
+			)
+		}
+		storedResult, err := readSucceededProviderResult(
+			ctx, tx, expected.RunID, expected.JobID,
+		)
+		if err != nil {
+			return 0, err
+		}
+		usageUnits, err := providerUsageUnits(storedResult.Usage)
+		if err != nil {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider usage projection is invalid",
+			)
+		}
+		if err := verifySucceededProviderCostProjection(
+			ctx, tx, expected.JobID, expected.ReservationID,
+			expected.AmountMicros, expected.Currency, expected.PricingVersion,
+			usageUnits, storedResult,
+		); err != nil {
+			return 0, err
+		}
+		return *storedResult.Cost.ActualMicros, nil
+	}
+	if jobState != "FAILED" && jobState != "CANCELLED" {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the SETTLED Provider allocation has a non-terminal job",
+		)
+	}
+	var failureCode string
+	var failureSnapshot []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(error_code, ''), error_snapshot
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		expected.JobID,
+	).Scan(&failureCode, &failureSnapshot); err != nil {
+		return 0, fmt.Errorf("read failed Provider cost evidence: %w", err)
+	}
+	var failureEvidence struct {
+		Code          string                 `json:"code"`
+		ProviderCost  providercontract.Cost  `json:"providerCost"`
+		ProviderUsage providercontract.Usage `json:"providerUsage"`
+	}
+	if failureCode == "" ||
+		json.Unmarshal(failureSnapshot, &failureEvidence) != nil ||
+		failureEvidence.Code != failureCode {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the failed Provider allocation has no immutable budget evidence",
+		)
+	}
+	failureCost := failureEvidence.ProviderCost
+	failureUsageUnits, usageErr := providerUsageUnits(failureEvidence.ProviderUsage)
+	trustedActual := failureCost.ActualMicros != nil &&
+		usageErr == nil &&
+		failureCost.Verified &&
+		*failureCost.ActualMicros >= 0 &&
+		failureCost.Currency == expected.Currency &&
+		failureCost.PricingVersion == expected.PricingVersion
+	if !trustedActual {
+		if releaseCount != 0 || actualCount > 1 {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a Provider claim without actual cost has unexpected ledger entries",
+			)
+		}
+		// New terminal reconciliation paths omit an untrusted ACTUAL entirely;
+		// older completion paths preserved the provider claim as one unverified
+		// ACTUAL. Both conservatively consume the full reservation.
+		if actualCount == 0 {
+			return expected.AmountMicros, nil
+		}
+		if failureCost.ActualMicros == nil {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a Provider claim without actual cost has an unexpected ACTUAL entry",
+			)
+		}
+	}
+	if actualCount != 1 {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"a failed Provider cost claim requires one deterministic ACTUAL entry",
+		)
+	}
+	var (
+		storedJobID, storedReservationID uuid.UUID
+		storedType                       string
+		storedAmount                     *int64
+		storedCurrency                   *string
+		storedPricing                    string
+		storedVerified                   bool
+		unitsMatch, unitNameMatches      bool
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id, budget_reservation_id, entry_type,
+		       amount_micros, currency, pricing_rule_version, verified,
+		       units IS NOT DISTINCT FROM $2,
+		       unit_name IS NOT DISTINCT FROM $3
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		actualID, failureUsageUnits, failureEvidence.ProviderUsage.Unit,
+	).Scan(
+		&storedJobID, &storedReservationID, &storedType,
+		&storedAmount, &storedCurrency, &storedPricing, &storedVerified,
+		&unitsMatch, &unitNameMatches,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the failed Provider job is missing its deterministic ACTUAL entry",
+			)
+		}
+		return 0, fmt.Errorf("read failed Provider ACTUAL projection: %w", err)
+	}
+	if storedJobID != expected.JobID || storedReservationID != expected.ReservationID ||
+		storedType != "ACTUAL" || storedAmount == nil || storedCurrency == nil ||
+		*storedAmount != *failureCost.ActualMicros ||
+		*storedCurrency != failureCost.Currency ||
+		storedPricing != failureCost.PricingVersion || storedVerified != trustedActual ||
+		!unitsMatch || !unitNameMatches {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the failed Provider ACTUAL cost projection has drifted",
+		)
+	}
+	if !trustedActual {
+		if releaseCount != 0 {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"an untrusted Provider ACTUAL has an unexpected RELEASE entry",
+			)
+		}
+		return expected.AmountMicros, nil
+	}
+	releaseExpected := *storedAmount < expected.AmountMicros
+	if !releaseExpected {
+		if releaseCount != 0 {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the failed Provider allocation has an unexpected RELEASE entry",
+			)
+		}
+		return *storedAmount, nil
+	}
+	if releaseCount != 1 {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the failed Provider allocation is missing its deterministic RELEASE entry",
+		)
+	}
+	var releaseExact bool
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id = $2
+		   AND budget_reservation_id = $3
+		   AND entry_type = 'RELEASE'
+		   AND amount_micros IS NOT DISTINCT FROM $4
+		   AND currency IS NOT DISTINCT FROM $5
+		   AND pricing_rule_version = $6
+		   AND verified = true
+		   AND units IS NULL
+		   AND unit_name IS NULL
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		releaseID, expected.JobID, expected.ReservationID,
+		expected.AmountMicros-*storedAmount,
+		expected.Currency, expected.PricingVersion,
+	).Scan(&releaseExact); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the failed Provider allocation is missing its deterministic RELEASE entry",
+			)
+		}
+		return 0, fmt.Errorf("read failed Provider RELEASE projection: %w", err)
+	}
+	if !releaseExact {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the failed Provider RELEASE cost projection has drifted",
+		)
+	}
+	return *storedAmount, nil
+}
+
+func verifyReleasedProviderBudgetProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+	reason string,
+) error {
+	jobState, reservationStatus, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return err
+	}
+	if reservationStatus != "RELEASED" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release chain has no exact RELEASED reservation",
+		)
+	}
+	var expectedErrorCode any
+	var expectedErrorSnapshot any
+	switch reason {
+	case providerCancelledReleaseReason:
+		if jobState != "CANCELLED" {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a provider-cancelled release requires an exact CANCELLED job",
+			)
+		}
+		expectedErrorCode = nil
+		expectedErrorSnapshot = nil
+	case workflowFailedReleaseReason:
+		if jobState != "FAILED" {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a pre-settlement workflow release requires an exact FAILED job",
+			)
+		}
+		expectedErrorCode = "WORKFLOW_FAILED_BEFORE_SETTLEMENT"
+		expectedErrorSnapshot = map[string]any{
+			"code":          "WORKFLOW_FAILED_BEFORE_SETTLEMENT",
+			"releaseReason": workflowFailedReleaseReason,
+		}
+	default:
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release reason differs from the immutable terminal path",
+		)
+	}
+	var errorCodeExact, errorSnapshotExact bool
+	if err := tx.QueryRow(ctx, `
+		SELECT error_code IS NOT DISTINCT FROM $2,
+		       error_snapshot IS NOT DISTINCT FROM $3::jsonb
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		expected.JobID, expectedErrorCode, expectedErrorSnapshot,
+	).Scan(&errorCodeExact, &errorSnapshotExact); err != nil {
+		return fmt.Errorf("read released Provider job terminal evidence: %w", err)
+	}
+	if !errorCodeExact || !errorSnapshotExact {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the released Provider job terminal evidence has drifted",
+		)
+	}
+	return verifyProviderReleaseLedgerProjection(ctx, tx, expected, reason)
+}
+
+func verifyProviderReleaseLedgerProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+	reason string,
+) error {
+	_, reservationStatus, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return err
+	}
+	if reservationStatus != "RELEASED" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release ledger has no exact RELEASED reservation",
+		)
+	}
+
+	reservationLedgerID := uuid.NewSHA1(expected.JobID, []byte("reservation-cost"))
+	actualID := uuid.NewSHA1(expected.JobID, []byte("actual-cost"))
+	releaseID := uuid.NewSHA1(expected.JobID, []byte("release:"+reason))
+	var actualCount, releaseCount, unexpectedCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT
+		  COUNT(*) FILTER (WHERE entry_type = 'ACTUAL' OR id = $3),
+		  COUNT(*) FILTER (WHERE entry_type = 'RELEASE' OR id = $4),
+		  COUNT(*) FILTER (WHERE id NOT IN ($3, $4, $5))
+		FROM video_pipeline.cost_ledger
+		WHERE provider_job_id = $1 OR budget_reservation_id = $2
+		   OR id IN ($3, $4, $5)`,
+		expected.JobID, expected.ReservationID, actualID, releaseID, reservationLedgerID,
+	).Scan(&actualCount, &releaseCount, &unexpectedCount); err != nil {
+		return fmt.Errorf("count Provider release-cost projections: %w", err)
+	}
+	if actualCount != 0 || releaseCount != 1 || unexpectedCount != 0 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release chain has missing or non-unique terminal cost entries",
+		)
+	}
+	var releaseExact bool
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id = $2
+		   AND budget_reservation_id = $3
+		   AND entry_type = 'RELEASE'
+		   AND amount_micros IS NOT DISTINCT FROM $4
+		   AND currency IS NOT DISTINCT FROM $5
+		   AND pricing_rule_version = $6
+		   AND verified = true
+		   AND units IS NULL
+		   AND unit_name IS NULL
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		releaseID, expected.JobID, expected.ReservationID,
+		expected.AmountMicros, expected.Currency, expected.PricingVersion,
+	).Scan(&releaseExact); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the deterministic Provider RELEASE ledger entry is missing",
+			)
+		}
+		return fmt.Errorf("read Provider RELEASE ledger projection: %w", err)
+	}
+	if !releaseExact {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider RELEASE ledger projection has drifted",
+		)
+	}
+	return nil
+}
+
+func readCumulativeProviderBudgetAllocation(
+	ctx context.Context,
+	tx pgx.Tx,
+	budgetApprovalID string,
+) (int64, error) {
+	budgetApprovalUUID, err := uuid.Parse(budgetApprovalID)
+	if err != nil {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the cumulative Provider budget approval is invalid",
+		)
+	}
+	canonicalApproval := budgetApprovalUUID.String()
+	approvalHex := strings.ReplaceAll(canonicalApproval, "-", "")
+	// PrepareProviderJob already holds the approval row FOR UPDATE. Keep this a
+	// SERIALIZABLE predicate read: locking every run here would invert the
+	// run-then-approval order of a concurrent Prepare and create a deadlock.
+	// Concurrent completion/cancellation observed before settlement is safe and
+	// conservative because RESERVED consumes the full amount.
+	rows, err := tx.Query(ctx, `
+		SELECT id, state
+		FROM video_pipeline.generation_runs
+		WHERE lower(replace(budget_approval_id, '-', '')) = $1
+		   OR EXISTS (
+		     SELECT 1
+		     FROM video_pipeline.generation_attempts ga
+		     JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+		     WHERE ga.generation_run_id = generation_runs.id
+		       AND lower(replace(
+		         COALESCE(pj.request_snapshot #>> '{prepared,productTruth,budgetApprovalId}', ''),
+		         '-', ''
+		       )) = $1
+		   )
+		ORDER BY id`,
+		approvalHex,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("read cumulative Provider budget runs: %w", err)
+	}
+	type cumulativeBudgetRun struct {
+		ID    uuid.UUID
+		State string
+	}
+	var budgetRuns []cumulativeBudgetRun
+	for rows.Next() {
+		var run cumulativeBudgetRun
+		if err := rows.Scan(&run.ID, &run.State); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("scan cumulative Provider budget run: %w", err)
+		}
+		budgetRuns = append(budgetRuns, run)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("iterate cumulative Provider budget runs: %w", err)
+	}
+	rows.Close()
+
+	var allocatedMicros int64
+	for _, run := range budgetRuns {
+		expected, exists, err := readProviderReservationExpectation(
+			ctx, tx, run.ID, canonicalApproval,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if !exists {
+			continue
+		}
+		_, reservationStatus, err := verifyProviderReservationIdentityProjection(
+			ctx, tx, expected,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if reservationStatus == "RELEASED" {
+			reason := ""
+			switch run.State {
+			case "CANCELLED":
+				reason = providerCancelledReleaseReason
+			case "FAILED":
+				reason = workflowFailedReleaseReason
+			default:
+				return 0, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"a released Provider allocation has no matching terminal run state",
+				)
+			}
+			if err := verifyReleasedProviderBudgetProjection(
+				ctx, tx, expected, reason,
+			); err != nil {
+				return 0, err
+			}
+			continue
+		}
+		allocation, err := verifyProviderDurableCostProjection(ctx, tx, expected)
+		if err != nil {
+			return 0, err
+		}
+		if allocation < 0 || allocatedMicros > math.MaxInt64-allocation {
+			return 0, controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"the cumulative Provider allocation exceeds the supported range",
+				"reconcile the immutable cost ledger before another paid submission",
+			)
+		}
+		allocatedMicros += allocation
+	}
+	return allocatedMicros, nil
+}
+
+func readSucceededProviderResult(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	jobID uuid.UUID,
+) (orchestration.ProviderResult, error) {
+	var (
+		storedTaskID, storedRequestID            string
+		storedDigest, storedURI, storedMediaType string
+		storedSize                               int64
+		storedMediaSpec                          []byte
+		outputCount                              int64
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(pj.upstream_task_id, ''),
+		       COALESCE(pj.upstream_request_id, ''),
+		       a.content_hash, a.artifact_uri, a.media_type, a.size_bytes,
+		       a.media_spec,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.run_artifacts outputs
+		        JOIN video_pipeline.artifacts output_artifact
+		          ON output_artifact.id = outputs.artifact_id
+		        WHERE outputs.generation_run_id = gr.id
+		          AND outputs.role = 'OUTPUT'
+		          AND COALESCE(output_artifact.media_spec->>'kind', 'shot_video') = 'shot_video')
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.id = pj.generation_attempt_id
+		JOIN video_pipeline.generation_runs gr
+		  ON gr.id = ga.generation_run_id
+		JOIN video_pipeline.run_artifacts ra
+		  ON ra.generation_run_id = gr.id AND ra.role = 'OUTPUT'
+		JOIN video_pipeline.artifacts a
+		  ON a.id = ra.artifact_id
+		 AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video'
+		 AND a.status = 'ACTIVE'
+		WHERE gr.id = $1 AND pj.id = $2
+		ORDER BY a.id
+		LIMIT 1
+		FOR SHARE OF a`,
+		runID, jobID,
+	).Scan(
+		&storedTaskID, &storedRequestID,
+		&storedDigest, &storedURI, &storedMediaType, &storedSize,
+		&storedMediaSpec, &outputCount,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return orchestration.ProviderResult{}, controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job has no unique ACTIVE immutable shot output",
+			)
+		}
+		return orchestration.ProviderResult{}, fmt.Errorf(
+			"read succeeded Provider completion: %w", err,
+		)
+	}
+	if outputCount != 1 {
+		return orchestration.ProviderResult{}, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the succeeded Provider job has a non-unique immutable shot output",
+		)
+	}
+	var mediaSpec providerCompletionMediaSpec
+	if err := json.Unmarshal(storedMediaSpec, &mediaSpec); err != nil {
+		return orchestration.ProviderResult{}, fmt.Errorf(
+			"decode succeeded Provider artifact media spec: %w", err,
+		)
+	}
+	return orchestration.ProviderResult{
+		UpstreamTaskID: storedTaskID,
+		RequestID:      storedRequestID,
+		ArtifactDigest: storedDigest,
+		ArtifactURI:    storedURI,
+		MediaType:      storedMediaType,
+		ArtifactSize:   storedSize,
+		Width:          mediaSpec.Width,
+		Height:         mediaSpec.Height,
+		DurationMillis: mediaSpec.DurationMillis,
+		Model:          mediaSpec.Model,
+		Usage:          mediaSpec.Usage,
+		Cost:           mediaSpec.Cost,
+	}, nil
+}
+
+// verifySucceededProviderCompletion makes terminal success an immutable
+// replay boundary. The Provider job row is already locked by the caller. Every
+// identity, artifact, usage, and cost field must match the first committed
+// result before an exact replay may continue to repair a missing QC projection.
+func verifySucceededProviderCompletion(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	jobID uuid.UUID,
+	reservationID uuid.UUID,
+	reservedMicros int64,
+	reservedCurrency string,
+	reservedPricing string,
+	usageUnits int64,
+	result orchestration.ProviderResult,
+) error {
+	stored, err := readSucceededProviderResult(ctx, tx, runID, jobID)
+	if err != nil {
+		return err
+	}
+	if !reflect.DeepEqual(stored, result) {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"Provider completion result differs from the immutable succeeded job",
+		)
+	}
+	if err := verifySucceededProviderCostProjection(
+		ctx, tx, jobID, reservationID,
+		reservedMicros, reservedCurrency, reservedPricing,
+		usageUnits, result,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+// verifySucceededProviderCostProjection freezes the complete successful cost
+// projection. A successful completion has exactly one deterministic ACTUAL row
+// and either exactly one deterministic unused-reservation RELEASE row or no
+// RELEASE at all when the actual consumed the full reservation. The caller
+// already holds FOR UPDATE locks on the Provider job and reservation.
+func verifySucceededProviderCostProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+	reservationID uuid.UUID,
+	reservedMicros int64,
+	reservedCurrency string,
+	reservedPricing string,
+	usageUnits int64,
+	result orchestration.ProviderResult,
+) error {
+	if result.Cost.ActualMicros == nil || !result.Cost.Verified ||
+		*result.Cost.ActualMicros < 0 || *result.Cost.ActualMicros > reservedMicros ||
+		result.Cost.Currency != reservedCurrency ||
+		result.Cost.PricingVersion != reservedPricing {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the succeeded Provider job has an invalid immutable cost result",
+		)
+	}
+
+	actualID := uuid.NewSHA1(jobID, []byte("actual-cost"))
+	var (
+		storedJobID, storedReservationID uuid.UUID
+		storedEntryType                  string
+		storedAmountMatch                bool
+		storedCurrencyMatch              bool
+		storedUnitsMatch                 bool
+		storedUnitNameMatch              bool
+		storedPricingMatch               bool
+		storedVerifiedMatch              bool
+		actualCount                      int64
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id, budget_reservation_id, entry_type,
+		       amount_micros IS NOT DISTINCT FROM $5,
+		       currency IS NOT DISTINCT FROM $6,
+		       units IS NOT DISTINCT FROM $3,
+		       unit_name IS NOT DISTINCT FROM $4,
+		       pricing_rule_version = $7,
+		       verified = $8,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.cost_ledger actual_count
+		        WHERE ((actual_count.provider_job_id = $2
+		                OR actual_count.budget_reservation_id = $9)
+		               AND actual_count.entry_type = 'ACTUAL')
+		           OR actual_count.id = $1)
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		actualID, jobID,
+		usageUnits, result.Usage.Unit,
+		*result.Cost.ActualMicros, result.Cost.Currency,
+		result.Cost.PricingVersion, result.Cost.Verified, reservationID,
+	).Scan(
+		&storedJobID, &storedReservationID, &storedEntryType,
+		&storedAmountMatch, &storedCurrencyMatch,
+		&storedUnitsMatch, &storedUnitNameMatch,
+		&storedPricingMatch, &storedVerifiedMatch, &actualCount,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job is missing its immutable ACTUAL cost",
+			)
+		}
+		return fmt.Errorf("read succeeded Provider ACTUAL cost: %w", err)
+	}
+	if actualCount != 1 || storedJobID != jobID ||
+		storedReservationID != reservationID || storedEntryType != "ACTUAL" ||
+		!storedAmountMatch || !storedCurrencyMatch ||
+		!storedUnitsMatch || !storedUnitNameMatch ||
+		!storedPricingMatch || !storedVerifiedMatch {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the succeeded Provider ACTUAL cost projection has drifted",
+		)
+	}
+
+	var releaseCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.cost_ledger
+		WHERE ((provider_job_id = $1 OR budget_reservation_id = $2)
+		       AND entry_type = 'RELEASE')
+		   OR id = $3`,
+		jobID, reservationID,
+		uuid.NewSHA1(jobID, []byte("unused-reservation-release")),
+	).Scan(&releaseCount); err != nil {
+		return fmt.Errorf("count succeeded Provider RELEASE costs: %w", err)
+	}
+	releaseExpected := *result.Cost.ActualMicros < reservedMicros
+	if !releaseExpected {
+		if releaseCount != 0 {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job has an unexpected RELEASE cost",
+			)
+		}
+		return nil
+	}
+
+	releaseID := uuid.NewSHA1(jobID, []byte("unused-reservation-release"))
+	var releaseUnitsNull, releaseUnitNameNull bool
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id, budget_reservation_id, entry_type,
+		       amount_micros IS NOT DISTINCT FROM $2,
+		       currency IS NOT DISTINCT FROM $3,
+		       pricing_rule_version = $4, verified = true,
+		       units IS NULL, unit_name IS NULL
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		releaseID, reservedMicros-*result.Cost.ActualMicros,
+		reservedCurrency, reservedPricing,
+	).Scan(
+		&storedJobID, &storedReservationID, &storedEntryType,
+		&storedAmountMatch, &storedCurrencyMatch,
+		&storedPricingMatch, &storedVerifiedMatch,
+		&releaseUnitsNull, &releaseUnitNameNull,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job is missing its immutable RELEASE cost",
+			)
+		}
+		return fmt.Errorf("read succeeded Provider RELEASE cost: %w", err)
+	}
+	if releaseCount != 1 || storedJobID != jobID ||
+		storedReservationID != reservationID || storedEntryType != "RELEASE" ||
+		!storedAmountMatch || !storedCurrencyMatch || !storedPricingMatch ||
+		!storedVerifiedMatch || !releaseUnitsNull || !releaseUnitNameNull {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the succeeded Provider RELEASE cost projection has drifted",
+		)
+	}
+	return nil
+}
+
 func (p *Postgres) RecordAutomaticQC(
 	ctx context.Context,
 	step orchestration.WorkflowStep,
@@ -1903,18 +3747,26 @@ func (p *Postgres) RecordAutomaticQC(
 		if err != nil {
 			return struct{}{}, fmt.Errorf("insert QC report: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE video_pipeline.shot_spec_revisions ssr
-			SET lifecycle_state = $2
-			FROM video_pipeline.generation_runs gr
-			WHERE gr.id = $1
-			  AND gr.state = 'SUCCEEDED'
-			  AND ssr.id = gr.shot_spec_revision_id`,
-			runID, shotState,
-		); err != nil {
-			return struct{}{}, fmt.Errorf("advance shot QC state: %w", err)
-		}
 		if tag.RowsAffected() == 1 {
+			shotTag, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.shot_spec_revisions ssr
+				SET lifecycle_state = $2
+				FROM video_pipeline.generation_runs gr
+				WHERE gr.id = $1
+				  AND gr.state = 'SUCCEEDED'
+				  AND ssr.id = gr.shot_spec_revision_id
+				  AND ssr.lifecycle_state = 'QC_PENDING'`,
+				runID, shotState,
+			)
+			if err != nil {
+				return struct{}{}, fmt.Errorf("advance shot QC state: %w", err)
+			}
+			if shotTag.RowsAffected() != 1 {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"new QC evidence requires the shot to be QC_PENDING",
+				)
+			}
 			if err := insertAuditAndOutbox(
 				ctx, tx,
 				uuid.NewSHA1(reportID, []byte("audit")),
@@ -2163,12 +4015,41 @@ func (p *Postgres) PrepareEpisodePostProduction(
 				"shot %s voice authorization: %w", clip.ShotSpecRevisionID, err,
 			)
 		}
+		if input.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2 {
+			if input.Config.SpeechVoice == nil {
+				return postproduction.Request{}, errors.New("speech-v2 requires an immutable VOICE binding")
+			}
+			for cueIndex := range shotCues {
+				if strings.TrimSpace(shotCues[cueIndex].VoiceRef) == "" {
+					continue
+				}
+				matched, err := p.voiceVersionDescendsFrom(
+					ctx,
+					input.Config.SpeechVoice.ParentAssetVersionID,
+					shotCues[cueIndex].VoiceRef,
+				)
+				if err != nil {
+					return postproduction.Request{}, err
+				}
+				if !matched {
+					return postproduction.Request{}, controlplane.NewPolicyError(
+						controlplane.CodeLicenseBlocked,
+						"speech-v2 parent voice does not descend from the approved shot binding",
+						"create a linear approved voice revision from the current package voice",
+					)
+				}
+				shotCues[cueIndex].VoiceRef = input.Config.SpeechVoice.AssetVersionID
+			}
+		}
 		cues = append(cues, shotCues...)
 		clips = append(clips, clip)
 		sourceRevisionIDs = append(sourceRevisionIDs, clip.ShotSpecRevisionID)
 		timelineOffset += clip.DurationMillis
 	}
 	if err := p.validateVoiceAssets(ctx, episodeRevisionID, voiceAssetIDs); err != nil {
+		return postproduction.Request{}, err
+	}
+	if err := p.validateSpeechV2Configuration(ctx, p.pool, episodeRevisionID, input.Config); err != nil {
 		return postproduction.Request{}, err
 	}
 	cueHash, err := digestValue(map[string]any{
@@ -2210,11 +4091,19 @@ func (p *Postgres) PrepareEpisodePostProduction(
 		Subtitle:            subtitle,
 		BackgroundAudio:     background,
 		Speech: postproduction.SpeechConfig{
-			Route:               input.Config.SpeechRoute,
-			ProviderProfileID:   input.Config.SpeechProviderProfileID,
-			BudgetApprovalID:    input.Config.SpeechBudgetApprovalID,
-			BudgetMaximumMicros: input.Config.SpeechBudgetMaximumMicros,
-			BudgetCurrency:      input.Config.SpeechBudgetCurrency,
+			Route:                            input.Config.SpeechRoute,
+			ProviderProfileID:                input.Config.SpeechProviderProfileID,
+			BudgetApprovalID:                 input.Config.SpeechBudgetApprovalID,
+			BudgetMaximumMicros:              input.Config.SpeechBudgetMaximumMicros,
+			BudgetCurrency:                   input.Config.SpeechBudgetCurrency,
+			IdentityVersion:                  input.Config.SpeechIdentityVersion,
+			Voice:                            input.Config.SpeechVoice,
+			AuthorizedCueID:                  input.Config.SpeechAuthorizedCueID,
+			MaximumAFPMilli:                  input.Config.SpeechMaximumAFPMilli,
+			MaximumNonSubscriptionCashMicros: input.Config.SpeechMaximumCashMicros,
+			MaxAttempts:                      input.Config.SpeechMaxAttempts,
+			BatchAuthorization:               input.Config.SpeechBatchAuthorization,
+			CompletedAttempts:                input.Config.SpeechCompletedAttempts,
 		},
 		Output: postproduction.OutputPolicy{
 			Width: 1280, Height: 720, FPS: 24, Format: "mp4",
@@ -2260,6 +4149,9 @@ func (p *Postgres) AuthorizeEpisodePostProduction(
 		if err := p.requireCurrentPostProductionBudget(
 			ctx, tx, episodeRevisionID, input.GenerationPlanID, input.Config,
 		); err != nil {
+			return struct{}{}, err
+		}
+		if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
 			return struct{}{}, err
 		}
 		return struct{}{}, nil
@@ -2312,6 +4204,9 @@ func (p *Postgres) CommitEpisodePostProduction(
 		); err != nil {
 			return struct{}{}, err
 		}
+		if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
+			return struct{}{}, err
+		}
 		var eligibleRuns int
 		if err := tx.QueryRow(ctx, `
 			SELECT COUNT(*)
@@ -2358,8 +4253,9 @@ func (p *Postgres) CommitEpisodePostProduction(
 				"kind": output.artifact.Kind, "durationMillis": output.artifact.DurationMillis,
 				"width": output.artifact.Width, "height": output.artifact.Height,
 				"fps": output.artifact.FPS, "evidence": result.Evidence,
-				"postProductionManifestHash": result.ManifestHash,
-				"speechCost":                 speechCost,
+				"postProductionManifestHash":   result.ManifestHash,
+				"postProductionManifestHashes": []string{result.ManifestHash},
+				"speechCost":                   speechCost,
 			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO video_pipeline.artifacts
@@ -2404,6 +4300,36 @@ func (p *Postgres) CommitEpisodePostProduction(
 				return struct{}{}, fmt.Errorf(
 					"artifact %s content hash is already bound to incompatible metadata",
 					output.artifact.Kind,
+				)
+			}
+			// Content-addressed artifacts such as an unchanged UTF-8 SRT can be
+			// reused by a later post-production revision. Preserve the original
+			// singular binding for historical manifests and append the new
+			// revision to an explicit membership set.
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.artifacts
+				SET media_spec = jsonb_set(
+				      media_spec,
+				      '{postProductionManifestHashes}',
+				      CASE
+				        WHEN jsonb_typeof(media_spec->'postProductionManifestHashes') = 'array'
+				          THEN media_spec->'postProductionManifestHashes'
+				        ELSE '[]'::jsonb
+				      END || jsonb_build_array($2::text),
+				      true
+				    )
+				WHERE id = $1
+				  AND COALESCE(media_spec->>'postProductionManifestHash', '') <> $2
+				  AND NOT (
+				    CASE
+				      WHEN jsonb_typeof(media_spec->'postProductionManifestHashes') = 'array'
+				        THEN media_spec->'postProductionManifestHashes'
+				      ELSE '[]'::jsonb
+				    END ? $2
+				  )`, artifactID, result.ManifestHash); err != nil {
+				return struct{}{}, fmt.Errorf(
+					"bind reused %s artifact to post-production revision: %w",
+					output.artifact.Kind, err,
 				)
 			}
 			for _, runID := range runIDs {
@@ -2522,10 +4448,21 @@ func (p *Postgres) BuildEpisodeManifest(
 			  'artifacts', COALESCE((
 			    SELECT jsonb_agg(
 			      to_jsonb(a) || jsonb_build_object(
-			        'role', ra.role,
-			        'media_spec', a.media_spec || jsonb_build_object(
-			          'kind', COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video')
-			        )
+				        'role', ra.role,
+				        'media_spec', a.media_spec || jsonb_build_object(
+				          'kind', COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video'),
+				          'postProductionManifestHash', CASE
+				            WHEN $3 <> '' AND (
+				              a.media_spec->>'postProductionManifestHash' = $3
+				              OR CASE
+				                WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+				                  THEN a.media_spec->'postProductionManifestHashes'
+				                ELSE '[]'::jsonb
+				              END ? $3
+				            ) THEN $3
+				            ELSE a.media_spec->>'postProductionManifestHash'
+				          END
+				        )
 			      )
 			      ORDER BY ra.role, a.id
 			    )
@@ -2538,7 +4475,14 @@ func (p *Postgres) BuildEpisodeManifest(
 			        NOT (a.media_spec ? 'postProductionManifestHash')
 			        OR (
 			          $3 <> ''
-			          AND a.media_spec->>'postProductionManifestHash' = $3
+			          AND (
+			            a.media_spec->>'postProductionManifestHash' = $3
+			            OR CASE
+			              WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+			                THEN a.media_spec->'postProductionManifestHashes'
+			              ELSE '[]'::jsonb
+			            END ? $3
+			          )
 			        )
 			      )
 			  ), '[]'::jsonb),
@@ -2675,7 +4619,14 @@ func (p *Postgres) BuildEpisodeManifest(
 		    OR
 		    ($2 <> ''
 		     AND a.media_spec->>'kind' = 'final_video'
-		     AND a.media_spec->>'postProductionManifestHash' = $2)
+		     AND (
+		       a.media_spec->>'postProductionManifestHash' = $2
+		       OR CASE
+		         WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+		           THEN a.media_spec->'postProductionManifestHashes'
+		         ELSE '[]'::jsonb
+		       END ? $2
+		     ))
 		  )
 		ORDER BY a.artifact_uri`,
 		runIDs, input.PostProductionManifestHash,
@@ -3195,7 +5146,14 @@ func requireActivePostProductionArtifacts(
 		FROM video_pipeline.run_artifacts ra
 		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
 		WHERE ra.generation_run_id = ANY($1::uuid[])
-		  AND a.media_spec->>'postProductionManifestHash' = $2
+		  AND (
+		    a.media_spec->>'postProductionManifestHash' = $2
+		    OR CASE
+		      WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+		        THEN a.media_spec->'postProductionManifestHashes'
+		      ELSE '[]'::jsonb
+		    END ? $2
+		  )
 		  AND a.status = 'ACTIVE'
 		ORDER BY ra.generation_run_id, a.media_spec->>'kind', a.id
 		FOR SHARE OF ra, a`,
@@ -3627,7 +5585,11 @@ func (p *Postgres) RecordProviderCancellation(
 	if err != nil {
 		return errors.New("runId must be a UUID")
 	}
+	requestedResult := result
+	cancellationUnconfirmed := false
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		result = requestedResult
+		cancellationUnconfirmed = false
 		var currentState string
 		if err := tx.QueryRow(ctx, `
 			SELECT state
@@ -3653,7 +5615,40 @@ func (p *Postgres) RecordProviderCancellation(
 			}
 			if !prepared {
 				result.State = "CANCELLED"
+				result.NoRemoteTask = true
 				result.ErrorCode = ""
+			}
+		}
+		if result.NoRemoteTask {
+			expected, exists, expectationErr := readProviderReservationExpectation(
+				ctx, tx, runID, "",
+			)
+			if expectationErr != nil {
+				return struct{}{}, expectationErr
+			}
+			if exists {
+				_, reservationStatus, identityErr := verifyProviderReservationIdentityProjection(
+					ctx, tx, expected,
+				)
+				if identityErr != nil {
+					return struct{}{}, identityErr
+				}
+				upstreamTaskID, upstreamRequestID, identityErr :=
+					readProviderUpstreamIdentity(ctx, tx, expected.JobID)
+				if identityErr != nil {
+					return struct{}{}, identityErr
+				}
+				if reservationStatus == "RESERVED" &&
+					(upstreamTaskID != "" || upstreamRequestID != "") {
+					// A missing adapter registry entry cannot prove absence after the
+					// durable paid task identity is known. Preserve the reservation
+					// and identities, and keep reconciliation retryable.
+					result = orchestration.CancelProviderResult{
+						State: "UNKNOWN", ErrorCode: "CANCEL_NOT_CONFIRMED",
+						UpstreamTaskID: upstreamTaskID, RequestID: upstreamRequestID,
+					}
+					cancellationUnconfirmed = true
+				}
 			}
 		}
 		switch result.State {
@@ -3682,8 +5677,36 @@ func (p *Postgres) RecordProviderCancellation(
 				return struct{}{}, fmt.Errorf("finish terminal-success cancellation race: %w", err)
 			}
 		case "CANCELLED":
+			if currentState == "CANCELLED" {
+				var err error
+				if result.NoRemoteTask {
+					err = releaseRunBudgetReservation(
+						ctx, tx, runID, providerCancelledReleaseReason,
+					)
+				} else {
+					err = settleProviderTerminalBudget(
+						ctx, tx, runID, "CANCELLED", result,
+					)
+				}
+				if err != nil {
+					return struct{}{}, err
+				}
+			}
 			if currentState != "SUCCEEDED" && currentState != "FAILED" &&
 				currentState != "CANCELLED" {
+				var err error
+				if result.NoRemoteTask {
+					err = releaseRunBudgetReservation(
+						ctx, tx, runID, providerCancelledReleaseReason,
+					)
+				} else {
+					err = settleProviderTerminalBudget(
+						ctx, tx, runID, "CANCELLED", result,
+					)
+				}
+				if err != nil {
+					return struct{}{}, err
+				}
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.provider_jobs pj
 					SET state = 'CANCELLED', terminal_at = now(), updated_at = now(),
@@ -3725,11 +5748,6 @@ func (p *Postgres) RecordProviderCancellation(
 				); err != nil {
 					return struct{}{}, fmt.Errorf("cancel shot revision: %w", err)
 				}
-				if err := releaseRunBudgetReservation(
-					ctx, tx, runID, "provider-cancelled",
-				); err != nil {
-					return struct{}{}, err
-				}
 			}
 			if _, err := tx.Exec(ctx, `
 				UPDATE video_pipeline.operation_requests
@@ -3745,6 +5763,53 @@ func (p *Postgres) RecordProviderCancellation(
 				runID,
 			); err != nil {
 				return struct{}{}, fmt.Errorf("finish cancellation operations: %w", err)
+			}
+		case "FAILED":
+			if currentState == "SUCCEEDED" || currentState == "CANCELLED" {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"a confirmed Provider failure cannot reverse terminal product truth",
+				)
+			}
+			if err := settleProviderTerminalBudget(
+				ctx, tx, runID, "FAILED", result,
+			); err != nil {
+				return struct{}{}, err
+			}
+			failureCode := strings.TrimSpace(result.ErrorCode)
+			if failureCode == "" {
+				failureCode = "PROVIDER_FAILED"
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_attempts
+				SET state = 'FAILED', failure_code = $2, finished_at = now()
+				WHERE generation_run_id = $1
+				  AND state NOT IN ('SUCCEEDED', 'CANCELLED')`,
+				runID, failureCode,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("fail reconciled Provider attempt: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.generation_runs
+				SET state = 'FAILED', failure_class = 'TRANSIENT',
+				    failure_code = $2, finished_at = now()
+				WHERE id = $1 AND state != 'SUCCEEDED' AND state != 'CANCELLED'`,
+				runID, failureCode,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("fail reconciled Provider run: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.operation_requests
+				SET state = CASE
+				    WHEN operation_type = 'CANCEL_GENERATION_RUN' THEN 'SUCCEEDED'
+				    ELSE 'FAILED'
+				  END,
+				  updated_at = now()
+				WHERE aggregate_type = 'GENERATION_RUN' AND aggregate_id = $1
+				  AND state IN ('ACCEPTED', 'RUNNING', 'CANCEL_REQUESTED')`,
+				runID,
+			); err != nil {
+				return struct{}{}, fmt.Errorf("finish reconciled Provider failure operations: %w", err)
 			}
 		default:
 			if currentState != "SUCCEEDED" && currentState != "FAILED" &&
@@ -3803,6 +5868,13 @@ func (p *Postgres) RecordProviderCancellation(
 			// audit/outbox facts until a terminal result is observed.
 			return struct{}{}, nil
 		}
+		if currentState == result.State &&
+			(result.State == "SUCCEEDED" || result.State == "CANCELLED" || result.State == "FAILED") {
+			// The terminal projection and its cost evidence were verified above.
+			// Activity-journal replay normally short-circuits before this boundary,
+			// but direct repository retries must not duplicate audit/outbox facts.
+			return struct{}{}, nil
+		}
 		return struct{}{}, insertAuditAndOutbox(
 			ctx, tx,
 			uuid.NewSHA1(runID, []byte("provider-cancellation-audit:"+step.ActivityID)),
@@ -3817,7 +5889,244 @@ func (p *Postgres) RecordProviderCancellation(
 			p.now().UTC(),
 		)
 	})
+	if err != nil {
+		return err
+	}
+	if cancellationUnconfirmed {
+		return errors.New("provider cancellation remains unconfirmed for the durable upstream task")
+	}
+	return nil
+}
+
+func settleProviderTerminalBudget(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	terminalState string,
+	result orchestration.CancelProviderResult,
+) error {
+	if terminalState != "CANCELLED" && terminalState != "FAILED" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider terminal cost state is invalid",
+		)
+	}
+	errorCode := strings.TrimSpace(result.ErrorCode)
+	if errorCode == "" {
+		if terminalState == "CANCELLED" {
+			errorCode = "PROVIDER_CANCELLED"
+		} else {
+			errorCode = "PROVIDER_FAILED"
+		}
+	}
+	expected, exists, err := readProviderReservationExpectation(ctx, tx, runID, "")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the confirmed Provider terminal outcome has no durable reservation",
+		)
+	}
+	jobState, reservationStatus, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return err
+	}
+	storedTaskID, storedRequestID, err := readProviderUpstreamIdentity(
+		ctx, tx, expected.JobID,
+	)
+	if err != nil {
+		return err
+	}
+	if (storedTaskID != "" && result.UpstreamTaskID != storedTaskID) ||
+		(storedRequestID != "" && result.RequestID != storedRequestID) {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider terminal outcome differs from the durable upstream identity",
+		)
+	}
+	evidence := map[string]any{
+		"code": errorCode, "providerCost": result.Cost,
+		"providerUsage": result.Usage,
+	}
+	usageUnits, usageErr := providerUsageUnits(result.Usage)
+	claimVerified := result.Cost.ActualMicros != nil && usageErr == nil &&
+		result.Cost.Verified && *result.Cost.ActualMicros >= 0 &&
+		result.Cost.Currency == expected.Currency &&
+		result.Cost.PricingVersion == expected.PricingVersion
+	actualTrusted := claimVerified && *result.Cost.ActualMicros <= expected.AmountMicros
+	evidence["actualTrustedForBudget"] = actualTrusted
+	if reservationStatus == "SETTLED" {
+		if jobState != terminalState {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider terminal replay changed its durable state",
+			)
+		}
+		if err := verifyProviderTerminalEvidence(
+			ctx, tx, expected.JobID, terminalState, errorCode, evidence, result,
+		); err != nil {
+			return err
+		}
+		_, err := verifyProviderAllocatedCostProjection(
+			ctx, tx, expected, jobState, reservationStatus,
+		)
+		return err
+	}
+	if reservationStatus != "RESERVED" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider terminal outcome has an invalid reservation state",
+		)
+	}
+	switch jobState {
+	case "DRAFT", "VALIDATED", "QUEUED", "RUNNING", "UNKNOWN", "REQUIRES_ACTION":
+	default:
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider terminal outcome cannot replace existing terminal truth",
+		)
+	}
+	if _, err := verifyProviderAllocatedCostProjection(
+		ctx, tx, expected, jobState, reservationStatus,
+	); err != nil {
+		return err
+	}
+	jobTag, err := tx.Exec(ctx, `
+		UPDATE video_pipeline.provider_jobs
+		SET upstream_task_id = COALESCE(NULLIF($2, ''), upstream_task_id),
+		    upstream_request_id = COALESCE(NULLIF($3, ''), upstream_request_id),
+		    state = $4, terminal_at = now(), updated_at = now(),
+		    error_code = $5, error_snapshot = $6
+		WHERE id = $1 AND state = $7`,
+		expected.JobID, result.UpstreamTaskID, result.RequestID,
+		terminalState, errorCode, evidence, jobState,
+	)
+	if err != nil {
+		return fmt.Errorf("freeze Provider terminal cost evidence: %w", err)
+	}
+	if jobTag.RowsAffected() != 1 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider job changed before terminal cost settlement",
+		)
+	}
+	reservationTag, err := tx.Exec(ctx, `
+		UPDATE video_pipeline.budget_reservations
+		SET status = 'SETTLED'
+		WHERE id = $1 AND generation_run_id = $2 AND status = 'RESERVED'`,
+		expected.ReservationID, expected.RunID,
+	)
+	if err != nil {
+		return fmt.Errorf("settle terminal Provider reservation: %w", err)
+	}
+	if reservationTag.RowsAffected() != 1 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider reservation changed before terminal cost settlement",
+		)
+	}
+	recordActual := result.Cost.ActualMicros != nil && usageErr == nil &&
+		*result.Cost.ActualMicros >= 0
+	if recordActual {
+		actualMicros := *result.Cost.ActualMicros
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, units, unit_name,
+				 pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'ACTUAL', $4, $5, $6, $7, $8, $9)`,
+			uuid.NewSHA1(expected.JobID, []byte("actual-cost")),
+			expected.JobID, expected.ReservationID, actualMicros,
+			result.Cost.Currency, usageUnits, result.Usage.Unit,
+			result.Cost.PricingVersion, claimVerified,
+		); err != nil {
+			return translateWriteError("record terminal Provider ACTUAL cost", err)
+		}
+		if actualTrusted && actualMicros < expected.AmountMicros {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'RELEASE', $4, $5, $6, true)`,
+				uuid.NewSHA1(expected.JobID, []byte("unused-reservation-release")),
+				expected.JobID, expected.ReservationID,
+				expected.AmountMicros-actualMicros,
+				expected.Currency, expected.PricingVersion,
+			); err != nil {
+				return translateWriteError("record terminal Provider unused release", err)
+			}
+		}
+	}
+	if err := verifyProviderTerminalEvidence(
+		ctx, tx, expected.JobID, terminalState, errorCode, evidence, result,
+	); err != nil {
+		return err
+	}
+	_, err = verifyProviderAllocatedCostProjection(
+		ctx, tx, expected, terminalState, "SETTLED",
+	)
 	return err
+}
+
+func verifyProviderTerminalEvidence(
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+	terminalState string,
+	errorCode string,
+	evidence map[string]any,
+	result orchestration.CancelProviderResult,
+) error {
+	var exact bool
+	if err := tx.QueryRow(ctx, `
+		SELECT state = $2
+		   AND error_code = $3
+		   AND error_snapshot = $4::jsonb
+		   AND upstream_task_id IS NOT DISTINCT FROM NULLIF($5, '')
+		   AND upstream_request_id IS NOT DISTINCT FROM NULLIF($6, '')
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		jobID, terminalState, errorCode, evidence,
+		result.UpstreamTaskID, result.RequestID,
+	).Scan(&exact); err != nil {
+		return fmt.Errorf("read Provider terminal cost evidence: %w", err)
+	}
+	if !exact {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider terminal cost evidence has drifted",
+		)
+	}
+	return nil
+}
+
+func readProviderUpstreamIdentity(
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+) (string, string, error) {
+	var upstreamTaskID, upstreamRequestID string
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(upstream_task_id, ''), COALESCE(upstream_request_id, '')
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		jobID,
+	).Scan(&upstreamTaskID, &upstreamRequestID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider job has no durable upstream identity projection",
+			)
+		}
+		return "", "", fmt.Errorf("read Provider upstream identity: %w", err)
+	}
+	return upstreamTaskID, upstreamRequestID, nil
 }
 
 func (p *Postgres) ProviderJobPrepared(ctx context.Context, runIDRaw string) (bool, error) {
@@ -3871,7 +6180,20 @@ func (p *Postgres) FinalizeShotRun(
 		operationState := "SUCCEEDED"
 		if input.State == "FAILED" {
 			operationState = "FAILED"
-			if currentState != "SUCCEEDED" && currentState != "CANCELLED" {
+			if currentState == "FAILED" {
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, workflowFailedReleaseReason,
+				); err != nil {
+					return struct{}{}, err
+				}
+			}
+			if currentState != "SUCCEEDED" && currentState != "CANCELLED" &&
+				currentState != "FAILED" {
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, workflowFailedReleaseReason,
+				); err != nil {
+					return struct{}{}, err
+				}
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.generation_runs
 					SET state = 'FAILED', failure_class = NULLIF($2, ''),
@@ -3889,11 +6211,6 @@ func (p *Postgres) FinalizeShotRun(
 					runID, input.FailureCode,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("fail shot attempt: %w", err)
-				}
-				if err := releaseRunBudgetReservation(
-					ctx, tx, runID, "workflow-failed-before-settlement",
-				); err != nil {
-					return struct{}{}, err
 				}
 			}
 		} else if input.State == "SUCCEEDED" && currentState != "SUCCEEDED" {
@@ -3954,49 +6271,149 @@ func releaseRunBudgetReservation(
 	runID uuid.UUID,
 	reason string,
 ) error {
-	var reservationID, jobID uuid.UUID
-	var amountMicros int64
-	var currency, pricingVersion, status string
-	err := tx.QueryRow(ctx, `
-		SELECT br.id, pj.id, br.amount_micros, br.currency,
-		       br.pricing_rule_version, br.status
-		FROM video_pipeline.budget_reservations br
-		JOIN video_pipeline.provider_jobs pj ON pj.budget_reservation_id = br.id
-		WHERE br.generation_run_id = $1
-		FOR UPDATE OF br, pj`,
-		runID,
-	).Scan(
-		&reservationID, &jobID, &amountMicros, &currency, &pricingVersion, &status,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if reason != providerCancelledReleaseReason && reason != workflowFailedReleaseReason {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release reason differs from the immutable terminal path",
+		)
+	}
+	expected, exists, err := readProviderReservationExpectation(ctx, tx, runID, "")
+	if err != nil {
+		return err
+	}
+	if !exists {
 		return nil
 	}
+	jobState, status, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
 	if err != nil {
-		return fmt.Errorf("lock releasable Provider reservation: %w", err)
+		return err
+	}
+	if status == "RELEASED" {
+		return verifyReleasedProviderBudgetProjection(ctx, tx, expected, reason)
+	}
+	if status == "SETTLED" {
+		_, err := verifyProviderAllocatedCostProjection(
+			ctx, tx, expected, jobState, status,
+		)
+		return err
 	}
 	if status != "RESERVED" {
-		return nil
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider reservation has an invalid release state",
+		)
 	}
-	if _, err := tx.Exec(ctx, `
+	upstreamTaskID, upstreamRequestID, err := readProviderUpstreamIdentity(
+		ctx, tx, expected.JobID,
+	)
+	if err != nil {
+		return err
+	}
+	if upstreamTaskID != "" || upstreamRequestID != "" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"a Provider allocation with a durable upstream identity requires terminal cost reconciliation",
+		)
+	}
+	switch jobState {
+	case "DRAFT", "VALIDATED", "QUEUED", "RUNNING", "UNKNOWN", "REQUIRES_ACTION":
+	default:
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release requires an unsettled non-terminal job",
+		)
+	}
+	allocation, err := verifyProviderAllocatedCostProjection(
+		ctx, tx, expected, jobState, status,
+	)
+	if err != nil {
+		return err
+	}
+	if allocation != expected.AmountMicros {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release amount differs from the immutable reservation",
+		)
+	}
+	releaseID := uuid.NewSHA1(expected.JobID, []byte("release:"+reason))
+	var terminalLedgerCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.cost_ledger
+		WHERE ((provider_job_id = $1 OR budget_reservation_id = $2)
+		       AND entry_type IN ('ACTUAL', 'RELEASE'))
+		   OR id = $3`,
+		expected.JobID, expected.ReservationID, releaseID,
+	).Scan(&terminalLedgerCount); err != nil {
+		return fmt.Errorf("count pre-release Provider ledger projection: %w", err)
+	}
+	if terminalLedgerCount != 0 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the RESERVED Provider allocation already has terminal cost evidence",
+		)
+	}
+	var terminalJobState string
+	var terminalErrorCode any
+	var terminalErrorSnapshot any
+	switch reason {
+	case providerCancelledReleaseReason:
+		terminalJobState = "CANCELLED"
+		terminalErrorCode = nil
+		terminalErrorSnapshot = nil
+	case workflowFailedReleaseReason:
+		terminalJobState = "FAILED"
+		terminalErrorCode = "WORKFLOW_FAILED_BEFORE_SETTLEMENT"
+		terminalErrorSnapshot = map[string]any{
+			"code":          "WORKFLOW_FAILED_BEFORE_SETTLEMENT",
+			"releaseReason": workflowFailedReleaseReason,
+		}
+	}
+	jobTag, err := tx.Exec(ctx, `
+		UPDATE video_pipeline.provider_jobs
+		SET state = $2, terminal_at = now(), updated_at = now(),
+		    error_code = $3, error_snapshot = $4
+		WHERE id = $1 AND state = $5`,
+		expected.JobID, terminalJobState, terminalErrorCode,
+		terminalErrorSnapshot, jobState,
+	)
+	if err != nil {
+		return fmt.Errorf("freeze released Provider job terminal state: %w", err)
+	}
+	if jobTag.RowsAffected() != 1 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider job changed before deterministic release",
+		)
+	}
+	tag, err := tx.Exec(ctx, `
 		UPDATE video_pipeline.budget_reservations
 		SET status = 'RELEASED'
-		WHERE id = $1 AND status = 'RESERVED'`,
-		reservationID,
-	); err != nil {
+		WHERE id = $1 AND generation_run_id = $2 AND status = 'RESERVED'`,
+		expected.ReservationID, expected.RunID,
+	)
+	if err != nil {
 		return fmt.Errorf("release Provider budget reservation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider reservation changed before deterministic release",
+		)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO video_pipeline.cost_ledger
 			(id, provider_job_id, budget_reservation_id, entry_type,
 			 amount_micros, currency, pricing_rule_version, verified)
-		VALUES ($1, $2, $3, 'RELEASE', $4, $5, $6, true)
-		ON CONFLICT (id) DO NOTHING`,
-		uuid.NewSHA1(jobID, []byte("release:"+reason)),
-		jobID, reservationID, amountMicros, currency, pricingVersion,
+		VALUES ($1, $2, $3, 'RELEASE', $4, $5, $6, true)`,
+		releaseID, expected.JobID, expected.ReservationID,
+		expected.AmountMicros, expected.Currency, expected.PricingVersion,
 	); err != nil {
-		return fmt.Errorf("record Provider budget release: %w", err)
+		return translateWriteError("record deterministic Provider budget release", err)
 	}
-	return nil
+	return verifyProviderReleaseLedgerProjection(ctx, tx, expected, reason)
 }
 
 func dialogueCues(
@@ -4101,6 +6518,176 @@ func collectVoiceAssetBindings(
 			)
 		}
 		result[voiceAssetID] = struct{}{}
+	}
+	return nil
+}
+
+func (p *Postgres) voiceVersionDescendsFrom(
+	ctx context.Context,
+	candidateParentVersionID string,
+	approvedShotVersionID string,
+) (bool, error) {
+	candidateID, err := uuid.Parse(candidateParentVersionID)
+	if err != nil {
+		return false, errors.New("speech parent voice asset version must be a UUID")
+	}
+	approvedID, err := uuid.Parse(approvedShotVersionID)
+	if err != nil {
+		return false, errors.New("approved shot voice asset version must be a UUID")
+	}
+	var matched bool
+	if err := p.pool.QueryRow(ctx, `
+		WITH RECURSIVE voice_lineage(id, parent_revision_id, asset_id) AS (
+			SELECT id, parent_revision_id, asset_id
+			FROM video_pipeline.asset_versions
+			WHERE id = $1 AND status = 'APPROVED'
+			UNION
+			SELECT parent.id, parent.parent_revision_id, parent.asset_id
+			FROM video_pipeline.asset_versions parent
+			JOIN voice_lineage child
+			  ON child.parent_revision_id = parent.id
+			 AND child.asset_id = parent.asset_id
+			WHERE parent.status = 'APPROVED'
+		)
+		SELECT EXISTS(SELECT 1 FROM voice_lineage WHERE id = $2)`,
+		candidateID, approvedID,
+	).Scan(&matched); err != nil {
+		return false, fmt.Errorf("validate speech voice ancestry: %w", err)
+	}
+	return matched, nil
+}
+
+type speechConfigurationQueryer interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+// validateSpeechV2Configuration binds the frozen canary to one new VOICE
+// revision, its exact license snapshot, and one live provider capability. The
+// same query runs during prepare and again inside the paid-boundary transaction.
+func (p *Postgres) validateSpeechV2Configuration(
+	ctx context.Context,
+	queryer speechConfigurationQueryer,
+	episodeRevisionID uuid.UUID,
+	config orchestration.PostProductionConfig,
+) error {
+	if config.SpeechIdentityVersion == "" {
+		return nil
+	}
+	if config.SpeechIdentityVersion != postproduction.SpeechIdentityV2 {
+		return controlplane.NewPolicyError(
+			controlplane.CodeCapability,
+			"post-production speech identity version is unsupported",
+			"freeze a supported speech configuration revision",
+		)
+	}
+	if config.SpeechVoice == nil {
+		return errors.New("speech-v2 requires an immutable VOICE binding")
+	}
+	voice := *config.SpeechVoice
+	assetID, err := uuid.Parse(voice.AssetID)
+	if err != nil {
+		return errors.New("speech voice assetId must be a UUID")
+	}
+	parentVersionID, err := uuid.Parse(voice.ParentAssetVersionID)
+	if err != nil {
+		return errors.New("speech parent voice asset version must be a UUID")
+	}
+	versionID, err := uuid.Parse(voice.AssetVersionID)
+	if err != nil {
+		return errors.New("speech voice asset version must be a UUID")
+	}
+	licenseID, err := uuid.Parse(voice.LicenseSnapshotID)
+	if err != nil {
+		return errors.New("speech voice license snapshot must be a UUID")
+	}
+	profileID, err := uuid.Parse(config.SpeechProviderProfileID)
+	if err != nil {
+		return errors.New("speech provider profile must be a UUID")
+	}
+	authorizationClause := ""
+	arguments := []any{
+		episodeRevisionID, assetID, parentVersionID, versionID, licenseID,
+		profileID, voice.AssetVersionHash, voice.Provider, voice.ModelID,
+		voice.ResourceID, voice.Speaker, config.SpeechRoute.RouteVersion,
+		voice.LicenseSnapshotHash, config.SpeechRoute.CapabilityHash,
+	}
+	if config.SpeechBatchAuthorization == nil {
+		authorizationClause = `
+		  AND pcs.limits->>'authorizedCueId' = $15
+		  AND (pcs.limits->>'maximumAfpMilli')::bigint = $16
+		  AND (pcs.limits->>'maximumNonSubscriptionCashMicros')::bigint = $17
+		  AND (pcs.limits->>'maxAttempts')::integer = $18`
+		arguments = append(arguments,
+			config.SpeechAuthorizedCueID, config.SpeechMaximumAFPMilli,
+			config.SpeechMaximumCashMicros, config.SpeechMaxAttempts,
+		)
+	}
+	var matched int
+	err = queryer.QueryRow(ctx, `
+		SELECT 1
+		FROM video_pipeline.episode_revisions er
+		JOIN video_pipeline.episodes ep ON ep.id = er.episode_id
+		JOIN video_pipeline.assets source_asset
+		  ON source_asset.id = $2
+		 AND source_asset.series_id = ep.series_id
+		 AND source_asset.asset_type = 'VOICE'
+		JOIN video_pipeline.asset_versions parent
+		  ON parent.id = $3
+		 AND parent.asset_id = source_asset.id
+		JOIN video_pipeline.asset_versions av
+		  ON av.id = $4
+		 AND av.asset_id = source_asset.id
+		 AND av.parent_revision_id = parent.id
+		JOIN video_pipeline.license_snapshots ls
+		  ON ls.id = $5
+		 AND ls.id = av.license_snapshot_id
+		JOIN video_pipeline.provider_profiles pp
+		  ON pp.id = $6
+		JOIN video_pipeline.provider_capability_snapshots pcs
+		  ON pcs.provider_profile_id = pp.id
+		 AND pcs.capability_alias = 'speech.primary'
+		WHERE er.id = $1
+		  AND parent.status = 'APPROVED'
+		  AND av.status = 'APPROVED'
+		  AND av.content_hash = $7
+		  AND av.artifact_uri = 'cas://sha256/' || $7
+		  AND av.media_type = 'audio/x-voice-profile+json'
+		  AND av.dimensions->>'provider' = $8
+		  AND av.dimensions->>'modelId' = $9
+		  AND av.dimensions->>'resourceId' = $10
+		  AND av.dimensions->>'speaker' = $11
+		  AND av.dimensions->>'routeVersion' = $12
+		  AND ls.license_hash = $13
+		  AND ls.subject_type = 'VOICE'
+		  AND ls.subject_ref = $8 || ':' || $10 || ':' || $11
+		  AND ls.policy_status = 'ALLOWED'
+		  AND ls.commercial_use
+		  AND (ls.expires_at IS NULL OR ls.expires_at > now())
+		  AND pp.provider = 'VOLCENGINE'
+		  AND pp.enabled
+		  AND pp.mode = 'LIVE'
+		  AND pp.health = 'READY'
+		  AND pp.config_hash = $14
+		  AND pcs.model_id = $9
+		  AND pcs.route_version = $12
+		  AND pcs.capability_hash = $14
+		  AND pcs.status = 'ACTIVE'
+		  AND (pcs.expires_at IS NULL OR pcs.expires_at > now())
+		  AND pcs.limits->>'resourceId' = $10
+		  AND pcs.limits->>'defaultSpeaker' = $11
+`+authorizationClause+`
+		FOR SHARE OF er, ep, source_asset, parent, av, ls, pp, pcs`,
+		arguments...,
+	).Scan(&matched)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeLicenseBlocked,
+			"speech-v2 voice, license, or provider configuration is no longer current",
+			"re-freeze the exact approved VOICE revision and Agent Plan capability",
+		)
+	}
+	if err != nil {
+		return fmt.Errorf("validate frozen speech-v2 configuration: %w", err)
 	}
 	return nil
 }

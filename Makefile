@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-secret-scan video-test web-build web-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-cer-test video-stage1-readiness video-stage1-materialize-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -39,6 +39,43 @@ video-migration-v7-rollback-guard-test:
 
 video-flo104-mock-evidence:
 	./video-pipeline/scripts/flo104-mock-evidence.sh artifacts/flo104-mock
+
+# Provider-free dual CER evaluator and frozen Unicode 17.0.0 data contract.
+video-cer-test:
+	go test -race ./cmd/video-cer-evidence ./internal/videopipeline/cerevaluation
+
+# Pure validation: this command has no Provider client and cannot incur cost.
+video-stage1-readiness:
+	go run ./cmd/video-stage1-readiness video-pipeline/config/flo104-stage1-readiness.json
+
+# Build/test only. Actual import additionally requires the four fixed issue
+# attachments, explicit ADMIN approval identity, PostgreSQL, and a CAS root.
+video-stage1-materialize-test:
+	go test ./cmd/video-stage1-materialize ./internal/videopipeline/stage1materialize ./internal/videopipeline/repository
+
+# Build/test only. The revoice command has no Provider client or Adapter URL.
+video-stage1-revoice-test:
+	go test ./cmd/video-stage1-revoice ./internal/videopipeline/stage1materialize ./internal/videopipeline/postproduction ./internal/videopipeline/volcengineprovider
+
+# Build/test only. The batch materializer has no Provider client and contract
+# tests assert ordered fail-closed submission.
+video-stage1-speech-batch-test:
+	go test -race ./cmd/video-stage1-authorize-speech ./internal/videopipeline/speechcontract ./internal/videopipeline/stage1materialize ./internal/videopipeline/postproduction ./internal/videopipeline/volcengineprovider
+
+# Build-only QA gate: does not start a container or contact an adapter.
+video-stage1-runner-build:
+	docker compose --env-file video-pipeline/.env.video.example -f video-pipeline/compose.yaml --profile live --profile stage1 build stage1-runner
+
+# The live profile reads provider and internal service-auth secrets only from
+# the invoking environment. The probe output directory is single-use.
+video-live-provider-up: video-bootstrap
+	@test -n "$${ARK_API_KEY:-}" || (echo "ARK_API_KEY must be injected at runtime" && exit 1)
+	@test "$${#VIDEO_PROVIDER_SERVICE_AUTH_SECRET}" -ge 32 || (echo "VIDEO_PROVIDER_SERVICE_AUTH_SECRET must contain at least 32 bytes" && exit 1)
+	$(VIDEO_COMPOSE) --profile live up --build --wait volcengine-provider
+
+video-live-probe: video-bootstrap
+	@test "$${#VIDEO_PROVIDER_SERVICE_AUTH_SECRET}" -ge 32 || (echo "VIDEO_PROVIDER_SERVICE_AUTH_SECRET must contain at least 32 bytes" && exit 1)
+	$(VIDEO_COMPOSE) --profile live run --build --rm live-probe
 
 video-secret-scan:
 	./video-pipeline/scripts/check-secrets.sh

@@ -4,6 +4,8 @@ package postproduction
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -123,6 +125,18 @@ func TestFFmpegProcessor_RendersDeterministicDelivery(t *testing.T) {
 		first.FinalVideo.FPS != 24 || first.FinalVideo.DurationMillis != 2_000 {
 		t.Fatalf("unexpected final media spec: %#v", first.FinalVideo)
 	}
+	assertCommittedAudioSpec(t, store, first.Dialogue, 2_000, 48_000, 2)
+	if len(first.AudioTimingCorrections) != 2 ||
+		first.QC.AudioVideoStartP95Millis == nil ||
+		first.QC.SubtitleBoundaryP95Millis == nil ||
+		first.QC.ManualTimingRequired || first.QC.State != "TIMING_PASSED_CER_PENDING" {
+		t.Fatalf("live timing evidence was not measured: %#v %#v", first.QC, first.AudioTimingCorrections)
+	}
+	for _, correction := range first.AudioTimingCorrections {
+		if correction.EndTrimApplied || correction.HardCutDetected {
+			t.Fatalf("live dialogue was hard-cut: %#v", correction)
+		}
+	}
 
 	// The contract mock deliberately stores JSON fixture bytes while labeling
 	// their intended media type. mock_only finalization must turn those lineage
@@ -149,6 +163,74 @@ func TestFFmpegProcessor_RendersDeterministicDelivery(t *testing.T) {
 	if mockResult.FinalVideo.Width != 320 || mockResult.FinalVideo.Height != 180 ||
 		mockResult.FinalVideo.FPS != 24 || mockResult.FinalVideo.DurationMillis != 2_000 {
 		t.Fatalf("unexpected mock final media spec: %#v", mockResult.FinalVideo)
+	}
+}
+
+func assertCommittedAudioSpec(
+	t *testing.T,
+	store *artifactstore.Store,
+	artifact Artifact,
+	wantDurationMillis int64,
+	wantSampleRate int,
+	wantChannels int,
+) {
+	t.Helper()
+	source, err := store.Open(artifact.Digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	path := filepath.Join(t.TempDir(), "dialogue.wav")
+	target, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		_ = target.Close()
+		t.Fatal(err)
+	}
+	if err := target.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := exec.Command(
+		"ffprobe", "-v", "error",
+		"-show_entries", "format=duration:stream=codec_type,duration,sample_rate,channels",
+		"-of", "json", path,
+	).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe, err := parseAudioProbe(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.DurationMillis != wantDurationMillis ||
+		probe.SampleRate != wantSampleRate || probe.Channels != wantChannels {
+		t.Fatalf("dialogue probe = %#v, want %dms %dHz/%dch", probe, wantDurationMillis, wantSampleRate, wantChannels)
+	}
+	if artifact.DurationMillis != probe.DurationMillis {
+		t.Fatalf("dialogue manifest duration = %dms, probed %dms", artifact.DurationMillis, probe.DurationMillis)
+	}
+}
+
+func TestParseAudioProbe(t *testing.T) {
+	t.Parallel()
+	payload, err := json.Marshal(map[string]any{
+		"streams": []map[string]any{{
+			"codec_type": "audio", "duration": "50.000000",
+			"sample_rate": "48000", "channels": 2,
+		}},
+		"format": map[string]any{"duration": "50.000000"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	probe, err := parseAudioProbe(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if probe.DurationMillis != 50_000 || probe.SampleRate != 48_000 || probe.Channels != 2 {
+		t.Fatalf("unexpected audio probe: %#v", probe)
 	}
 }
 

@@ -10,17 +10,19 @@ import (
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
 
 const (
-	WorkflowName        = "video.production.episode.v1"
-	DefaultTaskQueue    = "video-production-v1"
-	Gate3DecisionSignal = "video.production.gate3-decision.v1"
-	ShotDecisionSignal  = "video.production.shot-decision.v1"
-	ControlSignal       = "video.production.control.v1"
-	StatusQuery         = "video.production.status.v1"
+	WorkflowName                   = "video.production.episode.v1"
+	Stage1FinalizationWorkflowName = "video.production.stage1-finalization.v1"
+	DefaultTaskQueue               = "video-production-v1"
+	Gate3DecisionSignal            = "video.production.gate3-decision.v1"
+	ShotDecisionSignal             = "video.production.shot-decision.v1"
+	ControlSignal                  = "video.production.control.v1"
+	StatusQuery                    = "video.production.status.v1"
 
 	ActivityValidateBatch      = "video.activity.validate-batch.v1"
 	ActivityCompilePrompt      = "video.activity.compile-prompt.v1"
@@ -61,6 +63,15 @@ type EpisodeProductionResult struct {
 	PostProduction *postproduction.Result `json:"postProduction,omitempty"`
 	Gate3Decision  *Gate3Decision         `json:"gate3Decision,omitempty"`
 	Shots          map[string]ShotState   `json:"shots"`
+}
+
+// Stage1FinalizationResult is the durable result of the formal Stage 1
+// post-production-only workflow. Video submission remains exclusively owned by
+// video-stage1-runner; this workflow consumes only its evidence-gated immutable
+// FinalizeEpisodeInput and opens G3 after the committed post-production result.
+type Stage1FinalizationResult struct {
+	PostProduction postproduction.Result `json:"postProduction"`
+	Gate3Created   bool                  `json:"gate3Created"`
 }
 
 // ShotState is exposed through the workflow query handler.
@@ -153,17 +164,25 @@ type QCResult struct {
 // PostProductionConfig freezes the independent speech route, budget, subtitle
 // behavior, and optional licensed background asset before Temporal starts.
 type PostProductionConfig struct {
-	Enabled                       bool                           `json:"enabled"`
-	Evidence                      string                         `json:"evidence"`
-	SpeechRoute                   providercontract.ModelSnapshot `json:"speechRoute"`
-	SpeechProviderProfileID       string                         `json:"speechProviderProfileId"`
-	SpeechBudgetApprovalID        string                         `json:"speechBudgetApprovalId"`
-	SpeechBudgetMaximumMicros     int64                          `json:"speechBudgetMaximumMicros"`
-	SpeechBudgetCurrency          string                         `json:"speechBudgetCurrency"`
-	SubtitleLanguage              string                         `json:"subtitleLanguage"`
-	BurnSubtitles                 bool                           `json:"burnSubtitles"`
-	BackgroundAudioAssetVersionID string                         `json:"backgroundAudioAssetVersionId,omitempty"`
-	EnforcePoCDuration            bool                           `json:"enforcePoCDuration"`
+	Enabled                       bool                               `json:"enabled"`
+	Evidence                      string                             `json:"evidence"`
+	SpeechRoute                   providercontract.ModelSnapshot     `json:"speechRoute"`
+	SpeechProviderProfileID       string                             `json:"speechProviderProfileId"`
+	SpeechBudgetApprovalID        string                             `json:"speechBudgetApprovalId"`
+	SpeechBudgetMaximumMicros     int64                              `json:"speechBudgetMaximumMicros"`
+	SpeechBudgetCurrency          string                             `json:"speechBudgetCurrency"`
+	SpeechIdentityVersion         string                             `json:"speechIdentityVersion,omitempty"`
+	SpeechVoice                   *postproduction.SpeechVoiceBinding `json:"speechVoice,omitempty"`
+	SpeechAuthorizedCueID         string                             `json:"speechAuthorizedCueId,omitempty"`
+	SpeechMaximumAFPMilli         int64                              `json:"speechMaximumAfpMilli,omitempty"`
+	SpeechMaximumCashMicros       int64                              `json:"speechMaximumNonSubscriptionCashMicros,omitempty"`
+	SpeechMaxAttempts             int                                `json:"speechMaxAttempts,omitempty"`
+	SpeechBatchAuthorization      *speechcontract.BatchAuthorization `json:"speechBatchAuthorization,omitempty"`
+	SpeechCompletedAttempts       []postproduction.ProviderAttempt   `json:"speechCompletedAttempts,omitempty"`
+	SubtitleLanguage              string                             `json:"subtitleLanguage"`
+	BurnSubtitles                 bool                               `json:"burnSubtitles"`
+	BackgroundAudioAssetVersionID string                             `json:"backgroundAudioAssetVersionId,omitempty"`
+	EnforcePoCDuration            bool                               `json:"enforcePoCDuration"`
 }
 
 func (c PostProductionConfig) Validate() error {
@@ -185,7 +204,99 @@ func (c PostProductionConfig) Validate() error {
 	if c.SubtitleLanguage == "" {
 		return errors.New("post-production subtitle language is required")
 	}
+	if err := (postproduction.SpeechConfig{
+		Route: c.SpeechRoute, ProviderProfileID: c.SpeechProviderProfileID,
+		BudgetApprovalID:    c.SpeechBudgetApprovalID,
+		BudgetMaximumMicros: c.SpeechBudgetMaximumMicros,
+		BudgetCurrency:      c.SpeechBudgetCurrency,
+		IdentityVersion:     c.SpeechIdentityVersion, Voice: c.SpeechVoice,
+		AuthorizedCueID:                  c.SpeechAuthorizedCueID,
+		MaximumAFPMilli:                  c.SpeechMaximumAFPMilli,
+		MaximumNonSubscriptionCashMicros: c.SpeechMaximumCashMicros,
+		MaxAttempts:                      c.SpeechMaxAttempts,
+		BatchAuthorization:               c.SpeechBatchAuthorization,
+		CompletedAttempts:                c.SpeechCompletedAttempts,
+	}).Validate(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// Stage1FinalizationWorkflow completes the already-generated formal Stage 1
+// batch without recompiling prompts, creating Runs, or submitting video jobs.
+// The caller cannot select Runs: video-stage1-runner derives this input from its
+// immutable execution package and evidence-complete terminal ledger.
+func Stage1FinalizationWorkflow(
+	ctx workflow.Context,
+	input FinalizeEpisodeInput,
+) (Stage1FinalizationResult, error) {
+	if input.EpisodeRevisionID == "" || len(input.RunIDs) == 0 ||
+		input.GenerationPlanID == "" || input.TraceID == "" || !input.PersistProductTruth {
+		err := errors.New("formal Stage 1 finalization requires persisted episode, Run, Plan, and trace identity")
+		return Stage1FinalizationResult{}, temporal.NewNonRetryableApplicationError(
+			err.Error(), "VALIDATION_ERROR", err,
+		)
+	}
+	if err := input.Config.Validate(); err != nil {
+		return Stage1FinalizationResult{}, temporal.NewNonRetryableApplicationError(
+			err.Error(), "VALIDATION_ERROR", err,
+		)
+	}
+	if !input.Config.Enabled || input.Config.Evidence != postproduction.EvidenceLive {
+		err := errors.New("formal Stage 1 finalization requires live post-production evidence")
+		return Stage1FinalizationResult{}, temporal.NewNonRetryableApplicationError(
+			err.Error(), "VALIDATION_ERROR", err,
+		)
+	}
+
+	options := workflow.ActivityOptions{
+		StartToCloseTimeout: 45 * time.Minute,
+		HeartbeatTimeout:    30 * time.Second,
+		WaitForCancellation: true,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval:    time.Second,
+			BackoffCoefficient: 2,
+			MaximumInterval:    30 * time.Second,
+			MaximumAttempts:    3,
+			NonRetryableErrorTypes: []string{
+				"VALIDATION_ERROR", "LICENSE_BLOCKED", "CONSENT_REQUIRED",
+				string(providercontract.CodeBudgetExceeded),
+				string(providercontract.CodeUnauthenticated),
+				string(providercontract.CodeForbidden),
+				string(providercontract.CodeQuotaExceeded),
+				string(providercontract.CodeContentBlocked),
+				string(providercontract.CodeRegionUnavailable),
+				string(providercontract.CodeModelUnavailable),
+			},
+		},
+	}
+	var finalized postproduction.Result
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, options),
+		ActivityFinalizeEpisode,
+		input,
+	).Get(ctx, &finalized); err != nil {
+		return Stage1FinalizationResult{}, err
+	}
+
+	gateOptions := options
+	gateOptions.StartToCloseTimeout = 2 * time.Minute
+	if err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, gateOptions),
+		ActivityCreateGate3,
+		CreateGate3Input{
+			EpisodeRevisionID:             input.EpisodeRevisionID,
+			RunIDs:                        input.RunIDs,
+			GenerationPlanID:              input.GenerationPlanID,
+			PostProductionManifestHash:    finalized.ManifestHash,
+			BackgroundAudioAssetVersionID: input.Config.BackgroundAudioAssetVersionID,
+			TraceID:                       input.TraceID,
+			PersistProductTruth:           true,
+		},
+	).Get(ctx, nil); err != nil {
+		return Stage1FinalizationResult{}, err
+	}
+	return Stage1FinalizationResult{PostProduction: finalized, Gate3Created: true}, nil
 }
 
 // EpisodeProductionWorkflow runs a G2-approved production batch.
@@ -563,6 +674,10 @@ type ExecuteProviderJobInput struct {
 	ProviderProfileID   string                         `json:"providerProfileId,omitempty"`
 	TraceID             string                         `json:"traceId"`
 	PersistProductTruth bool                           `json:"persistProductTruth,omitempty"`
+	// ExpectedProductTruth is set only by the formal Stage 1 runner. The
+	// repository compares it with the facts locked in its SERIALIZABLE
+	// transaction before it inserts a reservation, Provider job, or cost row.
+	ExpectedProductTruth *PreparedProductTruth `json:"expectedProductTruth,omitempty"`
 }
 
 // PreparedProviderJob is the durable per-run budget allocation returned by the
@@ -570,6 +685,39 @@ type ExecuteProviderJobInput struct {
 type PreparedProviderJob struct {
 	Budget            providercontract.BudgetEnvelope    `json:"budget"`
 	BudgetReservation providercontract.BudgetReservation `json:"budgetReservation"`
+	ProductTruth      PreparedProductTruth               `json:"productTruth"`
+	// ReconcileOnly is derived from the durable Provider job projection on
+	// Activity replay. It is intentionally excluded from the immutable request
+	// snapshot: once a submit may have crossed the paid boundary, retries poll
+	// the stable JobID instead of issuing another POST.
+	ReconcileOnly bool `json:"-"`
+}
+
+// ProviderJobObservation freezes the paid-boundary state before an Activity
+// can fail or retry. UNKNOWN is a reconciliation state, never proof that the
+// upstream task failed or can be released.
+type ProviderJobObservation struct {
+	State          string `json:"state"`
+	UpstreamTaskID string `json:"upstreamTaskId,omitempty"`
+	RequestID      string `json:"requestId,omitempty"`
+	ErrorCode      string `json:"errorCode,omitempty"`
+}
+
+// PreparedProductTruth echoes the exact immutable PostgreSQL facts that were
+// revalidated in the same transaction as the Provider job and budget
+// reservation. A narrow runner can compare it with its signed-off package
+// without accepting any caller-reported authorization state.
+type PreparedProductTruth struct {
+	ShotSpecRevisionID  string                         `json:"shotSpecRevisionId"`
+	Run                 GenerationRunRef               `json:"run"`
+	PromptSnapshotID    string                         `json:"promptSnapshotId"`
+	PromptSnapshotHash  string                         `json:"promptSnapshotHash"`
+	GenerationPlanID    string                         `json:"generationPlanId"`
+	BudgetApprovalID    string                         `json:"budgetApprovalId"`
+	BudgetMaximumMicros int64                          `json:"budgetMaximumMicros"`
+	BudgetCurrency      string                         `json:"budgetCurrency"`
+	ProviderProfileID   string                         `json:"providerProfileId"`
+	Route               providercontract.ModelSnapshot `json:"route"`
 }
 
 type RunQCInput struct {

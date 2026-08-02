@@ -1,8 +1,12 @@
 package runtimeconfig
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 )
 
 func TestLoadControlPlane(t *testing.T) {
@@ -109,5 +113,275 @@ func TestLoadMockProviderDefaults(t *testing.T) {
 	}
 	if cfg.ProviderID != "fixture" || len(cfg.Capabilities) != 4 {
 		t.Fatalf("unexpected config: %#v", cfg)
+	}
+}
+
+func TestLoadVolcengineProviderRequiresExplicitKeyAndUsesAgentPlanDefaults(t *testing.T) {
+	base := map[string]string{
+		"VIDEO_ARTIFACT_ROOT": t.TempDir(),
+	}
+	lookup := func(name string) (string, bool) {
+		value, ok := base[name]
+		return value, ok
+	}
+	if _, err := loadVolcengineProvider(lookup); err == nil {
+		t.Fatal("loadVolcengineProvider() error = nil without ARK_API_KEY")
+	}
+	base["ARK_API_KEY"] = "test-runtime-credential"
+	if _, err := loadVolcengineProvider(lookup); err == nil {
+		t.Fatal("loadVolcengineProvider() error = nil without service authentication secret")
+	}
+	base["VIDEO_PROVIDER_SERVICE_AUTH_SECRET"] = "test-service-auth-secret-32-bytes-long"
+	cfg, err := loadVolcengineProvider(lookup)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.BaseURL != "https://ark.cn-beijing.volces.com/api/plan/v3" ||
+		cfg.VideoModel != "doubao-seedance-2.0" || cfg.PlanName != "agent-plan-large" ||
+		cfg.SpeechEndpoint != AgentPlanTTSEndpoint ||
+		cfg.SpeechModel != "doubao-seed-tts-2.0" || cfg.SpeechSpeaker != AgentPlanTTSSpeakerID ||
+		cfg.APIKey != "test-runtime-credential" || cfg.ServiceAuthSecret != "test-service-auth-secret-32-bytes-long" ||
+		cfg.MaxDownloadBytes != 256<<20 || cfg.MaxSpeechBytes != 32<<20 {
+		t.Fatalf("unexpected live defaults: %#v", cfg)
+	}
+}
+
+func TestLoadVolcengineProviderRejectsUnapprovedSpeechSpeaker(t *testing.T) {
+	t.Parallel()
+	values := map[string]string{
+		"ARK_API_KEY":                        "test-runtime-credential",
+		"VIDEO_PROVIDER_SERVICE_AUTH_SECRET": "test-service-auth-secret-32-bytes-long",
+		"VIDEO_ARTIFACT_ROOT":                t.TempDir(),
+		"VIDEO_VOLCENGINE_TTS_SPEAKER":       "zh_female_tianmeitaozi_mars_bigtts",
+	}
+	_, err := loadVolcengineProvider(func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	})
+	if err == nil || !strings.Contains(err.Error(), "approved TTS 2.0 speaker") {
+		t.Fatalf("loadVolcengineProvider() error = %v", err)
+	}
+}
+
+func TestLoadVolcengineProviderRejectsNonPlanSpeechEndpoint(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "standard route", endpoint: "https://openspeech.bytedance.com/api/v3/tts/unidirectional"},
+		{name: "query drift", endpoint: AgentPlanTTSEndpoint + "?billing=other"},
+		{name: "trailing slash", endpoint: AgentPlanTTSEndpoint + "/"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]string{
+				"ARK_API_KEY":                        "test-runtime-credential",
+				"VIDEO_PROVIDER_SERVICE_AUTH_SECRET": "test-service-auth-secret-32-bytes-long",
+				"VIDEO_ARTIFACT_ROOT":                t.TempDir(),
+				"VIDEO_VOLCENGINE_TTS_ENDPOINT":      tt.endpoint,
+			}
+			_, err := loadVolcengineProvider(func(name string) (string, bool) {
+				value, ok := values[name]
+				return value, ok
+			})
+			if err == nil || !strings.Contains(err.Error(), "exact Agent Plan subscription endpoint") {
+				t.Fatalf("loadVolcengineProvider() error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLoadVolcengineProviderErrorNeverContainsCredential(t *testing.T) {
+	credential := "sensitive-runtime-value"
+	values := map[string]string{
+		"ARK_API_KEY":               credential,
+		"VIDEO_VOLCENGINE_BASE_URL": "file:///invalid",
+	}
+	_, err := loadVolcengineProvider(func(name string) (string, bool) {
+		value, ok := values[name]
+		return value, ok
+	})
+	if err == nil {
+		t.Fatal("loadVolcengineProvider() error = nil")
+	}
+	if strings.Contains(err.Error(), credential) {
+		t.Fatalf("configuration error leaked credential: %v", err)
+	}
+}
+
+func TestLoadVolcengineProviderRequiresExactSpeechRetryPair(t *testing.T) {
+	tests := []struct {
+		name      string
+		jobID     string
+		record    string
+		wantError bool
+	}{
+		{name: "disabled"},
+		{name: "exact pair", jobID: "speech-job-1", record: strings.Repeat("a", 64)},
+		{name: "missing record", jobID: "speech-job-1", wantError: true},
+		{name: "missing job", record: strings.Repeat("a", 64), wantError: true},
+		{name: "non speech job", jobID: "video-job-1", record: strings.Repeat("a", 64), wantError: true},
+		{name: "invalid record", jobID: "speech-job-1", record: strings.Repeat("A", 64), wantError: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := map[string]string{
+				"ARK_API_KEY":                              "test-runtime-credential",
+				"VIDEO_PROVIDER_SERVICE_AUTH_SECRET":       "test-service-auth-secret-32-bytes-long",
+				"VIDEO_ARTIFACT_ROOT":                      t.TempDir(),
+				"VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID":        tt.jobID,
+				"VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256": tt.record,
+			}
+			cfg, err := loadVolcengineProvider(func(name string) (string, bool) {
+				value, ok := values[name]
+				return value, ok
+			})
+			if (err != nil) != tt.wantError {
+				t.Fatalf("loadVolcengineProvider() error = %v, wantError = %v", err, tt.wantError)
+			}
+			if err == nil && (cfg.SpeechRetryJobID != tt.jobID || cfg.SpeechRetryRecord != tt.record) {
+				t.Fatalf("retry config = %q/%q", cfg.SpeechRetryJobID, cfg.SpeechRetryRecord)
+			}
+		})
+	}
+}
+
+func TestLoadVolcengineProviderRequiresCompleteZeroCashSpeechCanary(t *testing.T) {
+	valid := map[string]string{
+		"ARK_API_KEY":                                         "test-runtime-credential",
+		"VIDEO_PROVIDER_SERVICE_AUTH_SECRET":                  "test-service-auth-secret-32-bytes-long",
+		"VIDEO_ARTIFACT_ROOT":                                 t.TempDir(),
+		"VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID":                  "speech-v2-0123456789abcdef0123456789abcdef",
+		"VIDEO_VOLCENGINE_TTS_CANARY_INPUT_SHA256":            strings.Repeat("1", 64),
+		"VIDEO_VOLCENGINE_TTS_CANARY_CUE_ID":                  "cue-001",
+		"VIDEO_VOLCENGINE_TTS_CANARY_VOICE_ASSET_ID":          "10400000-0000-4000-8000-00000000000f",
+		"VIDEO_VOLCENGINE_TTS_CANARY_PARENT_VOICE_VERSION_ID": "10400000-0000-4000-8000-000000000010",
+		"VIDEO_VOLCENGINE_TTS_CANARY_VOICE_VERSION_ID":        "10400000-0000-4000-8000-000000000011",
+		"VIDEO_VOLCENGINE_TTS_CANARY_VOICE_SHA256":            strings.Repeat("2", 64),
+		"VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SNAPSHOT_ID":     "10400000-0000-4000-8000-000000000012",
+		"VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SHA256":          strings.Repeat("3", 64),
+		"VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI":           "2228",
+		"VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS":         "0",
+	}
+	load := func(values map[string]string) (VolcengineProvider, error) {
+		return loadVolcengineProvider(func(name string) (string, bool) {
+			value, ok := values[name]
+			return value, ok
+		})
+	}
+	cfg, err := load(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpeechCanaryCueID != "cue-001" || cfg.SpeechCanaryMaximumAFPMilli != 2_228 ||
+		cfg.SpeechCanaryMaximumCashMicros != 0 {
+		t.Fatalf("speech canary config = %#v", cfg)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+	}{
+		{name: "missing frozen voice", mutate: func(values map[string]string) { delete(values, "VIDEO_VOLCENGINE_TTS_CANARY_VOICE_SHA256") }},
+		{name: "cash allowed", mutate: func(values map[string]string) { values["VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS"] = "1" }},
+		{name: "invalid job", mutate: func(values map[string]string) { values["VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID"] = "speech-old" }},
+		{name: "canary limit without identity", mutate: func(values map[string]string) {
+			for name := range values {
+				if strings.HasPrefix(name, "VIDEO_VOLCENGINE_TTS_CANARY_") {
+					delete(values, name)
+				}
+			}
+			values["VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI"] = "2228"
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := make(map[string]string, len(valid))
+			for name, value := range valid {
+				values[name] = value
+			}
+			tt.mutate(values)
+			if _, err := load(values); err == nil {
+				t.Fatal("invalid speech canary config unexpectedly passed")
+			}
+		})
+	}
+}
+
+func TestLoadVolcengineProviderRequiresExactSpeechBatchAuthorization(t *testing.T) {
+	inputHash := strings.Repeat("a", 64)
+	batch := speechcontract.BatchAuthorization{
+		SchemaVersion:              speechcontract.SchemaVersion,
+		ParentExecutionPackageHash: strings.Repeat("d", 64),
+		ApprovalCommentID:          "10400000-0000-4000-8000-000000000030",
+		ApprovalActorID:            "10400000-0000-4000-8000-000000000031",
+		ValidUntil:                 "2026-08-31T15:59:59Z",
+		Provider:                   "volcengine_ark", ModelID: "doubao-seed-tts-2.0",
+		RouteVersion: "agent-plan-large-tts-v2", ResourceID: "seed-tts-2.0",
+		Speaker:                   AgentPlanTTSSpeakerID,
+		VoiceAssetID:              "10400000-0000-4000-8000-00000000000f",
+		ParentVoiceAssetVersionID: "10400000-0000-4000-8000-000000000010",
+		VoiceAssetVersionID:       "10400000-0000-4000-8000-000000000011",
+		VoiceAssetVersionHash:     strings.Repeat("b", 64),
+		LicenseSnapshotID:         "10400000-0000-4000-8000-000000000012",
+		LicenseSnapshotHash:       strings.Repeat("c", 64),
+		MaximumSubmits:            1, EstimatedAFPMilli: 945, MaximumAFPMilli: 1040,
+		Cues: []speechcontract.CueAuthorization{{
+			CueID: "cue-006", JobID: "speech-v2-" + inputHash[:32], InputHash: inputHash,
+			UnicodeCharacters: 7, EstimatedAFPMilli: 945, MaximumAFPMilli: 1040,
+			MaxAttempts: 1,
+		}},
+	}
+	encoded, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := map[string]string{
+		"ARK_API_KEY":                                   "test-runtime-credential",
+		"VIDEO_PROVIDER_SERVICE_AUTH_SECRET":            "test-service-auth-secret-32-bytes-long",
+		"VIDEO_ARTIFACT_ROOT":                           t.TempDir(),
+		"VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON": string(encoded),
+	}
+	load := func(values map[string]string) (VolcengineProvider, error) {
+		return loadVolcengineProvider(func(name string) (string, bool) {
+			value, ok := values[name]
+			return value, ok
+		})
+	}
+	cfg, err := load(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpeechBatchAuthorization == nil || cfg.SpeechBatchAuthorization.Cues[0].CueID != "cue-006" {
+		t.Fatalf("speech batch config = %#v", cfg.SpeechBatchAuthorization)
+	}
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+	}{
+		{name: "unknown field", mutate: func(values map[string]string) {
+			values["VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON"] = strings.TrimSuffix(string(encoded), "}") + `,"extra":true}`
+		}},
+		{name: "combined with canary", mutate: func(values map[string]string) {
+			values["VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI"] = "1"
+		}},
+		{name: "cash enabled", mutate: func(values map[string]string) {
+			copy := batch
+			copy.MaximumNonSubscriptionCashMicros = 1
+			changed, _ := json.Marshal(copy)
+			values["VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON"] = string(changed)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := make(map[string]string, len(valid))
+			for name, value := range valid {
+				values[name] = value
+			}
+			tt.mutate(values)
+			if _, err := load(values); err == nil {
+				t.Fatal("invalid speech batch config unexpectedly passed")
+			}
+		})
 	}
 }

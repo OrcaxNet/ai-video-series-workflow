@@ -2,6 +2,8 @@ package orchestration
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,14 +12,70 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/testsuite"
 )
+
+type activityLiveProvider struct {
+	outputURL string
+	submits   atomic.Int32
+}
+
+func (p *activityLiveProvider) Discover(context.Context) ([]providercontract.Capability, error) {
+	return nil, nil
+}
+
+func (p *activityLiveProvider) Submit(_ context.Context, request providercontract.GenerationRequest) (providercontract.Job, error) {
+	p.submits.Add(1)
+	return providercontract.Job{
+		ID: "cgt-activity-live-1", Status: providercontract.StatusQueued,
+		Provider: "volcengine_ark", ProviderModel: request.ModelHint,
+		ProviderRegion: "cn-beijing", ProviderRequestID: "activity-submit-request-1",
+		CreatedAt: time.Unix(1_800_000_000, 0), UpdatedAt: time.Unix(1_800_000_000, 0),
+	}, nil
+}
+
+func (p *activityLiveProvider) Poll(context.Context, string) (providercontract.Job, error) {
+	return providercontract.Job{
+		ID: "cgt-activity-live-1", Status: providercontract.StatusSucceeded,
+		Provider: "volcengine_ark", ProviderModel: "doubao-seedance-2.0",
+		ProviderRegion: "cn-beijing", ProviderRequestID: "activity-poll-request-1",
+		CreatedAt: time.Unix(1_800_000_000, 0), UpdatedAt: time.Unix(1_800_000_030, 0),
+		Output: &providercontract.Output{
+			Actual: providercontract.OutputSpec{
+				Resolution: "720p", AspectRatio: "16:9", FPS: 24,
+				DurationMillis: 5_000, Format: "mp4",
+			},
+			Usage: providercontract.Usage{VideoTokens: 250_000, GeneratedMillis: 5_000},
+			Assets: []providercontract.AssetRef{{
+				ID: "activity-video", Revision: "provider-result",
+				Kind: providercontract.ModalityVideo, Role: providercontract.AssetRoleOutput,
+				URI: p.outputURL, SHA256: "pending_download",
+				LicenseReference: "request-license-manifest",
+			}},
+		},
+	}, nil
+}
+
+func (p *activityLiveProvider) Cancel(context.Context, string) (providercontract.Job, error) {
+	return providercontract.Job{ID: "cgt-activity-live-1", Status: providercontract.StatusCancelled}, nil
+}
+
+type activityLiveInspector struct{}
+
+func (activityLiveInspector) Inspect(context.Context, string) (volcengineprovider.MediaSpec, error) {
+	return volcengineprovider.MediaSpec{
+		Width: 1280, Height: 720, FPS: 24, DurationMillis: 5_062, Format: "mp4",
+	}, nil
+}
 
 type activityJournalFixture struct {
 	replay          json.RawMessage
@@ -33,6 +91,7 @@ type cancellationLedgerFixture struct {
 	prepared      bool
 	preparedCalls int
 	recorded      []CancelProviderResult
+	recordErr     error
 }
 
 type providerPreparationLedgerFixture struct {
@@ -42,6 +101,9 @@ type providerPreparationLedgerFixture struct {
 	resolveCalls   int
 	prepareErr     error
 	prepareCalls   int
+	prepared       PreparedProviderJob
+	reconcileOnly  bool
+	observations   []ProviderJobObservation
 }
 
 func (l *providerPreparationLedgerFixture) ResolvePromptSnapshot(
@@ -58,7 +120,23 @@ func (l *providerPreparationLedgerFixture) PrepareProviderJob(
 	ExecuteProviderJobInput,
 ) (PreparedProviderJob, error) {
 	l.prepareCalls++
-	return PreparedProviderJob{}, l.prepareErr
+	prepared := l.prepared
+	prepared.ReconcileOnly = l.reconcileOnly
+	return prepared, l.prepareErr
+}
+
+func (l *providerPreparationLedgerFixture) RecordProviderJobObservation(
+	_ context.Context,
+	_ WorkflowStep,
+	_ ExecuteProviderJobInput,
+	observation ProviderJobObservation,
+) error {
+	l.observations = append(l.observations, observation)
+	if observation.State == "UNKNOWN" || observation.State == "RUNNING" ||
+		observation.UpstreamTaskID != "" {
+		l.reconcileOnly = true
+	}
+	return nil
 }
 
 type postProductionLedgerFixture struct {
@@ -169,7 +247,7 @@ func (l *cancellationLedgerFixture) RecordProviderCancellation(
 	result CancelProviderResult,
 ) error {
 	l.recorded = append(l.recorded, result)
-	return nil
+	return l.recordErr
 }
 
 func (j *activityJournalFixture) BeginWorkflowStep(
@@ -306,7 +384,7 @@ func TestActivities_CancelProviderJobConvergesWithoutCallingUnpreparedProvider(t
 	if err := encoded.Get(&result); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if result.State != "CANCELLED" || result.ErrorCode != "" {
+	if result.State != "CANCELLED" || !result.NoRemoteTask || result.ErrorCode != "" {
 		t.Fatalf("result = %#v", result)
 	}
 	if ledger.preparedCalls != 1 || len(ledger.recorded) != 1 ||
@@ -322,6 +400,7 @@ func TestActivities_CancelProviderJobConvergesWithoutCallingUnpreparedProvider(t
 func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t *testing.T) {
 	t.Parallel()
 	providerCalls := 0
+	actualMicros := int64(20)
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		providerCalls++
 		if r.Method != http.MethodPost ||
@@ -333,7 +412,15 @@ func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t 
 			JobID:          "provider-job-run-prepared",
 			RunID:          "run-prepared",
 			UpstreamTaskID: "upstream-1",
+			RequestID:      "request-1",
 			State:          providercontract.StatusCancelled,
+			Usage: providercontract.Usage{
+				InputUnits: 2, OutputUnits: 3, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
 		}); err != nil {
 			t.Fatalf("encode provider response: %v", err)
 		}
@@ -369,7 +456,9 @@ func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t 
 
 	firstWorker := NewProductionActivities(provider.URL, journal, ledger, nil)
 	first := execute(firstWorker)
-	if first.State != "CANCELLED" || providerCalls != 1 ||
+	if first.State != "CANCELLED" || first.RequestID != "request-1" ||
+		first.Cost.ActualMicros == nil || *first.Cost.ActualMicros != 20 ||
+		first.Usage.InputUnits != 2 || providerCalls != 1 ||
 		ledger.preparedCalls != 1 || len(ledger.recorded) != 1 ||
 		len(journal.output) == 0 {
 		t.Fatalf(
@@ -388,7 +477,7 @@ func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t 
 	journal.replayCompleted = true
 	secondWorker := NewProductionActivities(provider.URL, journal, ledger, nil)
 	second := execute(secondWorker)
-	if second != first {
+	if !reflect.DeepEqual(second, first) {
 		t.Fatalf("replayed result = %#v, want %#v", second, first)
 	}
 	if providerCalls != 1 || ledger.preparedCalls != 1 || len(ledger.recorded) != 1 {
@@ -432,6 +521,53 @@ func TestActivities_CancelProviderJobKeepsUnknownRetryable(t *testing.T) {
 	}
 }
 
+func TestActivities_CancelProviderJobConvergesOnFailedTerminalCost(t *testing.T) {
+	t.Parallel()
+	actualMicros := int64(12)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+			JobID: "provider-job-run-provider-failed", RunID: "run-provider-failed",
+			State: providercontract.StatusFailed,
+			Usage: providercontract.Usage{
+				InputUnits: 1, OutputUnits: 2, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+			Error: &providercontract.Error{Code: providercontract.CodeModelUnavailable},
+		})
+	}))
+	defer provider.Close()
+	ledger := &cancellationLedgerFixture{prepared: true}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	encoded, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "reconcile-failed-operation",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-provider-failed"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY", TraceID: "provider-failed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result CancelProviderResult
+	if err := encoded.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "FAILED" ||
+		result.ErrorCode != string(providercontract.CodeModelUnavailable) ||
+		result.Cost.ActualMicros == nil || *result.Cost.ActualMicros != 12 ||
+		len(ledger.recorded) != 1 || ledger.recorded[0].State != "FAILED" {
+		t.Fatalf("failed cancellation reconciliation = result:%#v recorded:%#v", result, ledger.recorded)
+	}
+}
+
 func TestActivities_CancelProviderJobTreatsAuthoritativeAbsenceAsCancelled(t *testing.T) {
 	t.Parallel()
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -466,9 +602,104 @@ func TestActivities_CancelProviderJobTreatsAuthoritativeAbsenceAsCancelled(t *te
 	if err := encoded.Get(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result.State != "CANCELLED" || len(ledger.recorded) != 1 ||
-		ledger.recorded[0].State != "CANCELLED" {
+	if result.State != "CANCELLED" || !result.NoRemoteTask || len(ledger.recorded) != 1 ||
+		ledger.recorded[0].State != "CANCELLED" || !ledger.recorded[0].NoRemoteTask {
 		t.Fatalf("result=%#v recorded=%#v", result, ledger.recorded)
+	}
+}
+
+func TestActivities_CancelProviderJobRetriesWhenDurableIdentityDisprovesAbsence(t *testing.T) {
+	t.Parallel()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": providercontract.Error{
+				Code:        providercontract.CodeNotFound,
+				SafeMessage: "provider job was not found",
+			},
+		})
+	}))
+	defer provider.Close()
+
+	ledger := &cancellationLedgerFixture{
+		prepared:  true,
+		recordErr: errors.New("durable upstream task still requires reconciliation"),
+	}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	_, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "reconcile-known-upstream",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-known-upstream"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY",
+		TraceID:    "provider-registry-missing",
+	})
+	if err == nil {
+		t.Fatal("ExecuteActivity() error = nil, want retryable durable reconciliation")
+	}
+	var applicationErr *temporal.ApplicationError
+	if !errors.As(err, &applicationErr) || applicationErr.NonRetryable() {
+		t.Fatalf("ExecuteActivity() error = %#v, want retryable ApplicationError", err)
+	}
+	if len(ledger.recorded) != 1 || ledger.recorded[0].State != "CANCELLED" ||
+		!ledger.recorded[0].NoRemoteTask {
+		t.Fatalf("recorded cancellation = %#v", ledger.recorded)
+	}
+}
+
+func TestActivities_CancelProviderJobRejectsTerminalIdentityConflict(t *testing.T) {
+	t.Parallel()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		actualMicros := int64(12)
+		_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+			JobID: "provider-job-run-terminal-conflict", RunID: "run-terminal-conflict",
+			State:          providercontract.StatusFailed,
+			UpstreamTaskID: "unexpected-task",
+			RequestID:      "unexpected-request",
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		})
+	}))
+	defer provider.Close()
+
+	ledger := &cancellationLedgerFixture{
+		prepared: true,
+		recordErr: controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"provider terminal identity differs from the durable record",
+		),
+	}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	_, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "terminal-identity-conflict",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-terminal-conflict"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY",
+		TraceID:    "terminal-identity-conflict",
+	})
+	if err == nil {
+		t.Fatal("ExecuteActivity() error = nil, want non-retryable identity conflict")
+	}
+	var applicationErr *temporal.ApplicationError
+	if !errors.As(err, &applicationErr) || !applicationErr.NonRetryable() ||
+		applicationErr.Type() != string(controlplane.CodeRevisionConflict) {
+		t.Fatalf("ExecuteActivity() error = %#v, want non-retryable revision conflict", err)
+	}
+	if len(ledger.recorded) != 1 || ledger.recorded[0].State != "FAILED" {
+		t.Fatalf("recorded cancellation = %#v", ledger.recorded)
 	}
 }
 
@@ -667,6 +898,191 @@ func TestActivities_CreateGate3PreservesRightsErrorContract(t *testing.T) {
 	}
 }
 
+func TestActivities_ExecuteProviderJobUsesLiveAdapterAndReturnsMeasuredCASArtifact(t *testing.T) {
+	t.Parallel()
+	const serviceAuthSecret = "test-service-auth-secret-32-bytes-long"
+	download := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "video/mp4")
+		_, _ = w.Write([]byte("synthetic-live-activity-video"))
+	}))
+	defer download.Close()
+	provider := &activityLiveProvider{outputURL: download.URL + "/result.mp4?signature=transient"}
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	adapter, err := volcengineprovider.New(runtimeconfig.VolcengineProvider{
+		ProviderID: "volcengine-agent-plan-large", Region: "cn-beijing",
+		VideoModel: "doubao-seedance-2.0", PlanName: "agent-plan-large",
+		PricingVersion: "agent-plan-large-included-v1", Currency: "CNY",
+		MaxDownloadBytes: 1 << 20, DownloadTimeout: 5 * time.Second,
+		ServiceAuthSecret: serviceAuthSecret,
+	}, provider, store, volcengineprovider.Options{
+		DownloadClient: download.Client(), Inspector: activityLiveInspector{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+	capability := sha256.Sum256([]byte("volcengine-agent-plan-large\x00doubao-seedance-2.0"))
+	inputDigest := sha256.Sum256([]byte("immutable activity live input"))
+	activities := NewActivities(server.URL)
+	activities.HTTPClient, err = volcengineprovider.AuthenticatedHTTPClient(activities.HTTPClient, serviceAuthSecret)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := ExecuteProviderJobInput{
+		Run: GenerationRunRef{
+			RunID: "live-activity-run", RunSpecDigest: hex.EncodeToString(inputDigest[:]), Attempt: 1,
+		},
+		Prompt: PromptSnapshotRef{
+			ID: "live-activity-prompt", Digest: hex.EncodeToString(inputDigest[:]),
+			PositivePrompt: "original abstract glass fluid, fixed camera, no people or text",
+			Context: providercontract.ContextRefs{
+				SeriesSnapshotID: "series-live", EpisodeSnapshotID: "episode-live",
+				SceneSnapshotID: "scene-live", ShotSnapshotID: "shot-live",
+			},
+			Output: providercontract.OutputSpec{
+				Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+				FPS: 24, DurationMillis: 5_000, Format: "mp4",
+			},
+		},
+		Route: providercontract.ModelSnapshot{
+			CapabilityAlias: string(providercontract.CapabilityVideo),
+			Provider:        "volcengine_ark", ModelID: "doubao-seedance-2.0",
+			RouteVersion: "agent-plan-large-v1", CapabilityHash: hex.EncodeToString(capability[:]),
+			Verification: providercontract.PendingKey,
+		},
+		BudgetApprovalID: "activity-live-budget", BudgetMaximumMicros: 1_000_000,
+		BudgetCurrency: "CNY", TraceID: "trace-activity-live",
+	}
+	var suite testsuite.WorkflowTestSuite
+	environment := suite.NewTestActivityEnvironment()
+	environment.RegisterActivity(activities.ExecuteProviderJob)
+	encodedResult, err := environment.ExecuteActivity(activities.ExecuteProviderJob, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result ProviderResult
+	if err := encodedResult.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if provider.submits.Load() != 1 || result.UpstreamTaskID != "cgt-activity-live-1" ||
+		result.RequestID != "activity-submit-request-1" || result.Width != 1280 ||
+		result.Height != 720 || result.DurationMillis != 5_062 ||
+		result.ArtifactURI != "cas://sha256/"+result.ArtifactDigest ||
+		result.Usage.VideoTokens != 250_000 || result.Cost.ActualMicros == nil ||
+		*result.Cost.ActualMicros != 0 || result.Cost.BillingMode != "subscription_included" {
+		t.Fatalf("live Activity result = %#v, submits = %d", result, provider.submits.Load())
+	}
+	encoded, _ := json.Marshal(result)
+	if strings.Contains(string(encoded), "signature=") || strings.Contains(string(encoded), download.URL) {
+		t.Fatalf("Activity result leaked signed transport URL: %s", encoded)
+	}
+}
+
+func TestActivities_ExecuteProviderJobNeverResubmitsAfterAmbiguousPaidBoundary(t *testing.T) {
+	t.Parallel()
+	runID := "b5787943-28a8-43c8-a4b8-401b85ad7a9d"
+	approvalID := "39d1c01b-bf34-413b-893a-9eb7f8e48a69"
+	inputHash := strings.Repeat("a", 64)
+	capabilityHash := strings.Repeat("b", 64)
+	route := providercontract.ModelSnapshot{
+		CapabilityAlias: string(providercontract.CapabilityVideo),
+		Provider:        "MOCK", ModelID: "fixture-video-v1",
+		RouteVersion: "route-v1", CapabilityHash: capabilityHash,
+		Verification: "test",
+	}
+	prompt := PromptSnapshotRef{
+		ID: "prompt-ambiguous", Digest: strings.Repeat("c", 64),
+		PositivePrompt: "immutable ambiguous submission fixture",
+		Context: providercontract.ContextRefs{
+			SeriesSnapshotID: "series", EpisodeSnapshotID: "episode",
+			SceneSnapshotID: "scene", ShotSnapshotID: "shot",
+		},
+		Output: providercontract.OutputSpec{
+			Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+			FPS: 24, DurationMillis: 5_000, Format: "mp4",
+		},
+	}
+	budget := providercontract.BudgetEnvelope{
+		EstimatedCostMicros: 50, MaxCostMicros: 50, MaxAttempts: 1,
+	}
+	reservation, err := providercontract.BindBudgetReservation(
+		providercontract.BudgetReservation{
+			ReservationID: "993d4ba9-c37a-4536-a985-0859584274f3",
+			Currency:      "CNY", AmountMicros: 50, PricingVersion: "pricing-v1",
+			ConfirmedBy: approvalID,
+		},
+		providercontract.BudgetBindingInput{
+			RunID: runID, InputHash: inputHash, Model: route, Budget: budget,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := ExecuteProviderJobInput{
+		Run:    GenerationRunRef{RunID: runID, RunSpecDigest: inputHash, Attempt: 1},
+		Prompt: prompt, Route: route, BudgetApprovalID: strings.ToUpper(approvalID),
+		BudgetMaximumMicros: 50, BudgetCurrency: "CNY",
+		TraceID: "trace-ambiguous-submit", PersistProductTruth: true,
+	}
+	var submits atomic.Int32
+	var gets atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			submits.Add(1)
+			// Simulate a paid task accepted upstream while the adapter loses the
+			// response. Retrying this endpoint would create a second paid attempt.
+			http.Error(w, "accepted response lost", http.StatusServiceUnavailable)
+		case http.MethodGet:
+			call := gets.Add(1)
+			if call%2 == 0 {
+				http.Error(w, "poll unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+				JobID: "provider-job-" + runID, RunID: runID,
+				UpstreamTaskID: "upstream-ambiguous-1", RequestID: "request-ambiguous-1",
+				State: providercontract.StatusRunning, Model: route,
+			})
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer provider.Close()
+	ledger := &providerPreparationLedgerFixture{
+		resolvedPrompt: prompt,
+		prepared: PreparedProviderJob{
+			Budget: budget, BudgetReservation: reservation,
+		},
+	}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	for attempt := 0; attempt < 4; attempt++ {
+		env := suite.NewTestActivityEnvironment()
+		env.RegisterActivity(activities.ExecuteProviderJob)
+		if _, err := env.ExecuteActivity(activities.ExecuteProviderJob, input); err == nil {
+			t.Fatalf("attempt %d unexpectedly succeeded", attempt+1)
+		}
+	}
+	if submits.Load() != 1 {
+		t.Fatalf("paid POST calls = %d, want 1", submits.Load())
+	}
+	if gets.Load() != 6 {
+		t.Fatalf("stable JobID GET calls = %d, want 6", gets.Load())
+	}
+	if len(ledger.observations) < 7 ||
+		ledger.observations[0].State != "UNKNOWN" ||
+		ledger.observations[0].ErrorCode != "PROVIDER_SUBMISSION_PENDING" ||
+		!ledger.reconcileOnly {
+		t.Fatalf("durable reconciliation observations = %#v", ledger.observations)
+	}
+}
+
 func TestActivities_ExecuteProviderJobPreservesVideoBudgetErrorBeforeProvider(
 	t *testing.T,
 ) {
@@ -709,6 +1125,59 @@ func TestActivities_ExecuteProviderJobPreservesVideoBudgetErrorBeforeProvider(
 			ledger.prepareCalls,
 			providerCalls.Load(),
 		)
+	}
+}
+
+func TestActivities_ExecuteProviderJobPreservesAttemptContractErrorsBeforeProvider(
+	t *testing.T,
+) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		code controlplane.ErrorCode
+	}{
+		{name: "terminal attempt", code: controlplane.CodeConflict},
+		{name: "immutable attempt drift", code: controlplane.CodeRevisionConflict},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var providerCalls atomic.Int32
+			provider := httptest.NewServer(http.HandlerFunc(func(
+				response http.ResponseWriter,
+				_ *http.Request,
+			) {
+				providerCalls.Add(1)
+				http.Error(response, "provider must not be called", http.StatusInternalServerError)
+			}))
+			defer provider.Close()
+
+			ledger := &providerPreparationLedgerFixture{
+				prepareErr: controlplane.NewConflictError(
+					test.code,
+					"fixture generation attempt is terminal or drifted",
+				),
+			}
+			activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+			var suite testsuite.WorkflowTestSuite
+			env := suite.NewTestActivityEnvironment()
+			env.RegisterActivity(activities.ExecuteProviderJob)
+			_, err := env.ExecuteActivity(
+				activities.ExecuteProviderJob,
+				ExecuteProviderJobInput{
+					Run:     GenerationRunRef{RunID: "run-attempt-contract"},
+					TraceID: "trace-attempt-contract", PersistProductTruth: true,
+				},
+			)
+			assertNonRetryableApplicationError(t, err, string(test.code))
+			if ledger.prepareCalls != 1 || providerCalls.Load() != 0 {
+				t.Fatalf(
+					"attempt contract boundary side effects = prepare:%d provider:%d, want 1/0",
+					ledger.prepareCalls, providerCalls.Load(),
+				)
+			}
+		})
 	}
 }
 

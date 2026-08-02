@@ -111,7 +111,7 @@ FLO110_LIVE=1 ./scripts/flo110-preflight.sh
 
 - 已配置的 Claude Code/Anthropic 凭证不读取、不导出、不复用为火山凭证。现有后端的 `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` 仍只服务现有 Anthropic SDK 客户端。
 - 火山适配器只从进程运行时接收 `ARK_API_KEY` 和账号内完整模型 ID；不写 `.env`、数据库、fixture、日志、trace、issue 或 PR。
-- 语音凭证必须由独立 Secret 引用注入，不能假设 `ARK_API_KEY` 同时授权语音产品。
+- Agent Plan TTS 与视频共用运行时注入的 `ARK_API_KEY`；TTS Adapter 固定发送 `X-Api-Resource-Id: seed-tts-2.0`，不读取或要求旧版 `DOUBAO_TTS_APP_ID` / `DOUBAO_TTS_ACCESS_TOKEN`。
 - CI 先通过 Git 清单扫描全部 tracked 文件和未忽略的新文件（包含仓库根目录、隐藏目录与未来新增路径），再执行测试；被 `.gitignore` 明确排除的运行时 Secret 文件不读取。Provider 原始响应最多读取 2 MiB，错误体在适配层丢弃。
 - 开发者若只拥有 Claude Code 会话而没有火山密钥，正确结果就是 `pending_key`，不得借助本机配置探测或复制凭证。
 
@@ -150,7 +150,7 @@ FLO110_LIVE=1 ./scripts/flo110-preflight.sh
 - [Seedream 5.0 Lite / 4.5 / 4.0 能力说明](https://www.volcengine.com/docs/82379/1829186)
 - [Seedance 2.0 API 上线说明](https://developer.volcengine.com/articles/7628567056649125942)
 - [Seedance 原生 720p/1080p、24 FPS 技术说明](https://developer.volcengine.com/articles/7611443299467722779)
-- [语音合成 API](https://www.volcengine.com/docs/6561/79817?lang=zh)
+- [Agent Plan 语音模型配置指南](https://www.volcengine.com/docs/82379/2516286?lang=zh)
 - [语音技术服务 SLA](https://www.volcengine.com/docs/6561/107349?lang=zh)
 - [素材版权与 AI 标识要求](https://www.volcengine.com/docs/82379/2525200?lang=zh)
 - [模型服务协议与内容安全义务](https://www.volcengine.com/docs/82379/1142195)

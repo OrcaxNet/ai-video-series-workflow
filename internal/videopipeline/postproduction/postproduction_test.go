@@ -123,6 +123,12 @@ func TestBuildCommandPlanIsDeterministicAndDoesNotInterpolateDialogue(t *testing
 		!strings.Contains(string(encoded), "Dialogue") {
 		t.Fatal("final command does not preserve AI marker and independent dialogue track")
 	}
+	if !strings.Contains(string(encoded), "apad=whole_len=144000") ||
+		!strings.Contains(string(encoded), "atrim=end_sample=144000") ||
+		!strings.Contains(string(encoded), "sample_rates=48000:channel_layouts=stereo") ||
+		strings.Contains(string(encoded), "apad=whole_dur=") {
+		t.Fatal("dialogue command must produce the exact requested sample count and media specification")
+	}
 	if !strings.Contains(string(encoded), "color=c=0x") ||
 		!strings.Contains(string(encoded), "sine=frequency=") {
 		t.Fatal("mock_only command plan must use deterministic playable lavfi sources")
@@ -288,6 +294,7 @@ func (f *fakeSpeech) Synthesize(ctx context.Context, request SpeechRequest) (Pro
 
 type fakeMedia struct {
 	store *artifactstore.Store
+	calls int
 }
 
 func (f *fakeMedia) Render(
@@ -296,6 +303,7 @@ func (f *fakeMedia) Render(
 	_ []byte,
 	_ []ProviderAttempt,
 ) (RenderResult, error) {
+	f.calls++
 	dialogue, err := f.store.Put(ctx, strings.NewReader("dialogue:"+request.Subtitle.ContentHash))
 	if err != nil {
 		return RenderResult{}, err

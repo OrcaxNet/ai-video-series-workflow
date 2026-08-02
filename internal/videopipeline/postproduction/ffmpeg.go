@@ -27,12 +27,13 @@ type CommandPlan struct {
 }
 
 type RenderResult struct {
-	Dialogue        Artifact
-	FinalVideo      Artifact
-	CommandPlanHash string
-	QC              QCReport
-	FFmpegVersion   string
-	FFprobeVersion  string
+	Dialogue               Artifact
+	FinalVideo             Artifact
+	CommandPlanHash        string
+	QC                     QCReport
+	AudioTimingCorrections []AudioTimingCorrection
+	FFmpegVersion          string
+	FFprobeVersion         string
 }
 
 type MediaProcessor interface {
@@ -128,7 +129,11 @@ func (p *FFmpegProcessor) Render(
 		}
 	}
 
-	plan, err := BuildCommandPlan(request, attempts, p.FFmpeg)
+	corrections, err := p.measureSourceTiming(ctx, workdir, request, attempts)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	plan, err := buildCommandPlan(request, attempts, p.FFmpeg, corrections)
 	if err != nil {
 		return RenderResult{}, err
 	}
@@ -144,12 +149,45 @@ func (p *FFmpegProcessor) Render(
 			return RenderResult{}, err
 		}
 	}
+	if request.Evidence == EvidenceLive {
+		corrections, err = p.measureRenderedTiming(ctx, workdir, request, corrections)
+		if err != nil {
+			return RenderResult{}, err
+		}
+	}
+	policy := request.Output.withDefaults()
+	expectedDuration := request.DurationMillis()
+	dialogueProbeOutput, err := p.Runner.Run(
+		ctx,
+		workdir,
+		p.FFprobe,
+		"-v", "error",
+		"-show_entries", "format=duration:stream=codec_type,duration,sample_rate,channels",
+		"-of", "json",
+		"dialogue.wav",
+	)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	dialogueProbe, err := parseAudioProbe(dialogueProbeOutput)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	if dialogueProbe.SampleRate != policy.AudioSampleRate ||
+		dialogueProbe.Channels != policy.AudioChannels ||
+		dialogueProbe.DurationMillis != expectedDuration {
+		return RenderResult{}, fmt.Errorf(
+			"FFmpeg dialogue output is %dms at %d Hz/%d channels, expected %dms at %d Hz/%d channels",
+			dialogueProbe.DurationMillis, dialogueProbe.SampleRate, dialogueProbe.Channels,
+			expectedDuration, policy.AudioSampleRate, policy.AudioChannels,
+		)
+	}
 	probeOutput, err := p.Runner.Run(
 		ctx,
 		workdir,
 		p.FFprobe,
 		"-v", "error",
-		"-show_entries", "format=duration:stream=codec_type,width,height,r_frame_rate,start_time,sample_rate,channels",
+		"-show_entries", "format=duration:stream=codec_type,width,height,r_frame_rate,start_time,duration,sample_rate,channels",
 		"-of", "json",
 		"episode.mp4",
 	)
@@ -160,7 +198,6 @@ func (p *FFmpegProcessor) Render(
 	if err != nil {
 		return RenderResult{}, err
 	}
-	policy := request.Output.withDefaults()
 	if probe.Width != policy.Width || probe.Height != policy.Height || probe.FPS != policy.FPS {
 		return RenderResult{}, fmt.Errorf(
 			"FFmpeg output is %dx%d@%dfps, expected %dx%d@%dfps",
@@ -182,16 +219,21 @@ func (p *FFmpegProcessor) Render(
 			probe.AudioVideoStartDeltaMillis,
 		)
 	}
-	expectedDuration := request.DurationMillis()
 	if absolute(probe.DurationMillis-expectedDuration) > 40 {
 		return RenderResult{}, fmt.Errorf(
 			"FFmpeg output duration %dms differs from expected %dms",
 			probe.DurationMillis, expectedDuration,
 		)
 	}
+	if absolute(probe.AudioDurationMillis-expectedDuration) > 1 {
+		return RenderResult{}, fmt.Errorf(
+			"FFmpeg output audio duration %dms differs from expected %dms",
+			probe.AudioDurationMillis, expectedDuration,
+		)
+	}
 	dialogue, err := p.commitFile(ctx, filepath.Join(workdir, "dialogue.wav"), Artifact{
 		Kind: "dialogue_audio", MediaType: "audio/wav",
-		DurationMillis: probe.DurationMillis,
+		DurationMillis: dialogueProbe.DurationMillis,
 	})
 	if err != nil {
 		return RenderResult{}, err
@@ -211,21 +253,25 @@ func (p *FFmpegProcessor) Render(
 	if err != nil {
 		return RenderResult{}, err
 	}
+	qc := QCReport{
+		State:                "STRUCTURAL_PASSED",
+		ActualDurationMillis: probe.DurationMillis,
+		// Mock fixtures cannot establish CER or timing p95. Live media is
+		// measured below from the rendered independent dialogue track.
+		ManualTimingRequired: true,
+		MeasurementEvidence:  request.Evidence,
+	}
+	if request.Evidence == EvidenceLive {
+		qc = measuredTimingQC(probe.DurationMillis, request.Evidence, corrections)
+	}
 	return RenderResult{
-		Dialogue:        dialogue,
-		FinalVideo:      finalVideo,
-		CommandPlanHash: planHash,
-		QC: QCReport{
-			State:                "STRUCTURAL_PASSED",
-			ActualDurationMillis: probe.DurationMillis,
-			// Structural probing cannot establish CER or timing p95. Keep the
-			// manual timing gate closed until a measured live evidence report
-			// supplies those metrics.
-			ManualTimingRequired: true,
-			MeasurementEvidence:  request.Evidence,
-		},
-		FFmpegVersion:  ffmpegVersion,
-		FFprobeVersion: ffprobeVersion,
+		Dialogue:               dialogue,
+		FinalVideo:             finalVideo,
+		CommandPlanHash:        planHash,
+		QC:                     qc,
+		AudioTimingCorrections: corrections,
+		FFmpegVersion:          ffmpegVersion,
+		FFprobeVersion:         ffprobeVersion,
 	}, nil
 }
 
@@ -234,11 +280,27 @@ func BuildCommandPlan(
 	attempts []ProviderAttempt,
 	ffmpeg string,
 ) (CommandPlan, error) {
+	corrections, err := defaultAudioCorrections(request, attempts)
+	if err != nil {
+		return CommandPlan{}, err
+	}
+	return buildCommandPlan(request, attempts, ffmpeg, corrections)
+}
+
+func buildCommandPlan(
+	request Request,
+	attempts []ProviderAttempt,
+	ffmpeg string,
+	corrections []AudioTimingCorrection,
+) (CommandPlan, error) {
 	if err := request.Validate(); err != nil {
 		return CommandPlan{}, err
 	}
 	if len(attempts) != len(request.Subtitle.Cues) {
 		return CommandPlan{}, errors.New("speech attempt count must match subtitle cue count")
+	}
+	if request.Evidence == EvidenceLive && len(corrections) != len(attempts) {
+		return CommandPlan{}, errors.New("live speech correction count must match subtitle cue count")
 	}
 	if ffmpeg == "" {
 		ffmpeg = "ffmpeg"
@@ -288,12 +350,17 @@ func BuildCommandPlan(
 			"-map_metadata", "-1", "-c", "copy", "shots.mkv",
 		},
 	})
-	commands = append(commands, dialogueCommand(request, attempts, ffmpeg))
+	commands = append(commands, dialogueCommand(request, attempts, corrections, ffmpeg))
 	commands = append(commands, finalCommand(request, ffmpeg))
 	return CommandPlan{SchemaVersion: SchemaVersion, Commands: commands}, nil
 }
 
-func dialogueCommand(request Request, attempts []ProviderAttempt, ffmpeg string) Command {
+func dialogueCommand(
+	request Request,
+	attempts []ProviderAttempt,
+	corrections []AudioTimingCorrection,
+	ffmpeg string,
+) Command {
 	duration := seconds(request.DurationMillis())
 	policy := request.Output.withDefaults()
 	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y"}
@@ -325,18 +392,32 @@ func dialogueCommand(request Request, attempts []ProviderAttempt, ffmpeg string)
 			)
 		}
 		label := fmt.Sprintf("cue%d", index)
-		filterParts = append(filterParts, fmt.Sprintf(
-			"[%d:a]aresample=%d,atrim=duration=%s,asetpts=PTS-STARTPTS,"+
-				"adelay=%d|%d[%s]",
-			index, policy.AudioSampleRate, seconds(cue.EndMillis-cue.StartMillis),
-			cue.StartMillis, cue.StartMillis, label,
-		))
+		if request.Evidence == EvidenceLive {
+			correction := corrections[index]
+			filterParts = append(filterParts, fmt.Sprintf(
+				"[%d:a]aresample=%d,atrim=start=%s,asetpts=PTS-STARTPTS,"+
+					"atempo=%s,adelay=%d|%d[%s]",
+				index, policy.AudioSampleRate, seconds(correction.TrimStartMillis),
+				formatTempo(correction.TempoRatio), cue.StartMillis, cue.StartMillis, label,
+			))
+		} else {
+			filterParts = append(filterParts, fmt.Sprintf(
+				"[%d:a]aresample=%d,atrim=duration=%s,asetpts=PTS-STARTPTS,"+
+					"adelay=%d|%d[%s]",
+				index, policy.AudioSampleRate, seconds(cue.EndMillis-cue.StartMillis),
+				cue.StartMillis, cue.StartMillis, label,
+			))
+		}
 		mixInputs = append(mixInputs, "["+label+"]")
 	}
 	filterParts = append(filterParts, fmt.Sprintf(
 		"%samix=inputs=%d:normalize=0:duration=longest,"+
-			"loudnorm=I=-16:LRA=11:TP=-1.5,apad=whole_dur=%s[dialogue]",
-		strings.Join(mixInputs, ""), len(mixInputs), duration,
+			"loudnorm=I=-16:LRA=11:TP=-1.5,aresample=%d,"+
+			"aformat=sample_fmts=s16:sample_rates=%d:channel_layouts=stereo,"+
+			"asetpts=N/SR/TB,apad=whole_len=%d,atrim=end_sample=%d[dialogue]",
+		strings.Join(mixInputs, ""), len(mixInputs), policy.AudioSampleRate,
+		policy.AudioSampleRate, exactAudioSamples(request.DurationMillis(), policy.AudioSampleRate),
+		exactAudioSamples(request.DurationMillis(), policy.AudioSampleRate),
 	))
 	args = append(args,
 		"-filter_complex", strings.Join(filterParts, ";"),
@@ -345,6 +426,113 @@ func dialogueCommand(request Request, attempts []ProviderAttempt, ffmpeg string)
 		"dialogue.wav",
 	)
 	return Command{Program: ffmpeg, Args: args}
+}
+
+func defaultAudioCorrections(
+	request Request,
+	attempts []ProviderAttempt,
+) ([]AudioTimingCorrection, error) {
+	if request.Evidence != EvidenceLive {
+		return nil, nil
+	}
+	if len(attempts) != len(request.Subtitle.Cues) {
+		return nil, errors.New("speech attempt count must match subtitle cue count")
+	}
+	corrections := make([]AudioTimingCorrection, 0, len(attempts))
+	for index, attempt := range attempts {
+		correction, err := buildAudioCorrection(
+			request.Subtitle.Cues[index],
+			attempt.Artifact.DurationMillis,
+			silenceWindow{AudibleEndMillis: attempt.Artifact.DurationMillis},
+		)
+		if err != nil {
+			return nil, err
+		}
+		correction.SourceDigest = attempt.Artifact.Digest
+		corrections = append(corrections, correction)
+	}
+	return corrections, nil
+}
+
+func (p *FFmpegProcessor) measureSourceTiming(
+	ctx context.Context,
+	workdir string,
+	request Request,
+	attempts []ProviderAttempt,
+) ([]AudioTimingCorrection, error) {
+	if request.Evidence != EvidenceLive {
+		return nil, nil
+	}
+	corrections := make([]AudioTimingCorrection, 0, len(attempts))
+	for index, attempt := range attempts {
+		inputName := fmt.Sprintf("cue-%03d%s", index, extensionFor(attempt.Artifact.MediaType))
+		output, err := p.Runner.Run(
+			ctx,
+			workdir,
+			p.FFmpeg,
+			"-nostdin", "-hide_banner", "-loglevel", "info",
+			"-i", inputName,
+			"-af", silenceDetectFilter(),
+			"-f", "null", "-",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("measure source timing for cue %q: %w", attempt.CueID, err)
+		}
+		measurement, err := parseSilenceWindow(output, attempt.Artifact.DurationMillis)
+		if err != nil {
+			return nil, fmt.Errorf("parse source timing for cue %q: %w", attempt.CueID, err)
+		}
+		correction, err := buildAudioCorrection(
+			request.Subtitle.Cues[index], attempt.Artifact.DurationMillis, measurement,
+		)
+		if err != nil {
+			return nil, err
+		}
+		correction.SourceDigest = attempt.Artifact.Digest
+		corrections = append(corrections, correction)
+	}
+	return corrections, nil
+}
+
+func (p *FFmpegProcessor) measureRenderedTiming(
+	ctx context.Context,
+	workdir string,
+	request Request,
+	corrections []AudioTimingCorrection,
+) ([]AudioTimingCorrection, error) {
+	if len(corrections) != len(request.Subtitle.Cues) {
+		return nil, errors.New("rendered timing correction count must match subtitle cue count")
+	}
+	measured := append([]AudioTimingCorrection(nil), corrections...)
+	for index, cue := range request.Subtitle.Cues {
+		windowMillis := cue.EndMillis - cue.StartMillis
+		output, err := p.Runner.Run(
+			ctx,
+			workdir,
+			p.FFmpeg,
+			"-nostdin", "-hide_banner", "-loglevel", "info",
+			"-ss", seconds(cue.StartMillis), "-t", seconds(windowMillis),
+			"-i", "dialogue.wav",
+			"-af", silenceDetectFilter(),
+			"-f", "null", "-",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("measure rendered timing for cue %q: %w", cue.ID, err)
+		}
+		window, err := parseSilenceWindow(output, windowMillis)
+		if err != nil {
+			return nil, fmt.Errorf("parse rendered timing for cue %q: %w", cue.ID, err)
+		}
+		measured[index].MeasuredOnsetMillis = window.OnsetMillis
+		measured[index].MeasuredAudibleEndMillis = window.AudibleEndMillis
+		measured[index].MeasuredBoundaryDeviationMillis = absolute(windowMillis - window.AudibleEndMillis)
+		measured[index].HardCutDetected = !window.HasTrailingSilence
+	}
+	return measured, nil
+}
+
+func formatTempo(value float64) string {
+	return strconv.FormatFloat(value, 'f', 9, 64)
 }
 
 func finalCommand(request Request, ffmpeg string) Command {
@@ -465,7 +653,14 @@ type probeResult struct {
 	AudioStreams               int
 	AudioSampleRate            int
 	AudioChannels              int
+	AudioDurationMillis        int64
 	AudioVideoStartDeltaMillis int64
+}
+
+type audioProbeResult struct {
+	DurationMillis int64
+	SampleRate     int
+	Channels       int
 }
 
 func parseProbe(data []byte) (probeResult, error) {
@@ -476,6 +671,7 @@ func parseProbe(data []byte) (probeResult, error) {
 			Height     int    `json:"height"`
 			FrameRate  string `json:"r_frame_rate"`
 			StartTime  string `json:"start_time"`
+			Duration   string `json:"duration"`
 			SampleRate string `json:"sample_rate"`
 			Channels   int    `json:"channels"`
 		} `json:"streams"`
@@ -532,6 +728,17 @@ func parseProbe(data []byte) (probeResult, error) {
 				return probeResult{}, errors.New("ffprobe audio streams have inconsistent specifications")
 			}
 			result.AudioStreams++
+			audioDurationMillis, durationErr := parseDurationMillis(
+				stream.Duration, payload.Format.Duration,
+			)
+			if durationErr != nil {
+				return probeResult{}, durationErr
+			}
+			if result.AudioDurationMillis == 0 {
+				result.AudioDurationMillis = audioDurationMillis
+			} else if absolute(result.AudioDurationMillis-audioDurationMillis) > 1 {
+				return probeResult{}, errors.New("ffprobe audio streams have inconsistent durations")
+			}
 			audioStarts = append(audioStarts, startMillis)
 		}
 	}
@@ -548,6 +755,61 @@ func parseProbe(data []byte) (probeResult, error) {
 		}
 	}
 	return result, nil
+}
+
+func parseAudioProbe(data []byte) (audioProbeResult, error) {
+	var payload struct {
+		Streams []struct {
+			CodecType  string `json:"codec_type"`
+			Duration   string `json:"duration"`
+			SampleRate string `json:"sample_rate"`
+			Channels   int    `json:"channels"`
+		} `json:"streams"`
+		Format struct {
+			Duration string `json:"duration"`
+		} `json:"format"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(data)).Decode(&payload); err != nil {
+		return audioProbeResult{}, fmt.Errorf("decode dialogue ffprobe output: %w", err)
+	}
+	var result audioProbeResult
+	for _, stream := range payload.Streams {
+		if stream.CodecType != "audio" {
+			continue
+		}
+		if result.SampleRate != 0 {
+			return audioProbeResult{}, errors.New("dialogue artifact must contain exactly one audio stream")
+		}
+		sampleRate, err := strconv.Atoi(stream.SampleRate)
+		if err != nil || sampleRate <= 0 || stream.Channels <= 0 {
+			return audioProbeResult{}, errors.New("dialogue audio stream specification is invalid")
+		}
+		durationMillis, err := parseDurationMillis(stream.Duration, payload.Format.Duration)
+		if err != nil {
+			return audioProbeResult{}, err
+		}
+		result = audioProbeResult{
+			DurationMillis: durationMillis,
+			SampleRate:     sampleRate,
+			Channels:       stream.Channels,
+		}
+	}
+	if result.SampleRate == 0 {
+		return audioProbeResult{}, errors.New("dialogue artifact does not contain an audio stream")
+	}
+	return result, nil
+}
+
+func parseDurationMillis(streamDuration, formatDuration string) (int64, error) {
+	value := strings.TrimSpace(streamDuration)
+	if value == "" || value == "N/A" {
+		value = strings.TrimSpace(formatDuration)
+	}
+	seconds, err := strconv.ParseFloat(value, 64)
+	if err != nil || seconds <= 0 {
+		return 0, errors.New("ffprobe media duration is invalid")
+	}
+	return int64(seconds*1_000 + 0.5), nil
 }
 
 func parseStartMillis(value string) (int64, error) {
@@ -574,6 +836,10 @@ func writeConcatList(workdir string, clips int) error {
 
 func seconds(milliseconds int64) string {
 	return strconv.FormatFloat(float64(milliseconds)/1000, 'f', 3, 64)
+}
+
+func exactAudioSamples(durationMillis int64, sampleRate int) int64 {
+	return durationMillis * int64(sampleRate) / 1_000
 }
 
 func extensionFor(mediaType string) string {

@@ -187,11 +187,12 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		Model:          request.Model,
 		Usage:          providercontract.Usage{InputUnits: 100, OutputUnits: 25, Unit: "mock-units"},
 		Cost: providercontract.Cost{
-			EstimatedMicros: request.BudgetReservation.AmountMicros,
-			ActualMicros:    &actual,
-			Currency:        request.BudgetReservation.Currency,
-			PricingVersion:  request.BudgetReservation.PricingVersion,
-			Verified:        true,
+			EstimatedMicros:  request.BudgetReservation.AmountMicros,
+			ActualMicros:     &actual,
+			Currency:         request.BudgetReservation.Currency,
+			PricingVersion:   request.BudgetReservation.PricingVersion,
+			Verified:         true,
+			ProviderReported: true,
 		},
 	}
 	s.jobs[request.JobID] = &jobRecord{

@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -281,6 +282,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	voiceLicenseID, musicLicenseID, consentID := uuid.New(), uuid.New(), uuid.New()
 	voiceAssetID, voiceAssetVersionID := uuid.New(), uuid.New()
 	musicAssetID, musicAssetVersionID := uuid.New(), uuid.New()
+	voiceArtifactID, musicArtifactID := uuid.New(), uuid.New()
 	contextIDs := []uuid.UUID{uuid.New(), uuid.New(), uuid.New(), uuid.New()}
 	episodeHash := strings.Repeat("1", 64)
 	sourceHash := strings.Repeat("0", 64)
@@ -293,6 +295,12 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	profileHash := strings.Repeat("4", 64)
 	capabilityHash := strings.Repeat("5", 64)
 	textCapabilityHash := strings.Repeat("8", 64)
+	voiceContentHash := strings.Repeat(
+		strings.ReplaceAll(voiceArtifactID.String(), "-", ""), 2,
+	)
+	musicContentHash := strings.Repeat(
+		strings.ReplaceAll(musicArtifactID.String(), "-", ""), 2,
+	)
 
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.generation_profiles
@@ -362,10 +370,19 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 'integration-voice', $5, $6, 'integration'),
 			($7, $8, 1, 'APPROVED', $9, $10, 'audio/wav',
 			 'integration-music', $11, NULL, 'integration')`,
-		voiceAssetVersionID, voiceAssetID, strings.Repeat("f", 64),
-		"cas://sha256/"+strings.Repeat("f", 64), voiceLicenseID, consentID,
-		musicAssetVersionID, musicAssetID, strings.Repeat("7", 64),
-		"cas://sha256/"+strings.Repeat("7", 64), musicLicenseID,
+		voiceAssetVersionID, voiceAssetID, voiceContentHash,
+		"cas://sha256/"+voiceContentHash, voiceLicenseID, consentID,
+		musicAssetVersionID, musicAssetID, musicContentHash,
+		"cas://sha256/"+musicContentHash, musicLicenseID,
+	)
+	mustExec(t, ctx, pool, `
+		INSERT INTO video_pipeline.artifacts
+			(id, content_hash, artifact_uri, media_type, size_bytes, media_spec, status)
+		VALUES
+			($1, $2, $3, 'audio/wav', 1024, '{"kind":"voice_fixture"}', 'ACTIVE'),
+			($4, $5, $6, 'audio/wav', 2048, '{"kind":"music_fixture"}', 'ACTIVE')`,
+		voiceArtifactID, voiceContentHash, "cas://sha256/"+voiceContentHash,
+		musicArtifactID, musicContentHash, "cas://sha256/"+musicContentHash,
 	)
 	mustExec(t, ctx, pool, `
 		INSERT INTO video_pipeline.episode_revisions
@@ -784,6 +801,28 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if len(prompt.Assets) != 1 ||
+		prompt.Assets[0].Revision != voiceAssetVersionID.String() ||
+		prompt.Assets[0].SizeBytes != 1024 {
+		t.Fatalf("prompt ACTIVE CAS size evidence = %#v, want voice size 1024", prompt.Assets)
+	}
+	mustExec(t, ctx, pool, `UPDATE video_pipeline.artifacts SET status='DISABLED' WHERE id=$1`, voiceArtifactID)
+	if _, err := store.ResolvePromptSnapshot(ctx, prompt.ID); err == nil {
+		t.Fatal("prompt resolution accepted a DISABLED CAS artifact")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeLicenseBlocked {
+			t.Fatalf("DISABLED prompt artifact error = %#v", err)
+		}
+	}
+	mustExec(t, ctx, pool, `UPDATE video_pipeline.artifacts SET status='ACTIVE' WHERE id=$1`, voiceArtifactID)
+	resolvedPrompt, err := store.ResolvePromptSnapshot(ctx, prompt.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resolvedPrompt.Assets) != 1 || resolvedPrompt.Assets[0].SizeBytes != 1024 {
+		t.Fatalf("restored ACTIVE CAS size evidence = %#v", resolvedPrompt.Assets)
+	}
 	var promptInputCount, promptAssetCount int
 	if err := pool.QueryRow(ctx, `
 		SELECT
@@ -844,6 +883,194 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		BudgetCurrency: "CNY", ProviderProfileID: providerProfileID.String(),
 		TraceID: step.TraceID, PersistProductTruth: true,
 	}
+	attemptDriftCases := []struct {
+		name     string
+		wantCode controlplane.ErrorCode
+		mutate   func(t *testing.T)
+	}{
+		{
+			name:     "failed attempt",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'FAILED'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "cancelled attempt",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'CANCELLED'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "succeeded attempt",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'SUCCEEDED'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "unknown attempt without a prepared job",
+			wantCode: controlplane.CodeConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET state = 'UNKNOWN'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "input hash drift",
+			wantCode: controlplane.CodeRevisionConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET input_hash = $2
+					WHERE generation_run_id = $1`, run.RunID, strings.Repeat("f", 64))
+			},
+		},
+		{
+			name:     "attempt kind drift",
+			wantCode: controlplane.CodeRevisionConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET attempt_kind = 'CREATIVE_REVISION'
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+		{
+			name:     "attempt sequence drift",
+			wantCode: controlplane.CodeRevisionConflict,
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.generation_attempts
+					SET sequence = 2
+					WHERE generation_run_id = $1`, run.RunID)
+			},
+		},
+	}
+	for _, test := range attemptDriftCases {
+		t.Run("PrepareProviderJob rejects "+test.name, func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				UPDATE video_pipeline.generation_attempts
+				SET sequence = 1, attempt_kind = 'PROVIDER_REQUEST', state = 'VALIDATED',
+				    input_hash = $2, model_snapshot = $3
+				WHERE generation_run_id = $1`, run.RunID, run.RunSpecDigest, model)
+			test.mutate(t)
+			if _, err := store.PrepareProviderJob(ctx, step, dispatch); err == nil {
+				t.Fatal("PrepareProviderJob accepted a drifted generation attempt")
+			} else {
+				var domain *controlplane.DomainError
+				if !errors.As(err, &domain) || domain.Code != test.wantCode {
+					t.Fatalf("drifted generation attempt error = %#v, want %s", err, test.wantCode)
+				}
+			}
+			var reservations, jobs, costs int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT count(*) FROM video_pipeline.budget_reservations
+				   WHERE generation_run_id = $1),
+				  (SELECT count(*) FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1),
+				  (SELECT count(*) FROM video_pipeline.cost_ledger cl
+				   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`, run.RunID,
+			).Scan(&reservations, &jobs, &costs); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || costs != 0 {
+				t.Fatalf(
+					"drift rejection side effects = reservations:%d jobs:%d costs:%d",
+					reservations, jobs, costs,
+				)
+			}
+		})
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_attempts
+		SET sequence = 1, attempt_kind = 'PROVIDER_REQUEST', state = 'VALIDATED',
+		    input_hash = $2, model_snapshot = $3
+		WHERE generation_run_id = $1`, run.RunID, run.RunSpecDigest, model)
+	atomicMismatch := dispatch
+	atomicMismatch.ExpectedProductTruth = &orchestration.PreparedProductTruth{
+		ShotSpecRevisionID:  shotRevisionID.String(),
+		Run:                 run,
+		PromptSnapshotID:    prompt.ID,
+		PromptSnapshotHash:  prompt.Digest,
+		GenerationPlanID:    uuid.NewString(),
+		BudgetApprovalID:    budgetID.String(),
+		BudgetMaximumMicros: 1_000,
+		BudgetCurrency:      "CNY",
+		ProviderProfileID:   providerProfileID.String(),
+		Route:               model,
+	}
+	if _, err := store.PrepareProviderJob(ctx, step, atomicMismatch); err == nil {
+		t.Fatal("PrepareProviderJob accepted a frozen package / PostgreSQL truth mismatch")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("frozen package atomic mismatch error = %#v", err)
+		}
+	}
+	shotMismatch := dispatch
+	shotMismatch.ExpectedProductTruth = &orchestration.PreparedProductTruth{
+		ShotSpecRevisionID:  uuid.NewString(),
+		Run:                 run,
+		PromptSnapshotID:    prompt.ID,
+		PromptSnapshotHash:  prompt.Digest,
+		GenerationPlanID:    plan.Value.GenerationPlanID,
+		BudgetApprovalID:    budgetID.String(),
+		BudgetMaximumMicros: 1_000,
+		BudgetCurrency:      "CNY",
+		ProviderProfileID:   providerProfileID.String(),
+		Route:               model,
+	}
+	if _, err := store.PrepareProviderJob(ctx, step, shotMismatch); err == nil {
+		t.Fatal("PrepareProviderJob accepted a frozen ShotSpec / PostgreSQL truth mismatch")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("frozen ShotSpec atomic mismatch error = %#v", err)
+		}
+	}
+	var atomicReservations, atomicJobs, atomicCosts int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM video_pipeline.budget_reservations
+		   WHERE generation_run_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+		   JOIN video_pipeline.generation_attempts ga
+		     ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1),
+		  (SELECT COUNT(*) FROM video_pipeline.cost_ledger cl
+		   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+		   JOIN video_pipeline.generation_attempts ga
+		     ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1)`,
+		run.RunID,
+	).Scan(&atomicReservations, &atomicJobs, &atomicCosts); err != nil {
+		t.Fatal(err)
+	}
+	if atomicReservations != 0 || atomicJobs != 0 || atomicCosts != 0 {
+		t.Fatalf(
+			"frozen package atomic rejection side effects = reservations:%d jobs:%d costs:%d",
+			atomicReservations, atomicJobs, atomicCosts,
+		)
+	}
 	lineageShotID, lineageCommand := cloneIntegrationShotCommand(
 		t, ctx, pool, store, shotID.String(), publicCommand,
 	)
@@ -895,12 +1122,95 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		)
 	}
 
+	const raceProviderCallCount = 10
+	const raceFanout = raceProviderCallCount * 2
+	raceBaseCommands := make([]controlplane.CreateGenerationRunCommand, raceProviderCallCount)
+	raceShotRevisionIDs := make([]string, raceProviderCallCount)
+	raceBaseCommands[0] = lineageCommand
+	raceShotRevisionIDs[0] = lineageCommand.ShotSpecRevisionID
+	for index := 1; index < raceProviderCallCount; index++ {
+		_, raceBaseCommands[index] = cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		raceShotRevisionIDs[index] = raceBaseCommands[index].ShotSpecRevisionID
+	}
+	raceShotIDs, err := parseUUIDs(raceShotRevisionIDs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raceSafetyBindings := []controlplane.ApprovalBinding{
+		{
+			ObjectType: "EPISODE_REVISION", RevisionID: episodeRevisionID.String(),
+			ContentHash: episodeHash,
+		},
+		{
+			ObjectType: "ARTIFACT", RevisionID: safetyEvidenceArtifactID.String(),
+			ContentHash: safetyEvidenceHash,
+		},
+	}
+	raceSafetyRows, err := pool.Query(ctx, `
+		SELECT id, content_hash
+		FROM video_pipeline.shot_spec_revisions
+		WHERE id = ANY($1::uuid[])
+		ORDER BY id`,
+		raceShotIDs,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for raceSafetyRows.Next() {
+		var revisionID uuid.UUID
+		var contentHash string
+		if err := raceSafetyRows.Scan(&revisionID, &contentHash); err != nil {
+			raceSafetyRows.Close()
+			t.Fatal(err)
+		}
+		raceSafetyBindings = append(raceSafetyBindings, controlplane.ApprovalBinding{
+			ObjectType: "SHOT_SPEC_REVISION", RevisionID: revisionID.String(),
+			ContentHash: contentHash,
+		})
+	}
+	if err := raceSafetyRows.Err(); err != nil {
+		raceSafetyRows.Close()
+		t.Fatal(err)
+	}
+	raceSafetyRows.Close()
+	if len(raceSafetyBindings) != raceProviderCallCount+2 {
+		t.Fatalf(
+			"race safety bindings = %d, want %d",
+			len(raceSafetyBindings), raceProviderCallCount+2,
+		)
+	}
+	raceSafetyValidUntil := time.Now().UTC().Add(time.Hour)
+	raceSafetyCommand := controlplane.CreateApprovalDecisionCommand{
+		SchemaVersion: "v1", SeriesID: seriesID.String(), EpisodeID: episodeID.String(),
+		Gate: "SAFETY", Decision: "APPROVED", ReasonCode: "CONTENT_SAFETY_APPROVED",
+		PolicyVersion: "safety-v1", EvidenceHash: safetyEvidenceHash,
+		ValidUntil: &raceSafetyValidUntil, Bindings: raceSafetyBindings,
+		Actor: controlplane.Actor{ActorID: "safety-reviewer", Role: "SAFETY_REVIEWER"},
+	}
+	raceSafetyDigest, err := digestValue(raceSafetyCommand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raceSafety, err := store.CreateApprovalDecision(
+		ctx, raceSafetyCommand,
+		controlplane.Idempotency{
+			Scope: "workflow-projection-race-safety:" + lineageShotID,
+			Key:   uuid.NewString(), RequestHash: raceSafetyDigest,
+		},
+		"workflow-projection-race-safety",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	racePlanCommand := planCommand
-	racePlanCommand.ShotSpecRevisionIDs = []string{lineageCommand.ShotSpecRevisionID}
+	racePlanCommand.ShotSpecRevisionIDs = raceShotRevisionIDs
 	racePlanCommand.BudgetLimit = controlplane.BudgetLimit{
-		AmountMicros: 75, Currency: "CNY",
+		AmountMicros: 500, Currency: "CNY",
 	}
 	racePlanCommand.ExecutionPolicy = lineageCommand.ExecutionPolicy
+	racePlanCommand.ExecutionPolicy.ContentSafetyDecisionID = raceSafety.Value.DecisionID
 	racePlanDigest, err := digestValue(racePlanCommand)
 	if err != nil {
 		t.Fatal(err)
@@ -923,57 +1233,77 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 decided_at, generation_plan_id, budget_scope,
 			 budget_limit_micros, budget_currency)
 		VALUES ($1, $2, $3, 'BUDGET', 'APPROVED', 'PRODUCER',
-		        now(), $4, 'VIDEO', 75, 'CNY')`,
+		        now(), $4, 'VIDEO', 500, 'CNY')`,
 		raceBudgetID, seriesID, episodeID, racePlan.Value.GenerationPlanID,
 	)
-	raceCommands := []controlplane.CreateGenerationRunCommand{
-		lineageCommand,
-		lineageCommand,
-	}
+	raceCommands := make([]controlplane.CreateGenerationRunCommand, raceFanout)
 	for index := range raceCommands {
+		raceCommands[index] = raceBaseCommands[index%raceProviderCallCount]
+		raceCommands[index].CreativeAttempt = index/raceProviderCallCount + 1
 		raceCommands[index].GenerationPlanID = racePlan.Value.GenerationPlanID
 		raceCommands[index].BudgetApprovalID = raceBudgetID.String()
-		raceCommands[index].CreativeAttempt = index + 1
 	}
-	raceSteps := make([]orchestration.WorkflowStep, 2)
-	raceRuns := make([]orchestration.GenerationRunRef, 2)
-	raceDispatches := make([]orchestration.ExecuteProviderJobInput, 2)
+	raceSteps := make([]orchestration.WorkflowStep, raceFanout)
+	raceRuns := make([]orchestration.GenerationRunRef, raceFanout)
+	raceDispatches := make([]orchestration.ExecuteProviderJobInput, raceFanout)
 	for index := range raceCommands {
 		raceSteps[index], raceRuns[index], raceDispatches[index] =
 			createIntegrationWorkflowRun(
 				t, ctx, store, fmt.Sprintf("budget-race-%d", index+1),
 				raceCommands[index],
 			)
+		// Semantically identical UUID spellings must share one cumulative
+		// approval bucket, including under concurrent reservation pressure.
+		switch index % 3 {
+		case 1:
+			raceDispatches[index].BudgetApprovalID = strings.ToUpper(raceBudgetID.String())
+		case 2:
+			raceDispatches[index].BudgetApprovalID = strings.ReplaceAll(raceBudgetID.String(), "-", "")
+		}
 	}
-	raceErrors := make([]error, 2)
+	raceErrors := make([]error, raceFanout)
 	var raceWait sync.WaitGroup
+	var raceReady sync.WaitGroup
+	raceReady.Add(raceFanout)
+	raceStart := make(chan struct{})
 	for index := range raceDispatches {
 		index := index
 		raceWait.Add(1)
 		go func() {
 			defer raceWait.Done()
+			raceReady.Done()
+			<-raceStart
 			_, raceErrors[index] = store.PrepareProviderJob(
 				ctx, raceSteps[index], raceDispatches[index],
 			)
 		}()
 	}
+	raceReady.Wait()
+	close(raceStart)
 	raceWait.Wait()
-	winner, loser := -1, -1
+	winners := make([]int, 0, raceProviderCallCount)
+	losers := make([]int, 0, raceFanout-raceProviderCallCount)
 	for index, raceErr := range raceErrors {
 		if raceErr == nil {
-			winner = index
+			winners = append(winners, index)
 			continue
 		}
 		var domain *controlplane.DomainError
 		if !errors.As(raceErr, &domain) ||
-			domain.Code != controlplane.CodeBudgetExceeded {
+			domain.Code != controlplane.CodeBudgetExceeded || domain.Retryable {
 			t.Fatalf("concurrent cumulative reservation %d error = %#v", index, raceErr)
 		}
-		loser = index
+		losers = append(losers, index)
 	}
-	if winner < 0 || loser < 0 || winner == loser {
-		t.Fatalf("cumulative reservation race = %#v, want one success/one budget rejection", raceErrors)
+	if len(winners) != raceProviderCallCount ||
+		len(losers) != raceFanout-raceProviderCallCount {
+		t.Fatalf(
+			"cumulative reservation race = %#v, want %d successes/%d budget rejections",
+			raceErrors, raceProviderCallCount, raceFanout-raceProviderCallCount,
+		)
 	}
+	winner := winners[0]
+	loser := losers[0]
 	var raceReservations int
 	if err := pool.QueryRow(ctx, `
 		SELECT COUNT(*)
@@ -984,8 +1314,40 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	).Scan(&raceReservations); err != nil {
 		t.Fatal(err)
 	}
-	if raceReservations != 1 {
-		t.Fatalf("concurrent cumulative RESERVED rows = %d, want 1", raceReservations)
+	if raceReservations != raceProviderCallCount {
+		t.Fatalf(
+			"concurrent cumulative RESERVED rows = %d, want %d",
+			raceReservations, raceProviderCallCount,
+		)
+	}
+	var loserReservations, loserJobs, loserLedger int
+	for _, loserIndex := range losers {
+		if err := pool.QueryRow(ctx, `
+			SELECT
+			  (SELECT COUNT(*)
+			   FROM video_pipeline.budget_reservations
+			   WHERE generation_run_id = $1),
+			  (SELECT COUNT(*)
+			   FROM video_pipeline.provider_jobs pj
+			   JOIN video_pipeline.generation_attempts ga
+			     ON ga.id = pj.generation_attempt_id
+			   WHERE ga.generation_run_id = $1),
+			  (SELECT COUNT(*)
+			   FROM video_pipeline.cost_ledger cl
+			   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+			   JOIN video_pipeline.generation_attempts ga
+			     ON ga.id = pj.generation_attempt_id
+			   WHERE ga.generation_run_id = $1)`,
+			raceRuns[loserIndex].RunID,
+		).Scan(&loserReservations, &loserJobs, &loserLedger); err != nil {
+			t.Fatal(err)
+		}
+		if loserReservations != 0 || loserJobs != 0 || loserLedger != 0 {
+			t.Fatalf(
+				"concurrent budget loser %d side effects = reservations:%d jobs:%d ledger:%d",
+				loserIndex, loserReservations, loserJobs, loserLedger,
+			)
+		}
 	}
 	if err := store.RecordProviderCancellation(
 		ctx, raceSteps[winner],
@@ -994,14 +1356,334 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_RELEASE",
 			TraceID:    raceSteps[winner].TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}
+	winnerRunID := uuid.MustParse(raceRuns[winner].RunID)
+	winnerJobID := uuid.NewSHA1(winnerRunID, []byte("provider-job"))
+	winnerReservationID := uuid.NewSHA1(winnerRunID, []byte("budget-reservation"))
+	winnerReleaseID := uuid.NewSHA1(
+		winnerJobID, []byte("release:"+providerCancelledReleaseReason),
+	)
+	t.Run("exact cancellation release replay", func(t *testing.T) {
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := releaseRunBudgetReservation(
+			ctx, tx, winnerRunID, providerCancelledReleaseReason,
+		); err != nil {
+			t.Fatalf("exact cancellation release replay: %v", err)
+		}
+	})
+	t.Run("released reservation rejects a different reason replay", func(t *testing.T) {
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		err = releaseRunBudgetReservation(ctx, tx, winnerRunID, "different-release-reason")
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("different release reason replay error = %#v", err)
+		}
+	})
 	if _, err := store.PrepareProviderJob(
 		ctx, raceSteps[loser], raceDispatches[loser],
 	); err != nil {
 		t.Fatalf("reservation after release: %v", err)
+	}
+	replacementRunID := uuid.MustParse(raceRuns[loser].RunID)
+	replacementJobID := uuid.NewSHA1(replacementRunID, []byte("provider-job"))
+	replacementReservationID := uuid.NewSHA1(
+		replacementRunID, []byte("budget-reservation"),
+	)
+	releaseProbe := losers[1]
+	type releaseDriftCase struct {
+		name    string
+		mutate  func(t *testing.T)
+		restore func(t *testing.T)
+	}
+	wrongReleaseID := uuid.New()
+	extraReleaseID := uuid.New()
+	extraAdjustmentID := uuid.New()
+	releaseDrifts := []releaseDriftCase{
+		{
+			name: "missing RELEASE",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					INSERT INTO video_pipeline.cost_ledger
+						(id, provider_job_id, budget_reservation_id, entry_type,
+						 amount_micros, currency, pricing_rule_version, verified)
+					VALUES ($1, $2, $3, 'RELEASE', 50, 'CNY', 'pricing-v1', true)`,
+					winnerReleaseID, winnerJobID, winnerReservationID,
+				)
+			},
+		},
+		{
+			name: "RELEASE deterministic ID",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET id = $2 WHERE id = $1`, winnerReleaseID, wrongReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET id = $2 WHERE id = $1`, wrongReleaseID, winnerReleaseID)
+			},
+		},
+		{
+			name: "RELEASE provider job",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, winnerReleaseID, replacementJobID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, winnerReleaseID, winnerJobID)
+			},
+		},
+		{
+			name: "RELEASE reservation",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, winnerReleaseID, replacementReservationID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, winnerReleaseID, winnerReservationID)
+			},
+		},
+		{
+			name: "RELEASE entry type",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'ACTUAL' WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'RELEASE' WHERE id = $1`, winnerReleaseID)
+			},
+		},
+		{
+			name: "RELEASE amount",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 49 WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 50 WHERE id = $1`, winnerReleaseID)
+			},
+		},
+		{
+			name: "RELEASE currency",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'USD' WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'CNY' WHERE id = $1`, winnerReleaseID)
+			},
+		},
+		{
+			name: "RELEASE pricing",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'drift-v1' WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'pricing-v1' WHERE id = $1`, winnerReleaseID)
+			},
+		},
+		{
+			name: "RELEASE verified",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = true WHERE id = $1`, winnerReleaseID)
+			},
+		},
+		{
+			name: "RELEASE units",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = 1 WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = NULL WHERE id = $1`, winnerReleaseID)
+			},
+		},
+		{
+			name: "RELEASE unit name",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = 'drift-units' WHERE id = $1`, winnerReleaseID)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = NULL WHERE id = $1`, winnerReleaseID)
+			},
+		},
+		{
+			name: "duplicate RELEASE",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					INSERT INTO video_pipeline.cost_ledger
+						(id, provider_job_id, budget_reservation_id, entry_type,
+						 amount_micros, currency, pricing_rule_version, verified)
+					VALUES ($1, $2, $3, 'RELEASE', 50, 'CNY', 'pricing-v1', true)`,
+					extraReleaseID, winnerJobID, winnerReservationID,
+				)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraReleaseID)
+			},
+		},
+		{
+			name: "unexpected ADJUSTMENT",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					INSERT INTO video_pipeline.cost_ledger
+						(id, provider_job_id, budget_reservation_id, entry_type,
+						 amount_micros, currency, pricing_rule_version, verified)
+					VALUES ($1, $2, $3, 'ADJUSTMENT', 1, 'CNY', 'pricing-v1', true)`,
+					extraAdjustmentID, winnerJobID, winnerReservationID,
+				)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraAdjustmentID)
+			},
+		},
+	}
+	for _, releaseDrift := range releaseDrifts {
+		releaseDrift := releaseDrift
+		t.Run("cancelled RELEASE rejects "+releaseDrift.name+" drift", func(t *testing.T) {
+			releaseDrift.mutate(t)
+			t.Cleanup(func() { releaseDrift.restore(t) })
+			replayErr := store.RecordProviderCancellation(
+				ctx, raceSteps[winner],
+				orchestration.CancelProviderJobInput{
+					Dispatch:   raceDispatches[winner],
+					ReasonCode: "INTEGRATION_RELEASE",
+					TraceID:    raceSteps[winner].TraceID,
+				},
+				orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
+			)
+			var domain *controlplane.DomainError
+			if !errors.As(replayErr, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("cancelled RELEASE %s replay error = %#v", releaseDrift.name, replayErr)
+			}
+			_, prepareErr := store.PrepareProviderJob(
+				ctx, raceSteps[releaseProbe], raceDispatches[releaseProbe],
+			)
+			if !errors.As(prepareErr, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("cancelled RELEASE %s cumulative error = %#v", releaseDrift.name, prepareErr)
+			}
+			var reservations, jobs, ledger int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT COUNT(*) FROM video_pipeline.budget_reservations WHERE generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.cost_ledger cl
+				   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+				   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`,
+				raceRuns[releaseProbe].RunID,
+			).Scan(&reservations, &jobs, &ledger); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || ledger != 0 {
+				t.Fatalf(
+					"cancelled RELEASE %s candidate side effects = reservations:%d jobs:%d ledger:%d",
+					releaseDrift.name, reservations, jobs, ledger,
+				)
+			}
+		})
+	}
+	if _, err := store.PrepareProviderJob(
+		ctx, raceSteps[releaseProbe], raceDispatches[releaseProbe],
+	); err == nil {
+		t.Fatal("exact released allocation permitted an over-budget candidate")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeBudgetExceeded || domain.Retryable {
+			t.Fatalf("exact released allocation cumulative error = %#v", err)
+		}
+	}
+	workflowFailedWinner := winners[1]
+	if err := store.FinalizeShotRun(
+		ctx, raceSteps[workflowFailedWinner],
+		orchestration.FinalizeShotRunInput{
+			OperationID:  uuid.NewString(),
+			RunID:        raceRuns[workflowFailedWinner].RunID,
+			State:        "FAILED",
+			FailureClass: "INFRASTRUCTURE",
+			FailureCode:  "INTEGRATION_WORKFLOW_FAILED",
+			TraceID:      raceSteps[workflowFailedWinner].TraceID,
+		},
+	); err != nil {
+		t.Fatalf("workflow-failed deterministic release: %v", err)
+	}
+	workflowFailedRunID := uuid.MustParse(raceRuns[workflowFailedWinner].RunID)
+	workflowFailedJobID := uuid.NewSHA1(workflowFailedRunID, []byte("provider-job"))
+	workflowFailedReleaseID := uuid.NewSHA1(
+		workflowFailedJobID, []byte("release:"+workflowFailedReleaseReason),
+	)
+	var failedRunState, failedAttemptState, failedJobState, failedReservationState string
+	var failedReleaseCount int
+	if err := pool.QueryRow(ctx, `
+		SELECT gr.state, ga.state, pj.state, br.status,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.cost_ledger
+		        WHERE id = $2 AND provider_job_id = pj.id
+		          AND budget_reservation_id = br.id
+		          AND entry_type = 'RELEASE'
+		          AND amount_micros = br.amount_micros
+		          AND currency = br.currency
+		          AND pricing_rule_version = br.pricing_rule_version
+		          AND verified = true
+		          AND units IS NULL AND unit_name IS NULL)
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+		JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+		JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+		WHERE gr.id = $1`,
+		workflowFailedRunID, workflowFailedReleaseID,
+	).Scan(
+		&failedRunState, &failedAttemptState, &failedJobState,
+		&failedReservationState, &failedReleaseCount,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if failedRunState != "FAILED" || failedAttemptState != "FAILED" ||
+		failedJobState != "FAILED" || failedReservationState != "RELEASED" ||
+		failedReleaseCount != 1 {
+		t.Fatalf(
+			"workflow-failed release projection = run:%s attempt:%s job:%s reservation:%s release:%d",
+			failedRunState, failedAttemptState, failedJobState,
+			failedReservationState, failedReleaseCount,
+		)
+	}
+	t.Run("exact workflow-failed release replay", func(t *testing.T) {
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := releaseRunBudgetReservation(
+			ctx, tx, workflowFailedRunID, workflowFailedReleaseReason,
+		); err != nil {
+			t.Fatalf("exact workflow-failed release replay: %v", err)
+		}
+	})
+	if _, err := store.PrepareProviderJob(
+		ctx, raceSteps[releaseProbe], raceDispatches[releaseProbe],
+	); err != nil {
+		t.Fatalf("reservation after workflow-failed release: %v", err)
+	}
+	afterWorkflowReleaseProbe := losers[2]
+	if _, err := store.PrepareProviderJob(
+		ctx, raceSteps[afterWorkflowReleaseProbe], raceDispatches[afterWorkflowReleaseProbe],
+	); err == nil {
+		t.Fatal("workflow-failed release permitted an over-budget candidate")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeBudgetExceeded || domain.Retryable {
+			t.Fatalf("workflow-failed release cumulative error = %#v", err)
+		}
 	}
 	overBudgetDigest := strings.Repeat(
 		strings.ReplaceAll(uuid.NewString(), "-", ""),
@@ -1380,6 +2062,101 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 					strings.ReplaceAll(drift.name, " ", "-"),
 				secondCommand,
 			)
+			if drift.name == "cost is unverified" {
+				failedRunID := uuid.MustParse(driftRun.RunID)
+				failedJobID := uuid.NewSHA1(failedRunID, []byte("provider-job"))
+				failedActualID := uuid.NewSHA1(failedJobID, []byte("actual-cost"))
+				usageDrifts := []struct {
+					name    string
+					mutate  func(*testing.T)
+					restore func(*testing.T)
+				}{
+					{
+						name: "units",
+						mutate: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET units = units + 1
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+						restore: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET units = 30
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+					},
+					{
+						name: "unit name",
+						mutate: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET unit_name = 'mock-units-drift'
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+						restore: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET unit_name = 'mock-units'
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+					},
+				}
+				for _, usageDrift := range usageDrifts {
+					usageDrift := usageDrift
+					t.Run("failed ACTUAL rejects "+usageDrift.name+" drift", func(t *testing.T) {
+						usageDrift.mutate(t)
+						t.Cleanup(func() { usageDrift.restore(t) })
+						_, prepareErr := store.PrepareProviderJob(
+							ctx, secondStep, secondDispatch,
+						)
+						var domain *controlplane.DomainError
+						if !errors.As(prepareErr, &domain) ||
+							domain.Code != controlplane.CodeRevisionConflict {
+							t.Fatalf(
+								"failed ACTUAL %s drift error = %#v, want %s",
+								usageDrift.name, prepareErr, controlplane.CodeRevisionConflict,
+							)
+						}
+						var reservations, jobs, ledger int
+						if err := pool.QueryRow(ctx, `
+							SELECT
+							  (SELECT COUNT(*)
+							   FROM video_pipeline.budget_reservations
+							   WHERE generation_run_id = $1),
+							  (SELECT COUNT(*)
+							   FROM video_pipeline.provider_jobs pj
+							   JOIN video_pipeline.generation_attempts ga
+							     ON ga.id = pj.generation_attempt_id
+							   WHERE ga.generation_run_id = $1),
+							  (SELECT COUNT(*)
+							   FROM video_pipeline.cost_ledger cl
+							   JOIN video_pipeline.provider_jobs pj
+							     ON pj.id = cl.provider_job_id
+							   JOIN video_pipeline.generation_attempts ga
+							     ON ga.id = pj.generation_attempt_id
+							   WHERE ga.generation_run_id = $1)`,
+							secondRun.RunID,
+						).Scan(&reservations, &jobs, &ledger); err != nil {
+							t.Fatal(err)
+						}
+						if reservations != 0 || jobs != 0 || ledger != 0 {
+							t.Fatalf(
+								"failed ACTUAL %s drift side effects = reservations:%d jobs:%d ledger:%d",
+								usageDrift.name, reservations, jobs, ledger,
+							)
+						}
+					})
+				}
+			}
 			_, secondErr := store.PrepareProviderJob(
 				ctx, secondStep, secondDispatch,
 			)
@@ -1427,13 +2204,457 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 						ReasonCode: "INTEGRATION_DRIFT_SECONDARY_CLEANUP",
 						TraceID:    secondStep.TraceID,
 					},
-					orchestration.CancelProviderResult{State: "CANCELLED"},
+					orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 				); err != nil {
 					t.Fatal(err)
 				}
 			}
 		})
 	}
+
+	t.Run("public run persists canonical budget approval UUID", func(t *testing.T) {
+		clonedShotID, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		canonicalApproval := command.BudgetApprovalID
+		command.BudgetApprovalID = strings.ReplaceAll(
+			strings.ToUpper(command.BudgetApprovalID), "-", "",
+		)
+		requestHash, err := digestValue(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := store.CreateGenerationRun(
+			ctx, clonedShotID, 1, command,
+			controlplane.Idempotency{
+				Scope: "canonical-public-run:" + clonedShotID,
+				Key:   uuid.NewString(), RequestHash: requestHash,
+			},
+			"canonical-public-run",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var persistedApproval string
+		if err := pool.QueryRow(ctx, `
+			SELECT budget_approval_id
+			FROM video_pipeline.generation_runs
+			WHERE id = $1`,
+			created.Value.AggregateID,
+		).Scan(&persistedApproval); err != nil {
+			t.Fatal(err)
+		}
+		if persistedApproval != canonicalApproval {
+			t.Fatalf("persisted approval = %q, want %q", persistedApproval, canonicalApproval)
+		}
+	})
+
+	t.Run("confirmed cancellation settles actual cost and releases only unused budget", func(t *testing.T) {
+		_, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		cancelStep, cancelRun, cancelDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "cancel-with-actual-cost", command,
+		)
+		if _, err := store.PrepareProviderJob(ctx, cancelStep, cancelDispatch); err != nil {
+			t.Fatal(err)
+		}
+		actualMicros := int64(20)
+		cancelResult := orchestration.CancelProviderResult{
+			State: "CANCELLED", UpstreamTaskID: "cancel-cost-task",
+			RequestID: "cancel-cost-request",
+			Usage: providercontract.Usage{
+				InputUnits: 2, OutputUnits: 3, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		}
+		cancelInput := orchestration.CancelProviderJobInput{
+			Dispatch: cancelDispatch, ReasonCode: "INTEGRATION_CANCEL_WITH_COST",
+			TraceID: cancelStep.TraceID,
+		}
+		if err := store.RecordProviderJobObservation(
+			ctx, cancelStep, cancelDispatch,
+			orchestration.ProviderJobObservation{
+				State: "RUNNING", UpstreamTaskID: cancelResult.UpstreamTaskID,
+				RequestID: cancelResult.RequestID,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		identityDrift := cancelResult
+		identityDrift.UpstreamTaskID = "different-cancel-cost-task"
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, identityDrift,
+		); err == nil {
+			t.Fatal("costed cancellation accepted a different upstream task")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("costed cancellation identity drift = %#v", err)
+			}
+		}
+		var preRunState, preAttemptState, preJobState, preReservationState string
+		var preTerminalLedger int
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status`,
+			cancelRun.RunID,
+		).Scan(
+			&preRunState, &preAttemptState, &preJobState, &preReservationState,
+			&preTerminalLedger,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if preRunState != "RUNNING" || preAttemptState != "RUNNING" ||
+			preJobState != "RUNNING" || preReservationState != "RESERVED" ||
+			preTerminalLedger != 0 {
+			t.Fatalf(
+				"cancellation identity drift side effects = run:%s attempt:%s job:%s reservation:%s terminalLedger:%d",
+				preRunState, preAttemptState, preJobState, preReservationState,
+				preTerminalLedger,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, cancelResult,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var runState, attemptState, jobState, reservationState string
+		var actualCount, releaseCount int
+		var actualAmount, releaseAmount int64
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       COUNT(*) FILTER (WHERE cl.entry_type = 'ACTUAL'),
+			       COUNT(*) FILTER (WHERE cl.entry_type = 'RELEASE'),
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'ACTUAL'), 0),
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'RELEASE'), 0)
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl
+			  ON cl.provider_job_id = pj.id AND cl.entry_type IN ('ACTUAL', 'RELEASE')
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status`,
+			cancelRun.RunID,
+		).Scan(
+			&runState, &attemptState, &jobState, &reservationState,
+			&actualCount, &releaseCount, &actualAmount, &releaseAmount,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if runState != "CANCELLED" || attemptState != "CANCELLED" ||
+			jobState != "CANCELLED" || reservationState != "SETTLED" ||
+			actualCount != 1 || releaseCount != 1 ||
+			actualAmount != 20 || releaseAmount != 30 {
+			t.Fatalf(
+				"costed cancellation = run:%s attempt:%s job:%s reservation:%s actual:%d/%d release:%d/%d",
+				runState, attemptState, jobState, reservationState,
+				actualCount, actualAmount, releaseCount, releaseAmount,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, cancelResult,
+		); err != nil {
+			t.Fatalf("exact costed cancellation replay: %v", err)
+		}
+		missingIdentity := cancelResult
+		missingIdentity.UpstreamTaskID = ""
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, missingIdentity,
+		); err == nil {
+			t.Fatal("costed cancellation replay accepted a missing upstream task")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("missing cancellation identity replay = %#v", err)
+			}
+		}
+		drifted := cancelResult
+		driftedActual := int64(19)
+		drifted.Cost.ActualMicros = &driftedActual
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, drifted,
+		); err == nil {
+			t.Fatal("costed cancellation replay accepted changed actual cost")
+		}
+	})
+
+	t.Run("confirmed Provider failure settles cost without release escape", func(t *testing.T) {
+		_, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		failureStep, failureRun, failureDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "provider-failed-with-cost", command,
+		)
+		if _, err := store.PrepareProviderJob(ctx, failureStep, failureDispatch); err != nil {
+			t.Fatal(err)
+		}
+		actualMicros := int64(12)
+		failureResult := orchestration.CancelProviderResult{
+			State: "FAILED", UpstreamTaskID: "failed-cost-task",
+			RequestID: "failed-cost-request", ErrorCode: "model_unavailable",
+			Usage: providercontract.Usage{
+				InputUnits: 1, OutputUnits: 2, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		}
+		failureInput := orchestration.CancelProviderJobInput{
+			Dispatch: failureDispatch, ReasonCode: "RECONCILE_HISTORY",
+			TraceID: failureStep.TraceID,
+		}
+		if err := store.RecordProviderJobObservation(
+			ctx, failureStep, failureDispatch,
+			orchestration.ProviderJobObservation{
+				State: "RUNNING", UpstreamTaskID: failureResult.UpstreamTaskID,
+				RequestID: failureResult.RequestID,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		identityDrift := failureResult
+		identityDrift.RequestID = "different-failed-cost-request"
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, identityDrift,
+		); err == nil {
+			t.Fatal("Provider failure accepted a different upstream request")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("Provider failure identity drift = %#v", err)
+			}
+		}
+		var preRunState, preAttemptState, preJobState, preReservationState string
+		var preTerminalLedger int
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status`,
+			failureRun.RunID,
+		).Scan(
+			&preRunState, &preAttemptState, &preJobState, &preReservationState,
+			&preTerminalLedger,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if preRunState != "RUNNING" || preAttemptState != "RUNNING" ||
+			preJobState != "RUNNING" || preReservationState != "RESERVED" ||
+			preTerminalLedger != 0 {
+			t.Fatalf(
+				"failure identity drift side effects = run:%s attempt:%s job:%s reservation:%s terminalLedger:%d",
+				preRunState, preAttemptState, preJobState, preReservationState,
+				preTerminalLedger,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, failureResult,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var runState, failureClass, jobState, reservationState string
+		var actualAmount, releaseAmount int64
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, gr.failure_class, pj.state, br.status,
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'ACTUAL'), 0),
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'RELEASE'), 0)
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl
+			  ON cl.provider_job_id = pj.id AND cl.entry_type IN ('ACTUAL', 'RELEASE')
+			WHERE gr.id = $1
+			GROUP BY gr.state, gr.failure_class, pj.state, br.status`,
+			failureRun.RunID,
+		).Scan(
+			&runState, &failureClass, &jobState, &reservationState,
+			&actualAmount, &releaseAmount,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if runState != "FAILED" || failureClass != "TRANSIENT" ||
+			jobState != "FAILED" || reservationState != "SETTLED" ||
+			actualAmount != 12 || releaseAmount != 38 {
+			t.Fatalf(
+				"failed Provider settlement = run:%s class:%s job:%s reservation:%s actual:%d release:%d",
+				runState, failureClass, jobState, reservationState,
+				actualAmount, releaseAmount,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, failureResult,
+		); err != nil {
+			t.Fatalf("exact Provider failure replay: %v", err)
+		}
+		missingIdentity := failureResult
+		missingIdentity.RequestID = ""
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, missingIdentity,
+		); err == nil {
+			t.Fatal("Provider failure replay accepted a missing upstream request")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("missing Provider failure identity replay = %#v", err)
+			}
+		}
+	})
+
+	t.Run("ambiguous submit persists recover-only state and stable identities", func(t *testing.T) {
+		_, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		observationStep, observationRun, observationDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "ambiguous-submit-observation", command,
+		)
+		prepared, err := store.PrepareProviderJob(
+			ctx, observationStep, observationDispatch,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if prepared.ReconcileOnly {
+			t.Fatal("new Provider allocation started recover-only")
+		}
+		observationDispatch.BudgetApprovalID = strings.ToUpper(
+			observationDispatch.BudgetApprovalID,
+		)
+		if err := store.RecordProviderJobObservation(
+			ctx, observationStep, observationDispatch,
+			orchestration.ProviderJobObservation{
+				State: "UNKNOWN", ErrorCode: "PROVIDER_SUBMISSION_PENDING",
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		replayed, err := store.PrepareProviderJob(
+			ctx, observationStep, observationDispatch,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !replayed.ReconcileOnly {
+			t.Fatal("ambiguous paid boundary allowed another Provider submit")
+		}
+		if err := store.RecordProviderJobObservation(
+			ctx, observationStep, observationDispatch,
+			orchestration.ProviderJobObservation{
+				State: "RUNNING", UpstreamTaskID: "stable-observation-task",
+				RequestID: "stable-observation-request",
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordProviderJobObservation(
+			ctx, observationStep, observationDispatch,
+			orchestration.ProviderJobObservation{
+				State: "UNKNOWN", ErrorCode: "PROVIDER_POLL_UNKNOWN",
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		var runState, attemptState, jobState, reservationState string
+		var upstreamTaskID, requestID string
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       pj.upstream_task_id, pj.upstream_request_id
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			WHERE gr.id = $1`,
+			observationRun.RunID,
+		).Scan(
+			&runState, &attemptState, &jobState, &reservationState,
+			&upstreamTaskID, &requestID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if runState != "RECONCILING" || attemptState != "RECONCILING" ||
+			jobState != "UNKNOWN" || reservationState != "RESERVED" ||
+			upstreamTaskID != "stable-observation-task" ||
+			requestID != "stable-observation-request" {
+			t.Fatalf(
+				"ambiguous observation = run:%s attempt:%s job:%s reservation:%s task:%s request:%s",
+				runState, attemptState, jobState, reservationState,
+				upstreamTaskID, requestID,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, observationStep,
+			orchestration.CancelProviderJobInput{
+				Dispatch:   observationDispatch,
+				ReasonCode: "RECONCILE_HISTORY",
+				TraceID:    observationStep.TraceID,
+			},
+			orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
+		); err == nil {
+			t.Fatal("adapter absence released a durable upstream task")
+		}
+		var protectedRunState, protectedAttemptState, protectedJobState string
+		var protectedReservationState, protectedTaskID, protectedRequestID string
+		var protectedTerminalLedger int
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       pj.upstream_task_id, pj.upstream_request_id,
+			       COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status,
+			         pj.upstream_task_id, pj.upstream_request_id`,
+			observationRun.RunID,
+		).Scan(
+			&protectedRunState, &protectedAttemptState, &protectedJobState,
+			&protectedReservationState, &protectedTaskID, &protectedRequestID,
+			&protectedTerminalLedger,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if protectedRunState != "RECONCILING" || protectedAttemptState != "UNKNOWN" ||
+			protectedJobState != "UNKNOWN" || protectedReservationState != "RESERVED" ||
+			protectedTaskID != "stable-observation-task" ||
+			protectedRequestID != "stable-observation-request" ||
+			protectedTerminalLedger != 0 {
+			t.Fatalf(
+				"known upstream after adapter absence = run:%s attempt:%s job:%s reservation:%s task:%s request:%s terminalLedger:%d",
+				protectedRunState, protectedAttemptState, protectedJobState,
+				protectedReservationState, protectedTaskID, protectedRequestID,
+				protectedTerminalLedger,
+			)
+		}
+		reconcileReplay, err := store.PrepareProviderJob(
+			ctx, observationStep, observationDispatch,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reconcileReplay.ReconcileOnly {
+			t.Fatal("adapter absence reopened paid Provider submission")
+		}
+	})
 
 	_, cancelRaceCommand := cloneIntegrationShotCommand(
 		t, ctx, pool, store, shotID.String(), publicCommand,
@@ -1454,7 +2675,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_CANCEL_FIRST",
 			TraceID:    cancelRaceStep.TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1594,7 +2815,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_CONFLICT_CLEANUP",
 			TraceID:    artifactConflictStep.TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1627,6 +2848,77 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			budgetID, plan.Value.GenerationPlanID,
 		)
 	}
+	restorePaidBoundaryTruth := func() {
+		t.Helper()
+		restoreVideoApproval()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.consent_assets
+			SET status = 'ACTIVE', expires_at = now() + interval '1 hour'
+			WHERE id = $1`, consentID)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.license_snapshots
+			SET policy_status = 'ALLOWED', expires_at = now() + interval '1 hour'
+			WHERE id = $1`, voiceLicenseID)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.shot_spec_revisions
+			SET freshness = 'FRESH'
+			WHERE id = $1`, shotRevisionID)
+	}
+	paidTruthRegressions := []struct {
+		name   string
+		code   controlplane.ErrorCode
+		mutate func()
+	}{
+		{
+			name: "consent revoked after run creation", code: controlplane.CodeConsentRequired,
+			mutate: func() {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.consent_assets SET status = 'REVOKED' WHERE id = $1`, consentID)
+			},
+		},
+		{
+			name: "license expired after run creation", code: controlplane.CodeLicenseBlocked,
+			mutate: func() {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.license_snapshots SET expires_at = now() - interval '1 second' WHERE id = $1`, voiceLicenseID)
+			},
+		},
+		{
+			name: "shot freshness drift after run creation", code: controlplane.CodeGateRequired,
+			mutate: func() {
+				mustExec(t, ctx, pool, `UPDATE video_pipeline.shot_spec_revisions SET freshness = 'STALE' WHERE id = $1`, shotRevisionID)
+			},
+		},
+	}
+	for _, regression := range paidTruthRegressions {
+		regression := regression
+		t.Run("provider submit product truth "+regression.name, func(t *testing.T) {
+			restorePaidBoundaryTruth()
+			regression.mutate()
+			_, activityErr := videoActivityEnvironment.ExecuteActivity(
+				videoActivities.ExecuteProviderJob, dispatch,
+			)
+			var applicationErr *temporal.ApplicationError
+			if !errors.As(activityErr, &applicationErr) ||
+				applicationErr.Type() != string(regression.code) ||
+				!applicationErr.NonRetryable() {
+				t.Fatalf("paid-boundary Activity error = %#v, want non-retryable %s", activityErr, regression.code)
+			}
+			var reservations, jobs int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT COUNT(*) FROM video_pipeline.budget_reservations WHERE generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`,
+				run.RunID,
+			).Scan(&reservations, &jobs); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || videoProviderCalls.Load() != 0 {
+				t.Fatalf("blocked paid-boundary side effects = reservations:%d jobs:%d provider:%d", reservations, jobs, videoProviderCalls.Load())
+			}
+		})
+	}
+	restorePaidBoundaryTruth()
 	videoBudgetRegressions := []struct {
 		name        string
 		mutate      func()
@@ -1866,6 +3158,76 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err := store.ValidateWorkerUpgradeReadiness(ctx); err != nil {
 		t.Fatalf("v6 worker rejected restored Provider reservation lineage: %v", err)
 	}
+	replayedPreparedProvider, err := store.PrepareProviderJob(ctx, step, dispatch)
+	if err != nil {
+		t.Fatalf("exact prepared Provider job replay failed: %v", err)
+	}
+	if !reflect.DeepEqual(replayedPreparedProvider, preparedProvider) {
+		t.Fatal("exact prepared Provider job replay changed the durable allocation")
+	}
+	t.Run("RESERVED allocation rejects unexpected ledger entry", func(t *testing.T) {
+		runUUID := uuid.MustParse(run.RunID)
+		jobID := uuid.NewSHA1(runUUID, []byte("provider-job"))
+		reservationID := uuid.NewSHA1(runUUID, []byte("budget-reservation"))
+		extraID := uuid.New()
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'ADJUSTMENT', 1, 'CNY', 'pricing-v1', true)`,
+			extraID, jobID, reservationID,
+		)
+		if _, err := store.PrepareProviderJob(ctx, step, dispatch); err == nil {
+			t.Fatal("RESERVED replay accepted an unexpected ADJUSTMENT")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("unexpected RESERVED ledger error = %#v", err)
+			}
+		}
+		mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraID)
+		if _, err := store.PrepareProviderJob(ctx, step, dispatch); err != nil {
+			t.Fatalf("exact RESERVED replay after repair: %v", err)
+		}
+	})
+	// A late Temporal Activity replay can arrive after completion has already
+	// frozen both product records. It must recover the exact durable job rather
+	// than allocate a second paid boundary or reject the workflow's history.
+	var beforeReplayRunState, beforeReplayAttemptState string
+	if err := pool.QueryRow(ctx, `
+		SELECT gr.state, ga.state
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.generation_run_id = gr.id AND ga.sequence = 1
+		WHERE gr.id = $1`, run.RunID,
+	).Scan(&beforeReplayRunState, &beforeReplayAttemptState); err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_runs SET state = 'SUCCEEDED' WHERE id = $1`,
+		run.RunID,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_attempts
+		SET state = 'SUCCEEDED' WHERE generation_run_id = $1 AND sequence = 1`,
+		run.RunID,
+	)
+	terminalReplay, err := store.PrepareProviderJob(ctx, step, dispatch)
+	if err != nil {
+		t.Fatalf("terminal exact prepared Provider job replay failed: %v", err)
+	}
+	if !reflect.DeepEqual(terminalReplay, preparedProvider) {
+		t.Fatal("terminal exact Provider replay changed the durable allocation")
+	}
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_runs SET state = $2 WHERE id = $1`,
+		run.RunID, beforeReplayRunState,
+	)
+	mustExec(t, ctx, pool, `
+		UPDATE video_pipeline.generation_attempts
+		SET state = $2 WHERE generation_run_id = $1 AND sequence = 1`,
+		run.RunID, beforeReplayAttemptState,
+	)
 	qaPauseActor := controlplane.Actor{ActorID: "qa-operator", Role: "OPERATOR"}
 	qaPauseDigest, _ := digestValue(map[string]any{"runId": run.RunID, "reason": "QA_PAUSE"})
 	if _, err := store.RequestRunPause(
@@ -1925,9 +3287,907 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			PricingVersion: "pricing-v1", Verified: true,
 		},
 	}
-	if err := store.CompleteProviderJob(ctx, step, dispatch, providerResult); err != nil {
+	pauseDuringCompletionDigest, _ := digestValue(map[string]any{
+		"runId": run.RunID, "reason": "PAUSE_DURING_PROVIDER_COMPLETION",
+	})
+	if _, err := store.RequestRunPause(
+		ctx, run.RunID, 1, qaPauseActor, "PAUSE_DURING_PROVIDER_COMPLETION",
+		controlplane.Idempotency{
+			Scope: "workflow-projection-pause-during-completion:" + run.RunID,
+			Key:   uuid.NewString(), RequestHash: pauseDuringCompletionDigest,
+		},
+		step.TraceID,
+	); err != nil {
 		t.Fatal(err)
 	}
+	// The core completion may commit immediately before the Stage 1 caller
+	// records automatic QC, including while the run is PAUSED. The exact replay
+	// must preserve the pause; after RESUME_PAUSED it repairs only the run/shot
+	// and missing QC projections without changing the succeeded Provider result.
+	if err := store.CompleteProviderJob(
+		ctx, step, dispatch, providerResult,
+	); err != nil {
+		t.Fatalf("initial Provider completion: %v", err)
+	}
+	var qcBeforeRepair int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM video_pipeline.qc_reports
+		WHERE generation_run_id = $1`, run.RunID,
+	).Scan(&qcBeforeRepair); err != nil {
+		t.Fatal(err)
+	}
+	if qcBeforeRepair != 0 {
+		t.Fatalf("QC reports before prepared replay = %d, want 0", qcBeforeRepair)
+	}
+	if err := store.CompletePreparedProviderJob(
+		ctx, step, run.RunID, providerResult,
+	); err == nil {
+		t.Fatal("prepared completion created QC while the succeeded run remained paused")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeConflict {
+			t.Fatalf("paused prepared completion error = %#v", err)
+		}
+	}
+	resumeAfterCompletionDigest, _ := digestValue(map[string]any{
+		"runId": run.RunID, "mode": "RESUME_PAUSED_AFTER_PROVIDER_COMPLETION",
+	})
+	if _, err := store.RequestRunResume(
+		ctx, run.RunID, 1, qaPauseActor, "RESUME_PAUSED",
+		controlplane.Idempotency{
+			Scope: "workflow-projection-resume-after-completion:" + run.RunID,
+			Key:   uuid.NewString(), RequestHash: resumeAfterCompletionDigest,
+		},
+		step.TraceID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for replay := 1; replay <= 2; replay++ {
+		if err := store.CompletePreparedProviderJob(
+			ctx, step, run.RunID, providerResult,
+		); err != nil {
+			t.Fatalf("Stage 1 prepared completion replay %d: %v", replay, err)
+		}
+	}
+	var stage1PassedQC int
+	var stage1ShotState string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*)
+		   FROM video_pipeline.qc_reports
+		   WHERE generation_run_id = $1 AND state = 'PASSED'),
+		  (SELECT ssr.lifecycle_state
+		   FROM video_pipeline.shot_spec_revisions ssr
+		   JOIN video_pipeline.generation_runs gr
+		     ON gr.shot_spec_revision_id = ssr.id
+		   WHERE gr.id = $1)`,
+		run.RunID,
+	).Scan(&stage1PassedQC, &stage1ShotState); err != nil {
+		t.Fatal(err)
+	}
+	if stage1PassedQC != 1 || stage1ShotState != "REVIEW" {
+		t.Fatalf(
+			"Stage 1 completion QC projection = reports:%d shot:%s, want 1/REVIEW",
+			stage1PassedQC, stage1ShotState,
+		)
+	}
+	completionDriftCases := []struct {
+		name   string
+		mutate func(*orchestration.ProviderResult)
+	}{
+		{
+			name: "upstream task",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.UpstreamTaskID += "-drift"
+			},
+		},
+		{
+			name: "upstream request",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.RequestID += "-drift"
+			},
+		},
+		{
+			name: "artifact",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.ArtifactDigest = strings.Repeat("a", 64)
+				if candidate.ArtifactDigest == providerResult.ArtifactDigest {
+					candidate.ArtifactDigest = strings.Repeat("b", 64)
+				}
+				candidate.ArtifactURI = "cas://sha256/" + candidate.ArtifactDigest
+			},
+		},
+		{
+			name: "usage distribution",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.Usage.InputUnits++
+				candidate.Usage.OutputUnits--
+			},
+		},
+		{
+			name: "estimated cost",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.Cost.EstimatedMicros--
+			},
+		},
+		{
+			name: "actual cost",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				actual := *candidate.Cost.ActualMicros + 1
+				candidate.Cost.ActualMicros = &actual
+			},
+		},
+		{
+			name: "model",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.Model.RouteVersion += "-drift"
+			},
+		},
+	}
+	for _, test := range completionDriftCases {
+		t.Run("terminal Provider completion rejects "+test.name+" drift", func(t *testing.T) {
+			candidate := providerResult
+			test.mutate(&candidate)
+			err := store.CompletePreparedProviderJob(ctx, step, run.RunID, candidate)
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("completion drift error = %#v, want %s", err, controlplane.CodeRevisionConflict)
+			}
+
+			var (
+				storedTaskID, storedRequestID      string
+				outputCount, passedQC, actualCount int
+				driftArtifactCount                 int
+			)
+			if err := pool.QueryRow(ctx, `
+				SELECT COALESCE(pj.upstream_task_id, ''),
+				       COALESCE(pj.upstream_request_id, ''),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.run_artifacts
+				        WHERE generation_run_id = gr.id AND role = 'OUTPUT'),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.qc_reports
+				        WHERE generation_run_id = gr.id AND state = 'PASSED'),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.cost_ledger
+				        WHERE provider_job_id = pj.id AND entry_type = 'ACTUAL'),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.artifacts
+				        WHERE content_hash = $2 AND $2 <> $3)
+				FROM video_pipeline.provider_jobs pj
+				JOIN video_pipeline.generation_attempts ga
+				  ON ga.id = pj.generation_attempt_id
+				JOIN video_pipeline.generation_runs gr
+				  ON gr.id = ga.generation_run_id
+				WHERE gr.id = $1`,
+				run.RunID, candidate.ArtifactDigest, providerResult.ArtifactDigest,
+			).Scan(
+				&storedTaskID, &storedRequestID, &outputCount,
+				&passedQC, &actualCount, &driftArtifactCount,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if storedTaskID != providerResult.UpstreamTaskID ||
+				storedRequestID != providerResult.RequestID ||
+				outputCount != 1 || passedQC != 1 || actualCount != 1 ||
+				driftArtifactCount != 0 {
+				t.Fatalf(
+					"completion drift side effects = task:%q request:%q output:%d qc:%d actual:%d artifact:%d",
+					storedTaskID, storedRequestID, outputCount,
+					passedQC, actualCount, driftArtifactCount,
+				)
+			}
+		})
+	}
+	type terminalProjection struct {
+		RunState, RunFinishedAt, ShotState        string
+		JobState, TaskID, RequestID, JobUpdatedAt string
+		JobTerminalAt, ArtifactStatus             string
+		OutputCount, QCCount, JobLedgerCount      int
+		ReservationLedgerCount                    int
+	}
+	providerRunID := uuid.MustParse(run.RunID)
+	providerJobID := uuid.NewSHA1(providerRunID, []byte("provider-job"))
+	providerArtifactID := uuid.NewSHA1(
+		uuid.NameSpaceOID, []byte("artifact:"+providerResult.ArtifactDigest),
+	)
+	actualLedgerID := uuid.NewSHA1(providerJobID, []byte("actual-cost"))
+	releaseLedgerID := uuid.NewSHA1(providerJobID, []byte("unused-reservation-release"))
+	reservationLedgerID := uuid.NewSHA1(providerJobID, []byte("reservation-cost"))
+	readTerminalProjection := func(
+		t *testing.T,
+		runID string,
+		jobID uuid.UUID,
+		artifactDigest string,
+	) terminalProjection {
+		t.Helper()
+		var projection terminalProjection
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, COALESCE(gr.finished_at::text, ''), ssr.lifecycle_state,
+			       pj.state, COALESCE(pj.upstream_task_id, ''),
+			       COALESCE(pj.upstream_request_id, ''), pj.updated_at::text,
+			       COALESCE(pj.terminal_at::text, ''),
+			       COALESCE((SELECT status FROM video_pipeline.artifacts
+			                 WHERE content_hash = $3), 'MISSING'),
+			       (SELECT COUNT(*) FROM video_pipeline.run_artifacts
+			        WHERE generation_run_id = gr.id AND role = 'OUTPUT'),
+			       (SELECT COUNT(*) FROM video_pipeline.qc_reports
+			        WHERE generation_run_id = gr.id),
+			       (SELECT COUNT(*) FROM video_pipeline.cost_ledger
+			        WHERE provider_job_id = pj.id),
+			       (SELECT COUNT(*) FROM video_pipeline.cost_ledger
+			        WHERE budget_reservation_id = pj.budget_reservation_id)
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.shot_spec_revisions ssr
+			  ON ssr.id = gr.shot_spec_revision_id
+			JOIN video_pipeline.generation_attempts ga
+			  ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj
+			  ON pj.generation_attempt_id = ga.id AND pj.id = $2
+			WHERE gr.id = $1`,
+			runID, jobID, artifactDigest,
+		).Scan(
+			&projection.RunState, &projection.RunFinishedAt, &projection.ShotState,
+			&projection.JobState, &projection.TaskID, &projection.RequestID,
+			&projection.JobUpdatedAt, &projection.JobTerminalAt,
+			&projection.ArtifactStatus, &projection.OutputCount,
+			&projection.QCCount, &projection.JobLedgerCount,
+			&projection.ReservationLedgerCount,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return projection
+	}
+	prepareTerminalRepairWindow := func(t *testing.T, runID string) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.generation_runs SET state = 'RUNNING' WHERE id = $1`,
+			runID,
+		)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.shot_spec_revisions ssr
+			SET lifecycle_state = 'RUNNING'
+			FROM video_pipeline.generation_runs gr
+			WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
+			runID,
+		)
+	}
+	restoreTerminalProjection := func(t *testing.T, runID string) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.generation_runs SET state = 'SUCCEEDED' WHERE id = $1`,
+			runID,
+		)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.shot_spec_revisions ssr
+			SET lifecycle_state = 'REVIEW'
+			FROM video_pipeline.generation_runs gr
+			WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
+			runID,
+		)
+	}
+	assertTerminalReplayConflictWithoutWrites := func(
+		t *testing.T,
+		runID string,
+		jobID uuid.UUID,
+		artifactDigest string,
+		result orchestration.ProviderResult,
+	) {
+		t.Helper()
+		before := readTerminalProjection(t, runID, jobID, artifactDigest)
+		err := store.CompletePreparedProviderJob(ctx, step, runID, result)
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("terminal projection replay error = %#v, want %s", err, controlplane.CodeRevisionConflict)
+		}
+		after := readTerminalProjection(t, runID, jobID, artifactDigest)
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("terminal projection changed on rejected replay:\nbefore=%#v\nafter=%#v", before, after)
+		}
+	}
+
+	for _, artifactStatus := range []string{"ARCHIVED", "DISABLED", "ORPHAN_CANDIDATE"} {
+		artifactStatus := artifactStatus
+		t.Run("terminal Provider replay rejects "+artifactStatus+" shot output", func(t *testing.T) {
+			t.Cleanup(func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.artifacts
+					SET status = 'ACTIVE', orphaned_at = NULL, retention_until = NULL
+					WHERE id = $1`,
+					providerArtifactID,
+				)
+				restoreTerminalProjection(t, run.RunID)
+			})
+			mustExec(t, ctx, pool, `
+				UPDATE video_pipeline.artifacts
+				SET status = $2,
+				    orphaned_at = CASE WHEN $2 = 'ORPHAN_CANDIDATE' THEN now() ELSE NULL END,
+				    retention_until = CASE
+				      WHEN $2 = 'ORPHAN_CANDIDATE' THEN now() + interval '1 hour'
+				      ELSE NULL
+				    END
+				WHERE id = $1`,
+				providerArtifactID, artifactStatus,
+			)
+			prepareTerminalRepairWindow(t, run.RunID)
+			assertTerminalReplayConflictWithoutWrites(
+				t, run.RunID, providerJobID, providerResult.ArtifactDigest, providerResult,
+			)
+		})
+	}
+	t.Run("terminal Provider replay rejects missing shot output", func(t *testing.T) {
+		t.Cleanup(func() {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.run_artifacts
+					(generation_run_id, artifact_id, role)
+				VALUES ($1, $2, 'OUTPUT') ON CONFLICT DO NOTHING`,
+				run.RunID, providerArtifactID,
+			)
+			restoreTerminalProjection(t, run.RunID)
+		})
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.run_artifacts
+			WHERE generation_run_id = $1 AND artifact_id = $2 AND role = 'OUTPUT'`,
+			run.RunID, providerArtifactID,
+		)
+		prepareTerminalRepairWindow(t, run.RunID)
+		assertTerminalReplayConflictWithoutWrites(
+			t, run.RunID, providerJobID, providerResult.ArtifactDigest, providerResult,
+		)
+	})
+
+	var providerReservationID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT budget_reservation_id FROM video_pipeline.provider_jobs WHERE id = $1`,
+		providerJobID,
+	).Scan(&providerReservationID); err != nil {
+		t.Fatal(err)
+	}
+	var otherJobID, otherReservationID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT id, budget_reservation_id
+		FROM video_pipeline.provider_jobs
+		WHERE id <> $1
+		ORDER BY created_at
+		LIMIT 1`,
+		providerJobID,
+	).Scan(&otherJobID, &otherReservationID); err != nil {
+		t.Fatal(err)
+	}
+	restoreSuccessfulCostProjection := func(t *testing.T) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.cost_ledger
+			WHERE id IN ($1, $2)
+			   OR ((provider_job_id = $3 OR budget_reservation_id = $4)
+			       AND entry_type IN ('ACTUAL', 'RELEASE'))`,
+			actualLedgerID, releaseLedgerID, providerJobID, providerReservationID,
+		)
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, units, unit_name,
+				 pricing_rule_version, verified)
+			VALUES
+				($1, $3, $4, 'ACTUAL', 40, 'CNY', 30, 'mock-units', 'pricing-v1', true),
+				($2, $3, $4, 'RELEASE', 10, 'CNY', NULL, NULL, 'pricing-v1', true)`,
+			actualLedgerID, releaseLedgerID, providerJobID, providerReservationID,
+		)
+	}
+	var reservationEstimatePayload []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT estimate_payload
+		FROM video_pipeline.budget_reservations
+		WHERE id = $1`,
+		providerReservationID,
+	).Scan(&reservationEstimatePayload); err != nil {
+		t.Fatal(err)
+	}
+	var otherRunID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT ga.generation_run_id
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.id = pj.generation_attempt_id
+		WHERE pj.id = $1`,
+		otherJobID,
+	).Scan(&otherRunID); err != nil {
+		t.Fatal(err)
+	}
+	restoreDurableReservationProjection := func(t *testing.T) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.provider_jobs
+			SET budget_reservation_id = CASE
+			  WHEN id = $1 THEN $2::uuid
+			  WHEN id = $3 THEN $4::uuid
+			  ELSE budget_reservation_id
+			END
+			WHERE id IN ($1, $3)`,
+			providerJobID, providerReservationID, otherJobID, otherReservationID,
+		)
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.budget_reservations
+			WHERE generation_run_id = $1 AND id <> $2`,
+			providerRunID, providerReservationID,
+		)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.budget_reservations
+			SET generation_run_id = $2, amount_micros = 50,
+			    currency = 'CNY', pricing_rule_version = 'pricing-v1',
+			    estimate_payload = $3, status = 'SETTLED',
+			    confirmed_by = $4, confirmed_at = created_at
+			WHERE id = $1`,
+			providerReservationID, providerRunID,
+			reservationEstimatePayload, dispatch.BudgetApprovalID,
+		)
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.cost_ledger
+			WHERE id = $1
+			   OR ((provider_job_id = $2 OR budget_reservation_id = $3)
+			       AND entry_type = 'RESERVATION')`,
+			reservationLedgerID, providerJobID, providerReservationID,
+		)
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'RESERVATION', 50, 'CNY', 'pricing-v1', true)`,
+			reservationLedgerID, providerJobID, providerReservationID,
+		)
+	}
+	readDurablePaidProjection := func(t *testing.T) string {
+		t.Helper()
+		var projection string
+		if err := pool.QueryRow(ctx, `
+			SELECT jsonb_build_object(
+			  'reservations', COALESCE((
+			    SELECT jsonb_agg(to_jsonb(br) ORDER BY br.id)
+			    FROM video_pipeline.budget_reservations br
+			    WHERE br.id = $1 OR br.generation_run_id = $2
+			  ), '[]'::jsonb),
+			  'jobs', COALESCE((
+			    SELECT jsonb_agg(to_jsonb(pj) ORDER BY pj.id)
+			    FROM video_pipeline.provider_jobs pj
+			    WHERE pj.id = $3 OR pj.budget_reservation_id = $1
+			  ), '[]'::jsonb),
+			  'ledger', COALESCE((
+			    SELECT jsonb_agg(to_jsonb(cl) ORDER BY cl.id)
+			    FROM video_pipeline.cost_ledger cl
+			    WHERE cl.provider_job_id = $3 OR cl.budget_reservation_id = $1
+			       OR cl.id IN ($4, $5, $6)
+			  ), '[]'::jsonb)
+			)::text`,
+			providerReservationID, providerRunID, providerJobID,
+			reservationLedgerID, actualLedgerID, releaseLedgerID,
+		).Scan(&projection); err != nil {
+			t.Fatal(err)
+		}
+		return projection
+	}
+	assertReservationReplayConflictWithoutWrites := func(t *testing.T) {
+		t.Helper()
+		beforeTerminal := readTerminalProjection(
+			t, run.RunID, providerJobID, providerResult.ArtifactDigest,
+		)
+		beforePaid := readDurablePaidProjection(t)
+		if _, err := store.PrepareProviderJob(ctx, step, dispatch); err == nil {
+			t.Fatal("prepared Provider replay accepted a drifted durable reservation")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("prepared reservation replay error = %#v", err)
+			}
+		}
+		if err := store.CompletePreparedProviderJob(
+			ctx, step, run.RunID, providerResult,
+		); err == nil {
+			t.Fatal("terminal Provider replay accepted a drifted durable reservation")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("terminal reservation replay error = %#v", err)
+			}
+		}
+		afterTerminal := readTerminalProjection(
+			t, run.RunID, providerJobID, providerResult.ArtifactDigest,
+		)
+		afterPaid := readDurablePaidProjection(t)
+		if !reflect.DeepEqual(afterTerminal, beforeTerminal) || afterPaid != beforePaid {
+			t.Fatalf(
+				"durable reservation changed on rejected replay:\nterminal before=%#v\nterminal after=%#v\npaid before=%s\npaid after=%s",
+				beforeTerminal, afterTerminal, beforePaid, afterPaid,
+			)
+		}
+	}
+	reservationProjectionDrifts := []struct {
+		name   string
+		mutate func(*testing.T)
+	}{
+		{name: "reservation run", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET generation_run_id = $2 WHERE id = $1`, providerReservationID, otherRunID)
+		}},
+		{name: "reservation amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET amount_micros = 49 WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET currency = 'USD' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET pricing_rule_version = 'drift-v1' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation estimate payload", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET estimate_payload = jsonb_set(estimate_payload, '{estimatedMicros}', '49') WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation confirmer", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_by = 'drift-approval' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "missing reservation confirmer", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_by = NULL WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation confirmation time", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_at = confirmed_at + interval '1 second' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "missing reservation confirmation time", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_at = NULL WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation status", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET status = 'RESERVED' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "extra run reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.budget_reservations
+					(id, generation_run_id, amount_micros, currency,
+					 pricing_rule_version, estimate_payload, status,
+					 confirmed_by, confirmed_at)
+				VALUES ($1, $2, 50, 'CNY', 'pricing-v1', $3,
+				        'SETTLED', $4, now())`,
+				uuid.New(), providerRunID, reservationEstimatePayload, dispatch.BudgetApprovalID,
+			)
+		}},
+		{name: "extra job reservation binding", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.provider_jobs SET budget_reservation_id = $2 WHERE id = $1`, otherJobID, providerReservationID)
+		}},
+		{name: "missing RESERVATION ledger", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "non-deterministic RESERVATION ledger id", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET id = $2 WHERE id = $1`, reservationLedgerID, uuid.New())
+		}},
+		{name: "RESERVATION ledger job", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, reservationLedgerID, otherJobID)
+		}},
+		{name: "RESERVATION ledger reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, reservationLedgerID, otherReservationID)
+		}},
+		{name: "RESERVATION ledger type", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'ADJUSTMENT' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 49 WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'USD' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger units", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = 1 WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger unit name", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = 'drift-units' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'drift-v1' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "duplicate RESERVATION ledger", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'RESERVATION', 50, 'CNY', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+		{name: "unexpected ESTIMATE ledger", mutate: func(t *testing.T) {
+			extraID := uuid.New()
+			t.Cleanup(func() {
+				mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraID)
+			})
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ESTIMATE', 1, 'CNY', 'pricing-v1', true)`,
+				extraID, providerJobID, providerReservationID,
+			)
+		}},
+	}
+	for _, test := range reservationProjectionDrifts {
+		test := test
+		t.Run("Provider replay rejects "+test.name+" drift", func(t *testing.T) {
+			t.Cleanup(func() {
+				restoreDurableReservationProjection(t)
+				restoreSuccessfulCostProjection(t)
+				restoreTerminalProjection(t, run.RunID)
+			})
+			test.mutate(t)
+			prepareTerminalRepairWindow(t, run.RunID)
+			assertReservationReplayConflictWithoutWrites(t)
+		})
+	}
+
+	cumulativeCommand := publicCommand
+	cumulativeCommand.CreativeAttempt = 2
+	_, cumulativeRun, cumulativeDispatch := createIntegrationWorkflowRun(
+		t, ctx, store, "cumulative-binding-probe", cumulativeCommand,
+	)
+	cumulativeCostDrifts := []struct {
+		name   string
+		mutate func(*testing.T)
+	}{
+		{name: "other job borrows reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, units, unit_name,
+					 pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ACTUAL', 0, 'CNY', 0, 'mock-units', 'pricing-v1', true)`,
+				uuid.New(), otherJobID, providerReservationID,
+			)
+		}},
+		{name: "non-deterministic ACTUAL id", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET id = $2 WHERE id = $1`, actualLedgerID, uuid.New())
+		}},
+		{name: "missing ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "duplicate ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, units, unit_name,
+					 pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ACTUAL', 40, 'CNY', 30, 'mock-units', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+		{name: "ACTUAL amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 0 WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, actualLedgerID)
+		}},
+	}
+	for _, test := range cumulativeCostDrifts {
+		test := test
+		t.Run("cumulative allocation rejects "+test.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				restoreSuccessfulCostProjection(t)
+			})
+			test.mutate(t)
+			providerCallsBefore := videoProviderCalls.Load()
+			_, activityErr := videoActivityEnvironment.ExecuteActivity(
+				videoActivities.ExecuteProviderJob, cumulativeDispatch,
+			)
+			var applicationErr *temporal.ApplicationError
+			if !errors.As(activityErr, &applicationErr) ||
+				applicationErr.Type() != string(controlplane.CodeRevisionConflict) ||
+				!applicationErr.NonRetryable() {
+				t.Fatalf("cumulative allocation Activity error = %#v", activityErr)
+			}
+			var reservations, jobs, ledger int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT COUNT(*) FROM video_pipeline.budget_reservations
+				   WHERE generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.cost_ledger cl
+				   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`,
+				cumulativeRun.RunID,
+			).Scan(&reservations, &jobs, &ledger); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || ledger != 0 ||
+				videoProviderCalls.Load() != providerCallsBefore {
+				t.Fatalf(
+					"rejected cumulative allocation side effects = reservations:%d jobs:%d ledger:%d provider:%d→%d",
+					reservations, jobs, ledger,
+					providerCallsBefore, videoProviderCalls.Load(),
+				)
+			}
+		})
+	}
+	costProjectionDrifts := []struct {
+		name   string
+		mutate func(*testing.T)
+	}{
+		{name: "missing ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL provider job", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, actualLedgerID, otherJobID)
+		}},
+		{name: "ACTUAL reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, actualLedgerID, otherReservationID)
+		}},
+		{name: "ACTUAL entry type", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'ADJUSTMENT' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 41 WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL null amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = NULL WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'USD' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL null currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = NULL WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL units", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = 31 WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL unit name", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = 'drift-units' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'drift-v1' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "extra ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, units, unit_name,
+					 pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ACTUAL', 40, 'CNY', 30, 'mock-units', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+		{name: "missing RELEASE", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE provider job", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, releaseLedgerID, otherJobID)
+		}},
+		{name: "RELEASE reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, releaseLedgerID, otherReservationID)
+		}},
+		{name: "RELEASE entry type", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'ADJUSTMENT' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 11 WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE null amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = NULL WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'USD' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE null currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = NULL WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE units", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = 1 WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE unit name", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = 'drift-units' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'drift-v1' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "extra RELEASE", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'RELEASE', 10, 'CNY', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+	}
+	for _, test := range costProjectionDrifts {
+		test := test
+		t.Run("terminal Provider replay rejects "+test.name+" drift", func(t *testing.T) {
+			t.Cleanup(func() {
+				restoreSuccessfulCostProjection(t)
+				restoreTerminalProjection(t, run.RunID)
+			})
+			test.mutate(t)
+			prepareTerminalRepairWindow(t, run.RunID)
+			assertTerminalReplayConflictWithoutWrites(
+				t, run.RunID, providerJobID, providerResult.ArtifactDigest, providerResult,
+			)
+		})
+	}
+	t.Run("terminal Provider replay rejects unexpected RELEASE at full reservation", func(t *testing.T) {
+		_, fullReservationCommand := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		fullStep, fullRun, fullDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "full-reservation-terminal-replay", fullReservationCommand,
+		)
+		if _, err := store.PrepareProviderJob(ctx, fullStep, fullDispatch); err != nil {
+			t.Fatal(err)
+		}
+		fullArtifact, err := cas.Put(
+			ctx, bytes.NewReader([]byte("full reservation terminal replay artifact")),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fullActual := int64(50)
+		fullResult := providerResult
+		fullResult.UpstreamTaskID = "full-reservation-task"
+		fullResult.RequestID = "full-reservation-request"
+		fullResult.ArtifactDigest = fullArtifact.Digest
+		fullResult.ArtifactURI = fullArtifact.URI
+		fullResult.ArtifactSize = fullArtifact.Size
+		fullResult.Model = fullDispatch.Route
+		fullResult.Cost.ActualMicros = &fullActual
+		if err := store.CompletePreparedProviderJob(
+			ctx, fullStep, fullRun.RunID, fullResult,
+		); err != nil {
+			t.Fatal(err)
+		}
+		fullRunUUID := uuid.MustParse(fullRun.RunID)
+		fullJobID := uuid.NewSHA1(fullRunUUID, []byte("provider-job"))
+		var fullReservationID uuid.UUID
+		var fullReleaseCount int
+		if err := pool.QueryRow(ctx, `
+			SELECT pj.budget_reservation_id,
+			       (SELECT COUNT(*) FROM video_pipeline.cost_ledger
+			        WHERE provider_job_id = pj.id AND entry_type = 'RELEASE')
+			FROM video_pipeline.provider_jobs pj
+			WHERE pj.id = $1`,
+			fullJobID,
+		).Scan(&fullReservationID, &fullReleaseCount); err != nil {
+			t.Fatal(err)
+		}
+		if fullReleaseCount != 0 {
+			t.Fatalf("full-reservation completion RELEASE rows = %d, want 0", fullReleaseCount)
+		}
+		unexpectedReleaseID := uuid.NewSHA1(
+			fullJobID, []byte("unused-reservation-release"),
+		)
+		t.Cleanup(func() {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, unexpectedReleaseID)
+			restoreTerminalProjection(t, fullRun.RunID)
+		})
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'RELEASE', 1, 'CNY', 'pricing-v1', true)`,
+			unexpectedReleaseID, fullJobID, fullReservationID,
+		)
+		prepareTerminalRepairWindow(t, fullRun.RunID)
+		assertTerminalReplayConflictWithoutWrites(
+			t, fullRun.RunID, fullJobID, fullResult.ArtifactDigest, fullResult,
+		)
+		mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, unexpectedReleaseID)
+		restoreTerminalProjection(t, fullRun.RunID)
+		if err := store.CompletePreparedProviderJob(
+			ctx, fullStep, fullRun.RunID, fullResult,
+		); err != nil {
+			t.Fatalf("full-reservation exact terminal replay: %v", err)
+		}
+	})
 	if err := store.RecordProviderCancellation(
 		ctx, step,
 		orchestration.CancelProviderJobInput{
@@ -1935,7 +4195,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_SUCCESS_FIRST",
 			TraceID:    step.TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1946,13 +4206,6 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if completedAfterPause.State != "SUCCEEDED" ||
 		completedAfterPause.FailureClass != "" || completedAfterPause.FailureCode != "" {
 		t.Fatalf("success-first cancellation race projection = %#v", completedAfterPause)
-	}
-	step.ActivityID, step.ActivityType = "qc", orchestration.ActivityRunAutomaticQC
-	qcInput := orchestration.RunQCInput{
-		Run: run, Provider: providerResult, TraceID: step.TraceID, PersistProductTruth: true,
-	}
-	if err := store.RecordAutomaticQC(ctx, step, qcInput, orchestration.QCResult{Passed: true}); err != nil {
-		t.Fatal(err)
 	}
 	step.ActivityID, step.ActivityType = "review", orchestration.ActivityCreateShotReview
 	if err := store.OpenShotReview(ctx, step, orchestration.CreateReviewInput{
@@ -2382,6 +4635,112 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	if linkedPostArtifacts != 5 {
 		t.Fatalf("linked post-production artifacts = %d, want 5", linkedPostArtifacts)
+	}
+	// final_video is intentionally another OUTPUT binding for every source run.
+	// Terminal Provider replay must compare only the immutable shot_video output,
+	// so a legitimate post-production projection cannot make an exact replay fail.
+	if err := store.CompletePreparedProviderJob(
+		ctx, step, run.RunID, providerResult,
+	); err != nil {
+		t.Fatalf("exact Provider completion replay after post-production: %v", err)
+	}
+	var passedQCAfterPostProduction int
+	var shotStateAfterPostProductionReplay string
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*)
+		   FROM video_pipeline.qc_reports
+		   WHERE generation_run_id = $1 AND state = 'PASSED'),
+		  (SELECT ssr.lifecycle_state
+		   FROM video_pipeline.shot_spec_revisions ssr
+		   JOIN video_pipeline.generation_runs gr
+		     ON gr.shot_spec_revision_id = ssr.id
+		   WHERE gr.id = $1)`,
+		run.RunID,
+	).Scan(
+		&passedQCAfterPostProduction, &shotStateAfterPostProductionReplay,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if passedQCAfterPostProduction != 1 || shotStateAfterPostProductionReplay != "APPROVED" {
+		t.Fatalf(
+			"Provider completion replay after post-production = QC:%d shot:%s, want 1/APPROVED",
+			passedQCAfterPostProduction, shotStateAfterPostProductionReplay,
+		)
+	}
+	// A corrected post-production revision commonly reuses the exact UTF-8 SRT
+	// bytes while producing new dialogue/video/manifest bytes. The CAS artifact
+	// must remain valid for both historical manifest hashes, and the new
+	// Generation Manifest projection must expose the selected current binding.
+	revisedPostResult := postResult
+	revisedPostResult.Dialogue = putPostArtifact(
+		"dialogue_audio", "audio/wav", "revised fixture dialogue "+episodeRevisionID.String(),
+		5_000, 0, 0, 0,
+	)
+	revisedPostResult.FinalVideo = putPostArtifact(
+		"final_video", "video/mp4", "revised fixture final video "+episodeRevisionID.String(),
+		5_000, 1280, 720, 24,
+	)
+	revisedPostResult.Manifest = putPostArtifact(
+		"postproduction_manifest",
+		"application/vnd.video-series.postproduction-manifest+json",
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q,"revision":2}`,
+			episodeRevisionID.String(),
+		),
+		0, 0, 0, 0,
+	)
+	revisedPostResult.ServiceBOM = putPostArtifact(
+		"service_bom",
+		"application/vnd.video-series.service-bom+json",
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q,"revision":2,"components":[]}`,
+			episodeRevisionID.String(),
+		),
+		0, 0, 0, 0,
+	)
+	revisedPostResult.ManifestHash = revisedPostResult.Manifest.Digest
+	revisedPostResult.ServiceBOMHash = revisedPostResult.ServiceBOM.Digest
+	revisedPostResult.CommandPlanHash = strings.Repeat("e", 64)
+	if err := store.CommitEpisodePostProduction(ctx, step, finalizeInput, revisedPostResult); err != nil {
+		t.Fatalf("commit corrected post-production revision with reused SRT: %v", err)
+	}
+	revisedManifestPayload, err := store.BuildEpisodeManifest(ctx, step, orchestration.CreateGate3Input{
+		EpisodeRevisionID: episodeRevisionID.String(), RunIDs: []string{run.RunID},
+		GenerationPlanID:              plan.Value.GenerationPlanID,
+		PostProductionManifestHash:    revisedPostResult.ManifestHash,
+		BackgroundAudioAssetVersionID: musicAssetVersionID.String(),
+		TraceID:                       step.TraceID,
+	})
+	if err != nil {
+		t.Fatalf("build corrected Generation Manifest with reused SRT: %v", err)
+	}
+	var revisedManifest struct {
+		ProviderExecutions []struct {
+			Artifacts []struct {
+				ContentHash string `json:"content_hash"`
+				MediaSpec   struct {
+					Kind                       string `json:"kind"`
+					PostProductionManifestHash string `json:"postProductionManifestHash"`
+				} `json:"media_spec"`
+			} `json:"artifacts"`
+		} `json:"providerExecutions"`
+	}
+	if err := json.Unmarshal(revisedManifestPayload, &revisedManifest); err != nil {
+		t.Fatal(err)
+	}
+	foundReusedSubtitle := false
+	for _, execution := range revisedManifest.ProviderExecutions {
+		for _, artifact := range execution.Artifacts {
+			if artifact.ContentHash == postResult.Subtitle.Digest &&
+				artifact.MediaSpec.Kind == "subtitle_srt" &&
+				artifact.MediaSpec.PostProductionManifestHash == revisedPostResult.ManifestHash {
+				foundReusedSubtitle = true
+			}
+		}
+	}
+	if !foundReusedSubtitle {
+		t.Fatal("corrected Generation Manifest omitted the reused SRT current binding")
 	}
 	oldPostManifestHash := fixtureDigest("old post-production manifest")
 	oldFinalVideoHash := fixtureDigest("old final video")
@@ -2914,6 +5273,16 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		t.Fatal(err)
 	}
 	if temporalAddress := os.Getenv("VIDEO_TEST_TEMPORAL_ADDRESS"); temporalAddress != "" {
+		// This monolithic integration scenario has already exercised G3 and
+		// publication locking above. Reset only the fixture lifecycle state so
+		// the independent pause/outage cases still model a pre-G3 paid submit;
+		// PrepareProviderJob must reject a genuinely G3_LOCKED revision.
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.episode_revisions
+			SET status = 'G2_APPROVED'
+			WHERE id = $1`,
+			episodeRevisionID,
+		)
 		testHTTPTemporalRecoveryAndPause(
 			t,
 			ctx,
@@ -3621,22 +5990,28 @@ func testComposeProviderPollingCancellation(
 		t.Fatalf("decode Compose create operation: %v", err)
 	}
 	providerJobDeadline := time.Now().Add(15 * time.Second)
+	durableTaskID, durableRequestID := "", ""
 	for {
 		var providerJobs int
 		if err := pool.QueryRow(ctx, `
-			SELECT COUNT(*)
+			SELECT COUNT(*),
+			       COALESCE(MAX(pj.upstream_task_id), ''),
+			       COALESCE(MAX(pj.upstream_request_id), '')
 			FROM video_pipeline.provider_jobs pj
 			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
 			WHERE ga.generation_run_id = $1`,
 			createOperation.AggregateID,
-		).Scan(&providerJobs); err != nil {
+		).Scan(&providerJobs, &durableTaskID, &durableRequestID); err != nil {
 			t.Fatal(err)
 		}
-		if providerJobs == 1 {
+		if providerJobs == 1 && durableTaskID != "" && durableRequestID != "" {
 			break
 		}
 		if time.Now().After(providerJobDeadline) {
-			t.Fatal("Compose worker did not prepare the provider job")
+			t.Fatalf(
+				"Compose worker did not durably observe the provider identity: jobs=%d task=%q request=%q",
+				providerJobs, durableTaskID, durableRequestID,
+			)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -3734,49 +6109,111 @@ func testComposeProviderPollingCancellation(
 			t.Fatalf("decode Compose reconcile operation: %v", err)
 		}
 	}
-	recoveryDeadline := time.Now().Add(30 * time.Second)
+	// The restarted mock adapter intentionally lost its in-memory registry and
+	// returns 404 for the stable JobID. PostgreSQL still proves that a paid
+	// upstream task/request existed, so reconciliation must remain retryable and
+	// retain the full reservation; adapter absence is not terminal evidence.
+	recoveryDeadline := time.Now().Add(15 * time.Second)
+	retryingCancellationObserved := false
 	for {
 		run, getErr := store.GetGenerationRun(ctx, createOperation.AggregateID)
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		createState, cancelState, recoveryState, providerState := "", "", "", ""
+		createState, cancelState, recoveryState := "", "", ""
+		attemptState, providerState, reservationState := "", "", ""
+		storedTaskID, storedRequestID := "", ""
+		terminalLedger := 0
 		if err := pool.QueryRow(ctx, `
 			SELECT
 			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $1),
 			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $2),
 			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $3),
-			  (SELECT pj.state FROM video_pipeline.provider_jobs pj
-			   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
-			   WHERE ga.generation_run_id = $4)`,
+			  ga.state, pj.state, br.status,
+			  COALESCE(pj.upstream_task_id, ''),
+			  COALESCE(pj.upstream_request_id, ''),
+			  COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_attempts ga
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE ga.generation_run_id = $4
+			GROUP BY ga.state, pj.state, br.status,
+			         pj.upstream_task_id, pj.upstream_request_id`,
 			createOperation.OperationID,
 			cancelOperation.OperationID,
 			reconcileOperation.OperationID,
 			createOperation.AggregateID,
-		).Scan(&createState, &cancelState, &recoveryState, &providerState); err != nil {
+		).Scan(
+			&createState, &cancelState, &recoveryState,
+			&attemptState, &providerState, &reservationState,
+			&storedTaskID, &storedRequestID, &terminalLedger,
+		); err != nil {
 			t.Fatal(err)
 		}
-		if run.State == "CANCELLED" &&
-			createState == "CANCELLED" &&
-			cancelState == "SUCCEEDED" &&
-			recoveryState == "SUCCEEDED" &&
-			providerState == "CANCELLED" {
-			if run.FailureClass != "" || run.FailureCode != "" {
-				t.Fatalf("Compose reconciled run retained failure = %#v", run)
+		description, describeErr := temporalClient.DescribeWorkflowExecution(
+			ctx, reconcileOperation.TemporalWorkflowID, "",
+		)
+		if describeErr != nil {
+			t.Fatalf("describe Compose reconciliation: %v", describeErr)
+		}
+		for _, pending := range description.GetPendingActivities() {
+			if pending.GetActivityType().GetName() == orchestration.ActivityCancelProviderJob &&
+				pending.GetLastFailure() != nil {
+				retryingCancellationObserved = true
+				break
 			}
+		}
+		if run.State == "RECONCILING" && attemptState == "UNKNOWN" &&
+			providerState == "UNKNOWN" && reservationState == "RESERVED" &&
+			storedTaskID == durableTaskID && storedRequestID == durableRequestID &&
+			terminalLedger == 0 && retryingCancellationObserved {
 			break
 		}
 		if time.Now().After(recoveryDeadline) {
 			t.Fatalf(
-				"Compose recovery did not converge: run=%#v create=%s cancel=%s recovery=%s provider=%s",
+				"Compose 404 safety did not hold: run=%#v create=%s cancel=%s recovery=%s attempt=%s provider=%s reservation=%s task=%q request=%q terminalLedger=%d retryingCancellation=%t",
 				run,
 				createState,
 				cancelState,
 				recoveryState,
+				attemptState,
 				providerState,
+				reservationState,
+				storedTaskID,
+				storedRequestID,
+				terminalLedger,
+				retryingCancellationObserved,
 			)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if err := temporalClient.CancelWorkflow(
+		ctx, reconcileOperation.TemporalWorkflowID, "",
+	); err != nil {
+		t.Fatalf("cancel Compose reconciliation fixture: %v", err)
+	}
+	if err := temporalClient.GetWorkflow(
+		ctx, reconcileOperation.TemporalWorkflowID, "",
+	).Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
+		t.Fatalf("Compose reconciliation cleanup = %v, want Canceled", err)
+	}
+	recoveryHistory := temporalClient.GetWorkflowHistory(
+		ctx,
+		reconcileOperation.TemporalWorkflowID,
+		"",
+		false,
+		enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT,
+	)
+	for recoveryHistory.HasNext() {
+		event, historyErr := recoveryHistory.Next()
+		if historyErr != nil {
+			t.Fatalf("read Compose reconciliation history: %v", historyErr)
+		}
+		scheduled := event.GetActivityTaskScheduledEventAttributes()
+		if scheduled != nil && scheduled.ActivityType.GetName() == orchestration.ActivityExecuteProviderJob {
+			t.Fatal("Compose reconciliation scheduled a second paid provider POST")
+		}
 	}
 	var providerJobs, cancelOperations, recoveryOperations int
 	if err := pool.QueryRow(ctx, `
@@ -3794,7 +6231,7 @@ func testComposeProviderPollingCancellation(
 	}
 	if providerJobs != 1 || cancelOperations != 1 || recoveryOperations != 1 {
 		t.Fatalf(
-			"Compose recovery duplicated durable facts: providerJobs=%d cancelOperations=%d recoveryOperations=%d",
+			"Compose 404 safety duplicated durable facts: providerJobs=%d cancelOperations=%d recoveryOperations=%d",
 			providerJobs,
 			cancelOperations,
 			recoveryOperations,
@@ -3813,6 +6250,7 @@ func cloneIntegrationShotCommand(
 	t.Helper()
 	newShotID := uuid.New()
 	newShotRevisionID := uuid.New()
+	newGate2ID := uuid.New()
 	newShotHash := strings.Repeat(
 		strings.ReplaceAll(uuid.NewString(), "-", ""),
 		2,
@@ -3828,6 +6266,21 @@ func cloneIntegrationShotCommand(
 		t.Fatalf("clone integration shot: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.approval_decisions
+		  (id, series_id, episode_id, gate, decision, reason_code,
+		   actor_id, actor_role, trace_id)
+		SELECT $3, source.series_id, source.episode_id, 'G2', 'APPROVED',
+		       'integration-clone', 'integration-director', 'DIRECTOR',
+		       'integration-clone-' || $2::text
+		FROM video_pipeline.shot_spec_revisions ssr
+		JOIN video_pipeline.approval_decisions source
+		  ON source.id = ssr.gate2_decision_id
+		WHERE ssr.id = $1`,
+		source.ShotSpecRevisionID, newShotID, newGate2ID,
+	); err != nil {
+		t.Fatalf("clone integration G2 decision: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO video_pipeline.shot_spec_revisions
 		  (id, shot_id, storyboard_revision_id, revision, parent_revision_id,
 		   lifecycle_state, freshness, duration_ms, aspect_profile, fps, width, height,
@@ -3838,12 +6291,27 @@ func cloneIntegrationShotCommand(
 		       'READY', 'FRESH', duration_ms, aspect_profile, fps, width, height,
 		       cast_count, primary_action_count, narrative, asset_version_refs,
 		       context_revision_ids, $4, continuity, cinematography,
-		       generation_profile_id, gate2_decision_id, $4, 'integration-clone'
+		       generation_profile_id, $5, $4, 'integration-clone'
 		FROM video_pipeline.shot_spec_revisions
 		WHERE id = $1`,
-		source.ShotSpecRevisionID, newShotRevisionID, newShotID, newShotHash,
+		source.ShotSpecRevisionID, newShotRevisionID, newShotID, newShotHash, newGate2ID,
 	); err != nil {
 		t.Fatalf("clone integration shot revision: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO video_pipeline.approval_bindings
+		  (decision_id, object_type, revision_id, content_hash)
+		SELECT $1::uuid, original.object_type, original.revision_id, original.content_hash
+		FROM video_pipeline.shot_spec_revisions ssr
+		JOIN video_pipeline.approval_bindings original
+		  ON original.decision_id = ssr.gate2_decision_id
+		 AND original.object_type = 'EPISODE_REVISION'
+		WHERE ssr.id = $2
+		UNION ALL
+		SELECT $1::uuid, 'SHOT_SPEC_REVISION', $3::uuid, $4`,
+		newGate2ID, source.ShotSpecRevisionID, newShotRevisionID, newShotHash,
+	); err != nil {
+		t.Fatalf("clone integration G2 bindings: %v", err)
 	}
 	clonedPrompt, err := store.CompilePromptSnapshot(
 		ctx,

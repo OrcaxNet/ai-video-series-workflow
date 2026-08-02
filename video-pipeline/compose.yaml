@@ -110,6 +110,135 @@ services:
     cap_drop: [ALL]
     restart: unless-stopped
 
+  volcengine-provider:
+    profiles: [live]
+    build:
+      context: ..
+      dockerfile: Dockerfile.video-pipeline
+      args:
+        TARGET: video-volcengine-provider
+    image: ai-video-series-volcengine-provider:${VIDEO_BUILD_VERSION:-dev}
+    environment:
+      VIDEO_VOLCENGINE_PROVIDER_HTTP_ADDRESS: :8091
+      VIDEO_VOLCENGINE_PROVIDER_ID: volcengine-agent-plan-large
+      VIDEO_VOLCENGINE_BASE_URL: https://ark.cn-beijing.volces.com/api/plan/v3
+      VIDEO_VOLCENGINE_REGION: cn-beijing
+      VIDEO_VOLCENGINE_VIDEO_MODEL: doubao-seedance-2.0
+      VIDEO_VOLCENGINE_TTS_ENDPOINT: https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional
+      VIDEO_VOLCENGINE_TTS_SPEAKER: ${VIDEO_VOLCENGINE_TTS_SPEAKER:-zh_female_vv_uranus_bigtts}
+      VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID: ${VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID:-}
+      VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256: ${VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID: ${VIDEO_VOLCENGINE_TTS_CANARY_JOB_ID:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_INPUT_SHA256: ${VIDEO_VOLCENGINE_TTS_CANARY_INPUT_SHA256:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_CUE_ID: ${VIDEO_VOLCENGINE_TTS_CANARY_CUE_ID:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_VOICE_ASSET_ID: ${VIDEO_VOLCENGINE_TTS_CANARY_VOICE_ASSET_ID:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_PARENT_VOICE_VERSION_ID: ${VIDEO_VOLCENGINE_TTS_CANARY_PARENT_VOICE_VERSION_ID:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_VOICE_VERSION_ID: ${VIDEO_VOLCENGINE_TTS_CANARY_VOICE_VERSION_ID:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_VOICE_SHA256: ${VIDEO_VOLCENGINE_TTS_CANARY_VOICE_SHA256:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SNAPSHOT_ID: ${VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SNAPSHOT_ID:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SHA256: ${VIDEO_VOLCENGINE_TTS_CANARY_LICENSE_SHA256:-}
+      VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI: ${VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI:-0}
+      VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS: ${VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS:-0}
+      VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON: ${VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON:-}
+      VIDEO_VOLCENGINE_PLAN: agent-plan-large
+      VIDEO_VOLCENGINE_PRICING_VERSION: agent-plan-large-included-v1
+      VIDEO_VOLCENGINE_CURRENCY: CNY
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
+      VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+      ARK_API_KEY: ${ARK_API_KEY:-}
+    volumes:
+      - video-artifacts:/var/lib/video-pipeline/artifacts
+    expose:
+      - "8091"
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8091/health/ready
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [video-backplane]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  live-probe:
+    profiles: [live]
+    build:
+      context: ..
+      dockerfile: Dockerfile.video-pipeline
+      args:
+        TARGET: video-live-probe
+    image: ai-video-series-live-probe:${VIDEO_BUILD_VERSION:-dev}
+    environment:
+      VIDEO_PROVIDER_ADAPTER_URL: http://volcengine-provider:8091
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
+      VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+      VIDEO_LIVE_PROBE_OUTPUT_DIR: /var/lib/video-pipeline/evidence/flo104-live-probe
+      VIDEO_BUILD_VERSION: ${VIDEO_BUILD_VERSION:-dev}
+      VIDEO_VOLCENGINE_REGION: cn-beijing
+      VIDEO_VOLCENGINE_PLAN: agent-plan-large
+    volumes:
+      - video-artifacts:/var/lib/video-pipeline/artifacts:ro
+      - ../artifacts:/var/lib/video-pipeline/evidence
+    depends_on:
+      volcengine-provider:
+        condition: service_healthy
+    networks: [video-backplane]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: "no"
+
+  stage1-runner:
+    profiles: [stage1]
+    build:
+      context: ..
+      dockerfile: Dockerfile.video-pipeline
+      args:
+        TARGET: video-stage1-runner
+    image: ai-video-series-stage1-runner:${VIDEO_BUILD_VERSION:-dev}
+    environment:
+      VIDEO_STAGE1_PLAN_PATH: /etc/video-pipeline/flo104-stage1-plan.json
+      VIDEO_STAGE1_LEDGER_PATH: /var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-ledger.json
+      VIDEO_STAGE1_EXECUTION_PACKAGE_PATH: ${VIDEO_STAGE1_EXECUTION_PACKAGE_PATH:-/var/lib/video-pipeline/artifacts/stage1/flo104-sample-1-execution-package.json}
+      VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH: ${VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH:-}
+      VIDEO_STAGE1_RETRY_PACKAGE_PATH: ${VIDEO_STAGE1_RETRY_PACKAGE_PATH:-}
+      VIDEO_PROVIDER_ADAPTER_URL: http://volcengine-provider:8091
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
+      VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
+      VIDEO_POSTGRES_DSN: postgres://${VIDEO_POSTGRES_USER:-video}:${VIDEO_POSTGRES_PASSWORD:-video-local-only}@postgres:5432/${VIDEO_POSTGRES_DATABASE:-video_pipeline}?sslmode=disable
+      VIDEO_TEMPORAL_ADDRESS: temporal:7233
+      VIDEO_TEMPORAL_NAMESPACE: ${VIDEO_TEMPORAL_NAMESPACE:-default}
+      VIDEO_TEMPORAL_TASK_QUEUE: ${VIDEO_TEMPORAL_TASK_QUEUE:-video-production-v1}
+    volumes:
+      - video-artifacts:/var/lib/video-pipeline/artifacts
+      - ./config/flo104-stage1-readiness.json:/etc/video-pipeline/flo104-stage1-plan.json:ro
+    depends_on:
+      volcengine-provider:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks: [video-backplane]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: "no"
+
   orchestrator-worker:
     build:
       context: ..
@@ -121,7 +250,9 @@ services:
       VIDEO_TEMPORAL_ADDRESS: temporal:7233
       VIDEO_TEMPORAL_NAMESPACE: default
       VIDEO_TEMPORAL_TASK_QUEUE: video-production-v1
-      VIDEO_PROVIDER_ADAPTER_URL: http://mock-provider:8090
+      VIDEO_PROVIDER_ADAPTER_URL: ${VIDEO_PROVIDER_ADAPTER_URL:-http://mock-provider:8090}
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
+      VIDEO_SPEECH_PROVIDER_ADAPTER_URL: ${VIDEO_SPEECH_PROVIDER_ADAPTER_URL:-http://mock-provider:8090}
       VIDEO_POSTGRES_ADDRESS: postgres:5432
       VIDEO_POSTGRES_USER: ${VIDEO_POSTGRES_USER:-video}
       VIDEO_POSTGRES_PASSWORD: ${VIDEO_POSTGRES_PASSWORD:-video-local-only}
@@ -167,7 +298,7 @@ services:
       VIDEO_TEMPORAL_NAMESPACE: default
       VIDEO_TEMPORAL_TASK_QUEUE: video-production-v1
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
-      VIDEO_PROVIDER_ADAPTER_URL: http://mock-provider:8090
+      VIDEO_PROVIDER_ADAPTER_URL: ${VIDEO_PROVIDER_ADAPTER_URL:-http://mock-provider:8090}
       VIDEO_REQUIRE_DEPENDENCIES: "true"
     volumes:
       - video-artifacts:/var/lib/video-pipeline/artifacts

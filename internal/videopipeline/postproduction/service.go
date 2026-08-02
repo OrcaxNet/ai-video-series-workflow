@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 )
 
@@ -55,16 +56,40 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 
 	attempts := make([]ProviderAttempt, 0, len(request.Subtitle.Cues))
 	if len(request.Subtitle.Cues) > 0 {
-		baseBudget := request.Speech.BudgetMaximumMicros / int64(len(request.Subtitle.Cues))
-		remainder := request.Speech.BudgetMaximumMicros % int64(len(request.Subtitle.Cues))
+		completed := make(map[string]ProviderAttempt, len(request.Speech.CompletedAttempts))
+		for _, attempt := range request.Speech.CompletedAttempts {
+			completed[attempt.CueID] = attempt
+		}
+		paidCueCount := len(request.Subtitle.Cues) - len(completed)
+		if paidCueCount == 0 {
+			paidCueCount = 1
+		}
+		baseBudget := request.Speech.BudgetMaximumMicros / int64(paidCueCount)
+		remainder := request.Speech.BudgetMaximumMicros % int64(paidCueCount)
 		if baseBudget == 0 {
 			return Result{}, errors.New("speech budget cannot allocate a positive amount to every cue")
 		}
-		for index, cue := range request.Subtitle.Cues {
+		paidIndex := 0
+		var batchAFPMilli int64
+		for _, cue := range request.Subtitle.Cues {
+			if attempt, ok := completed[cue.ID]; ok {
+				attempts = append(attempts, attempt)
+				continue
+			}
+			if request.Speech.IdentityVersion == SpeechIdentityV2 &&
+				request.Speech.BatchAuthorization == nil && cue.ID != request.Speech.AuthorizedCueID {
+				return Result{}, &providercontract.Error{
+					Code: providercontract.CodeConflict, Retryable: false,
+					SafeMessage:     "speech canary is limited to the frozen authorized cue",
+					RequiresAction:  true,
+					SuggestedAction: "authorize a new frozen speech package before another cue",
+				}
+			}
 			cueBudget := baseBudget
-			if int64(index) < remainder {
+			if int64(paidIndex) < remainder {
 				cueBudget++
 			}
+			paidIndex++
 			if request.AuthorizePaidSubmit != nil {
 				if err := request.AuthorizePaidSubmit(ctx, cue); err != nil {
 					return Result{}, fmt.Errorf(
@@ -96,6 +121,24 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 				return Result{}, fmt.Errorf("validate cue %q speech evidence: %w", cue.ID, err)
 			}
 			attempts = append(attempts, attempt)
+			if request.Speech.BatchAuthorization != nil {
+				batchAFPMilli += attempt.Usage.OutputUnits
+				if batchAFPMilli > request.Speech.BatchAuthorization.MaximumAFPMilli {
+					return Result{}, &providercontract.Error{
+						Code: providercontract.CodeBudgetExceeded, Retryable: false,
+						SafeMessage:     "speech batch exceeded its cumulative AFP ceiling",
+						RequiresAction:  true,
+						SuggestedAction: "stop the batch and inspect the immutable usage evidence",
+					}
+				}
+			} else if request.Speech.IdentityVersion == SpeechIdentityV2 {
+				return Result{}, &providercontract.Error{
+					Code: providercontract.CodeConflict, Retryable: false,
+					SafeMessage:     "speech canary completed and remaining cues are not authorized",
+					RequiresAction:  true,
+					SuggestedAction: "inspect canary evidence before authorizing additional speech jobs",
+				}
+			}
 		}
 	}
 	rendered, err := s.Media.Render(ctx, request, subtitleBytes, attempts)
@@ -132,16 +175,19 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		"runIds":              request.RunIDs,
 		"clips":               request.Clips,
 		"subtitleRevision":    request.Subtitle,
+		"speechConfig":        request.Speech,
 		"speechAttempts":      attempts,
 		"outputPolicy":        request.Output.withDefaults(),
 		"outputs": []Artifact{
 			subtitleArtifact, rendered.Dialogue, rendered.FinalVideo, serviceBOM,
 		},
-		"gates":           request.Gates,
-		"qc":              rendered.QC,
-		"commandPlanHash": rendered.CommandPlanHash,
-		"aiContentMarker": true,
-		"traceId":         request.TraceID,
+		"gates":                           request.Gates,
+		"qc":                              rendered.QC,
+		"audioTimingCorrections":          rendered.AudioTimingCorrections,
+		"postProductionAlgorithmRevision": AlgorithmRevision,
+		"commandPlanHash":                 rendered.CommandPlanHash,
+		"aiContentMarker":                 true,
+		"traceId":                         request.TraceID,
 	}
 	manifestBytes, err := canonicalJSON(manifestPayload)
 	if err != nil {
@@ -194,10 +240,7 @@ func (s *Service) commitBytes(
 }
 
 func buildComponents(request Request, rendered RenderResult) ([]ServiceComponent, error) {
-	speechHash, err := digestJSON(map[string]any{
-		"providerProfileId": request.Speech.ProviderProfileID,
-		"route":             request.Speech.Route,
-	})
+	speechHash, err := digestJSON(request.Speech)
 	if err != nil {
 		return nil, err
 	}

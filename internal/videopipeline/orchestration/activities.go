@@ -19,6 +19,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/production"
+	"github.com/google/uuid"
 	"go.temporal.io/sdk/activity"
 	"go.temporal.io/sdk/temporal"
 )
@@ -51,6 +52,7 @@ type ProductionLedger interface {
 	ResolvePromptSnapshot(context.Context, string) (PromptSnapshotRef, error)
 	CreateWorkflowRun(context.Context, WorkflowStep, CreateRunInput) (GenerationRunRef, error)
 	PrepareProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput) (PreparedProviderJob, error)
+	RecordProviderJobObservation(context.Context, WorkflowStep, ExecuteProviderJobInput, ProviderJobObservation) error
 	CompleteProviderJob(context.Context, WorkflowStep, ExecuteProviderJobInput, ProviderResult) error
 	RecordAutomaticQC(context.Context, WorkflowStep, RunQCInput, QCResult) error
 	OpenShotReview(context.Context, WorkflowStep, CreateReviewInput) error
@@ -212,6 +214,11 @@ func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput
 // CreateRun makes production runs idempotent PostgreSQL transactions with an
 // outbox row. Isolated workflow tests use a deterministic in-memory identity.
 func (a *Activities) CreateRun(ctx context.Context, input CreateRunInput) (GenerationRunRef, error) {
+	if input.PersistProductTruth {
+		if approvalID, err := uuid.Parse(input.BudgetApprovalID); err == nil {
+			input.BudgetApprovalID = approvalID.String()
+		}
+	}
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (GenerationRunRef, error) {
 		if input.PersistProductTruth {
 			if a.Production == nil {
@@ -254,6 +261,14 @@ func (a *Activities) CreateRun(ctx context.Context, input CreateRunInput) (Gener
 // Activity retries reuse jobId and upstreamTaskId, so they never create a new
 // paid attempt. UNKNOWN is polled; it is not treated as a failed generation.
 func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProviderJobInput) (ProviderResult, error) {
+	if input.PersistProductTruth {
+		if approvalID, err := uuid.Parse(input.BudgetApprovalID); err == nil {
+			input.BudgetApprovalID = approvalID.String()
+		}
+		// The normalized value becomes part of the Activity journal digest and
+		// immutable Provider dispatch. Equivalent UUID spellings therefore
+		// cannot fork either idempotency or cumulative budget accounting.
+	}
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (ProviderResult, error) {
 		var step WorkflowStep
 		var prepared PreparedProviderJob
@@ -291,7 +306,7 @@ func (a *Activities) ExecuteProviderJob(ctx context.Context, input ExecuteProvid
 				return ProviderResult{}, classifyPostProductionError(err)
 			}
 		}
-		result, err := a.executeProviderJob(ctx, input, prepared)
+		result, err := a.executeProviderJob(ctx, step, input, prepared)
 		if err != nil {
 			return ProviderResult{}, err
 		}
@@ -325,6 +340,7 @@ func promptSnapshotCarriesExecutionFields(prompt PromptSnapshotRef) bool {
 
 func (a *Activities) executeProviderJob(
 	ctx context.Context,
+	step WorkflowStep,
 	input ExecuteProviderJobInput,
 	prepared PreparedProviderJob,
 ) (ProviderResult, error) {
@@ -332,18 +348,6 @@ func (a *Activities) executeProviderJob(
 		return ProviderResult{}, errors.New("provider HTTP client is required")
 	}
 	activity.RecordHeartbeat(ctx, map[string]any{"phase": "submitting", "runId": input.Run.RunID})
-	jobID := "provider-job-" + input.Run.RunID
-	promptText := input.Prompt.PositivePrompt
-	if input.Prompt.NegativePrompt != "" {
-		promptText += "\nNEGATIVE CONSTRAINTS: " + input.Prompt.NegativePrompt
-	}
-	if promptText == "" {
-		return ProviderResult{}, errors.New("immutable compiled prompt text is required")
-	}
-	outputSpec := input.Prompt.Output
-	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
-		return ProviderResult{}, errors.New("immutable compiled output specification is required")
-	}
 	budget := prepared.Budget
 	budgetReservation := prepared.BudgetReservation
 	if !input.PersistProductTruth {
@@ -372,37 +376,69 @@ func (a *Activities) executeProviderJob(
 			return ProviderResult{}, fmt.Errorf("bind budget approval: %w", err)
 		}
 	}
-	if err := budgetReservation.ValidateFor(providercontract.BudgetBindingInput{
-		RunID: input.Run.RunID, InputHash: input.Run.RunSpecDigest,
-		Model: input.Route, Budget: budget,
-	}); err != nil {
-		return ProviderResult{}, fmt.Errorf("validate prepared budget allocation: %w", err)
-	}
-	generationRequest := providercontract.GenerationRequest{
-		RequestID:        jobID,
-		IdempotencyKey:   jobID,
-		Modality:         providercontract.ModalityVideo,
-		Prompt:           promptText,
-		PromptSnapshotID: input.Prompt.ID,
-		Context:          input.Prompt.Context,
-		Assets:           input.Prompt.Assets,
-		Output:           outputSpec,
-		ModelHint:        input.Route.ModelID,
-		Budget:           budget,
-	}
-	result, err := mockprovider.Submit(ctx, a.HTTPClient, a.ProviderAdapterURL, providercontract.JobRequest{
-		SchemaVersion:     "v1",
-		JobID:             jobID,
-		RunID:             input.Run.RunID,
-		Capability:        providercontract.CapabilityVideo,
-		InputHash:         input.Run.RunSpecDigest,
-		Model:             input.Route,
-		Request:           generationRequest,
-		BudgetReservation: budgetReservation,
-		TraceID:           input.TraceID,
+	jobRequest, err := BuildProviderJobRequest(input, PreparedProviderJob{
+		Budget: budget, BudgetReservation: budgetReservation,
 	})
 	if err != nil {
+		return ProviderResult{}, err
+	}
+	var result providercontract.JobResponse
+	if prepared.ReconcileOnly {
+		activity.RecordHeartbeat(ctx, map[string]any{
+			"phase": "reconciling", "providerJobId": jobRequest.JobID,
+		})
+		result, err = mockprovider.Get(
+			ctx, a.HTTPClient, a.ProviderAdapterURL, jobRequest.JobID,
+		)
+	} else {
+		if input.PersistProductTruth {
+			// Freeze the paid-boundary intent before POST. A crash or timeout after
+			// this commit can only reconcile the stable JobID; it can never issue a
+			// second paid submit.
+			if err := a.Production.RecordProviderJobObservation(
+				ctx, step, input, ProviderJobObservation{
+					State: "UNKNOWN", ErrorCode: "PROVIDER_SUBMISSION_PENDING",
+				},
+			); err != nil {
+				return ProviderResult{}, classifyPostProductionError(err)
+			}
+		}
+		result, err = mockprovider.Submit(
+			ctx, a.HTTPClient, a.ProviderAdapterURL, jobRequest,
+		)
+	}
+	if err != nil {
+		if input.PersistProductTruth &&
+			(prepared.ReconcileOnly || providerSubmissionMayExist(err)) {
+			observationErr := a.Production.RecordProviderJobObservation(
+				ctx, step, input, ProviderJobObservation{
+					State: "UNKNOWN", ErrorCode: "PROVIDER_OUTCOME_UNKNOWN",
+				},
+			)
+			if observationErr != nil {
+				// Workflow cancellation can arrive after the provider request has
+				// already failed but before this best-effort UNKNOWN projection can
+				// open its transaction. Preserve the provider failure in that race:
+				// Temporal must record the in-flight ActivityFailure (with
+				// RetryState=CancelRequested), while the cancellation compensator
+				// owns durable reconciliation of the same stable JobID.
+				if ctx.Err() != nil {
+					return ProviderResult{}, classifyProviderError(err)
+				}
+				return ProviderResult{}, classifyPostProductionError(observationErr)
+			}
+		}
 		return ProviderResult{}, classifyProviderError(err)
+	}
+	if err := validateProviderJobResponse(result, jobRequest); err != nil {
+		return ProviderResult{}, err
+	}
+	if input.PersistProductTruth {
+		if err := a.Production.RecordProviderJobObservation(
+			ctx, step, input, providerObservation(result),
+		); err != nil {
+			return ProviderResult{}, classifyPostProductionError(err)
+		}
 	}
 	activity.RecordHeartbeat(ctx, map[string]any{
 		"phase":          "submitted",
@@ -415,9 +451,32 @@ func (a *Activities) executeProviderJob(
 		if err := sleepContext(ctx, 500*time.Millisecond); err != nil {
 			return ProviderResult{}, err
 		}
-		result, err = mockprovider.Get(ctx, a.HTTPClient, a.ProviderAdapterURL, result.JobID)
+		result, err = mockprovider.Get(ctx, a.HTTPClient, a.ProviderAdapterURL, jobRequest.JobID)
 		if err != nil {
+			if input.PersistProductTruth {
+				observationErr := a.Production.RecordProviderJobObservation(
+					ctx, step, input, ProviderJobObservation{
+						State: "UNKNOWN", ErrorCode: "PROVIDER_POLL_UNKNOWN",
+					},
+				)
+				if observationErr != nil {
+					if ctx.Err() != nil {
+						return ProviderResult{}, classifyProviderError(err)
+					}
+					return ProviderResult{}, classifyPostProductionError(observationErr)
+				}
+			}
 			return ProviderResult{}, classifyProviderError(err)
+		}
+		if err := validateProviderJobResponse(result, jobRequest); err != nil {
+			return ProviderResult{}, err
+		}
+		if input.PersistProductTruth {
+			if err := a.Production.RecordProviderJobObservation(
+				ctx, step, input, providerObservation(result),
+			); err != nil {
+				return ProviderResult{}, classifyPostProductionError(err)
+			}
 		}
 		activity.RecordHeartbeat(ctx, map[string]any{
 			"phase":          "reconciling",
@@ -467,6 +526,103 @@ func (a *Activities) executeProviderJob(
 		Usage:          result.Usage,
 		Cost:           result.Cost,
 	}, nil
+}
+
+func validateProviderJobResponse(
+	response providercontract.JobResponse,
+	request providercontract.JobRequest,
+) error {
+	if response.JobID != request.JobID || response.RunID != request.RunID ||
+		response.Model != request.Model {
+		return temporal.NewNonRetryableApplicationError(
+			"provider response differs from the immutable dispatch",
+			string(controlplane.CodeRevisionConflict),
+			nil,
+		)
+	}
+	return nil
+}
+
+func providerSubmissionMayExist(err error) bool {
+	switch providercontract.ErrorCodeOf(err) {
+	case providercontract.CodeUnavailable, providercontract.CodeTimeout, "":
+		return true
+	default:
+		return false
+	}
+}
+
+func providerObservation(response providercontract.JobResponse) ProviderJobObservation {
+	state := "UNKNOWN"
+	switch response.State {
+	case providercontract.StatusQueued:
+		// A successful POST response proves submission even when a provider does
+		// not allocate its upstream task id until later. RUNNING suppresses every
+		// future paid POST and forces stable JobID reconciliation.
+		state = "RUNNING"
+	case providercontract.StatusRunning:
+		state = "RUNNING"
+	case providercontract.StatusRequiresAction:
+		state = "REQUIRES_ACTION"
+	case providercontract.StatusSucceeded:
+		// Product truth is not terminal until the artifact and cost commit in the
+		// same PostgreSQL transaction. RUNNING still suppresses a second submit.
+		state = "RUNNING"
+	}
+	errorCode := ""
+	if response.Error != nil {
+		errorCode = string(response.Error.Code)
+	}
+	return ProviderJobObservation{
+		State: state, UpstreamTaskID: response.UpstreamTaskID,
+		RequestID: response.RequestID, ErrorCode: errorCode,
+	}
+}
+
+// BuildProviderJobRequest is the single prompt-bearing Provider envelope
+// builder shared by Temporal and the formal Stage 1 runner. Callers may only
+// invoke it after PostgreSQL PrepareProviderJob returns the durable budget
+// reservation; the prompt and output specification must be the exact resolved
+// snapshot, never stdin-supplied execution truth.
+func BuildProviderJobRequest(
+	input ExecuteProviderJobInput,
+	prepared PreparedProviderJob,
+) (providercontract.JobRequest, error) {
+	jobID := "provider-job-" + input.Run.RunID
+	promptText := input.Prompt.PositivePrompt
+	if input.Prompt.NegativePrompt != "" {
+		promptText += "\nNEGATIVE CONSTRAINTS: " + input.Prompt.NegativePrompt
+	}
+	if promptText == "" {
+		return providercontract.JobRequest{}, errors.New("immutable compiled prompt text is required")
+	}
+	outputSpec := input.Prompt.Output
+	if outputSpec.Width <= 0 || outputSpec.Height <= 0 || outputSpec.DurationMillis <= 0 {
+		return providercontract.JobRequest{}, errors.New("immutable compiled output specification is required")
+	}
+	if err := prepared.BudgetReservation.ValidateFor(providercontract.BudgetBindingInput{
+		RunID: input.Run.RunID, InputHash: input.Run.RunSpecDigest,
+		Model: input.Route, Budget: prepared.Budget,
+	}); err != nil {
+		return providercontract.JobRequest{}, fmt.Errorf("validate prepared budget allocation: %w", err)
+	}
+	request := providercontract.JobRequest{
+		SchemaVersion: "v1", JobID: jobID, RunID: input.Run.RunID,
+		Capability: providercontract.CapabilityVideo, InputHash: input.Run.RunSpecDigest,
+		Model: input.Route, TraceID: input.TraceID,
+		Request: providercontract.GenerationRequest{
+			RequestID: jobID, IdempotencyKey: jobID,
+			Modality: providercontract.ModalityVideo, Prompt: promptText,
+			PromptSnapshotID: input.Prompt.ID, Context: input.Prompt.Context,
+			Assets: input.Prompt.Assets, Output: outputSpec,
+			ModelHint: input.Route.ModelID, Budget: prepared.Budget,
+		},
+		BudgetReservation: prepared.BudgetReservation,
+	}
+	if err := request.Validate(); err != nil {
+		return providercontract.JobRequest{}, fmt.Errorf("validate immutable Provider request: %w", err)
+	}
+	return request, nil
 }
 
 func toPromptSnapshotRef(snapshot production.PromptSnapshot) PromptSnapshotRef {
@@ -702,6 +858,11 @@ func (a *Activities) CancelProviderJob(
 	ctx context.Context,
 	input CancelProviderJobInput,
 ) (CancelProviderResult, error) {
+	if input.Dispatch.PersistProductTruth {
+		if approvalID, err := uuid.Parse(input.Dispatch.BudgetApprovalID); err == nil {
+			input.Dispatch.BudgetApprovalID = approvalID.String()
+		}
+	}
 	return journalActivity(ctx, a.Journal, input.TraceID, input, func() (CancelProviderResult, error) {
 		step, err := currentWorkflowStep(ctx, input.TraceID)
 		if err != nil {
@@ -716,9 +877,9 @@ func (a *Activities) CancelProviderJob(
 				return CancelProviderResult{}, err
 			}
 			if !prepared {
-				result := CancelProviderResult{State: "CANCELLED"}
+				result := CancelProviderResult{State: "CANCELLED", NoRemoteTask: true}
 				if err := a.Production.RecordProviderCancellation(ctx, step, input, result); err != nil {
-					return CancelProviderResult{}, err
+					return CancelProviderResult{}, classifyPostProductionError(err)
 				}
 				return result, nil
 			}
@@ -731,9 +892,20 @@ func (a *Activities) CancelProviderJob(
 			// provider reporting that the idempotent JobID does not exist proves
 			// there is no upstream task left to cancel.
 			result.State = "CANCELLED"
+			result.NoRemoteTask = true
 			result.ErrorCode = ""
 		} else if cancelErr == nil {
+			if response.JobID != jobID ||
+				response.RunID != input.Dispatch.Run.RunID ||
+				response.Model != input.Dispatch.Route {
+				return CancelProviderResult{}, temporal.NewNonRetryableApplicationError(
+					"provider cancellation response differs from the immutable dispatch",
+					string(controlplane.CodeRevisionConflict),
+					nil,
+				)
+			}
 			result.UpstreamTaskID = response.UpstreamTaskID
+			result.RequestID = response.RequestID
 			switch response.State {
 			case providercontract.StatusSucceeded:
 				if len(response.Artifacts) > 0 {
@@ -743,6 +915,16 @@ func (a *Activities) CancelProviderJob(
 			case providercontract.StatusCancelled:
 				result.State = "CANCELLED"
 				result.ErrorCode = ""
+				result.Usage = response.Usage
+				result.Cost = response.Cost
+			case providercontract.StatusFailed:
+				result.State = "FAILED"
+				result.Usage = response.Usage
+				result.Cost = response.Cost
+				result.ErrorCode = "PROVIDER_FAILED"
+				if response.Error != nil && response.Error.Code != "" {
+					result.ErrorCode = string(response.Error.Code)
+				}
 			default:
 				result.State = "UNKNOWN"
 			}
@@ -783,7 +965,7 @@ func (a *Activities) CancelProviderJob(
 				}
 			}
 			if err := a.Production.RecordProviderCancellation(ctx, step, input, result); err != nil {
-				return CancelProviderResult{}, err
+				return CancelProviderResult{}, classifyPostProductionError(err)
 			}
 		}
 		if result.State == "UNKNOWN" {
@@ -926,6 +1108,9 @@ func classifyPostProductionError(err error) error {
 		case controlplane.CodeConsentRequired,
 			controlplane.CodeLicenseBlocked,
 			controlplane.CodeBudgetExceeded,
+			controlplane.CodeConflict,
+			controlplane.CodeGateRequired,
+			controlplane.CodeContentBlocked,
 			controlplane.CodeRevisionConflict,
 			controlplane.CodeStaleDependency,
 			controlplane.CodeCapability:

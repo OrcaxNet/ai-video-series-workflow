@@ -24,6 +24,25 @@ G1/G2 approved inputs
 `postProduction` 为可选增量。启用时必须冻结独立的 `speech.primary`
 路由、预算审批和证据等级：
 
+Agent Plan Live 路径由 `volcengine-provider` 同时承载 `speech.primary`，复用运行时
+`ARK_API_KEY`，固定套餐专属
+`https://openspeech.bytedance.com/api/v3/plan/tts/unidirectional` 与
+`X-Api-Resource-Id: seed-tts-2.0`。标准 OpenSpeech URL、query、尾斜杠或 host 漂移
+均在网络调用前失败关闭，防止绕开套餐归因或产生额外费用。每次请求必须返回 usage
+tokens，并在 speech attempt 中保留 request/connect ID 与 `X-Tt-Logid`；默认
+Compose/fixture 路径仍保持 Mock，不会因配置 Live Adapter 而自动产生真实调用。
+
+若同步 TTS 在上游任务、音频、request/connect/log ID 与 usage 均为空时进入
+`requires_action`，不得删除幂等记录或直接重提。操作员只能同时注入精确的
+`VIDEO_VOLCENGINE_TTS_RETRY_JOB_ID` 与当前持久记录
+`VIDEO_VOLCENGINE_TTS_RETRY_RECORD_SHA256`；Adapter 在每次重提前原子保留旧响应和
+授权 hash。为覆盖本样片已发生的错误路由恢复，单个 job 的审计历史硬上限为两次
+reconciliation；每次都必须授权当时完整持久记录的精确 SHA-256，attempt 连续为 1、2，
+第三次永远失败关闭。若在任一次重提前后崩溃，已消费的授权不会再次调用 Provider；
+第二次授权落盘失败也不得清空或改写第一次历史。错误响应仍持久化已分配的
+request/connect ID、服务端返回的 `X-Tt-Logid` 和可获得的 usage，且不保存 Secret、正文或
+transport URL。
+
 创建 Generation Plan 时还必须把相同的 `speechBudgetLimit` 纳入请求；
 额度与币种会进入不可变 plan hash 和审计证据。启动生产时的
 `postProduction.speechBudgetLimit` 必须与 Plan 完全一致。
@@ -212,7 +231,11 @@ Provider 的 `pending_key` 状态。
 3. 以 `live_provider_call` 运行同一代表性授权输入三次，不挑选最好一次。
 4. 每次导出 MP4、SRT、Dialogue、输入配置、日志、G1/G2/G3、QC、Manifest、Service BOM、usage/cost 和复现说明。
 5. 汇总 Provider queue/poll/callback/generation/E2E p50/p95、成功率、错误分类、重试、存储量与人工分钟。
-6. 使用金标测量 CER ≤2%、字幕边界 p95 ≤250 ms、音画起点 p95 ≤120 ms；不达标则通过新的字幕 revision 人工校时并重跑后期，原 revision 不变。
+6. 按 `flo-104-cer-evaluation.md` 的冻结双轨协议报告标准 CER，并以
+   `mandarin_tone_aware_cer ≤2%` 作为音频可懂度发布门禁；同时测量字幕边界
+   p95 ≤250 ms、音画起点 p95 ≤120 ms。标准 CER 与 tone-aware CER 不得混写，
+   标准 CER 超限时不得宣称其已通过；时间边界不达标则通过新的字幕 revision
+   人工校时并重跑后期，原 revision 不变。
 7. 演练 401/403、429、5xx、timeout、quota、content/region/model 阻断、响应丢失、乱序/重复 callback、取消竞态和 Worker 重启；确认重复付费任务和重复最终资产均为 0。
 
 三次真实运行与完整统计完成前，FLO-104 不能置为 `done`。

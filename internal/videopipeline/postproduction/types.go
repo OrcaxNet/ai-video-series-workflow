@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
+	"github.com/google/uuid"
 )
 
 const (
@@ -19,6 +21,7 @@ const (
 	EvidenceMockOnly    = "mock_only"
 	EvidenceLive        = "live_provider_call"
 	EvidencePendingKey  = "pending_key"
+	SpeechIdentityV2    = "speech-v2"
 	defaultAudioRate    = 48_000
 	defaultAudioChannel = 2
 )
@@ -101,12 +104,75 @@ func (g GateBinding) Validate() error {
 	return nil
 }
 
+// SpeechVoiceBinding freezes the provider-facing voice configuration separately
+// from Cue.VoiceRef. VoiceRef is an immutable product asset version UUID; it is
+// never a provider speaker name. The parent binding keeps an auditable link to
+// the voice revision that was approved with the already-generated video shots.
+type SpeechVoiceBinding struct {
+	AssetID              string `json:"assetId"`
+	ParentAssetVersionID string `json:"parentAssetVersionId"`
+	AssetVersionID       string `json:"assetVersionId"`
+	AssetVersionHash     string `json:"assetVersionHash"`
+	LicenseSnapshotID    string `json:"licenseSnapshotId"`
+	LicenseSnapshotHash  string `json:"licenseSnapshotHash"`
+	Provider             string `json:"provider"`
+	ModelID              string `json:"modelId"`
+	ResourceID           string `json:"resourceId"`
+	Speaker              string `json:"speaker"`
+}
+
+func (v SpeechVoiceBinding) Validate(route providercontract.ModelSnapshot) error {
+	for name, value := range map[string]string{
+		"assetId":              v.AssetID,
+		"parentAssetVersionId": v.ParentAssetVersionID,
+		"assetVersionId":       v.AssetVersionID,
+		"licenseSnapshotId":    v.LicenseSnapshotID,
+	} {
+		if _, err := uuid.Parse(value); err != nil {
+			return fmt.Errorf("speech voice %s must be a UUID", name)
+		}
+	}
+	if v.ParentAssetVersionID == v.AssetVersionID {
+		return errors.New("speech voice revision must differ from its parent")
+	}
+	if !validDigest(v.AssetVersionHash) || !validDigest(v.LicenseSnapshotHash) {
+		return errors.New("speech voice asset and license hashes must be lowercase SHA-256 values")
+	}
+	if strings.TrimSpace(v.Provider) == "" || strings.TrimSpace(v.ModelID) == "" ||
+		strings.TrimSpace(v.ResourceID) == "" || strings.TrimSpace(v.Speaker) == "" {
+		return errors.New("speech voice provider, model, resource, and speaker are required")
+	}
+	if !sameSpeechProvider(v.Provider, route.Provider) || v.ModelID != route.ModelID {
+		return errors.New("speech voice provider/model must match the frozen route")
+	}
+	return nil
+}
+
+func sameSpeechProvider(left, right string) bool {
+	normalize := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "volcengine" {
+			return "volcengine_ark"
+		}
+		return value
+	}
+	return normalize(left) == normalize(right)
+}
+
 type SpeechConfig struct {
-	Route               providercontract.ModelSnapshot `json:"route"`
-	ProviderProfileID   string                         `json:"providerProfileId"`
-	BudgetApprovalID    string                         `json:"budgetApprovalId"`
-	BudgetMaximumMicros int64                          `json:"budgetMaximumMicros"`
-	BudgetCurrency      string                         `json:"budgetCurrency"`
+	Route                            providercontract.ModelSnapshot     `json:"route"`
+	ProviderProfileID                string                             `json:"providerProfileId"`
+	BudgetApprovalID                 string                             `json:"budgetApprovalId"`
+	BudgetMaximumMicros              int64                              `json:"budgetMaximumMicros"`
+	BudgetCurrency                   string                             `json:"budgetCurrency"`
+	IdentityVersion                  string                             `json:"identityVersion,omitempty"`
+	Voice                            *SpeechVoiceBinding                `json:"voice,omitempty"`
+	AuthorizedCueID                  string                             `json:"authorizedCueId,omitempty"`
+	MaximumAFPMilli                  int64                              `json:"maximumAfpMilli,omitempty"`
+	MaximumNonSubscriptionCashMicros int64                              `json:"maximumNonSubscriptionCashMicros,omitempty"`
+	MaxAttempts                      int                                `json:"maxAttempts,omitempty"`
+	BatchAuthorization               *speechcontract.BatchAuthorization `json:"batchAuthorization,omitempty"`
+	CompletedAttempts                []ProviderAttempt                  `json:"completedAttempts,omitempty"`
 }
 
 func (s SpeechConfig) Validate() error {
@@ -122,6 +188,52 @@ func (s SpeechConfig) Validate() error {
 		return errors.New("speech budget maximum must be positive")
 	case len(s.BudgetCurrency) != 3:
 		return errors.New("speech budget currency must be an ISO 4217 code")
+	}
+	if s.IdentityVersion == "" {
+		return nil
+	}
+	if s.IdentityVersion != SpeechIdentityV2 {
+		return errors.New("speech identity version is unsupported")
+	}
+	if s.Voice == nil {
+		return errors.New("speech-v2 requires an immutable VOICE binding")
+	}
+	if err := s.Voice.Validate(s.Route); err != nil {
+		return err
+	}
+	if s.BatchAuthorization != nil {
+		if strings.TrimSpace(s.AuthorizedCueID) != "" || s.MaximumAFPMilli != 0 ||
+			s.MaximumNonSubscriptionCashMicros != 0 || s.MaxAttempts != 0 {
+			return errors.New("speech-v2 batch cannot retain the single-cue canary fields")
+		}
+		if err := s.BatchAuthorization.Validate(); err != nil {
+			return err
+		}
+		batch := s.BatchAuthorization
+		if !sameSpeechProvider(batch.Provider, s.Route.Provider) ||
+			batch.ModelID != s.Route.ModelID || batch.RouteVersion != s.Route.RouteVersion ||
+			batch.ResourceID != s.Voice.ResourceID || batch.Speaker != s.Voice.Speaker ||
+			batch.VoiceAssetID != s.Voice.AssetID ||
+			batch.ParentVoiceAssetVersionID != s.Voice.ParentAssetVersionID ||
+			batch.VoiceAssetVersionID != s.Voice.AssetVersionID ||
+			batch.VoiceAssetVersionHash != s.Voice.AssetVersionHash ||
+			batch.LicenseSnapshotID != s.Voice.LicenseSnapshotID ||
+			batch.LicenseSnapshotHash != s.Voice.LicenseSnapshotHash {
+			return errors.New("speech-v2 batch route, VOICE, or license drifted from the frozen configuration")
+		}
+		return nil
+	}
+	if strings.TrimSpace(s.AuthorizedCueID) == "" {
+		return errors.New("speech-v2 requires one explicitly authorized cue")
+	}
+	if s.MaximumAFPMilli <= 0 {
+		return errors.New("speech-v2 requires a positive AFP ceiling")
+	}
+	if s.MaximumNonSubscriptionCashMicros != 0 {
+		return errors.New("speech-v2 canary requires a zero non-subscription cash ceiling")
+	}
+	if s.MaxAttempts != 1 {
+		return errors.New("speech-v2 canary requires MaxAttempts=1")
 	}
 	return nil
 }
@@ -234,6 +346,9 @@ func (r Request) Validate() error {
 	if err := r.Speech.Validate(); err != nil {
 		return err
 	}
+	if err := validateSpeechAuthorizationCoverage(r); err != nil {
+		return err
+	}
 	if err := r.Output.Validate(); err != nil {
 		return err
 	}
@@ -264,6 +379,8 @@ type ProviderAttempt struct {
 	JobID          string                         `json:"jobId"`
 	RequestID      string                         `json:"requestId"`
 	UpstreamTaskID string                         `json:"upstreamTaskId"`
+	ConnectID      string                         `json:"connectId,omitempty"`
+	LogID          string                         `json:"logId,omitempty"`
 	Model          providercontract.ModelSnapshot `json:"modelSnapshot"`
 	Usage          providercontract.Usage         `json:"usage"`
 	Cost           providercontract.Cost          `json:"cost"`
@@ -329,6 +446,9 @@ func (r Result) Validate() error {
 	if r.FinalVideo.DurationMillis <= 0 ||
 		r.FinalVideo.Width <= 0 || r.FinalVideo.Height <= 0 || r.FinalVideo.FPS <= 0 {
 		return errors.New("post-production final video media specification is incomplete")
+	}
+	if r.Dialogue.DurationMillis <= 0 || r.Dialogue.DurationMillis != r.FinalVideo.DurationMillis {
+		return errors.New("dialogue duration must match the final video duration")
 	}
 	if !validDigest(r.CommandPlanHash) || !validDigest(r.ManifestHash) ||
 		!validDigest(r.ServiceBOMHash) {

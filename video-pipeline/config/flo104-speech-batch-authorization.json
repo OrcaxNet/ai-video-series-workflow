@@ -1,0 +1,87 @@
+{
+  "schemaVersion": "flo104.speech-batch-revision.v1",
+  "batchId": "flo104-sample-1",
+  "parentExecutionPackageHash": "470084b5e10f703e45e67cca35480ad9a31c68833c707573ee1621bd1de90e16",
+  "maximumSubmits": 5,
+  "estimatedAfpMilli": 8505,
+  "maximumAfpMilli": 9358,
+  "maximumNonSubscriptionCashMicros": 0,
+  "cues": [
+    {
+      "cueId": "cue-002",
+      "unicodeCharacters": 21,
+      "estimatedAfpMilli": 2835,
+      "maximumAfpMilli": 3119,
+      "maxAttempts": 1
+    },
+    {
+      "cueId": "cue-004",
+      "unicodeCharacters": 17,
+      "estimatedAfpMilli": 2295,
+      "maximumAfpMilli": 2525,
+      "maxAttempts": 1
+    },
+    {
+      "cueId": "cue-006",
+      "unicodeCharacters": 7,
+      "estimatedAfpMilli": 945,
+      "maximumAfpMilli": 1040,
+      "maxAttempts": 1
+    },
+    {
+      "cueId": "cue-008",
+      "unicodeCharacters": 11,
+      "estimatedAfpMilli": 1485,
+      "maximumAfpMilli": 1634,
+      "maxAttempts": 1
+    },
+    {
+      "cueId": "cue-010",
+      "unicodeCharacters": 7,
+      "estimatedAfpMilli": 945,
+      "maximumAfpMilli": 1040,
+      "maxAttempts": 1
+    }
+  ],
+  "completedAttempts": [
+    {
+      "cueId": "cue-001",
+      "jobId": "speech-v2-c61235443b5d6436210496a6c739f041",
+      "requestId": "61a86d34-a538-4d09-ae55-f4a345240c9a",
+      "upstreamTaskId": "99d05156-cb06-47a7-9354-4c040d0aa37e",
+      "connectId": "99d05156-cb06-47a7-9354-4c040d0aa37e",
+      "logId": "202608020824051BF0C483B49AA612FF85",
+      "modelSnapshot": {
+        "capability_alias": "speech.primary",
+        "provider": "VOLCENGINE",
+        "model_id": "doubao-seed-tts-2.0",
+        "route_version": "agent-plan-large-tts-v2",
+        "capability_hash": "4cd3001768d4741262109067e59dc3e2495134b30a25f0e84acdd06be620e4b7",
+        "verification": "pending_key"
+      },
+      "usage": {
+        "generated_chars": 15,
+        "output_units": 2025,
+        "unit": "milli_afp"
+      },
+      "cost": {
+        "estimated_micros": 3333334,
+        "actual_micros": 0,
+        "currency": "CNY",
+        "pricing_version": "post-production-approved-v1",
+        "verified": true,
+        "billing_mode": "subscription_included",
+        "provider_reported": false
+      },
+      "artifact": {
+        "kind": "dialogue_segment",
+        "sha256": "b77ae37440ac2ac535e3fc8e01c430d39a255561e3cff8f61da62289f989adb0",
+        "uri": "cas://sha256/b77ae37440ac2ac535e3fc8e01c430d39a255561e3cff8f61da62289f989adb0",
+        "mediaType": "audio/mpeg",
+        "sizeBytes": 32493,
+        "durationMillis": 4056
+      },
+      "evidence": "live_provider_call"
+    }
+  ]
+}

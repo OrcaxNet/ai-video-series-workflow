@@ -26,7 +26,10 @@ import (
 const (
 	idempotencyTTL  = 24 * time.Hour
 	workflowStepTTL = 90 * 24 * time.Hour
-	maxTxAttempts   = 3
+	// Ten paid candidates may contend on one approval in the frozen MVP.
+	// Keep one retry per admissible winner plus room for the final domain
+	// budget decision; exhaustion is still mapped to a stable conflict.
+	maxTxAttempts   = 12
 	defaultMaxConns = 20
 	defaultMinConns = 2
 )
@@ -121,7 +124,20 @@ func (p *Postgres) ValidateWorkerUpgradeReadiness(ctx context.Context) error {
 		  'RECONCILING', 'REQUIRES_ACTION', 'CANCEL_REQUESTED', 'PAUSED'
 		)
 		  AND (
-		    ps.compiler_version <> 'control-plane-compiler-v1'
+		    ps.compiler_version NOT IN ('control-plane-compiler-v1', 'stage1-product-input-v1')
+		    OR (
+		      ps.compiler_version = 'stage1-product-input-v1'
+		      AND NOT EXISTS (
+		        SELECT 1
+		        FROM video_pipeline.audit_events imported
+		        WHERE imported.action = 'prompt_snapshot.imported'
+		          AND imported.aggregate_type = 'PROMPT_SNAPSHOT'
+		          AND imported.aggregate_id = ps.id
+		          AND imported.payload->>'derivedPromptHash' = ps.content_hash
+		          AND imported.payload->>'inputPackageHash' ~ '^[0-9a-f]{64}$'
+		          AND imported.payload->>'originalPromptHash' ~ '^[0-9a-f]{64}$'
+		      )
+		    )
 		    OR ps.output_spec = '{}'::jsonb
 		    OR ps.input_revision_hashes = '{}'::jsonb
 		    OR (
@@ -1133,6 +1149,15 @@ func (p *Postgres) CreateGenerationRun(
 	if err != nil {
 		return controlplane.Stored[controlplane.Operation]{}, controlplane.NewNotFoundError("shot", shotIDRaw)
 	}
+	budgetApprovalID, err := uuid.Parse(command.BudgetApprovalID)
+	if err != nil {
+		return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"budgetApprovalId is invalid",
+			"use the exact approved budget decision",
+		)
+	}
+	canonicalBudgetApprovalID := budgetApprovalID.String()
 	runID := uuid.New()
 	attemptID := uuid.New()
 	operationID := uuid.New()
@@ -1278,7 +1303,7 @@ func (p *Postgres) CreateGenerationRun(
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 		if err := requireBudgetApproval(
-			ctx, tx, command.BudgetApprovalID, seriesID, episodeID,
+			ctx, tx, canonicalBudgetApprovalID, seriesID, episodeID,
 			command.GenerationPlanID, "VIDEO", planRecord.BudgetLimit,
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
@@ -1325,7 +1350,7 @@ func (p *Postgres) CreateGenerationRun(
 				 trace_id, created_by, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, 'VALIDATED', NULLIF($8, ''), false, $9, $10, $11, $12)`,
 			runID, shotSpecID, promptID, profileID, workflowID, runDigest, command.CreativeAttempt,
-			command.FallbackReasonCode, command.BudgetApprovalID, traceID, command.Actor.ActorID, now,
+			command.FallbackReasonCode, canonicalBudgetApprovalID, traceID, command.Actor.ActorID, now,
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, translateWriteError("insert generation run", err)
 		}
@@ -2304,14 +2329,26 @@ func withSerializable[T any](ctx context.Context, pool *pgxpool.Pool, fn func(pg
 		value, runErr := fn(tx)
 		if runErr != nil {
 			_ = tx.Rollback(ctx)
-			if retryableTransaction(runErr) && attempt < maxTxAttempts {
-				continue
+			if retryableTransaction(runErr) {
+				if attempt < maxTxAttempts {
+					continue
+				}
+				return zero, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"transaction contention did not converge after bounded retries",
+				)
 			}
 			return zero, runErr
 		}
 		if err := tx.Commit(ctx); err != nil {
-			if retryableTransaction(err) && attempt < maxTxAttempts {
-				continue
+			if retryableTransaction(err) {
+				if attempt < maxTxAttempts {
+					continue
+				}
+				return zero, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"transaction contention did not converge after bounded retries",
+				)
 			}
 			return zero, fmt.Errorf("commit serializable transaction: %w", err)
 		}
@@ -2779,6 +2816,39 @@ func requireBudgetApproval(
 	budgetScope string,
 	required controlplane.BudgetLimit,
 ) error {
+	return requireBudgetApprovalWithLock(
+		ctx, tx, approvalIDRaw, seriesID, episodeID,
+		generationPlanIDRaw, budgetScope, required, false,
+	)
+}
+
+func requireBudgetApprovalForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	approvalIDRaw string,
+	seriesID uuid.UUID,
+	episodeID uuid.UUID,
+	generationPlanIDRaw string,
+	budgetScope string,
+	required controlplane.BudgetLimit,
+) error {
+	return requireBudgetApprovalWithLock(
+		ctx, tx, approvalIDRaw, seriesID, episodeID,
+		generationPlanIDRaw, budgetScope, required, true,
+	)
+}
+
+func requireBudgetApprovalWithLock(
+	ctx context.Context,
+	tx pgx.Tx,
+	approvalIDRaw string,
+	seriesID uuid.UUID,
+	episodeID uuid.UUID,
+	generationPlanIDRaw string,
+	budgetScope string,
+	required controlplane.BudgetLimit,
+	forUpdate bool,
+) error {
 	approvalID, err := uuid.Parse(approvalIDRaw)
 	if err != nil {
 		return controlplane.NewPolicyError(
@@ -2795,7 +2865,7 @@ func requireBudgetApproval(
 	var approvedPlanID *uuid.UUID
 	var approvedScope, approvedCurrency *string
 	var approvedMicros *int64
-	if err := tx.QueryRow(ctx, `
+	const sharedApprovalQuery = `
 		SELECT state, generation_plan_id, budget_scope,
 		       budget_limit_micros, budget_currency
 		FROM video_pipeline.review_tasks
@@ -2803,7 +2873,21 @@ func requireBudgetApproval(
 		  AND review_type = 'BUDGET'
 		  AND series_id = $2
 		  AND (episode_id IS NULL OR episode_id = $3)
-		FOR SHARE`,
+		FOR SHARE`
+	const exclusiveApprovalQuery = `
+		SELECT state, generation_plan_id, budget_scope,
+		       budget_limit_micros, budget_currency
+		FROM video_pipeline.review_tasks
+		WHERE id = $1
+		  AND review_type = 'BUDGET'
+		  AND series_id = $2
+		  AND (episode_id IS NULL OR episode_id = $3)
+		FOR UPDATE`
+	approvalQuery := sharedApprovalQuery
+	if forUpdate {
+		approvalQuery = exclusiveApprovalQuery
+	}
+	if err := tx.QueryRow(ctx, approvalQuery,
 		approvalID, seriesID, episodeID,
 	).Scan(
 		&state, &approvedPlanID, &approvedScope, &approvedMicros, &approvedCurrency,

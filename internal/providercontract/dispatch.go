@@ -261,6 +261,11 @@ type Cost struct {
 	Currency        string `json:"currency"`
 	PricingVersion  string `json:"pricing_version"`
 	Verified        bool   `json:"verified"`
+	// BillingMode distinguishes a metered charge from a request included in a
+	// prepaid subscription. ProviderReported is false when the provider returns
+	// usage units but no per-task monetary amount.
+	BillingMode      string `json:"billing_mode,omitempty"`
+	ProviderReported bool   `json:"provider_reported"`
 }
 
 // JobRequest is the secret-free control-plane-to-adapter envelope. Simulation
@@ -318,6 +323,8 @@ type JobResponse struct {
 	RunID          string        `json:"run_id"`
 	UpstreamTaskID string        `json:"upstream_task_id"`
 	RequestID      string        `json:"request_id"`
+	ConnectID      string        `json:"connect_id,omitempty"`
+	LogID          string        `json:"log_id,omitempty"`
 	State          JobStatus     `json:"state"`
 	Progress       int           `json:"progress"`
 	Model          ModelSnapshot `json:"model_snapshot"`

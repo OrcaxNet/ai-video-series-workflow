@@ -52,9 +52,13 @@ type CancelProviderJobInput struct {
 }
 
 type CancelProviderResult struct {
-	State          string `json:"state"`
-	UpstreamTaskID string `json:"upstreamTaskId,omitempty"`
-	ErrorCode      string `json:"errorCode,omitempty"`
+	State          string                 `json:"state"`
+	NoRemoteTask   bool                   `json:"noRemoteTask,omitempty"`
+	UpstreamTaskID string                 `json:"upstreamTaskId,omitempty"`
+	RequestID      string                 `json:"requestId,omitempty"`
+	Usage          providercontract.Usage `json:"usage"`
+	Cost           providercontract.Cost  `json:"cost"`
+	ErrorCode      string                 `json:"errorCode,omitempty"`
 }
 
 type FinalizeShotRunInput struct {
@@ -185,15 +189,19 @@ func ShotProductionWorkflow(
 				State: cancelled.State, Run: input.Run,
 			}, workflowCancellationError(ctx, err)
 		}
-		if finalizeErr := finalizeShot(ctx, options, FinalizeShotRunInput{
-			OperationID: input.OperationID, RunID: input.Run.RunID, State: "FAILED",
-			FailureClass: "INFRASTRUCTURE", FailureCode: "PROVIDER_EXECUTION_FAILED",
-			TraceID: input.TraceID,
-		}); finalizeErr != nil {
-			return ShotProductionResult{State: "FAILED", Run: input.Run},
-				fmt.Errorf("finalize provider failure: %w", finalizeErr)
+		// Submit/poll failures are not proof that the upstream task failed. Keep
+		// reconciling the stable JobID until the adapter proves absence, confirms
+		// cancellation, or returns a terminal result with exact cost evidence.
+		// This path deliberately never calls FinalizeShotRun(FAILED), because
+		// doing so would release a task that may still be running and billable.
+		reconciled, reconcileErr := reconcileProviderExecutionFailure(
+			ctx, input, dispatch,
+		)
+		if reconcileErr != nil {
+			return ShotProductionResult{State: "RECONCILING", Run: input.Run},
+				fmt.Errorf("reconcile provider execution failure: %w", reconcileErr)
 		}
-		status.State = "FAILED"
+		status.State = reconciled.State
 		return ShotProductionResult{State: status.State, Run: input.Run}, err
 	}
 	shot.ArtifactDigest = generated.ArtifactDigest
@@ -302,6 +310,31 @@ func ShotProductionWorkflow(
 	}
 	status.State = "SUCCEEDED"
 	return ShotProductionResult{State: status.State, Run: input.Run, Provider: generated, QC: qc}, nil
+}
+
+func reconcileProviderExecutionFailure(
+	ctx workflow.Context,
+	input ShotProductionInput,
+	dispatch ExecuteProviderJobInput,
+) (CancelProviderResult, error) {
+	options := workflow.ActivityOptions{
+		StartToCloseTimeout: 2 * time.Minute,
+		HeartbeatTimeout:    20 * time.Second,
+		RetryPolicy: &temporal.RetryPolicy{
+			InitialInterval: time.Second, BackoffCoefficient: 2,
+			MaximumInterval: 30 * time.Second, MaximumAttempts: 0,
+		},
+	}
+	var result CancelProviderResult
+	err := workflow.ExecuteActivity(
+		workflow.WithActivityOptions(ctx, options),
+		ActivityCancelProviderJob,
+		CancelProviderJobInput{
+			OperationID: input.OperationID, Dispatch: dispatch,
+			ReasonCode: "RECONCILE_HISTORY", TraceID: input.TraceID,
+		},
+	).Get(ctx, &result)
+	return result, err
 }
 
 func executeProviderWithControls(
