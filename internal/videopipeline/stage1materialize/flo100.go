@@ -980,6 +980,9 @@ func materializeFormalDB(
 		return nil, errors.New("partial FLO-100 formal materialization exists; refusing an ambiguous replay")
 	}
 	if existingCount == 3 {
+		if err := verifyFormalProjectionSeal(ctx, tx, prepared, objects); err != nil {
+			return nil, err
+		}
 		packages, err := loadFormalReplay(ctx, tx, prepared)
 		if err != nil {
 			return nil, err
@@ -1159,6 +1162,9 @@ func materializeFormalDB(
 		}
 		packages = append(packages, package_)
 	}
+	if err := sealFormalProjection(ctx, tx, prepared, approval, objects, now); err != nil {
+		return nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
@@ -1230,8 +1236,14 @@ func materializeFormalBatch(
 		VALUES ($1,$2,$3,1,'DRAFT',$4,$5,$6)`, sceneRevisionID, sceneID, episodeRevisionID, sceneHash, batch.product.Contexts.Scene, createdBy); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
-	scriptHash, _ := digest(map[string]any{"dialogue": batch.product.Dialogue, "shots": batch.product.Shots, "productInputHash": batch.product.ContentHash})
-	storyboardHash, _ := digest(map[string]any{"scriptHash": scriptHash, "shots": batch.product.Shots, "productInputHash": batch.product.ContentHash})
+	scriptHash, err := digest(map[string]any{"dialogue": batch.product.Dialogue, "shots": batch.product.Shots, "productInputHash": batch.product.ContentHash})
+	if err != nil {
+		return stage1.ExecutionPackage{}, fmt.Errorf("hash %s script: %w", batchID, err)
+	}
+	storyboardHash, err := digest(map[string]any{"scriptHash": scriptHash, "shots": batch.product.Shots, "productInputHash": batch.product.ContentHash})
+	if err != nil {
+		return stage1.ExecutionPackage{}, fmt.Errorf("hash %s storyboard: %w", batchID, err)
+	}
 	if err := exec("formal script", `INSERT INTO video_pipeline.episode_script_revisions
 		(id,episode_id,revision,status,schema_version,payload,content_hash,created_by)
 		VALUES ($1,$2,1,'DRAFT','flo100.script.v1',$3,$4,$5)`, scriptID, episodeID,
@@ -1313,13 +1325,19 @@ func materializeFormalBatch(
 		shotID := formalUUID("shot:" + shot.ShotSpecRevisionID)
 		shotContextID := formalUUID("context:shot:" + shot.ShotSpecRevisionID)
 		effectiveContextID := formalUUID("effective-context:" + shot.ShotSpecRevisionID)
-		shotContextHash, _ := digest(map[string]any{"shot": shot, "productInputHash": batch.product.ContentHash})
+		shotContextHash, err := digest(map[string]any{"shot": shot, "productInputHash": batch.product.ContentHash})
+		if err != nil {
+			return stage1.ExecutionPackage{}, fmt.Errorf("hash %s context: %w", shot.ShotID, err)
+		}
 		contexts := []uuid.UUID{seriesContextID, episodeContextID, sceneContextID, shotContextID}
 		contextHashes := map[string]string{
 			"context:series": shot.ContextHashes["series"], "context:episode": shot.ContextHashes["episode"],
 			"context:scene": shot.ContextHashes["scene"], "context:shot": shotContextHash,
 		}
-		effectiveHash, _ := digest(map[string]any{"contextRevisionIds": contexts, "contextHashes": contextHashes, "productInputHash": batch.product.ContentHash})
+		effectiveHash, err := digest(map[string]any{"contextRevisionIds": contexts, "contextHashes": contextHashes, "productInputHash": batch.product.ContentHash})
+		if err != nil {
+			return stage1.ExecutionPackage{}, fmt.Errorf("hash %s effective context: %w", shot.ShotID, err)
+		}
 		assetIDs := make([]uuid.UUID, len(shot.AssetVersionIDs))
 		inputHashes := map[string]string{
 			"shot_spec": shot.ContentHash, "generation_profile": profileHash,
@@ -1597,6 +1615,225 @@ func loadFormalReplay(ctx context.Context, tx pgx.Tx, prepared preparedFormal) (
 	return packages, nil
 }
 
+type formalProjectionSection struct {
+	Name string            `json:"name"`
+	Rows []json.RawMessage `json:"rows"`
+}
+
+type formalProjectionSnapshot struct {
+	SchemaVersion      string                    `json:"schemaVersion"`
+	OfflinePackageHash string                    `json:"offlinePackageHash"`
+	Sections           []formalProjectionSection `json:"sections"`
+}
+
+type formalProjectionSectionSpec struct {
+	name     string
+	expected int
+	query    string
+	args     []any
+}
+
+func sealFormalProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	prepared preparedFormal,
+	approval Approval,
+	objects map[string]artifactstore.Artifact,
+	now time.Time,
+) error {
+	projectionHash, err := formalProjectionHash(ctx, tx, prepared, objects)
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO video_pipeline.audit_events
+		(id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload)
+		VALUES ($1,$2,$3,'ADMIN','flo100.formal_projection.sealed','SERIES',$4,
+			'FLO100_FORMAL_PROJECTION_V1','flo100-formal-projection',$5)`,
+		formalUUID("audit:projection-seal"), now, approval.ActorID, formalUUID("series"), map[string]any{
+			"schemaVersion":      "flo100.formal-projection.v1",
+			"sourceCodeCommit":   formalSourceCommit,
+			"offlinePackageHash": prepared.manifest.ContentHash,
+			"approvalCommentId":  approval.CommentID,
+			"projectionHash":     projectionHash,
+		}); err != nil {
+		return fmt.Errorf("seal FLO-100 formal projection: %w", err)
+	}
+	return nil
+}
+
+func verifyFormalProjectionSeal(
+	ctx context.Context,
+	tx pgx.Tx,
+	prepared preparedFormal,
+	objects map[string]artifactstore.Artifact,
+) error {
+	var sealCount int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.audit_events
+		WHERE action='flo100.formal_projection.sealed'
+		  AND aggregate_type='SERIES' AND aggregate_id=$1
+		  AND reason_code='FLO100_FORMAL_PROJECTION_V1'`, formalUUID("series")).Scan(&sealCount); err != nil {
+		return fmt.Errorf("count FLO-100 formal projection seals: %w", err)
+	}
+	if sealCount != 1 {
+		return fmt.Errorf("formal projection drift: expected exactly one immutable projection seal, got %d", sealCount)
+	}
+	var actorID, actorRole, traceID string
+	var payload struct {
+		SchemaVersion      string `json:"schemaVersion"`
+		SourceCodeCommit   string `json:"sourceCodeCommit"`
+		OfflinePackageHash string `json:"offlinePackageHash"`
+		ApprovalCommentID  string `json:"approvalCommentId"`
+		ProjectionHash     string `json:"projectionHash"`
+	}
+	if err := tx.QueryRow(ctx, `SELECT actor_id,actor_role,trace_id,payload
+		FROM video_pipeline.audit_events
+		WHERE id=$1 AND action='flo100.formal_projection.sealed'
+		  AND aggregate_type='SERIES' AND aggregate_id=$2
+		  AND reason_code='FLO100_FORMAL_PROJECTION_V1'`,
+		formalUUID("audit:projection-seal"), formalUUID("series")).Scan(&actorID, &actorRole, &traceID, &payload); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errors.New("formal projection drift: deterministic projection seal is missing or rebound")
+		}
+		return fmt.Errorf("load FLO-100 formal projection seal: %w", err)
+	}
+	if actorID != prepared.manifest.ScopeAuthorizationActorID || actorRole != "ADMIN" ||
+		traceID != "flo100-formal-projection" || payload.SchemaVersion != "flo100.formal-projection.v1" ||
+		payload.SourceCodeCommit != formalSourceCommit || payload.OfflinePackageHash != prepared.manifest.ContentHash ||
+		payload.ApprovalCommentID != prepared.manifest.ScopeAuthorizationCommentID || !validFormalDigest(payload.ProjectionHash) {
+		return errors.New("formal projection drift: projection seal identity differs from the frozen authorization")
+	}
+	projectionHash, err := formalProjectionHash(ctx, tx, prepared, objects)
+	if err != nil {
+		return err
+	}
+	if projectionHash != payload.ProjectionHash {
+		return fmt.Errorf("formal projection drift: current PostgreSQL projection hash %s differs from sealed %s", projectionHash, payload.ProjectionHash)
+	}
+	return nil
+}
+
+func formalProjectionHash(
+	ctx context.Context,
+	tx pgx.Tx,
+	prepared preparedFormal,
+	objects map[string]artifactstore.Artifact,
+) (string, error) {
+	seriesID := formalUUID("series")
+	providerProfileIDs := []uuid.UUID{
+		formalUUID("provider-profile:video"),
+		formalUUID("provider-profile:speech"),
+		formalUUID("provider-profile:offline-renderer"),
+	}
+	capabilityIDs := []uuid.UUID{
+		formalUUID("capability:video:" + formalVideoHash),
+		formalUUID("capability:speech:" + formalSpeechHash),
+		formalUUID("capability:image:" + formalRendererHash),
+	}
+	generationProfileIDs := make([]uuid.UUID, 0, len(prepared.batches))
+	decisionIDs := []uuid.UUID{formalUUID("gate:g1:all-assets")}
+	licenseIDs := make([]uuid.UUID, 0, len(prepared.assets.Versions))
+	expectedApprovalBindings := len(prepared.assets.Versions)
+	expectedPromptAssets := 0
+	for _, asset := range prepared.assets.Versions {
+		licenseIDs = append(licenseIDs, mustUUID(asset.License.SnapshotID))
+	}
+	for _, batch := range prepared.batches {
+		generationProfileIDs = append(generationProfileIDs, formalUUID("generation-profile:"+batch.product.BatchID))
+		decisionIDs = append(decisionIDs,
+			formalUUID("gate:g2:"+batch.product.BatchID),
+			formalUUID("gate:safety:"+batch.product.BatchID),
+		)
+		expectedApprovalBindings += len(batch.assetVersionIDs) + 23
+		for _, shot := range batch.product.Shots {
+			expectedPromptAssets += len(shot.AssetVersionIDs)
+		}
+	}
+	artifactHashSet := make(map[string]struct{}, len(objects))
+	for _, object := range objects {
+		artifactHashSet[object.Digest] = struct{}{}
+	}
+	artifactHashes := make([]string, 0, len(artifactHashSet))
+	for digest := range artifactHashSet {
+		artifactHashes = append(artifactHashes, digest)
+	}
+	sort.Strings(artifactHashes)
+
+	sections := []formalProjectionSectionSpec{
+		{"artifacts", len(artifactHashes), `SELECT to_jsonb(a) FROM video_pipeline.artifacts a WHERE content_hash=ANY($1) ORDER BY content_hash`, []any{artifactHashes}},
+		{"provider_profiles", 3, `SELECT to_jsonb(p) FROM video_pipeline.provider_profiles p WHERE id=ANY($1) ORDER BY id`, []any{providerProfileIDs}},
+		{"provider_capabilities", 3, `SELECT to_jsonb(c) FROM video_pipeline.provider_capability_snapshots c WHERE id=ANY($1) ORDER BY id`, []any{capabilityIDs}},
+		{"generation_profiles", 3, `SELECT to_jsonb(g) FROM video_pipeline.generation_profiles g WHERE id=ANY($1) ORDER BY id`, []any{generationProfileIDs}},
+		{"series", 1, `SELECT to_jsonb(s) FROM video_pipeline.series s WHERE id=$1 ORDER BY id`, []any{seriesID}},
+		{"source_revisions", 3, `SELECT to_jsonb(s) FROM video_pipeline.source_revisions s WHERE series_id=$1 ORDER BY id`, []any{seriesID}},
+		{"episodes", 3, `SELECT to_jsonb(e) FROM video_pipeline.episodes e WHERE series_id=$1 ORDER BY id`, []any{seriesID}},
+		{"episode_revisions", 3, `SELECT to_jsonb(er) FROM video_pipeline.episode_revisions er JOIN video_pipeline.episodes e ON e.id=er.episode_id WHERE e.series_id=$1 ORDER BY er.id`, []any{seriesID}},
+		{"scenes", 3, `SELECT to_jsonb(s) FROM video_pipeline.scenes s JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY s.id`, []any{seriesID}},
+		{"scene_revisions", 3, `SELECT to_jsonb(sr) FROM video_pipeline.scene_revisions sr JOIN video_pipeline.scenes s ON s.id=sr.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY sr.id`, []any{seriesID}},
+		{"scripts", 3, `SELECT to_jsonb(esr) FROM video_pipeline.episode_script_revisions esr JOIN video_pipeline.episodes e ON e.id=esr.episode_id WHERE e.series_id=$1 ORDER BY esr.id`, []any{seriesID}},
+		{"storyboards", 3, `SELECT to_jsonb(sr) FROM video_pipeline.storyboard_revisions sr JOIN video_pipeline.episodes e ON e.id=sr.episode_id WHERE e.series_id=$1 ORDER BY sr.id`, []any{seriesID}},
+		{"contexts", 37, `SELECT to_jsonb(c) FROM video_pipeline.context_revisions c WHERE series_id=$1 ORDER BY id`, []any{seriesID}},
+		{"approval_decisions", 7, `SELECT to_jsonb(d) FROM video_pipeline.approval_decisions d WHERE series_id=$1 ORDER BY id`, []any{seriesID}},
+		{"approval_bindings", expectedApprovalBindings, `SELECT to_jsonb(b) FROM video_pipeline.approval_bindings b WHERE decision_id=ANY($1) ORDER BY decision_id,object_type,revision_id`, []any{decisionIDs}},
+		{"license_snapshots", 8, `SELECT to_jsonb(l) FROM video_pipeline.license_snapshots l WHERE id=ANY($1) ORDER BY id`, []any{licenseIDs}},
+		{"assets", 8, `SELECT to_jsonb(a) FROM video_pipeline.assets a WHERE series_id=$1 ORDER BY id`, []any{seriesID}},
+		{"asset_versions", 8, `SELECT to_jsonb(av) FROM video_pipeline.asset_versions av JOIN video_pipeline.assets a ON a.id=av.asset_id WHERE a.series_id=$1 ORDER BY av.id`, []any{seriesID}},
+		{"shots", 30, `SELECT to_jsonb(sh) FROM video_pipeline.shots sh JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY sh.id`, []any{seriesID}},
+		{"shot_specs", 30, `SELECT to_jsonb(ssr) FROM video_pipeline.shot_spec_revisions ssr JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY ssr.id`, []any{seriesID}},
+		{"effective_contexts", 30, `SELECT to_jsonb(ecs) FROM video_pipeline.effective_context_snapshots ecs JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ecs.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY ecs.id`, []any{seriesID}},
+		{"prompts", 30, `SELECT to_jsonb(ps) FROM video_pipeline.prompt_snapshots ps JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY ps.id`, []any{seriesID}},
+		{"prompt_inputs", 180, `SELECT to_jsonb(psi) FROM video_pipeline.prompt_snapshot_inputs psi JOIN video_pipeline.prompt_snapshots ps ON ps.id=psi.prompt_snapshot_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY psi.prompt_snapshot_id,psi.input_type,psi.dependency_role`, []any{seriesID}},
+		{"prompt_assets", expectedPromptAssets, `SELECT to_jsonb(psa) FROM video_pipeline.prompt_snapshot_assets psa JOIN video_pipeline.prompt_snapshots ps ON ps.id=psa.prompt_snapshot_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY psa.prompt_snapshot_id,psa.alias`, []any{seriesID}},
+		{"runs", 30, `SELECT to_jsonb(gr) FROM video_pipeline.generation_runs gr JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY gr.id`, []any{seriesID}},
+		{"attempts", 30, `SELECT to_jsonb(ga) FROM video_pipeline.generation_attempts ga JOIN video_pipeline.generation_runs gr ON gr.id=ga.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY ga.id`, []any{seriesID}},
+		{"operation_requests", 3, `SELECT to_jsonb(o) FROM video_pipeline.operation_requests o WHERE aggregate_id=$1 AND operation_type='CREATE_GENERATION_PLAN' ORDER BY id`, []any{seriesID}},
+		{"idempotency_records", 3, `SELECT to_jsonb(i) FROM video_pipeline.idempotency_records i WHERE scope='flo100-formal-materialize' ORDER BY idempotency_key`, nil},
+		{"budget_reviews", 6, `SELECT to_jsonb(r) FROM video_pipeline.review_tasks r WHERE series_id=$1 AND review_type='BUDGET' ORDER BY id`, []any{seriesID}},
+		{"formal_audits", 66, `SELECT to_jsonb(a) FROM video_pipeline.audit_events a WHERE reason_code='FLO100_FORMAL_OFFLINE_V1' ORDER BY id`, nil},
+		{"provider_jobs", 0, `SELECT to_jsonb(pj) FROM video_pipeline.provider_jobs pj JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id JOIN video_pipeline.generation_runs gr ON gr.id=ga.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY pj.id`, []any{seriesID}},
+		{"budget_reservations", 0, `SELECT to_jsonb(br) FROM video_pipeline.budget_reservations br JOIN video_pipeline.generation_runs gr ON gr.id=br.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY br.id`, []any{seriesID}},
+		{"cost_ledger", 0, `SELECT to_jsonb(cl) FROM video_pipeline.cost_ledger cl JOIN video_pipeline.provider_jobs pj ON pj.id=cl.provider_job_id JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id JOIN video_pipeline.generation_runs gr ON gr.id=ga.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY cl.id`, []any{seriesID}},
+	}
+	snapshot := formalProjectionSnapshot{
+		SchemaVersion: "flo100.formal-projection.v1", OfflinePackageHash: prepared.manifest.ContentHash,
+		Sections: make([]formalProjectionSection, 0, len(sections)),
+	}
+	for _, section := range sections {
+		rows, err := queryFormalProjectionRows(ctx, tx, section.query, section.args...)
+		if err != nil {
+			return "", fmt.Errorf("read formal projection section %s: %w", section.name, err)
+		}
+		if len(rows) != section.expected {
+			return "", fmt.Errorf("formal projection drift: section %s has %d rows, expected %d", section.name, len(rows), section.expected)
+		}
+		snapshot.Sections = append(snapshot.Sections, formalProjectionSection{Name: section.name, Rows: rows})
+	}
+	projectionHash, err := digest(snapshot)
+	if err != nil {
+		return "", fmt.Errorf("hash FLO-100 formal projection: %w", err)
+	}
+	return projectionHash, nil
+}
+
+func queryFormalProjectionRows(ctx context.Context, tx pgx.Tx, query string, args ...any) ([]json.RawMessage, error) {
+	rows, err := tx.Query(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	payloads := make([]json.RawMessage, 0)
+	for rows.Next() {
+		var payload json.RawMessage
+		if err := rows.Scan(&payload); err != nil {
+			return nil, err
+		}
+		payloads = append(payloads, append(json.RawMessage(nil), payload...))
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return payloads, nil
+}
+
 func verifyFormal(
 	ctx context.Context,
 	pool *pgxpool.Pool,
@@ -1605,6 +1842,14 @@ func verifyFormal(
 	packages []stage1.ExecutionPackage,
 	objects map[string]artifactstore.Artifact,
 ) (FormalReport, error) {
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return FormalReport{}, err
+	}
+	defer tx.Rollback(ctx)
+	if err := verifyFormalProjectionSeal(ctx, tx, prepared, objects); err != nil {
+		return FormalReport{}, err
+	}
 	if len(packages) != 3 {
 		return FormalReport{}, errors.New("formal materialization did not seal all three packages")
 	}
@@ -1625,7 +1870,7 @@ func verifyFormal(
 	}
 	for name, query := range queries {
 		var count int64
-		if err := pool.QueryRow(ctx, query, seriesID).Scan(&count); err != nil {
+		if err := tx.QueryRow(ctx, query, seriesID).Scan(&count); err != nil {
 			return FormalReport{}, err
 		}
 		counts[name] = count
@@ -1641,7 +1886,7 @@ func verifyFormal(
 		}
 	}
 	var providerJobs, reservations, cost int64
-	if err := pool.QueryRow(ctx, `
+	if err := tx.QueryRow(ctx, `
 		WITH package_attempts AS (
 			SELECT id FROM video_pipeline.generation_attempts WHERE generation_run_id=ANY($1)
 		), package_jobs AS (
@@ -1683,6 +1928,9 @@ func verifyFormal(
 			AssetVersionIDs:       append([]string(nil), batch.assetVersionIDs...),
 			IntentIdempotencyKeys: intentKeys, LiveProviderSubmit: "DENIED",
 		})
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return FormalReport{}, err
 	}
 	return report, nil
 }

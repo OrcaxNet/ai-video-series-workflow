@@ -37,7 +37,7 @@ The output directory contains:
 - `flo100-gold-b-v1.execution-package.json`
 - `flo100-gold-c-v1.execution-package.json`
 
-Re-running the same command performs an identity-checked replay. A partial prior materialization, changed package, approval drift, duplicate/missing asset or shot, route/budget drift, or any paid-boundary record fails closed.
+Re-running the same command performs an identity-checked replay. The first materialization seals a canonical hash of every frozen PostgreSQL projection in an immutable audit event. Replay and report generation both recompute that hash in a serializable read-only snapshot before returning data. The seal covers provider profiles and capabilities, generation profiles, assets/CAS/licenses and approval bindings, all gate and budget reviews, every shot/prompt/run/attempt and related audit, plus the absence of Provider jobs, reservations, and cost entries. A partial prior materialization, changed package, approval drift, duplicate/missing row, any field-level route/budget/asset/gate drift, or any paid-boundary record fails closed.
 
 ## Independent integration gate
 
@@ -47,4 +47,4 @@ VIDEO_TEST_FLO100_PACK_PATH='./FLO-100-stage3-offline-pack-v1' \
 make video-flo100-materialize-integration-test
 ```
 
-The test asserts the fresh materialization, replay stability, 3/30/8 counts, 30 intent idempotency keys, tamper rejection without a durable side effect, and zero Provider jobs/reservations/cost entries.
+The test asserts the fresh materialization, replay stability, 3/30/8 counts, 30 intent idempotency keys, tamper rejection without a durable side effect, and zero Provider jobs/reservations/cost entries. It also commits and restores three negative SQL probes—enabling the video profile for live use, raising the GOLD-A budget, and approving an asset while G1 remains returned—and requires each replay to fail without emitting a package, report, or durable audit.
