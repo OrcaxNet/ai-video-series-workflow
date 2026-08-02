@@ -33,6 +33,7 @@ import (
 const (
 	maxResolvedProviderAssetBytes = 20 << 20
 	maxSpeechVoiceDescriptorBytes = 64 << 10
+	speechDurationToleranceMillis = int64(250)
 )
 
 var errProviderJobIntentExists = errors.New("provider job intent already exists")
@@ -41,7 +42,16 @@ type jobRecord struct {
 	RequestHash     string                       `json:"request_hash"`
 	Expected        providercontract.OutputSpec  `json:"expected_output"`
 	Response        providercontract.JobResponse `json:"response"`
+	SpeechDuration  *speechDurationQC            `json:"speech_duration_qc,omitempty"`
 	Reconciliations []speechReconciliation       `json:"speech_reconciliations,omitempty"`
+}
+
+type speechDurationQC struct {
+	RequestedMillis int64  `json:"requested_millis"`
+	MeasuredMillis  int64  `json:"measured_millis"`
+	DeltaMillis     int64  `json:"delta_millis"`
+	ToleranceMillis int64  `json:"tolerance_millis"`
+	State           string `json:"state"`
 }
 
 type speechReconciliation struct {
@@ -380,6 +390,10 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		intent.Response = response
+		intent.SpeechDuration = newSpeechDurationQC(
+			int64(request.Request.Output.DurationMillis),
+			response.Artifacts[0].DurationMillis,
+		)
 		if err := s.updateRecord(request.JobID, intent); err != nil {
 			writeProviderError(w, err)
 			return
@@ -1149,6 +1163,14 @@ func (s *Server) synthesizeSpeech(
 	if err != nil {
 		return response, safeError(providercontract.CodeUnavailable, "Agent Plan TTS audio could not be committed to CAS", true)
 	}
+	measured, err := s.inspector.Inspect(ctx, committed.Path)
+	if err != nil || validateMeasuredSpeech(measured, request.Request.Output) != nil {
+		return response, safeError(
+			providercontract.CodeUnavailable,
+			"Agent Plan TTS audio failed media inspection and requires operator reconciliation",
+			false,
+		)
+	}
 	response = providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		UpstreamTaskID: result.ConnectID, RequestID: result.RequestID,
@@ -1159,11 +1181,39 @@ func (s *Server) synthesizeSpeech(
 			Kind: providercontract.ModalityAudio, Role: providercontract.AssetRoleOutput,
 			URI: committed.URI, SHA256: committed.Digest,
 			LicenseReference: "request-license-manifest", MediaType: result.MediaType,
-			SizeBytes: committed.Size, DurationMillis: int64(request.Request.Output.DurationMillis),
+			SizeBytes: committed.Size, DurationMillis: measured.DurationMillis,
 		}},
 		Usage: usage, Cost: s.subscriptionCost(request),
 	}
 	return response, nil
+}
+
+func newSpeechDurationQC(requested, measured int64) *speechDurationQC {
+	delta := measured - requested
+	if delta < 0 {
+		delta = -delta
+	}
+	state := "passed"
+	if requested <= 0 || measured <= 0 || delta > speechDurationToleranceMillis {
+		state = "requires_adjustment"
+	}
+	return &speechDurationQC{
+		RequestedMillis: requested,
+		MeasuredMillis:  measured,
+		DeltaMillis:     delta,
+		ToleranceMillis: speechDurationToleranceMillis,
+		State:           state,
+	}
+}
+
+func validateMeasuredSpeech(measured MediaSpec, expected providercontract.OutputSpec) error {
+	if measured.DurationMillis <= 0 || measured.Width != 0 || measured.Height != 0 || measured.FPS != 0 {
+		return errors.New("speech media inspection did not return an audio-only duration")
+	}
+	if expected.Format != "" && measured.Format != expected.Format {
+		return errors.New("speech media format differs from the frozen output specification")
+	}
+	return nil
 }
 
 func (s *Server) subscriptionCost(request providercontract.JobRequest) providercontract.Cost {

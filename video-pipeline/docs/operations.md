@@ -177,6 +177,20 @@ Adapter 在返回成功前使用 ffprobe 实测分辨率/FPS/时长并提交 CAS
 成本记录为 `subscription_included`、实际增量 `0 CNY`、
 `provider_reported=false`，不得伪造按次价格。
 
+Speech 成功路径同样以 CAS 中的真实音频为准：Adapter 在写入成功 registry 前用
+ffprobe 校验音频格式并实测时长，返回 artifact、后续字幕/Manifest 和恢复均使用
+实测值。请求中的 cue 时长只保留在 `expected_output`；registry 另外记录
+`speech_duration_qc` 的请求值、实测值、绝对偏差、250ms 门限和 QC 状态。探测失败
+会进入不可自动重试的 `requires_action`，避免已经获得音频后再次付费提交。
+
+历史错误证据不得原地修改。`go run ./cmd/video-speech-evidence-correction`
+是纯离线追加工具：它逐一核验旧 provider registry、Stage 1 ledger、音频 CAS 和
+runtime SBOM 的固定 SHA，重新测量音频，再以 create-if-absent 方式写 correction；
+完全相同的重放幂等，冲突内容失败关闭。若旧 SBOM 只列出了候选镜像、没有把具体
+request/job 绑定到实际 Adapter/Worker 实例，correction 必须明确标记
+`requestInstanceBinding=unverifiable` 和
+`evidenceClassification=model_availability_only`，不得把镜像清单冒充执行证明。
+
 Adapter 会先把不含 prompt/Secret/URL 的提交意图原子写入共享 CAS volume 下的
 `provider-jobs/`，再调用远端；重启后以同一 `jobId` 重放已知 task/result。若进程
 在远端接收与 task ID 落盘之间崩溃，记录转为需人工对账且绝不自动重提，避免重复

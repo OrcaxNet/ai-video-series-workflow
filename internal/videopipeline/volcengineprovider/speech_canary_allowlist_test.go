@@ -33,7 +33,7 @@ func TestSpeechV2RequiresConfiguredCanaryAllowlist(t *testing.T) {
 	cfg.SpeechCanaryMaximumCashMicros = 0
 
 	speech := &fakeSpeechSynthesizer{}
-	server, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	server, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -157,7 +157,7 @@ func TestSpeechV2CanaryAllowlistContract(t *testing.T) {
 			storeSpeechCanaryVoiceDescriptor(t, store, &config, &request)
 			tt.mutate(&config)
 			speech := &fakeSpeechSynthesizer{}
-			server, err := New(config, &fakeProvider{}, store, Options{Speech: speech})
+			server, err := New(config, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -253,7 +253,7 @@ func TestSpeechV2CanaryValidatesFrozenVoiceDescriptorCAS(t *testing.T) {
 			config, request := testSpeechCanaryFixture(t)
 			tt.setup(t, store, &config, &request)
 			speech := &fakeSpeechSynthesizer{}
-			server, err := New(config, &fakeProvider{}, store, Options{Speech: speech})
+			server, err := New(config, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -336,6 +338,135 @@ func (s *fakeSpeechSynthesizer) callCount() int {
 	return s.calls
 }
 
+func fakeSpeechInspector() MediaInspector {
+	return fixedInspector{spec: MediaSpec{DurationMillis: 2_000, Format: "mp3"}}
+}
+
+func generatedSpeechMP3(t *testing.T) []byte {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skip("ffmpeg is required for the decodable MP3 regression")
+	}
+	path := filepath.Join(t.TempDir(), "speech.mp3")
+	command := exec.CommandContext(
+		t.Context(),
+		"ffmpeg", "-v", "error",
+		"-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono",
+		"-t", "4.0", "-codec:a", "libmp3lame", "-b:a", "64k",
+		path,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("generate MP3 fixture: %v: %s", err, output)
+	}
+	audio, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return audio
+}
+
+// TestQATTSArtifactDurationMatchesDecodedAudio is a no-network reproduction
+// of QA-TTS-DURATION-08. The requested cue is 3700 ms, while a real MP3 is
+// independently measured from its immutable CAS bytes after synthesis.
+func TestQATTSArtifactDurationMatchesDecodedAudio(t *testing.T) {
+	audio := generatedSpeechMP3(t)
+	speech := &fakeSpeechSynthesizer{result: SpeechSynthesisResult{
+		Audio: audio, MediaType: "audio/mpeg",
+		RequestID: "qa-request-id", ConnectID: "qa-connect-id", LogID: "qa-log-id",
+		UsageTokens: 15,
+	}}
+	root := t.TempDir()
+	store, err := artifactstore.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testLiveConfig()
+	cfg.SpeechModel = AgentPlanTTSModelID
+	adapter, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+
+	request := testSpeechJobRequest(t)
+	request.Request.Output.DurationMillis = 3_700
+	created := postJob(t, server.URL, request)
+	if len(created.Artifacts) != 1 {
+		t.Fatalf("artifacts = %#v", created.Artifacts)
+	}
+	artifact := created.Artifacts[0]
+	path := filepath.Join(root, "sha256", artifact.SHA256[:2], artifact.SHA256)
+	decoded, err := (FFprobeInspector{}).Inspect(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if artifact.DurationMillis != decoded.DurationMillis {
+		t.Fatalf("artifact duration = %d ms, want decoded audio duration %d ms", artifact.DurationMillis, decoded.DurationMillis)
+	}
+	if artifact.DurationMillis-int64(request.Request.Output.DurationMillis) <= speechDurationToleranceMillis {
+		t.Fatalf("fixture did not cross the %d ms QC tolerance: requested=%d measured=%d", speechDurationToleranceMillis, request.Request.Output.DurationMillis, artifact.DurationMillis)
+	}
+	record, ok, err := adapter.loadRecord(request.JobID)
+	if err != nil || !ok {
+		t.Fatalf("load record: ok=%v err=%v", ok, err)
+	}
+	if record.Expected.DurationMillis != 3_700 || record.SpeechDuration == nil ||
+		record.SpeechDuration.RequestedMillis != 3_700 ||
+		record.SpeechDuration.MeasuredMillis != artifact.DurationMillis ||
+		record.SpeechDuration.DeltaMillis != artifact.DurationMillis-3_700 ||
+		record.SpeechDuration.ToleranceMillis != speechDurationToleranceMillis ||
+		record.SpeechDuration.State != "requires_adjustment" {
+		t.Fatalf("speech duration QC = %#v", record.SpeechDuration)
+	}
+
+	replayed := postJob(t, server.URL, request)
+	if replayed.Artifacts[0].DurationMillis != artifact.DurationMillis || speech.callCount() != 1 {
+		t.Fatalf("replay = %#v, TTS calls = %d", replayed, speech.callCount())
+	}
+	restartedSpeech := &fakeSpeechSynthesizer{}
+	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: restartedSpeech})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedHTTP := httptest.NewServer(restarted.Handler())
+	defer restartedHTTP.Close()
+	if got := postJob(t, restartedHTTP.URL, request); got.Artifacts[0].DurationMillis != artifact.DurationMillis || restartedSpeech.callCount() != 0 {
+		t.Fatalf("restart replay = %#v, new TTS calls = %d", got, restartedSpeech.callCount())
+	}
+}
+
+func TestServer_SpeechInspectionFailureRequiresActionWithoutRetry(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testLiveConfig()
+	cfg.SpeechModel = AgentPlanTTSModelID
+	speech := &fakeSpeechSynthesizer{}
+	adapter, err := New(cfg, &fakeProvider{}, store, Options{
+		Speech:    speech,
+		Inspector: fixedInspector{err: errors.New("fixture ffprobe failure")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+	request := testSpeechJobRequest(t)
+
+	if status := submitSpeechJobStatus(t, server.URL, request); status != http.StatusServiceUnavailable {
+		t.Fatalf("submit status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+	replayed := postJob(t, server.URL, request)
+	if speech.callCount() != 1 || replayed.State != providercontract.StatusRequiresAction ||
+		replayed.Error == nil || replayed.Error.Retryable || !replayed.Error.RequiresAction ||
+		len(replayed.Artifacts) != 0 {
+		t.Fatalf("replay = %#v, TTS calls = %d", replayed, speech.callCount())
+	}
+}
+
 func TestServer_SpeechSubmitCommitsCASAndReplaysWithoutSecondTTSCall(t *testing.T) {
 	t.Parallel()
 	provider := &fakeProvider{}
@@ -346,7 +477,7 @@ func TestServer_SpeechSubmitCommitsCASAndReplaysWithoutSecondTTSCall(t *testing.
 	}
 	cfg := testLiveConfig()
 	cfg.SpeechModel = AgentPlanTTSModelID
-	adapter, err := New(cfg, provider, store, Options{Speech: speech})
+	adapter, err := New(cfg, provider, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -460,8 +591,9 @@ func TestServer_SpeechRetryRequiresExactRecordAndPreservesFailure(t *testing.T) 
 			tt.configure(&cfg, digest)
 			speech := &fakeSpeechSynthesizer{}
 			adapter, err := New(cfg, &fakeProvider{}, store, Options{
-				Speech: speech,
-				Now:    func() time.Time { return time.Unix(1_800_000_000, 0).UTC() },
+				Speech:    speech,
+				Inspector: fakeSpeechInspector(),
+				Now:       func() time.Time { return time.Unix(1_800_000_000, 0).UTC() },
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -701,15 +833,17 @@ func TestQASecondReconciliationAcrossAdapterInstancesIsSingleCall(t *testing.T) 
 	cfg.SpeechRetryRecord = digest
 	speech := &fakeSpeechSynthesizer{}
 	first, err := New(cfg, &fakeProvider{}, store, Options{
-		Speech: speech,
-		Now:    func() time.Time { return time.Unix(1_800_000_100, 0).UTC() },
+		Speech:    speech,
+		Inspector: fakeSpeechInspector(),
+		Now:       func() time.Time { return time.Unix(1_800_000_100, 0).UTC() },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, err := New(cfg, &fakeProvider{}, store, Options{
-		Speech: speech,
-		Now:    func() time.Time { return time.Unix(1_800_000_101, 0).UTC() },
+		Speech:    speech,
+		Inspector: fakeSpeechInspector(),
+		Now:       func() time.Time { return time.Unix(1_800_000_101, 0).UTC() },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -795,7 +929,7 @@ func TestQASecondReconciliationAcrossAdapterInstancesIsSingleCall(t *testing.T) 
 	if claim.SchemaVersion != "v1" || claim.JobID != request.JobID || claim.AuthorizedRecordSHA256 != digest {
 		t.Fatalf("durable claim = %#v", claim)
 	}
-	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -814,11 +948,11 @@ func TestSpeechV2CanaryAcrossAdapterInstancesSubmitsExactlyOnceAndReplays(t *tes
 	cfg, request := testSpeechCanaryFixture(t)
 	storeSpeechCanaryVoiceDescriptor(t, store, &cfg, &request)
 	speech := &fakeSpeechSynthesizer{}
-	first, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	first, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	second, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -883,7 +1017,7 @@ func TestSpeechV2CanaryAcrossAdapterInstancesSubmitsExactlyOnceAndReplays(t *tes
 		t.Fatalf("speech-v2 submit calls = %d, statuses = %#v", speech.callCount(), statuses)
 	}
 
-	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech})
+	restarted, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
 	if err != nil {
 		t.Fatal(err)
 	}

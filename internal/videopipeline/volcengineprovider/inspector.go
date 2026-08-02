@@ -25,7 +25,8 @@ type MediaInspector interface {
 	Inspect(context.Context, string) (MediaSpec, error)
 }
 
-// FFprobeInspector measures the immutable local object committed to CAS.
+// FFprobeInspector measures an immutable local audio or video object committed
+// to CAS. Audio specs intentionally leave width, height, and FPS at zero.
 type FFprobeInspector struct {
 	Binary string
 }
@@ -65,7 +66,15 @@ func (i FFprobeInspector) Inspect(ctx context.Context, path string) (MediaSpec, 
 	if err != nil || durationSeconds <= 0 {
 		return MediaSpec{}, errors.New("ffprobe returned an invalid duration")
 	}
+	format := strings.Split(probe.Format.Name, ",")[0]
+	if format == "mov" {
+		format = "mp4"
+	}
+	hasAudio := false
 	for _, stream := range probe.Streams {
+		if stream.CodecType == "audio" {
+			hasAudio = true
+		}
 		if stream.CodecType != "video" {
 			continue
 		}
@@ -76,10 +85,6 @@ func (i FFprobeInspector) Inspect(ctx context.Context, path string) (MediaSpec, 
 		if err != nil || stream.Width <= 0 || stream.Height <= 0 {
 			return MediaSpec{}, errors.New("ffprobe returned an invalid video stream")
 		}
-		format := strings.Split(probe.Format.Name, ",")[0]
-		if format == "mov" {
-			format = "mp4"
-		}
 		return MediaSpec{
 			Width:          stream.Width,
 			Height:         stream.Height,
@@ -88,7 +93,13 @@ func (i FFprobeInspector) Inspect(ctx context.Context, path string) (MediaSpec, 
 			Format:         format,
 		}, nil
 	}
-	return MediaSpec{}, errors.New("ffprobe found no video stream")
+	if hasAudio {
+		return MediaSpec{
+			DurationMillis: int64(math.Round(durationSeconds * 1000)),
+			Format:         format,
+		}, nil
+	}
+	return MediaSpec{}, errors.New("ffprobe found no supported audio or video stream")
 }
 
 func parseFrameRate(value string) (int, error) {
