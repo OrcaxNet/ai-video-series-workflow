@@ -12,7 +12,7 @@ ready="$(curl -fsS "${control_plane_url}/health/ready")"
 printf '%s' "${ready}" | grep -Fq '"status":"ready"'
 
 provider_status="$(curl -fsS "${control_plane_url}/api/v1/providers/status")"
-printf '%s' "${provider_status}" | grep -Fq '"mode":"dry-run"'
+printf '%s' "${provider_status}" | grep -Fq '"mode":"disabled"'
 test "$(printf '%s' "${provider_status}" | grep -o '"liveConfigured":false' | wc -l | tr -d ' ')" = "4"
 
 payload='{"schema_version":"v1","job_id":"smoke-job","run_id":"smoke-run","capability":"video.primary","input_hash":"0000000000000000000000000000000000000000000000000000000000000000","model_snapshot":{"capability_alias":"video.primary","provider":"fake","model_id":"fixture-video-v1","route_version":"mock-routes-v1","capability_hash":"0000000000000000000000000000000000000000000000000000000000000000","verification":"mock_only"},"request":{"request_id":"smoke-request","idempotency_key":"smoke-job","modality":"video","prompt":"smoke fixture","prompt_snapshot_id":"smoke-prompt-v1","context":{"series_snapshot_id":"series-context-v1","episode_snapshot_id":"episode-context-v1","scene_snapshot_id":"scene-context-v1","shot_snapshot_id":"shot-context-v1"},"output":{"width":1280,"height":720,"aspect_ratio":"16:9","fps":24,"duration_millis":5000,"format":"mp4"},"budget":{"estimated_cost_micros":100,"max_cost_micros":150,"max_attempts":1}},"budget_reservation":{"reservation_id":"smoke-budget","currency":"CNY","amount_micros":150,"pricing_version":"mock-pricing-v1","confirmed_by":"smoke-reviewer","binding_hash":"eca6cdd0d058692fdec0593cd73b96b6c89151836c394de4b5a93ceeaa189510"},"trace_id":"smoke-trace"}'
