@@ -65,3 +65,22 @@ func TestGitCommitRejectsTrackedDriftButAllowsUntrackedEvidence(t *testing.T) {
 		t.Fatalf("gitCommit(dirty) error = %v", err)
 	}
 }
+
+func TestSealedAnalyzerProgramIsAbsoluteForIsolatedWorkdir(t *testing.T) {
+	root := t.TempDir()
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relativeRoot, err := filepath.Rel(workingDirectory, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	program, err := sealedAnalyzerProgram(relativeRoot, "bin/flo154-analyzer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(program) || program != filepath.Join(root, "bin/flo154-analyzer") {
+		t.Fatalf("sealedAnalyzerProgram() = %q", program)
+	}
+}

@@ -169,7 +169,10 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, files Files) (Report, error
 	for kind, hash := range analyzerEvidence.Components {
 		hashes["analyzer_"+kind] = hash
 	}
-	program := filepath.Join(files.AnalyzerRoot, filepath.Clean(manifest.Analyzer.Path))
+	program, err := sealedAnalyzerProgram(files.AnalyzerRoot, manifest.Analyzer.Path)
+	if err != nil {
+		return Report{}, err
+	}
 	fixture, err := verifyFixture(ctx, program, manifest.Analyzer.Version, files.FixtureInput)
 	if err != nil {
 		return Report{}, err
@@ -182,6 +185,14 @@ func Verify(ctx context.Context, pool *pgxpool.Pool, files Files) (Report, error
 		SchemaVersion: SchemaVersion, BatchID: package_.BatchID,
 		Hashes: hashes, Counts: counts, Fixture: fixture,
 	}, nil
+}
+
+func sealedAnalyzerProgram(root, relative string) (string, error) {
+	analyzerRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve analyzer root: %w", err)
+	}
+	return filepath.Join(analyzerRoot, filepath.Clean(relative)), nil
 }
 
 func gitCommit(ctx context.Context, root string) (string, error) {
