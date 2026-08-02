@@ -1214,6 +1214,33 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if raceReservations != 1 {
 		t.Fatalf("concurrent cumulative RESERVED rows = %d, want 1", raceReservations)
 	}
+	var loserReservations, loserJobs, loserLedger int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*)
+		   FROM video_pipeline.budget_reservations
+		   WHERE generation_run_id = $1),
+		  (SELECT COUNT(*)
+		   FROM video_pipeline.provider_jobs pj
+		   JOIN video_pipeline.generation_attempts ga
+		     ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1),
+		  (SELECT COUNT(*)
+		   FROM video_pipeline.cost_ledger cl
+		   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+		   JOIN video_pipeline.generation_attempts ga
+		     ON ga.id = pj.generation_attempt_id
+		   WHERE ga.generation_run_id = $1)`,
+		raceRuns[loser].RunID,
+	).Scan(&loserReservations, &loserJobs, &loserLedger); err != nil {
+		t.Fatal(err)
+	}
+	if loserReservations != 0 || loserJobs != 0 || loserLedger != 0 {
+		t.Fatalf(
+			"concurrent budget loser side effects = reservations:%d jobs:%d ledger:%d",
+			loserReservations, loserJobs, loserLedger,
+		)
+	}
 	if err := store.RecordProviderCancellation(
 		ctx, raceSteps[winner],
 		orchestration.CancelProviderJobInput{
@@ -1607,6 +1634,101 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 					strings.ReplaceAll(drift.name, " ", "-"),
 				secondCommand,
 			)
+			if drift.name == "cost is unverified" {
+				failedRunID := uuid.MustParse(driftRun.RunID)
+				failedJobID := uuid.NewSHA1(failedRunID, []byte("provider-job"))
+				failedActualID := uuid.NewSHA1(failedJobID, []byte("actual-cost"))
+				usageDrifts := []struct {
+					name    string
+					mutate  func(*testing.T)
+					restore func(*testing.T)
+				}{
+					{
+						name: "units",
+						mutate: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET units = units + 1
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+						restore: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET units = 30
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+					},
+					{
+						name: "unit name",
+						mutate: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET unit_name = 'mock-units-drift'
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+						restore: func(t *testing.T) {
+							mustExec(t, ctx, pool, `
+								UPDATE video_pipeline.cost_ledger
+								SET unit_name = 'mock-units'
+								WHERE id = $1`,
+								failedActualID,
+							)
+						},
+					},
+				}
+				for _, usageDrift := range usageDrifts {
+					usageDrift := usageDrift
+					t.Run("failed ACTUAL rejects "+usageDrift.name+" drift", func(t *testing.T) {
+						usageDrift.mutate(t)
+						t.Cleanup(func() { usageDrift.restore(t) })
+						_, prepareErr := store.PrepareProviderJob(
+							ctx, secondStep, secondDispatch,
+						)
+						var domain *controlplane.DomainError
+						if !errors.As(prepareErr, &domain) ||
+							domain.Code != controlplane.CodeRevisionConflict {
+							t.Fatalf(
+								"failed ACTUAL %s drift error = %#v, want %s",
+								usageDrift.name, prepareErr, controlplane.CodeRevisionConflict,
+							)
+						}
+						var reservations, jobs, ledger int
+						if err := pool.QueryRow(ctx, `
+							SELECT
+							  (SELECT COUNT(*)
+							   FROM video_pipeline.budget_reservations
+							   WHERE generation_run_id = $1),
+							  (SELECT COUNT(*)
+							   FROM video_pipeline.provider_jobs pj
+							   JOIN video_pipeline.generation_attempts ga
+							     ON ga.id = pj.generation_attempt_id
+							   WHERE ga.generation_run_id = $1),
+							  (SELECT COUNT(*)
+							   FROM video_pipeline.cost_ledger cl
+							   JOIN video_pipeline.provider_jobs pj
+							     ON pj.id = cl.provider_job_id
+							   JOIN video_pipeline.generation_attempts ga
+							     ON ga.id = pj.generation_attempt_id
+							   WHERE ga.generation_run_id = $1)`,
+							secondRun.RunID,
+						).Scan(&reservations, &jobs, &ledger); err != nil {
+							t.Fatal(err)
+						}
+						if reservations != 0 || jobs != 0 || ledger != 0 {
+							t.Fatalf(
+								"failed ACTUAL %s drift side effects = reservations:%d jobs:%d ledger:%d",
+								usageDrift.name, reservations, jobs, ledger,
+							)
+						}
+					})
+				}
+			}
 			_, secondErr := store.PrepareProviderJob(
 				ctx, secondStep, secondDispatch,
 			)

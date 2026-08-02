@@ -2172,6 +2172,7 @@ func (p *Postgres) CompleteProviderJob(
 				"reservedCurrency":       reservedCurrency,
 				"reservedPricingVersion": reservedPricing,
 				"providerCost":           result.Cost,
+				"providerUsage":          result.Usage,
 				"actualTrustedForBudget": actualTrustedForAllocation,
 			})
 			if encodeErr != nil {
@@ -2692,8 +2693,9 @@ func verifyProviderAllocatedCostProjection(
 		return 0, fmt.Errorf("read failed Provider cost evidence: %w", err)
 	}
 	var failureEvidence struct {
-		Code         string                `json:"code"`
-		ProviderCost providercontract.Cost `json:"providerCost"`
+		Code          string                 `json:"code"`
+		ProviderCost  providercontract.Cost  `json:"providerCost"`
+		ProviderUsage providercontract.Usage `json:"providerUsage"`
 	}
 	if failureCode != "BUDGET_EXCEEDED" ||
 		json.Unmarshal(failureSnapshot, &failureEvidence) != nil ||
@@ -2719,6 +2721,13 @@ func verifyProviderAllocatedCostProjection(
 			"a failed Provider cost claim requires one deterministic ACTUAL entry",
 		)
 	}
+	failureUsageUnits, err := providerUsageUnits(failureEvidence.ProviderUsage)
+	if err != nil {
+		return 0, controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the failed Provider allocation has invalid immutable usage evidence",
+		)
+	}
 
 	var (
 		storedJobID, storedReservationID uuid.UUID
@@ -2727,21 +2736,21 @@ func verifyProviderAllocatedCostProjection(
 		storedCurrency                   *string
 		storedPricing                    string
 		storedVerified                   bool
-		validUnits, validUnitName        bool
+		unitsMatch, unitNameMatches      bool
 	)
 	if err := tx.QueryRow(ctx, `
 		SELECT provider_job_id, budget_reservation_id, entry_type,
 		       amount_micros, currency, pricing_rule_version, verified,
-		       COALESCE(units >= 0 AND units = trunc(units), false),
-		       unit_name IS NOT NULL
+		       units IS NOT DISTINCT FROM $2,
+		       unit_name IS NOT DISTINCT FROM $3
 		FROM video_pipeline.cost_ledger
 		WHERE id = $1
 		FOR SHARE`,
-		actualID,
+		actualID, failureUsageUnits, failureEvidence.ProviderUsage.Unit,
 	).Scan(
 		&storedJobID, &storedReservationID, &storedType,
 		&storedAmount, &storedCurrency, &storedPricing, &storedVerified,
-		&validUnits, &validUnitName,
+		&unitsMatch, &unitNameMatches,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, controlplane.NewConflictError(
@@ -2759,7 +2768,7 @@ func verifyProviderAllocatedCostProjection(
 		*storedAmount != *failureCost.ActualMicros ||
 		*storedCurrency != failureCost.Currency ||
 		storedPricing != failureCost.PricingVersion || storedVerified != trustedActual ||
-		!validUnits || !validUnitName {
+		!unitsMatch || !unitNameMatches {
 		return 0, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"the failed Provider ACTUAL cost projection has drifted",
@@ -2824,12 +2833,16 @@ func readCumulativeProviderBudgetAllocation(
 	tx pgx.Tx,
 	budgetApprovalID string,
 ) (int64, error) {
+	// PrepareProviderJob already holds the approval row FOR UPDATE. Keep this a
+	// SERIALIZABLE predicate read: locking every run here would invert the
+	// run-then-approval order of a concurrent Prepare and create a deadlock.
+	// Concurrent completion/cancellation observed before settlement is safe and
+	// conservative because RESERVED consumes the full amount.
 	rows, err := tx.Query(ctx, `
 		SELECT id
 		FROM video_pipeline.generation_runs
 		WHERE budget_approval_id = $1
-		ORDER BY id
-		FOR SHARE`,
+		ORDER BY id`,
 		budgetApprovalID,
 	)
 	if err != nil {
