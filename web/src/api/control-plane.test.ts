@@ -411,6 +411,88 @@ describe("HttpControlPlaneApi", () => {
     vi.unstubAllGlobals();
   });
 
+  it("creates a schema v1 live-shot plan with an idempotency key and no authorization", async () => {
+    const plan = {
+      schemaVersion: "v1",
+      planId: "22222222-2222-4222-8222-222222222222",
+      seriesId: "11111111-1111-4111-8111-111111111111",
+      planHash: "a".repeat(64),
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(plan), { status: 201, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("/api/v1");
+    const input = {
+      title: "雨夜重逢",
+      sceneText: "两个人在空站台重逢。",
+      aspectRatio: "16:9" as const,
+      rightsAccepted: true,
+    };
+
+    await expect(api.createLiveShotPlan(input, "11111111-1111-4111-8111-111111111111"))
+      .resolves.toMatchObject(plan);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/creator/live-shot-plans");
+    expect(init).toMatchObject({ method: "POST", credentials: "omit", referrerPolicy: "no-referrer" });
+    expect(init.headers).toMatchObject({
+      "Content-Type": "application/json",
+      "Idempotency-Key": "11111111-1111-4111-8111-111111111111",
+    });
+    expect(init.headers).not.toHaveProperty("Authorization");
+    expect(JSON.parse(String(init.body))).toEqual({ schemaVersion: "v1", ...input });
+  });
+
+  it("confirms the exact planHash in both body and If-Match", async () => {
+    const run = { schemaVersion: "v1", runId: "33333333-3333-4333-8333-333333333333" };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(run), { status: 202, headers: { "Content-Type": "application/json" } }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("/api/v1");
+    const hash = "d".repeat(64);
+
+    await api.confirmLiveShotPlan(
+      "22222222-2222-4222-8222-222222222222",
+      hash,
+      "44444444-4444-4444-8444-444444444444",
+    );
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/v1/creator/live-shot-plans/22222222-2222-4222-8222-222222222222/confirm");
+    expect(init.headers).toMatchObject({
+      "Idempotency-Key": "44444444-4444-4444-8444-444444444444",
+      "If-Match": `"${hash}"`,
+    });
+    expect(JSON.parse(String(init.body))).toEqual({ schemaVersion: "v1", planHash: hash, confirmed: true });
+  });
+
+  it("uses ETag polling and treats 304 as an unchanged projection", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 304 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("/api/v1");
+
+    await expect(api.getLiveShotRun("33333333-3333-4333-8333-333333333333", '"run-etag"'))
+      .resolves.toEqual({ notModified: true, etag: '"run-etag"' });
+    expect(fetchMock.mock.calls[0]?.[1]).toMatchObject({
+      method: "GET",
+      headers: { Accept: "application/json", "If-None-Match": '"run-etag"' },
+    });
+  });
+
+  it("blocks cross-origin control-plane and artifact URLs before network access", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new HttpControlPlaneApi("https://provider.example/v1");
+
+    await expect(api.getProviderStatus()).rejects.toMatchObject({
+      errorCode: "CROSS_ORIGIN_CONTROL_PLANE_BLOCKED",
+    });
+    expect(() => api.liveShotArtifactUrl("33333333-3333-4333-8333-333333333333")).toThrow(
+      expect.objectContaining({ errorCode: "CROSS_ORIGIN_CONTROL_PLANE_BLOCKED" }),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("fails closed before fetch when a Mock-derived project is submitted in live mode", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

@@ -1,4 +1,5 @@
 export type ViewId =
+  | "live-shot"
   | "overview"
   | "assets"
   | "storyboard"
@@ -192,7 +193,12 @@ export interface ProviderCapability {
   dryRunAvailable: boolean;
   mockAvailable: boolean;
   defaultProvider: string;
-  liveEvidence: "not_configured" | "pending_key_validation" | "live_provider_call";
+  liveEvidence:
+    | "not_configured"
+    | "pending_key_validation"
+    | "not_enabled_for_creator_v1"
+    | "authenticated_adapter_snapshot"
+    | "live_provider_call";
   mockEvidence: "mock_only";
 }
 
@@ -231,6 +237,194 @@ export interface StudioState {
   activity: Activity[];
   toasts: ToastMessage[];
   lastProblem?: ApiProblem;
+  liveShot: LiveShotState;
+}
+
+export type LiveShotPhase =
+  | "DRAFT"
+  | "PLANNING"
+  | "AWAITING_CONFIRMATION"
+  | "CONFIRMING"
+  | "RECOVERING"
+  | "TRACKING"
+  | "TERMINAL";
+
+export interface CreateLiveShotPlanInput {
+  title: string;
+  sceneText: string;
+  aspectRatio: "16:9" | "9:16";
+  rightsAccepted: boolean;
+}
+
+export interface CreatorRoute {
+  capabilityAlias: "video.primary";
+  provider: string;
+  modelId: string;
+  endpointId?: string;
+  routeVersion: string;
+  capabilityHash: string;
+  verification: string;
+  billingMode: "subscription";
+}
+
+export interface CreatorLiveShotSpec {
+  candidates: 1;
+  durationSeconds: 5;
+  resolution: "720p";
+  audio: false;
+  aspectRatio: "16:9" | "9:16";
+}
+
+export interface CreatorLiveShotBudget {
+  maxTasksThisConfirmation: number;
+  maxVideoTokensThisConfirmation: number;
+  projectTaskLimit: number;
+  projectTokenLimit: number;
+  projectTasksUsed: number;
+  projectTokensUsed: number;
+  cashAmountMaximum: number | null;
+  currency: string | null;
+  verified: boolean;
+}
+
+export interface CreatorLiveShotPlan {
+  schemaVersion: "v1";
+  planId: string;
+  seriesId: string;
+  state: "AWAITING_CONFIRMATION";
+  confirmable: boolean;
+  blockers: string[];
+  title: string;
+  sceneTextHash: string;
+  aspectRatio: "16:9" | "9:16";
+  providerCallCount: number;
+  providerSubmitCount: number;
+  planHash: string;
+  spec: CreatorLiveShotSpec;
+  route: CreatorRoute;
+  budget: CreatorLiveShotBudget;
+  bindings: Record<string, string>;
+  executionPolicy: Record<string, unknown>;
+  traceId: string;
+  expiresAt: string;
+  createdAt: string;
+}
+
+export type CreatorLiveShotRunState =
+  | "QUEUED"
+  | "RUNNING"
+  | "UNKNOWN"
+  | "RECONCILING"
+  | "SUCCEEDED"
+  | "FAILED"
+  | "CANCELLED"
+  | "REQUIRES_ACTION";
+
+export interface CreatorUsage {
+  promptVideoTokens: number | null;
+  completionVideoTokens: number | null;
+  totalVideoTokens: number | null;
+  generatedDurationMs: number | null;
+}
+
+export interface CreatorCashCost {
+  amountMicros: number | null;
+  currency: string | null;
+  verified: false;
+  billingMode: "subscription";
+}
+
+export interface CreatorLiveShotArtifact {
+  sha256: string;
+  mediaType: "video/mp4" | string;
+  sizeBytes: number;
+  width?: number;
+  height?: number;
+  durationMs?: number;
+  downloadUrl: string;
+}
+
+export interface CreatorManifestSummary {
+  id: string;
+  hash: string;
+  url: string;
+  evidence: "live_provider_call";
+}
+
+export interface CreatorFailure {
+  errorCode: string;
+  retryable: boolean;
+  suggestedAction: string;
+}
+
+export interface CreatorLiveShotRun {
+  schemaVersion: "v1";
+  runId: string;
+  planId: string;
+  seriesId: string;
+  operationId: string;
+  providerJobId: string;
+  state: CreatorLiveShotRunState;
+  progress: number | null;
+  planHash: string;
+  route: CreatorRoute;
+  providerTaskId: string | null;
+  providerRequestId: string | null;
+  submitCount: number;
+  replayed: boolean;
+  failure: CreatorFailure | null;
+  artifact: CreatorLiveShotArtifact | null;
+  usage: CreatorUsage;
+  cost: CreatorCashCost;
+  manifestHash?: string;
+  manifest: CreatorManifestSummary | null;
+  traceId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreatorLiveShotProject {
+  schemaVersion: "v1";
+  seriesId: string;
+  plan: CreatorLiveShotPlan;
+  runs: CreatorLiveShotRun[];
+}
+
+export interface CreatorLiveShotManifest {
+  schemaVersion: "creator-live-shot-manifest.v1";
+  manifestId: string;
+  evidence: "live_provider_call";
+  runId: string;
+  planId: string;
+  planHash: string;
+  provider: CreatorRoute;
+  providerRegion: string | null;
+  providerJobId: string;
+  upstreamTaskId: string;
+  requestId: string;
+  inputHash: string;
+  outputHash: string;
+  media: CreatorLiveShotArtifact;
+  usage: CreatorUsage;
+  budget: {
+    budgetApprovalId: string;
+    reservationId: string;
+    reservedTasks: number;
+    reservedVideoTokens: number;
+    settledVideoTokens: number | null;
+    settlement: string;
+  };
+  cost: CreatorCashCost;
+  createdAt: string;
+}
+
+export interface LiveShotState {
+  phase: LiveShotPhase;
+  plan?: CreatorLiveShotPlan;
+  run?: CreatorLiveShotRun;
+  manifest?: CreatorLiveShotManifest;
+  etag?: string;
+  problem?: ApiProblem;
 }
 
 export interface CreateProjectInput {

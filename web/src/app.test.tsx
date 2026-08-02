@@ -118,7 +118,7 @@ describe("creator studio", () => {
     renderStudio(new AgentPlanExperienceApi());
 
     await waitFor(() => {
-      expect(screen.getByText("Agent Plan 已配置", { selector: ".mode-pill strong" })).toBeInTheDocument();
+      expect(screen.getByText("与真实项目隔离", { selector: ".mode-pill small" })).toBeInTheDocument();
     });
     fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
     expect(screen.getByText("Agent Plan 已注入 · 创作交互为 Mock 演练")).toBeInTheDocument();

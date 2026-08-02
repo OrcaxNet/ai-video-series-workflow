@@ -2,7 +2,9 @@
 
 `web/` 是 FLO-101 的桌面端优先 React/TypeScript PoC。它以 `video-pipeline/contracts/openapi.yaml` 为 API 真相源，展示内容、资产、剧本、分镜、Provider 任务、三道人工闸门、版本差异与生成谱系。
 
-默认启动在无 Key 的 `mock_only` 模式。Mock 用于验证交互、状态机、幂等、异常映射和闸门顺序，不代表真实模型质量、时延、成功率或费用。
+默认开发命令启动在无 Key 的 `mock_only` 模式。生产镜像使用
+`local-experience`：真实单镜入口消费同源 Creator facade，原有多页面流程仍作为视觉隔离的 Mock 演练，不代表真实模型质量、时延、成功率或费用。
+生产镜像默认直接打开“真实单镜预览”；开发 Mock 模式仍从片场总览开始。
 
 ## 运行
 
@@ -29,25 +31,23 @@ Playwright 固定在 `127.0.0.1:4174` 启动独立 Mock 测试服务器，使用
 `--strictPort` 且禁止复用已有服务。因此即使 OrbStack Studio 正常常驻于 `4173`，
 `npm test` / `make web-test` 仍只测试本次启动的隔离测试构建。
 
-如已在 `localhost:18080` 启动控制面，可使用同源开发代理读取真实 `/api/v1/providers/status`：
+如已在 `localhost:18080` 启动控制面，可使用同源开发代理接入 Creator facade：
 
 ```bash
 VITE_STUDIO_MODE=live npm run dev
 ```
 
-最新控制面已经提供 Series、PromptSnapshot、GenerationRun、Approval、Manifest 与
-publication lock 等公开端点，但这些写操作必须绑定 PostgreSQL 中真实存在的
-shot/context/asset/Prompt、冻结 route、预算审批、内容安全、Consent/License 与
-artifact commit。PoC 尚未从真实投影加载这些 UUID，因此 live client 只启用无 Secret
-的 provider discovery；项目创建、G1/G2/G3、Job attempt、Mock 完成、revision
-重生成和并发注入全部在 `fetch` 前 fail closed。客户端不会发送硬编码/Mock UUID、
-全零权利证据、缺失 episode 或非不可变 binding，也不会把 contract-only 操作显示为
-已由真实控制面完成。
+“真实单镜预览”只消费 schema v1 的 `creator/live-shot-*` facade：计划阶段
+`providerSubmitCount=0`，确认携带同一 `planHash` 与 `If-Match`，运行态通过 ETag
+轮询真实 projection，成功后使用同源 artifact / Manifest 路由。原有 G1/G2/G3、
+Job attempt、Mock 完成、revision 重生成和并发注入仍属于独立演练区；在纯 `live`
+client 下会在 `fetch` 前 fail closed，绝不会把 Mock UUID 发送为 production binding。
 
 ## 页面
 
 | 页面 | 用户工作 | 主要真相 |
 |---|---|---|
+| 真实单镜预览 | 零提交计划、精确确认、状态恢复、播放/下载 | Creator plan / run projection / CAS / Manifest |
 | 片场总览 | 查看本集进度与下一步 | Gate / Job projection |
 | 内容与资产 | 选择资产 revision、权利核验、G1 | assets / asset versions / approval bindings |
 | 剧本与分镜 | 镜头拆分、四层上下文、G2 | script / storyboard / effective context / prompt snapshot |
@@ -92,9 +92,10 @@ artifact commit。PoC 尚未从真实投影加载这些 UUID，因此 live clien
 
 ## Secret 与权限边界
 
-- API client 使用 `credentials: "omit"`，不读取或写入浏览器持久化存储。
+- Creator API client 强制同源路径，并使用 `credentials: "omit"` 与 `Referrer-Policy: no-referrer`。
+- 恢复存储只保留 `seriesId`、`planId`、`planHash`、`runId` 和不透明确认意图；不保存标题、场景原文或 Prompt。
 - UI 只展示 provider profile、capability alias、model/route snapshot、task/request ID、trace、用量、费用及 hash。
-- Key、Authorization、cookie、原始 provider error body 和临时签名地址不进入 fixture、组件状态、错误、截图或 Manifest。
+- Key、Authorization、cookie、原始 provider error body 和临时签名地址不进入 DOM、storage、fixture、组件状态、错误、截图或 Manifest；服务端返回的 artifact URL 不被信任，浏览器始终按 run ID 构造同源路由。
 - `pending_key`、`mock_only` 与 `live_provider_call` 是互斥证据级别；费用另有 `verified` 标志。
 
 详细状态映射和回滚说明见 `video-pipeline/docs/ui-state-boundary.md`。
