@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "flo100.batch-a-duration-projection.v3",
+  "normalizationVersion": "duration-normalized-afp/v1",
+  "roundingVersion": "half-up-nonnegative-integer/v1",
+  "referenceAfpMilli": 2504700,
+  "referenceDurationMs": 5000,
+  "completedSet": ["GOLD-A01"],
+  "allowedSubmitSet": ["GOLD-A02", "GOLD-A03", "GOLD-A04", "GOLD-A05", "GOLD-A06", "GOLD-A07", "GOLD-A08", "GOLD-A09", "GOLD-A10"],
+  "a01Terminal": {
+    "taskId": "cgt-20260803044117-2zwsb",
+    "mp4Sha256": "f791f6914f2fa31c4fecbc8728846b4bbb0a22d45716b83b3845bf05256b125a",
+    "actualAfpMilli": 2007900,
+    "expectedAfpMilli": 2003760,
+    "actualVideoTokens": 87300,
+    "actualCashMicros": 0,
+    "resubmitAllowed": false
+  },
+  "stateMachine": ["v2_stopped_after_A01", "supersession_package_pending_v3", "v3_authorized_A02_A10", "quota_reserved", "A02_submitted"]
+}

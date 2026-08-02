@@ -1,0 +1,33 @@
+{
+  "schemaVersion": "flo100.batch-a-supersession.v3",
+  "state": "supersession_package_pending_v3",
+  "legacyAuthorizationHash": "7bf55cad2a4f81f54eb6617bbab81fd21f789785ce1176213014f5833ce4ac25",
+  "legacyExecutionPackageHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "legacyProjectionHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "legacyTerminalLedgerHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "legacyStopEvidenceHash": "dd1954608254791425d7574fe7333d1c1d7cd77cb843572f79d84a3dbeadea76",
+  "authorization": {
+    "completedSet": ["GOLD-A01"],
+    "allowedSubmitSet": ["GOLD-A02", "GOLD-A03", "GOLD-A04", "GOLD-A05", "GOLD-A06", "GOLD-A07", "GOLD-A08", "GOLD-A09", "GOLD-A10"],
+    "maximumPrimaryJobs": 10,
+    "maximumControlledRetries": 1,
+    "maximumVideoTokens": 1200000,
+    "maximumVideoAfpMilli": 30306870,
+    "maximumSpeechAfpMilli": 1039,
+    "maximumNonSubscriptionCashMicros": 0
+  },
+  "shots": [
+    {"shotId":"GOLD-A01","durationMs":4000,"expectedAfpMilli":2003760},
+    {"shotId":"GOLD-A02","durationMs":4500,"expectedAfpMilli":2254230},
+    {"shotId":"GOLD-A03","durationMs":5000,"expectedAfpMilli":2504700},
+    {"shotId":"GOLD-A04","durationMs":5500,"expectedAfpMilli":2755170},
+    {"shotId":"GOLD-A05","durationMs":4000,"expectedAfpMilli":2003760},
+    {"shotId":"GOLD-A06","durationMs":5000,"expectedAfpMilli":2504700},
+    {"shotId":"GOLD-A07","durationMs":4500,"expectedAfpMilli":2254230},
+    {"shotId":"GOLD-A08","durationMs":5500,"expectedAfpMilli":2755170},
+    {"shotId":"GOLD-A09","durationMs":4000,"expectedAfpMilli":2003760},
+    {"shotId":"GOLD-A10","durationMs":4500,"expectedAfpMilli":2254230}
+  ],
+  "canonicalContentHash": "75d039d98dba6762e1d5f34d427762377ecdf9f3c19f22a55a577b0b8adf272b",
+  "note": "Human-readable projection of the fully bound package used by TestFLO167CanonicalMaterializationIsStable; per-shot pricing/route/gate/input digests are asserted by code and intentionally summarized here."
+}
