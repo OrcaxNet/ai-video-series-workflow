@@ -37,10 +37,13 @@ Final Mix、Final Video、字幕、Audio QC report、命令计划 hash、工具�
 
 Worker 只接受同时配置的 `VIDEO_AUDIO_ANALYZER_COMMAND`、
 `VIDEO_AUDIO_ANALYZER_ROOT`、`VIDEO_AUDIO_ANALYZER_SEAL`。启动时先校验封印、可执行文件、
-模型/Tokenizer/Normalizer/VAD/人脸口部/音画同步/FFmpeg/FFprobe/许可证快照的 SHA-256，
-每次 native G3 分析还会在 Service 边界、外部命令启动前及命令返回后重新复算完整封印，
-并与执行包里的 analyzer seal 比对；任一 executable/config/model/license/inventory 漂移
-均返回不可重试的完整性错误，且不会生成可接受的 QC/G3 证据。命令接收
+模型/Tokenizer/Normalizer/VAD/人脸口部/音画同步/FFmpeg/FFprobe/许可证快照，以及 Python
+环境清单内每个文件的 SHA-256。校验通过后把完整安装复制到进程私有快照，再次逐项校验并
+冻结为只读；命令只从该快照执行，worker 退出时删除。源安装随后发生的持久或瞬时
+swap/restore 都无法改变执行对象；每次 native G3 分析仍会在 Service 边界、命令启动前和
+返回后复算快照封印，并与执行包里的 analyzer seal 比对。快照内部任一
+executable/config/model/license/inventory 漂移均返回不可重试的完整性错误，且不会生成
+可接受的 QC/G3 证据。命令接收
 `input.json analysis.json` 两个参数；输入只含 CAS 媒体路径/hash、cue 时间窗、run
 时间窗、Scene Context ambience identity/version/continuity、镜头口型要求和 frozen
 ASR 配置，不提供参考字幕正文，避免 ASR

@@ -90,6 +90,11 @@ func main() {
 		if analyzerErr != nil {
 			log.Fatalf("configure native audio analyzer: %v", analyzerErr)
 		}
+		defer func() {
+			if closeErr := analyzer.Close(); closeErr != nil {
+				log.Printf("remove native audio analyzer snapshot: %v", closeErr)
+			}
+		}()
 		analyzers = append(analyzers, analyzer)
 	}
 	postProduction, err := postproduction.NewService(speech, media, artifacts, analyzers...)

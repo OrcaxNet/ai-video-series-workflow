@@ -69,6 +69,16 @@ type Evidence struct {
 	Components       map[string]string `json:"components"`
 }
 
+type environmentInventory struct {
+	SchemaVersion string                     `json:"schemaVersion"`
+	Files         []environmentInventoryFile `json:"files"`
+}
+
+type environmentInventoryFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+}
+
 func Verify(root, manifestPath string) (Manifest, Evidence, error) {
 	root, err := filepath.Abs(root)
 	if err != nil {
@@ -123,6 +133,11 @@ func Verify(root, manifestPath string) (Manifest, Evidence, error) {
 		}, false); err != nil {
 			return Manifest{}, Evidence{}, fmt.Errorf("analyzer component %q: %w", component.Name, err)
 		}
+		if component.Kind == "python_environment" {
+			if err := verifyEnvironmentInventory(root, component.Path); err != nil {
+				return Manifest{}, Evidence{}, fmt.Errorf("analyzer component %q: %w", component.Name, err)
+			}
+		}
 		components[component.Name] = component.SHA256
 		kinds[component.Kind] = struct{}{}
 	}
@@ -136,6 +151,48 @@ func Verify(root, manifestPath string) (Manifest, Evidence, error) {
 		SealSHA256: sealDigest, ExecutableSHA256: manifest.Analyzer.SHA256,
 		ConfigSHA256: manifest.Config.SHA256, Components: componentsByKind(manifest.Components),
 	}, nil
+}
+
+func verifyEnvironmentInventory(root, relative string) error {
+	path, err := resolve(root, relative)
+	if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if len(data) == 0 || len(data) > 16<<20 {
+		return errors.New("Python environment inventory size is invalid")
+	}
+	var inventory environmentInventory
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&inventory); err != nil {
+		return fmt.Errorf("decode Python environment inventory: %w", err)
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("Python environment inventory must contain exactly one JSON value")
+	}
+	if inventory.SchemaVersion != "flo154.python-environment.v1" ||
+		len(inventory.Files) == 0 || len(inventory.Files) > 100_000 {
+		return errors.New("Python environment inventory schema or file count is invalid")
+	}
+	seen := make(map[string]struct{}, len(inventory.Files))
+	for index, file := range inventory.Files {
+		clean := filepath.Clean(file.Path)
+		if _, duplicate := seen[clean]; duplicate {
+			return fmt.Errorf("duplicate Python environment inventory path %q", clean)
+		}
+		seen[clean] = struct{}{}
+		if err := verifyArtifact(root, Artifact{
+			Path: file.Path, SHA256: file.SHA256, Version: "inventory-v1",
+		}, false); err != nil {
+			return fmt.Errorf("Python environment inventory file %d: %w", index, err)
+		}
+	}
+	return nil
 }
 
 func verifyArtifact(root string, artifact Artifact, executable bool) error {

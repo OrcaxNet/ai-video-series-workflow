@@ -57,7 +57,7 @@ func TestVerify(t *testing.T) {
 				}
 				if !validDigest(evidence.SealSHA256) ||
 					evidence.ExecutableSHA256 != manifest.Analyzer.SHA256 ||
-					len(evidence.Components) != len(requiredKinds) {
+					len(evidence.Components) < len(requiredKinds) {
 					t.Fatalf("evidence = %#v", evidence)
 				}
 				return
@@ -69,10 +69,27 @@ func TestVerify(t *testing.T) {
 	}
 }
 
+func TestVerifyRejectsEnvironmentInventoryMemberDrift(t *testing.T) {
+	root := t.TempDir()
+	manifest := writeSealFixture(t, root)
+	manifestPath := filepath.Join(root, "seal.json")
+	writeJSON(t, manifestPath, manifest)
+	if err := os.WriteFile(filepath.Join(root, "environment/member.py"), []byte("drifted\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := Verify(root, manifestPath)
+	if err == nil || !strings.Contains(err.Error(), "Python environment inventory file") {
+		t.Fatalf("Verify() error = %v, want environment member integrity failure", err)
+	}
+}
+
 func writeSealFixture(t *testing.T, root string) Manifest {
 	t.Helper()
 	write := func(name, contents string, mode os.FileMode) Artifact {
 		path := filepath.Join(root, name)
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
 		if err := os.WriteFile(path, []byte(contents), mode); err != nil {
 			t.Fatal(err)
 		}
@@ -95,6 +112,23 @@ func writeSealFixture(t *testing.T, root string) Manifest {
 			Source: "https://example.invalid/" + kind,
 		})
 	}
+	environmentMember := write("environment/member.py", "environment member\n", 0o640)
+	inventoryPath := filepath.Join(root, "python-environment.json")
+	writeJSON(t, inventoryPath, environmentInventory{
+		SchemaVersion: "flo154.python-environment.v1",
+		Files: []environmentInventoryFile{{
+			Path: environmentMember.Path, SHA256: environmentMember.SHA256,
+		}},
+	})
+	inventoryBytes, err := os.ReadFile(inventoryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest.Components = append(manifest.Components, Component{
+		Name: "python-environment", Kind: "python_environment", Path: "python-environment.json",
+		SHA256: testDigest(inventoryBytes), Version: "fixture-v1", SPDXLicense: "MIT",
+		CommercialUse: true, Source: "https://example.invalid/python-environment",
+	})
 	return manifest
 }
 

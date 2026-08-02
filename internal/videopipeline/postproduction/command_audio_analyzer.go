@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/analyzerseal"
@@ -30,6 +31,9 @@ type CommandAudioAnalyzer struct {
 	Runner                      CommandRunner
 	sealSHA256, analyzerVersion string
 	sealedRoot, sealPath        string
+	snapshotDir                 string
+	closeOnce                   sync.Once
+	closeErr                    error
 }
 
 // NewSealedCommandAudioAnalyzer accepts only the executable named by the
@@ -62,15 +66,41 @@ func NewSealedCommandAudioAnalyzer(
 	if gotProgram != wantProgram {
 		return nil, errors.New("audio analyzer command differs from the sealed executable")
 	}
-	analyzer, err := NewCommandAudioAnalyzer(wantProgram, store)
+	snapshotDir, snapshotRoot, snapshotSeal, snapshotManifest, snapshotEvidence, err :=
+		createAnalyzerSnapshot(sealedRoot, sealPath, evidence.SealSHA256)
 	if err != nil {
+		return nil, fmt.Errorf("create immutable audio analyzer snapshot: %w", err)
+	}
+	wantSnapshotProgram, err := filepath.Abs(filepath.Join(snapshotRoot, snapshotManifest.Analyzer.Path))
+	if err != nil {
+		_ = removeAnalyzerSnapshot(snapshotDir)
 		return nil, err
 	}
-	analyzer.sealSHA256 = evidence.SealSHA256
-	analyzer.analyzerVersion = manifest.Analyzer.Version
-	analyzer.sealedRoot = sealedRoot
-	analyzer.sealPath = sealPath
+	analyzer, err := NewCommandAudioAnalyzer(wantSnapshotProgram, store)
+	if err != nil {
+		_ = removeAnalyzerSnapshot(snapshotDir)
+		return nil, err
+	}
+	analyzer.sealSHA256 = snapshotEvidence.SealSHA256
+	analyzer.analyzerVersion = snapshotManifest.Analyzer.Version
+	analyzer.sealedRoot = snapshotRoot
+	analyzer.sealPath = snapshotSeal
+	analyzer.snapshotDir = snapshotDir
 	return analyzer, nil
+}
+
+// Close removes the private analyzer snapshot after the worker has stopped.
+// It is idempotent so startup failures and tests can safely register cleanup.
+func (a *CommandAudioAnalyzer) Close() error {
+	if a == nil {
+		return nil
+	}
+	a.closeOnce.Do(func() {
+		if a.snapshotDir != "" {
+			a.closeErr = removeAnalyzerSnapshot(a.snapshotDir)
+		}
+	})
+	return a.closeErr
 }
 
 func (a *CommandAudioAnalyzer) AnalyzerSealSHA256() string {
@@ -117,6 +147,141 @@ func analyzerIntegrityError() *providercontract.Error {
 		SafeMessage:     "native audio analyzer integrity verification failed",
 		SuggestedAction: "restore the exact sealed analyzer before opening G3",
 	}
+}
+
+func createAnalyzerSnapshot(
+	root, sealPath, expectedSeal string,
+) (string, string, string, analyzerseal.Manifest, analyzerseal.Evidence, error) {
+	sealRelative, err := filepath.Rel(root, sealPath)
+	if err != nil || sealRelative == ".." || strings.HasPrefix(sealRelative, ".."+string(filepath.Separator)) {
+		return "", "", "", analyzerseal.Manifest{}, analyzerseal.Evidence{},
+			errors.New("audio analyzer seal must be stored inside its root")
+	}
+	snapshotDir, err := os.MkdirTemp("", "video-audio-analyzer-snapshot-*")
+	if err != nil {
+		return "", "", "", analyzerseal.Manifest{}, analyzerseal.Evidence{}, err
+	}
+	snapshotRoot := filepath.Join(snapshotDir, "root")
+	cleanup := func(cause error) (string, string, string, analyzerseal.Manifest, analyzerseal.Evidence, error) {
+		_ = removeAnalyzerSnapshot(snapshotDir)
+		return "", "", "", analyzerseal.Manifest{}, analyzerseal.Evidence{}, cause
+	}
+	if err := copyAnalyzerTree(root, snapshotRoot); err != nil {
+		return cleanup(err)
+	}
+	snapshotSeal := filepath.Join(snapshotRoot, sealRelative)
+	manifest, evidence, err := analyzerseal.Verify(snapshotRoot, snapshotSeal)
+	if err != nil {
+		return cleanup(fmt.Errorf("verify copied analyzer snapshot: %w", err))
+	}
+	if evidence.SealSHA256 != expectedSeal {
+		return cleanup(errors.New("copied analyzer snapshot differs from the approved seal"))
+	}
+	if err := freezeAnalyzerTree(snapshotRoot); err != nil {
+		return cleanup(err)
+	}
+	return snapshotDir, snapshotRoot, snapshotSeal, manifest, evidence, nil
+}
+
+func copyAnalyzerTree(sourceRoot, targetRoot string) error {
+	if err := os.Mkdir(targetRoot, 0o700); err != nil {
+		return err
+	}
+	return filepath.WalkDir(sourceRoot, func(sourcePath string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(sourceRoot, sourcePath)
+		if err != nil {
+			return err
+		}
+		if relative == "." {
+			return nil
+		}
+		targetPath := filepath.Join(targetRoot, relative)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			return os.Mkdir(targetPath, 0o700)
+		}
+		if info.Mode().IsRegular() {
+			return copyAnalyzerFile(sourcePath, targetPath, info.Mode())
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			targetInfo, err := os.Stat(sourcePath)
+			if err != nil {
+				return err
+			}
+			if !targetInfo.Mode().IsRegular() {
+				return fmt.Errorf("analyzer snapshot symlink %q does not resolve to a regular file", relative)
+			}
+			return copyAnalyzerFile(sourcePath, targetPath, targetInfo.Mode())
+		}
+		return fmt.Errorf("analyzer snapshot contains unsupported file %q", relative)
+	})
+}
+
+func copyAnalyzerFile(sourcePath, targetPath string, mode os.FileMode) error {
+	source, err := os.Open(sourcePath)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	target, err := os.OpenFile(targetPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600|mode.Perm()&0o111)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(target, source); err != nil {
+		_ = target.Close()
+		return err
+	}
+	if err := target.Sync(); err != nil {
+		_ = target.Close()
+		return err
+	}
+	return target.Close()
+}
+
+func freezeAnalyzerTree(root string) error {
+	var paths []string
+	if err := filepath.Walk(root, func(path string, _ os.FileInfo, err error) error {
+		if err == nil {
+			paths = append(paths, path)
+		}
+		return err
+	}); err != nil {
+		return err
+	}
+	for index := len(paths) - 1; index >= 0; index-- {
+		info, err := os.Lstat(paths[index])
+		if err != nil {
+			return err
+		}
+		mode := os.FileMode(0o444) | info.Mode().Perm()&0o111
+		if info.IsDir() {
+			mode = 0o555
+		}
+		if err := os.Chmod(paths[index], mode); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeAnalyzerSnapshot(snapshotDir string) error {
+	_ = filepath.Walk(snapshotDir, func(path string, info os.FileInfo, err error) error {
+		if err == nil && info != nil {
+			mode := os.FileMode(0o600)
+			if info.IsDir() {
+				mode = 0o700
+			}
+			_ = os.Chmod(path, mode)
+		}
+		return nil
+	})
+	return os.RemoveAll(snapshotDir)
 }
 
 type analyzerMediaInput struct {
