@@ -26,7 +26,10 @@ import (
 const (
 	idempotencyTTL  = 24 * time.Hour
 	workflowStepTTL = 90 * 24 * time.Hour
-	maxTxAttempts   = 3
+	// Ten paid candidates may contend on one approval in the frozen MVP.
+	// Keep one retry per admissible winner plus room for the final domain
+	// budget decision; exhaustion is still mapped to a stable conflict.
+	maxTxAttempts   = 12
 	defaultMaxConns = 20
 	defaultMinConns = 2
 )
@@ -2317,14 +2320,26 @@ func withSerializable[T any](ctx context.Context, pool *pgxpool.Pool, fn func(pg
 		value, runErr := fn(tx)
 		if runErr != nil {
 			_ = tx.Rollback(ctx)
-			if retryableTransaction(runErr) && attempt < maxTxAttempts {
-				continue
+			if retryableTransaction(runErr) {
+				if attempt < maxTxAttempts {
+					continue
+				}
+				return zero, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"transaction contention did not converge after bounded retries",
+				)
 			}
 			return zero, runErr
 		}
 		if err := tx.Commit(ctx); err != nil {
-			if retryableTransaction(err) && attempt < maxTxAttempts {
-				continue
+			if retryableTransaction(err) {
+				if attempt < maxTxAttempts {
+					continue
+				}
+				return zero, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"transaction contention did not converge after bounded retries",
+				)
 			}
 			return zero, fmt.Errorf("commit serializable transaction: %w", err)
 		}
@@ -2792,6 +2807,39 @@ func requireBudgetApproval(
 	budgetScope string,
 	required controlplane.BudgetLimit,
 ) error {
+	return requireBudgetApprovalWithLock(
+		ctx, tx, approvalIDRaw, seriesID, episodeID,
+		generationPlanIDRaw, budgetScope, required, false,
+	)
+}
+
+func requireBudgetApprovalForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	approvalIDRaw string,
+	seriesID uuid.UUID,
+	episodeID uuid.UUID,
+	generationPlanIDRaw string,
+	budgetScope string,
+	required controlplane.BudgetLimit,
+) error {
+	return requireBudgetApprovalWithLock(
+		ctx, tx, approvalIDRaw, seriesID, episodeID,
+		generationPlanIDRaw, budgetScope, required, true,
+	)
+}
+
+func requireBudgetApprovalWithLock(
+	ctx context.Context,
+	tx pgx.Tx,
+	approvalIDRaw string,
+	seriesID uuid.UUID,
+	episodeID uuid.UUID,
+	generationPlanIDRaw string,
+	budgetScope string,
+	required controlplane.BudgetLimit,
+	forUpdate bool,
+) error {
 	approvalID, err := uuid.Parse(approvalIDRaw)
 	if err != nil {
 		return controlplane.NewPolicyError(
@@ -2808,7 +2856,7 @@ func requireBudgetApproval(
 	var approvedPlanID *uuid.UUID
 	var approvedScope, approvedCurrency *string
 	var approvedMicros *int64
-	if err := tx.QueryRow(ctx, `
+	const sharedApprovalQuery = `
 		SELECT state, generation_plan_id, budget_scope,
 		       budget_limit_micros, budget_currency
 		FROM video_pipeline.review_tasks
@@ -2816,7 +2864,21 @@ func requireBudgetApproval(
 		  AND review_type = 'BUDGET'
 		  AND series_id = $2
 		  AND (episode_id IS NULL OR episode_id = $3)
-		FOR SHARE`,
+		FOR SHARE`
+	const exclusiveApprovalQuery = `
+		SELECT state, generation_plan_id, budget_scope,
+		       budget_limit_micros, budget_currency
+		FROM video_pipeline.review_tasks
+		WHERE id = $1
+		  AND review_type = 'BUDGET'
+		  AND series_id = $2
+		  AND (episode_id IS NULL OR episode_id = $3)
+		FOR UPDATE`
+	approvalQuery := sharedApprovalQuery
+	if forUpdate {
+		approvalQuery = exclusiveApprovalQuery
+	}
+	if err := tx.QueryRow(ctx, approvalQuery,
 		approvalID, seriesID, episodeID,
 	).Scan(
 		&state, &approvedPlanID, &approvedScope, &approvedMicros, &approvedCurrency,

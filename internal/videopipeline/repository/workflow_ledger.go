@@ -46,6 +46,11 @@ type providerReservationExpectation struct {
 	EstimatePayload providerReservationEstimatePayload
 }
 
+const (
+	providerCancelledReleaseReason = "provider-cancelled"
+	workflowFailedReleaseReason    = "workflow-failed-before-settlement"
+)
+
 // CompilePromptSnapshot materializes the exact four-level context resolution
 // and immutable prompt used by a workflow Activity.
 func (p *Postgres) CompilePromptSnapshot(
@@ -1466,41 +1471,14 @@ func (p *Postgres) PrepareProviderJob(
 				"persisted generation run digest no longer matches its frozen inputs",
 			)
 		}
-		if err := requireBudgetApproval(
+		if err := requireBudgetApprovalForUpdate(
 			ctx, tx, persistedBudgetApprovalID, seriesID, episodeID,
 			generationPlanID, "VIDEO", plan.BudgetLimit,
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
-		approvalID, err := uuid.Parse(persistedBudgetApprovalID)
-		if err != nil {
-			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
-				controlplane.CodeBudgetExceeded,
-				"budget approval identifier is invalid",
-				"approve the exact immutable generation plan budget",
-			)
-		}
-		var approvedMicros int64
-		var approvedCurrency string
-		if err := tx.QueryRow(ctx, `
-			SELECT budget_limit_micros, budget_currency
-			FROM video_pipeline.review_tasks
-			WHERE id = $1 AND state = 'APPROVED'
-			FOR UPDATE`,
-			approvalID,
-		).Scan(&approvedMicros, &approvedCurrency); err != nil {
-			return orchestration.PreparedProviderJob{}, fmt.Errorf(
-				"lock cumulative budget approval: %w", err,
-			)
-		}
-		if approvedMicros != plan.BudgetLimit.AmountMicros ||
-			approvedCurrency != plan.BudgetLimit.Currency {
-			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
-				controlplane.CodeBudgetExceeded,
-				"locked budget approval differs from the immutable generation plan",
-				"approve the exact plan amount and currency",
-			)
-		}
+		approvedMicros := plan.BudgetLimit.AmountMicros
+		approvedCurrency := plan.BudgetLimit.Currency
 		var capabilityID uuid.UUID
 		var pricingVersion string
 		var capabilityLimitsJSON []byte
@@ -2432,6 +2410,111 @@ func newProviderReservationExpectation(
 	}, nil
 }
 
+func readProviderReservationExpectation(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	requiredBudgetApprovalID string,
+) (providerReservationExpectation, bool, error) {
+	jobID := uuid.NewSHA1(runID, []byte("provider-job"))
+	reservationID := uuid.NewSHA1(runID, []byte("budget-reservation"))
+	var persistedBudgetApprovalID string
+	var reservationCount, jobCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT gr.budget_approval_id,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.budget_reservations br
+		        WHERE br.id = $2 OR br.generation_run_id = gr.id),
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.provider_jobs pj
+		        LEFT JOIN video_pipeline.generation_attempts ga
+		          ON ga.id = pj.generation_attempt_id
+		        WHERE pj.id = $3 OR pj.budget_reservation_id = $2
+		           OR ga.generation_run_id = gr.id)
+		FROM video_pipeline.generation_runs gr
+		WHERE gr.id = $1`,
+		runID, reservationID, jobID,
+	).Scan(&persistedBudgetApprovalID, &reservationCount, &jobCount); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return providerReservationExpectation{}, false,
+				controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"the Provider allocation has no immutable generation run",
+				)
+		}
+		return providerReservationExpectation{}, false,
+			fmt.Errorf("count deterministic Provider allocation: %w", err)
+	}
+	if requiredBudgetApprovalID != "" &&
+		persistedBudgetApprovalID != requiredBudgetApprovalID {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider run belongs to a different budget approval",
+			)
+	}
+	if reservationCount == 0 && jobCount == 0 {
+		return providerReservationExpectation{}, false, nil
+	}
+	if reservationCount != 1 || jobCount != 1 {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider allocation has partial or non-unique durable projections",
+			)
+	}
+
+	var requestHash string
+	var requestSnapshot []byte
+	if err := tx.QueryRow(ctx, `
+		SELECT request_hash, request_snapshot
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		jobID,
+	).Scan(&requestHash, &requestSnapshot); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return providerReservationExpectation{}, false,
+				controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"the Provider allocation has no deterministic job",
+				)
+		}
+		return providerReservationExpectation{}, false,
+			fmt.Errorf("read deterministic Provider request snapshot: %w", err)
+	}
+	var request immutableProviderRequest
+	if err := json.Unmarshal(requestSnapshot, &request); err != nil {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider request snapshot is invalid",
+			)
+	}
+	recomputedHash, err := digestValue(request)
+	if err != nil {
+		return providerReservationExpectation{}, false, err
+	}
+	if recomputedHash != requestHash ||
+		request.Input.Run != request.Prepared.ProductTruth.Run ||
+		request.Input.Run.RunID != runID.String() ||
+		request.Input.BudgetApprovalID != persistedBudgetApprovalID ||
+		request.Prepared.ProductTruth.BudgetApprovalID != persistedBudgetApprovalID {
+		return providerReservationExpectation{}, false,
+			controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider request differs from its immutable run approval",
+			)
+	}
+	expected, err := newProviderReservationExpectation(
+		runID, jobID, reservationID, request.Prepared,
+	)
+	if err != nil {
+		return providerReservationExpectation{}, false, err
+	}
+	return expected, true, nil
+}
+
 func verifyProviderDurableCostProjection(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -2448,7 +2531,7 @@ func verifyProviderDurableCostProjection(
 	)
 }
 
-func verifyProviderReservationProjection(
+func verifyProviderReservationIdentityProjection(
 	ctx context.Context,
 	tx pgx.Tx,
 	expected providerReservationExpectation,
@@ -2536,27 +2619,6 @@ func verifyProviderReservationProjection(
 			"the Provider job and reservation cross-binding has drifted",
 		)
 	}
-	switch jobState {
-	case "DRAFT", "VALIDATED", "QUEUED", "RUNNING", "UNKNOWN", "REQUIRES_ACTION":
-		if storedStatus != "RESERVED" {
-			return "", "", controlplane.NewConflictError(
-				controlplane.CodeRevisionConflict,
-				"a non-terminal Provider job requires an exact RESERVED allocation",
-			)
-		}
-	case "SUCCEEDED", "FAILED":
-		if storedStatus != "SETTLED" {
-			return "", "", controlplane.NewConflictError(
-				controlplane.CodeRevisionConflict,
-				"a terminal Provider job requires an exact SETTLED allocation",
-			)
-		}
-	default:
-		return "", "", controlplane.NewConflictError(
-			controlplane.CodeRevisionConflict,
-			"the Provider job has no replayable reservation state",
-		)
-	}
 
 	reservationLedgerID := uuid.NewSHA1(expected.JobID, []byte("reservation-cost"))
 	var (
@@ -2604,6 +2666,41 @@ func verifyProviderReservationProjection(
 		return "", "", controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"the Provider RESERVATION ledger projection has drifted",
+		)
+	}
+	return jobState, storedStatus, nil
+}
+
+func verifyProviderReservationProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+) (string, string, error) {
+	jobState, storedStatus, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return "", "", err
+	}
+	switch jobState {
+	case "DRAFT", "VALIDATED", "QUEUED", "RUNNING", "UNKNOWN", "REQUIRES_ACTION":
+		if storedStatus != "RESERVED" {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a non-terminal Provider job requires an exact RESERVED allocation",
+			)
+		}
+	case "SUCCEEDED", "FAILED":
+		if storedStatus != "SETTLED" {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a terminal Provider job requires an exact SETTLED allocation",
+			)
+		}
+	default:
+		return "", "", controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider job has no replayable reservation state",
 		)
 	}
 	return jobState, storedStatus, nil
@@ -2828,6 +2925,147 @@ func verifyProviderAllocatedCostProjection(
 	return *storedAmount, nil
 }
 
+func verifyReleasedProviderBudgetProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+	reason string,
+) error {
+	jobState, reservationStatus, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return err
+	}
+	if reservationStatus != "RELEASED" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release chain has no exact RELEASED reservation",
+		)
+	}
+	var expectedErrorCode any
+	var expectedErrorSnapshot any
+	switch reason {
+	case providerCancelledReleaseReason:
+		if jobState != "CANCELLED" {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a provider-cancelled release requires an exact CANCELLED job",
+			)
+		}
+		expectedErrorCode = nil
+		expectedErrorSnapshot = nil
+	case workflowFailedReleaseReason:
+		if jobState != "FAILED" {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"a pre-settlement workflow release requires an exact FAILED job",
+			)
+		}
+		expectedErrorCode = "WORKFLOW_FAILED_BEFORE_SETTLEMENT"
+		expectedErrorSnapshot = map[string]any{
+			"code":          "WORKFLOW_FAILED_BEFORE_SETTLEMENT",
+			"releaseReason": workflowFailedReleaseReason,
+		}
+	default:
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release reason differs from the immutable terminal path",
+		)
+	}
+	var errorCodeExact, errorSnapshotExact bool
+	if err := tx.QueryRow(ctx, `
+		SELECT error_code IS NOT DISTINCT FROM $2,
+		       error_snapshot IS NOT DISTINCT FROM $3::jsonb
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		expected.JobID, expectedErrorCode, expectedErrorSnapshot,
+	).Scan(&errorCodeExact, &errorSnapshotExact); err != nil {
+		return fmt.Errorf("read released Provider job terminal evidence: %w", err)
+	}
+	if !errorCodeExact || !errorSnapshotExact {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the released Provider job terminal evidence has drifted",
+		)
+	}
+	return verifyProviderReleaseLedgerProjection(ctx, tx, expected, reason)
+}
+
+func verifyProviderReleaseLedgerProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	expected providerReservationExpectation,
+	reason string,
+) error {
+	_, reservationStatus, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
+	if err != nil {
+		return err
+	}
+	if reservationStatus != "RELEASED" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release ledger has no exact RELEASED reservation",
+		)
+	}
+
+	actualID := uuid.NewSHA1(expected.JobID, []byte("actual-cost"))
+	releaseID := uuid.NewSHA1(expected.JobID, []byte("release:"+reason))
+	var actualCount, releaseCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT
+		  COUNT(*) FILTER (WHERE entry_type = 'ACTUAL' OR id = $3),
+		  COUNT(*) FILTER (WHERE entry_type = 'RELEASE' OR id = $4)
+		FROM video_pipeline.cost_ledger
+		WHERE provider_job_id = $1 OR budget_reservation_id = $2
+		   OR id IN ($3, $4)`,
+		expected.JobID, expected.ReservationID, actualID, releaseID,
+	).Scan(&actualCount, &releaseCount); err != nil {
+		return fmt.Errorf("count Provider release-cost projections: %w", err)
+	}
+	if actualCount != 0 || releaseCount != 1 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release chain has missing or non-unique terminal cost entries",
+		)
+	}
+	var releaseExact bool
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id = $2
+		   AND budget_reservation_id = $3
+		   AND entry_type = 'RELEASE'
+		   AND amount_micros IS NOT DISTINCT FROM $4
+		   AND currency IS NOT DISTINCT FROM $5
+		   AND pricing_rule_version = $6
+		   AND verified = true
+		   AND units IS NULL
+		   AND unit_name IS NULL
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		releaseID, expected.JobID, expected.ReservationID,
+		expected.AmountMicros, expected.Currency, expected.PricingVersion,
+	).Scan(&releaseExact); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the deterministic Provider RELEASE ledger entry is missing",
+			)
+		}
+		return fmt.Errorf("read Provider RELEASE ledger projection: %w", err)
+	}
+	if !releaseExact {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider RELEASE ledger projection has drifted",
+		)
+	}
+	return nil
+}
+
 func readCumulativeProviderBudgetAllocation(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -2839,7 +3077,7 @@ func readCumulativeProviderBudgetAllocation(
 	// Concurrent completion/cancellation observed before settlement is safe and
 	// conservative because RESERVED consumes the full amount.
 	rows, err := tx.Query(ctx, `
-		SELECT id
+		SELECT id, state
 		FROM video_pipeline.generation_runs
 		WHERE budget_approval_id = $1
 		ORDER BY id`,
@@ -2848,14 +3086,18 @@ func readCumulativeProviderBudgetAllocation(
 	if err != nil {
 		return 0, fmt.Errorf("read cumulative Provider budget runs: %w", err)
 	}
-	var runIDs []uuid.UUID
+	type cumulativeBudgetRun struct {
+		ID    uuid.UUID
+		State string
+	}
+	var budgetRuns []cumulativeBudgetRun
 	for rows.Next() {
-		var runID uuid.UUID
-		if err := rows.Scan(&runID); err != nil {
+		var run cumulativeBudgetRun
+		if err := rows.Scan(&run.ID, &run.State); err != nil {
 			rows.Close()
 			return 0, fmt.Errorf("scan cumulative Provider budget run: %w", err)
 		}
-		runIDs = append(runIDs, runID)
+		budgetRuns = append(budgetRuns, run)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -2864,76 +3106,41 @@ func readCumulativeProviderBudgetAllocation(
 	rows.Close()
 
 	var allocatedMicros int64
-	for _, runID := range runIDs {
-		jobID := uuid.NewSHA1(runID, []byte("provider-job"))
-		reservationID := uuid.NewSHA1(runID, []byte("budget-reservation"))
-		var activeReservationCount, activeJobCount int64
-		if err := tx.QueryRow(ctx, `
-			SELECT
-			  (SELECT COUNT(*)
-			   FROM video_pipeline.budget_reservations
-			   WHERE generation_run_id = $1
-			     AND status IN ('RESERVED', 'SETTLED')),
-			  (SELECT COUNT(*)
-			   FROM video_pipeline.provider_jobs pj
-			   JOIN video_pipeline.generation_attempts ga
-			     ON ga.id = pj.generation_attempt_id
-			   WHERE ga.generation_run_id = $1
-			     AND pj.state <> 'CANCELLED')`,
-			runID,
-		).Scan(&activeReservationCount, &activeJobCount); err != nil {
-			return 0, fmt.Errorf("count cumulative Provider run allocation: %w", err)
-		}
-		if activeReservationCount == 0 && activeJobCount == 0 {
-			continue
-		}
-		if activeReservationCount != 1 || activeJobCount != 1 {
-			return 0, controlplane.NewConflictError(
-				controlplane.CodeRevisionConflict,
-				"the cumulative Provider allocation has non-unique run projections",
-			)
-		}
-
-		var requestHash string
-		var requestSnapshot []byte
-		if err := tx.QueryRow(ctx, `
-			SELECT request_hash, request_snapshot
-			FROM video_pipeline.provider_jobs
-			WHERE id = $1
-			FOR SHARE`,
-			jobID,
-		).Scan(&requestHash, &requestSnapshot); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return 0, controlplane.NewConflictError(
-					controlplane.CodeRevisionConflict,
-					"the cumulative Provider allocation has no deterministic job",
-				)
-			}
-			return 0, fmt.Errorf("read cumulative Provider request snapshot: %w", err)
-		}
-		var request immutableProviderRequest
-		if err := json.Unmarshal(requestSnapshot, &request); err != nil {
-			return 0, controlplane.NewConflictError(
-				controlplane.CodeRevisionConflict,
-				"the cumulative Provider request snapshot is invalid",
-			)
-		}
-		recomputedHash, err := digestValue(request)
-		if err != nil {
-			return 0, err
-		}
-		if recomputedHash != requestHash || request.Input.Run.RunID != runID.String() ||
-			request.Prepared.ProductTruth.BudgetApprovalID != budgetApprovalID {
-			return 0, controlplane.NewConflictError(
-				controlplane.CodeRevisionConflict,
-				"the cumulative Provider request differs from its immutable approval",
-			)
-		}
-		expected, err := newProviderReservationExpectation(
-			runID, jobID, reservationID, request.Prepared,
+	for _, run := range budgetRuns {
+		expected, exists, err := readProviderReservationExpectation(
+			ctx, tx, run.ID, budgetApprovalID,
 		)
 		if err != nil {
 			return 0, err
+		}
+		if !exists {
+			continue
+		}
+		_, reservationStatus, err := verifyProviderReservationIdentityProjection(
+			ctx, tx, expected,
+		)
+		if err != nil {
+			return 0, err
+		}
+		if reservationStatus == "RELEASED" {
+			reason := ""
+			switch run.State {
+			case "CANCELLED":
+				reason = providerCancelledReleaseReason
+			case "FAILED":
+				reason = workflowFailedReleaseReason
+			default:
+				return 0, controlplane.NewConflictError(
+					controlplane.CodeRevisionConflict,
+					"a released Provider allocation has no matching terminal run state",
+				)
+			}
+			if err := verifyReleasedProviderBudgetProjection(
+				ctx, tx, expected, reason,
+			); err != nil {
+				return 0, err
+			}
+			continue
 		}
 		allocation, err := verifyProviderDurableCostProjection(ctx, tx, expected)
 		if err != nil {
@@ -5181,8 +5388,20 @@ func (p *Postgres) RecordProviderCancellation(
 				return struct{}{}, fmt.Errorf("finish terminal-success cancellation race: %w", err)
 			}
 		case "CANCELLED":
+			if currentState == "CANCELLED" {
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, providerCancelledReleaseReason,
+				); err != nil {
+					return struct{}{}, err
+				}
+			}
 			if currentState != "SUCCEEDED" && currentState != "FAILED" &&
 				currentState != "CANCELLED" {
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, providerCancelledReleaseReason,
+				); err != nil {
+					return struct{}{}, err
+				}
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.provider_jobs pj
 					SET state = 'CANCELLED', terminal_at = now(), updated_at = now(),
@@ -5223,11 +5442,6 @@ func (p *Postgres) RecordProviderCancellation(
 					runID,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("cancel shot revision: %w", err)
-				}
-				if err := releaseRunBudgetReservation(
-					ctx, tx, runID, "provider-cancelled",
-				); err != nil {
-					return struct{}{}, err
 				}
 			}
 			if _, err := tx.Exec(ctx, `
@@ -5370,7 +5584,20 @@ func (p *Postgres) FinalizeShotRun(
 		operationState := "SUCCEEDED"
 		if input.State == "FAILED" {
 			operationState = "FAILED"
-			if currentState != "SUCCEEDED" && currentState != "CANCELLED" {
+			if currentState == "FAILED" {
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, workflowFailedReleaseReason,
+				); err != nil {
+					return struct{}{}, err
+				}
+			}
+			if currentState != "SUCCEEDED" && currentState != "CANCELLED" &&
+				currentState != "FAILED" {
+				if err := releaseRunBudgetReservation(
+					ctx, tx, runID, workflowFailedReleaseReason,
+				); err != nil {
+					return struct{}{}, err
+				}
 				if _, err := tx.Exec(ctx, `
 					UPDATE video_pipeline.generation_runs
 					SET state = 'FAILED', failure_class = NULLIF($2, ''),
@@ -5388,11 +5615,6 @@ func (p *Postgres) FinalizeShotRun(
 					runID, input.FailureCode,
 				); err != nil {
 					return struct{}{}, fmt.Errorf("fail shot attempt: %w", err)
-				}
-				if err := releaseRunBudgetReservation(
-					ctx, tx, runID, "workflow-failed-before-settlement",
-				); err != nil {
-					return struct{}{}, err
 				}
 			}
 		} else if input.State == "SUCCEEDED" && currentState != "SUCCEEDED" {
@@ -5453,49 +5675,137 @@ func releaseRunBudgetReservation(
 	runID uuid.UUID,
 	reason string,
 ) error {
-	var reservationID, jobID uuid.UUID
-	var amountMicros int64
-	var currency, pricingVersion, status string
-	err := tx.QueryRow(ctx, `
-		SELECT br.id, pj.id, br.amount_micros, br.currency,
-		       br.pricing_rule_version, br.status
-		FROM video_pipeline.budget_reservations br
-		JOIN video_pipeline.provider_jobs pj ON pj.budget_reservation_id = br.id
-		WHERE br.generation_run_id = $1
-		FOR UPDATE OF br, pj`,
-		runID,
-	).Scan(
-		&reservationID, &jobID, &amountMicros, &currency, &pricingVersion, &status,
-	)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if reason != providerCancelledReleaseReason && reason != workflowFailedReleaseReason {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release reason differs from the immutable terminal path",
+		)
+	}
+	expected, exists, err := readProviderReservationExpectation(ctx, tx, runID, "")
+	if err != nil {
+		return err
+	}
+	if !exists {
 		return nil
 	}
+	jobState, status, err := verifyProviderReservationIdentityProjection(
+		ctx, tx, expected,
+	)
 	if err != nil {
-		return fmt.Errorf("lock releasable Provider reservation: %w", err)
+		return err
+	}
+	if status == "RELEASED" {
+		return verifyReleasedProviderBudgetProjection(ctx, tx, expected, reason)
+	}
+	if status == "SETTLED" {
+		_, err := verifyProviderAllocatedCostProjection(
+			ctx, tx, expected, jobState, status,
+		)
+		return err
 	}
 	if status != "RESERVED" {
-		return nil
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider reservation has an invalid release state",
+		)
 	}
-	if _, err := tx.Exec(ctx, `
+	switch jobState {
+	case "DRAFT", "VALIDATED", "QUEUED", "RUNNING", "UNKNOWN", "REQUIRES_ACTION":
+	default:
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release requires an unsettled non-terminal job",
+		)
+	}
+	allocation, err := verifyProviderAllocatedCostProjection(
+		ctx, tx, expected, jobState, status,
+	)
+	if err != nil {
+		return err
+	}
+	if allocation != expected.AmountMicros {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider release amount differs from the immutable reservation",
+		)
+	}
+	releaseID := uuid.NewSHA1(expected.JobID, []byte("release:"+reason))
+	var terminalLedgerCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.cost_ledger
+		WHERE ((provider_job_id = $1 OR budget_reservation_id = $2)
+		       AND entry_type IN ('ACTUAL', 'RELEASE'))
+		   OR id = $3`,
+		expected.JobID, expected.ReservationID, releaseID,
+	).Scan(&terminalLedgerCount); err != nil {
+		return fmt.Errorf("count pre-release Provider ledger projection: %w", err)
+	}
+	if terminalLedgerCount != 0 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the RESERVED Provider allocation already has terminal cost evidence",
+		)
+	}
+	var terminalJobState string
+	var terminalErrorCode any
+	var terminalErrorSnapshot any
+	switch reason {
+	case providerCancelledReleaseReason:
+		terminalJobState = "CANCELLED"
+		terminalErrorCode = nil
+		terminalErrorSnapshot = nil
+	case workflowFailedReleaseReason:
+		terminalJobState = "FAILED"
+		terminalErrorCode = "WORKFLOW_FAILED_BEFORE_SETTLEMENT"
+		terminalErrorSnapshot = map[string]any{
+			"code":          "WORKFLOW_FAILED_BEFORE_SETTLEMENT",
+			"releaseReason": workflowFailedReleaseReason,
+		}
+	}
+	jobTag, err := tx.Exec(ctx, `
+		UPDATE video_pipeline.provider_jobs
+		SET state = $2, terminal_at = now(), updated_at = now(),
+		    error_code = $3, error_snapshot = $4
+		WHERE id = $1 AND state = $5`,
+		expected.JobID, terminalJobState, terminalErrorCode,
+		terminalErrorSnapshot, jobState,
+	)
+	if err != nil {
+		return fmt.Errorf("freeze released Provider job terminal state: %w", err)
+	}
+	if jobTag.RowsAffected() != 1 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider job changed before deterministic release",
+		)
+	}
+	tag, err := tx.Exec(ctx, `
 		UPDATE video_pipeline.budget_reservations
 		SET status = 'RELEASED'
-		WHERE id = $1 AND status = 'RESERVED'`,
-		reservationID,
-	); err != nil {
+		WHERE id = $1 AND generation_run_id = $2 AND status = 'RESERVED'`,
+		expected.ReservationID, expected.RunID,
+	)
+	if err != nil {
 		return fmt.Errorf("release Provider budget reservation: %w", err)
+	}
+	if tag.RowsAffected() != 1 {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider reservation changed before deterministic release",
+		)
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO video_pipeline.cost_ledger
 			(id, provider_job_id, budget_reservation_id, entry_type,
 			 amount_micros, currency, pricing_rule_version, verified)
-		VALUES ($1, $2, $3, 'RELEASE', $4, $5, $6, true)
-		ON CONFLICT (id) DO NOTHING`,
-		uuid.NewSHA1(jobID, []byte("release:"+reason)),
-		jobID, reservationID, amountMicros, currency, pricingVersion,
+		VALUES ($1, $2, $3, 'RELEASE', $4, $5, $6, true)`,
+		releaseID, expected.JobID, expected.ReservationID,
+		expected.AmountMicros, expected.Currency, expected.PricingVersion,
 	); err != nil {
-		return fmt.Errorf("record Provider budget release: %w", err)
+		return translateWriteError("record deterministic Provider budget release", err)
 	}
-	return nil
+	return verifyProviderReleaseLedgerProjection(ctx, tx, expected, reason)
 }
 
 func dialogueCues(
