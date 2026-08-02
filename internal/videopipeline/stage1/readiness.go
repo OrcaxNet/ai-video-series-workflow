@@ -64,6 +64,11 @@ type Plan struct {
 	RequiredEvidence          []string              `json:"requiredEvidence"`
 	TTSPreflight              TTSPreflight          `json:"ttsPreflight"`
 	NativeAudio               *NativeAudioPreflight `json:"nativeAudio,omitempty"`
+	// OfflineOnly selects the parameterized formal-package policy. It permits
+	// zero-cash, quota-pending packages to be sealed for independent QA, while
+	// deliberately rejecting a live credential or Provider authorization.
+	// The zero value preserves the fixed FLO-104 sample-1 contract.
+	OfflineOnly bool `json:"offlineOnly,omitempty"`
 }
 
 // NativeAudioPreflight makes the FLO-154 zero-TTS execution boundary explicit.
@@ -93,6 +98,9 @@ type TTSPreflight struct {
 func (p Plan) Validate() error {
 	if p.SchemaVersion == NativeSchemaVersion {
 		return p.validateNative()
+	}
+	if p.OfflineOnly {
+		return p.validateOffline()
 	}
 	switch {
 	case p.SchemaVersion != SchemaVersion:
@@ -204,6 +212,56 @@ func (p Plan) validateNative() error {
 	sort.Strings(wantEvidence)
 	if strings.Join(gotEvidence, "\x00") != strings.Join(wantEvidence, "\x00") {
 		return errors.New("FLO-154 native plan does not require the complete evidence set")
+	}
+	return nil
+}
+
+func (p Plan) validateOffline() error {
+	switch {
+	case p.SchemaVersion != SchemaVersion:
+		return errors.New("stage 1 schemaVersion must be v1")
+	case strings.TrimSpace(p.BatchID) == "":
+		return errors.New("offline formal batchId is required")
+	case p.VideoModel != FormalVideoModel:
+		return errors.New("offline formal packages must use doubao-seedance-2.0")
+	case len(p.PrimaryShotIDs) != RequiredPrimaryJobs:
+		return fmt.Errorf("offline formal batch requires exactly %d primary shots", RequiredPrimaryJobs)
+	case p.MaximumNewJobs != MaximumNewProviderJobs || p.MaximumControlledRetries != MaximumControlledRetries:
+		return errors.New("offline formal batch must be capped at 10 primary jobs plus one controlled retry")
+	case p.MaximumVideoTokens != MaximumVideoTokens:
+		return errors.New("offline formal video token cap must equal 1200000")
+	case p.MonthlyBaselineAFPMilli < 0 || p.MonthlyBaselineAFPMilli >= p.MonthlyMaximumAFPMilli:
+		return errors.New("offline formal monthly AFP envelope is invalid")
+	case p.ReferenceJobAFPMilli <= 0 || p.MaximumAFPDriftBPS != MaximumAFPDriftBPS:
+		return errors.New("offline formal reference AFP and 10 percent drift limit are required")
+	case p.MaximumCashMicros != 0:
+		return errors.New("offline formal package must cap non-subscription cash at zero")
+	case p.MaximumDialogueCharacters < 0 || p.MaximumDialogueCharacters > MaximumDialogueChars:
+		return errors.New("offline formal dialogue cap must be between 0 and 600 Unicode characters")
+	case p.MaximumTTSAFPMilli != p.MaximumDialogueCharacters*135:
+		return errors.New("offline formal TTS attribution must equal 135 milli-AFP per character")
+	case !p.TTSPreflight.CompletedNoCost || p.TTSPreflight.Provider != "volcengine_ark" ||
+		p.TTSPreflight.Model != "doubao-seed-tts-2.0" || p.TTSPreflight.Region != "cn-beijing" ||
+		p.TTSPreflight.ResourceID != "seed-tts-2.0" ||
+		p.TTSPreflight.CredentialReference != "ARK_API_KEY" || p.TTSPreflight.CredentialAvailable ||
+		p.TTSPreflight.Pricing != "1350_afp_per_10000_chars" ||
+		p.TTSPreflight.UsageAttribution != "provider_usage_tokens_per_request":
+		return errors.New("offline formal package requires the quota-pending no-cost TTS snapshot without credentials")
+	}
+	seen := make(map[string]struct{}, len(p.PrimaryShotIDs))
+	for _, shotID := range p.PrimaryShotIDs {
+		if strings.TrimSpace(shotID) == "" {
+			return errors.New("offline formal shot IDs cannot be empty")
+		}
+		if _, duplicate := seen[shotID]; duplicate {
+			return fmt.Errorf("duplicate offline formal shot ID %q", shotID)
+		}
+		seen[shotID] = struct{}{}
+	}
+	gotEvidence := append([]string(nil), p.RequiredEvidence...)
+	sort.Strings(gotEvidence)
+	if strings.Join(gotEvidence, "\x00") != strings.Join(requiredEvidence, "\x00") {
+		return errors.New("offline formal plan does not require the complete evidence set")
 	}
 	return nil
 }
@@ -994,6 +1052,9 @@ type Executor struct {
 func NewExecutor(gate *Gate, submitter Submitter) (*Executor, error) {
 	if gate == nil || submitter == nil {
 		return nil, errors.New("stage 1 gate and submitter are required")
+	}
+	if gate.Plan().OfflineOnly {
+		return nil, providerError(providercontract.CodeForbidden, "offline-only stage 1 packages cannot construct a Provider executor")
 	}
 	return &Executor{gate: gate, submitter: submitter}, nil
 }

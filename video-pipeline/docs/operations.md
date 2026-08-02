@@ -19,6 +19,35 @@ Mock Provider healthy
   → Control Plane ready
 ```
 
+### 1.1 OrbStack 常驻体验
+
+```bash
+# ARK_API_KEY 只能由当前进程环境或 Secret Store 注入，不写入 .env.video。
+make video-orbstack-up
+make video-orbstack-status
+```
+
+该目标仅在 Docker context 为 `orbstack` 时运行，并启动 `studio`、控制面、Worker、
+PostgreSQL、Temporal UI、Mock Provider 与 Live Adapter。它使用显式服务清单排除
+`live-probe` 和 `stage1-runner`，因此启动/重启本身不会提交付费生成任务。内部服务
+认证 Secret 未提供时由目标生成，并同时注入 Live Adapter 与 Worker；`ARK_API_KEY`
+只注入 Live Adapter。容器由 `restart: unless-stopped` 常驻，数据位于命名卷。
+OrbStack 入口使用独立的 `ai-video-series-*-orbstack` 数据卷，避免覆盖或复用普通
+`video-up` 留下的本地数据；旧卷不会被自动删除。所有宿主机端口默认只绑定
+`127.0.0.1`，避免无认证的本地体验控制面暴露到局域网。
+
+访问入口：
+
+| 地址 | 内容 |
+|---|---|
+| `http://127.0.0.1:4173` | 创作者操作台 |
+| `http://127.0.0.1:18080/health/ready` | 控制面联合就绪 |
+| `http://127.0.0.1:8233` | Temporal UI |
+
+操作台的项目创建、Gate、异常注入和成片锁版仍使用 Mock projection；Provider 状态
+来自控制面并能显示 Agent Plan 已配置。真实 mutation 在加载 series/episode、权利、
+revision、route、budget 和 policy 等不可变绑定前保持 fail closed。
+
 ### v5 → v6/v7 数据升级
 
 `000006_generation_mainline` 创建 v6 主链路表；`000007_generation_mainline_upgrade`

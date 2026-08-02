@@ -32,7 +32,7 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	flags := flag.NewFlagSet("video-stage1-materialize", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	var files stage1materialize.Files
-	var planPath, outputPath, reportPath string
+	var planPath, outputPath, reportPath, formalRoot, expectedPackageHash string
 	var approvalComment, approvalActor, approvalValidUntil string
 	flags.StringVar(&files.Product, "product", "", "fixed product-input JSON")
 	flags.StringVar(&files.Source, "source", "", "fixed source text")
@@ -43,7 +43,9 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	flags.StringVar(&files.CodeCommit, "code-commit", "", "FLO-154 lowercase 40-character code commit SHA")
 	flags.StringVar(&files.BuildSHA256, "build-sha256", "", "FLO-154 materializer build SHA-256")
 	flags.StringVar(&planPath, "plan", "", "Stage 1 readiness plan")
-	flags.StringVar(&outputPath, "output", "", "prompt-free execution package output")
+	flags.StringVar(&formalRoot, "formal-pack", "", "FLO-100 formal offline package directory (A/B/C mode)")
+	flags.StringVar(&expectedPackageHash, "expected-package-hash", "", "independently pinned FLO-100 package content hash")
+	flags.StringVar(&outputPath, "output", "", "prompt-free execution package output, or output directory in formal-pack mode")
 	flags.StringVar(&reportPath, "report", "", "offline materialization report output")
 	flags.StringVar(&approvalComment, "approval-comment", "", "ADMIN approval comment UUID")
 	flags.StringVar(&approvalActor, "approval-actor", "", "ADMIN actor UUID")
@@ -51,16 +53,23 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || files.Product == "" || files.Source == "" || files.Safety == "" || files.Visual == "" || planPath == "" || outputPath == "" || reportPath == "" {
-		return errors.New("product, source, safety, visual, plan, output, and report are required")
+	if flags.NArg() != 0 || outputPath == "" || reportPath == "" {
+		return errors.New("output and report are required")
+	}
+	formalMode := formalRoot != ""
+	if formalMode {
+		if files.Product != "" || files.Source != "" || files.Safety != "" || files.Visual != "" || planPath != "" {
+			return errors.New("formal-pack mode cannot be combined with legacy product, source, safety, visual, or plan inputs")
+		}
+		if expectedPackageHash == "" {
+			return errors.New("expected-package-hash is required in formal-pack mode")
+		}
+	} else if files.Product == "" || files.Source == "" || files.Safety == "" || files.Visual == "" || planPath == "" {
+		return errors.New("product, source, safety, visual, and plan are required in legacy mode")
 	}
 	validUntil, err := time.Parse(time.RFC3339, approvalValidUntil)
 	if err != nil {
 		return errors.New("approval-valid-until must be RFC3339")
-	}
-	var plan stage1.Plan
-	if err := decodeFile(planPath, &plan); err != nil {
-		return fmt.Errorf("read Stage 1 plan: %w", err)
 	}
 	dsn, err := requiredEnv(lookup, "VIDEO_POSTGRES_DSN")
 	if err != nil {
@@ -82,9 +91,32 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	if err != nil {
 		return err
 	}
-	package_, report, err := stage1materialize.Materialize(ctx, pool, cas, plan, files, stage1materialize.Approval{
+	approval := stage1materialize.Approval{
 		CommentID: approvalComment, ActorID: approvalActor, ValidUntil: validUntil.UTC(),
-	})
+	}
+	if formalMode {
+		packages, report, err := stage1materialize.MaterializeFLO100(ctx, pool, cas, stage1materialize.FormalOptions{
+			Root: formalRoot, ExpectedPackageHash: expectedPackageHash, Approval: approval,
+		})
+		if err != nil {
+			return err
+		}
+		for _, package_ := range packages {
+			path := filepath.Join(outputPath, stage1materialize.FormalBatchOutputName(package_.BatchID))
+			if err := writeJSONAtomically(path, package_); err != nil {
+				return fmt.Errorf("write %s execution package: %w", package_.BatchID, err)
+			}
+		}
+		if err := writeJSONAtomically(reportPath, report); err != nil {
+			return fmt.Errorf("write formal verification report: %w", err)
+		}
+		return nil
+	}
+	var plan stage1.Plan
+	if err := decodeFile(planPath, &plan); err != nil {
+		return fmt.Errorf("read Stage 1 plan: %w", err)
+	}
+	package_, report, err := stage1materialize.Materialize(ctx, pool, cas, plan, files, approval)
 	if err != nil {
 		return err
 	}

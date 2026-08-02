@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-cer-test video-stage1-readiness video-stage1-materialize-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-orbstack-up video-orbstack-status video-orbstack-down video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-cer-test video-stage1-readiness video-stage1-materialize-test video-flo100-materialize-integration-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -17,6 +17,33 @@ video-up: video-bootstrap
 
 video-up-tools: video-bootstrap
 	$(VIDEO_COMPOSE) --profile tools up --build --wait
+
+# Persistent local creator experience for OrbStack. The explicit service list
+# intentionally excludes live-probe and stage1-runner because both are one-shot
+# execution paths, not long-running UI dependencies. ARK_API_KEY is inherited
+# only by the live adapter container; the internal HMAC secret is regenerated
+# atomically whenever the stack is recreated.
+video-orbstack-up: video-bootstrap
+	@test "$$(docker context show)" = "orbstack" || (echo "Docker context must be orbstack" && exit 1)
+	@test -n "$${ARK_API_KEY:-}" || (echo "ARK_API_KEY must be an Agent Plan key injected at runtime" && exit 1)
+	@provider_secret="$${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-$$(openssl rand -hex 32)}"; \
+	build_version="$$(git rev-parse --short=12 HEAD)"; \
+	VIDEO_BUILD_VERSION="$$build_version" \
+	VIDEO_PROVIDER_SERVICE_AUTH_SECRET="$$provider_secret" \
+	VIDEO_PROVIDER_ADAPTER_URL="http://volcengine-provider:8091" \
+	VIDEO_SPEECH_PROVIDER_ADAPTER_URL="http://volcengine-provider:8091" \
+	VIDEO_LIVE_PROVIDER_CONFIGURED="true" \
+	VIDEO_POSTGRES_VOLUME="ai-video-series-postgres-orbstack" \
+	VIDEO_ARTIFACT_VOLUME="ai-video-series-artifacts-orbstack" \
+	$(VIDEO_COMPOSE) up --build --wait --force-recreate \
+		postgres migrate temporal temporal-ui mock-provider volcengine-provider \
+		orchestrator-worker control-plane studio
+
+video-orbstack-status: video-bootstrap
+	$(VIDEO_COMPOSE) ps
+
+video-orbstack-down: video-bootstrap
+	$(VIDEO_COMPOSE) down
 
 video-down: video-bootstrap
 	$(VIDEO_COMPOSE) down
@@ -52,6 +79,13 @@ video-stage1-readiness:
 # attachments, explicit ADMIN approval identity, PostgreSQL, and a CAS root.
 video-stage1-materialize-test:
 	go test ./cmd/video-stage1-materialize ./internal/videopipeline/stage1materialize ./internal/videopipeline/repository
+
+# Provider-free fresh-PostgreSQL materialize -> replay -> seal/verify gate for
+# FLO-100 GOLD A/B/C. The caller supplies the independently downloaded pack.
+video-flo100-materialize-integration-test:
+	@test -n "$(VIDEO_TEST_POSTGRES_DSN)" || (echo "VIDEO_TEST_POSTGRES_DSN is required" && exit 1)
+	@test -n "$(VIDEO_TEST_FLO100_PACK_PATH)" || (echo "VIDEO_TEST_FLO100_PACK_PATH is required" && exit 1)
+	go test -tags=integration -run TestMaterializeFLO100PersistsReplaysAndStaysProviderFree -v ./internal/videopipeline/stage1materialize
 
 # Build/test only. The revoice command has no Provider client or Adapter URL.
 video-stage1-revoice-test:

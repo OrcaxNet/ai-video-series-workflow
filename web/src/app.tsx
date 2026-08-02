@@ -64,6 +64,7 @@ export function App() {
   const projectSwitcherRef = useRef<HTMLButtonElement>(null);
   const closeProjectDialog = useCallback(() => setProjectDialogOpen(false), []);
   const CurrentPage = pages[state.view];
+  const agentPlanConfigured = state.capabilities.some((capability) => capability.liveConfigured);
 
   return (
     <div className={`studio-shell ${state.inspectorOpen ? "with-inspector" : ""}`}>
@@ -97,11 +98,18 @@ export function App() {
           <ChevronDown size={14} aria-hidden="true" />
         </button>
         <div className="topbar-actions">
-          <div className="mode-pill" title="当前不进行真实 Provider 调用">
-            <CloudOff size={14} aria-hidden="true" />
+          <div
+            className="mode-pill"
+            title={
+              agentPlanConfigured
+                ? "Agent Plan 凭据仅注入后端；当前界面操作仍是可复现演练"
+                : "当前不进行真实 Provider 调用"
+            }
+          >
+            {agentPlanConfigured ? <ShieldCheck size={14} aria-hidden="true" /> : <CloudOff size={14} aria-hidden="true" />}
             <span>
-              <strong>Mock only</strong>
-              <small>live pending_key</small>
+              <strong>{agentPlanConfigured ? "Agent Plan 已配置" : "Mock only"}</strong>
+              <small>{agentPlanConfigured ? "交互仍为安全演练" : "live pending_key"}</small>
             </span>
           </div>
           <button className="icon-button" type="button" aria-label="搜索">

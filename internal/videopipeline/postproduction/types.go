@@ -276,8 +276,9 @@ func (s SpeechConfig) Validate() error {
 		return errors.New("speech provider profile is required")
 	case strings.TrimSpace(s.BudgetApprovalID) == "":
 		return errors.New("speech budget approval is required")
-	case s.BudgetMaximumMicros <= 0:
-		return errors.New("speech budget maximum must be positive")
+	case s.BudgetMaximumMicros < 0 ||
+		(s.BudgetMaximumMicros == 0 && s.Route.Verification != providercontract.PendingKey):
+		return errors.New("speech budget maximum must be positive unless the route is quota-pending and cash-locked")
 	case len(s.BudgetCurrency) != 3:
 		return errors.New("speech budget currency must be an ISO 4217 code")
 	}

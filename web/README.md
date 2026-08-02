@@ -25,6 +25,10 @@ npx playwright install chromium
 npm run test:e2e
 ```
 
+Playwright 固定在 `127.0.0.1:4174` 启动独立 Mock 测试服务器，使用
+`--strictPort` 且禁止复用已有服务。因此即使 OrbStack Studio 正常常驻于 `4173`，
+`npm test` / `make web-test` 仍只测试本次启动的隔离测试构建。
+
 如已在 `localhost:18080` 启动控制面，可使用同源开发代理读取真实 `/api/v1/providers/status`：
 
 ```bash

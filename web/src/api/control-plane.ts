@@ -586,7 +586,28 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
   }
 }
 
-export const createControlPlaneApi = (): ControlPlaneApi =>
-  import.meta.env.VITE_STUDIO_MODE === "live"
-    ? new HttpControlPlaneApi(import.meta.env.VITE_API_BASE || "/api/v1")
-    : new MockControlPlaneApi();
+// LocalExperienceControlPlaneApi keeps the creator-facing rehearsal fully
+// interactive while sourcing the provider connection status from the real
+// local control plane. Real mutations remain unavailable until the UI loads
+// immutable production bindings instead of its deterministic PoC fixtures.
+export class LocalExperienceControlPlaneApi extends MockControlPlaneApi {
+  private readonly providerStatusApi: HttpControlPlaneApi;
+
+  constructor(baseUrl = "/api/v1") {
+    super();
+    this.providerStatusApi = new HttpControlPlaneApi(baseUrl);
+  }
+
+  override getProviderStatus(): Promise<ProviderCapability[]> {
+    return this.providerStatusApi.getProviderStatus();
+  }
+}
+
+export const createControlPlaneApi = (): ControlPlaneApi => {
+  const baseUrl = import.meta.env.VITE_API_BASE || "/api/v1";
+  if (import.meta.env.VITE_STUDIO_MODE === "live") return new HttpControlPlaneApi(baseUrl);
+  if (import.meta.env.VITE_STUDIO_MODE === "local-experience") {
+    return new LocalExperienceControlPlaneApi(baseUrl);
+  }
+  return new MockControlPlaneApi();
+};

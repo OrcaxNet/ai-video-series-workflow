@@ -426,6 +426,66 @@ func TestValidateDialoguePins600CharactersAnd81AFP(t *testing.T) {
 	}
 }
 
+func TestOfflinePlanAcceptsParameterizedZeroCashDialogueCaps(t *testing.T) {
+	for _, characters := range []int64{7, 5, 0} {
+		t.Run(fmt.Sprintf("characters_%d", characters), func(t *testing.T) {
+			plan := testPlan()
+			plan.BatchID = fmt.Sprintf("flo100-gold-%d-v1", characters)
+			plan.MonthlyBaselineAFPMilli = 0
+			plan.MonthlyMaximumAFPMilli = 135_000_000
+			plan.MaximumCashMicros = 0
+			plan.MaximumDialogueCharacters = characters
+			plan.MaximumTTSAFPMilli = characters * 135
+			plan.TTSPreflight.CredentialAvailable = false
+			plan.OfflineOnly = true
+			if err := plan.Validate(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestOfflinePlanRejectsCredentialOrCashAuthorization(t *testing.T) {
+	for _, mutate := range []func(*Plan){
+		func(plan *Plan) { plan.TTSPreflight.CredentialAvailable = true },
+		func(plan *Plan) { plan.MaximumCashMicros = 1 },
+		func(plan *Plan) { plan.MaximumTTSAFPMilli++ },
+	} {
+		plan := testPlan()
+		plan.BatchID = "flo100-gold-a-v1"
+		plan.MonthlyBaselineAFPMilli = 0
+		plan.MonthlyMaximumAFPMilli = 135_000_000
+		plan.MaximumCashMicros = 0
+		plan.MaximumDialogueCharacters = 7
+		plan.MaximumTTSAFPMilli = 945
+		plan.TTSPreflight.CredentialAvailable = false
+		plan.OfflineOnly = true
+		mutate(&plan)
+		if err := plan.Validate(); err == nil {
+			t.Fatal("unsafe offline plan was accepted")
+		}
+	}
+}
+
+func TestOfflinePlanCannotConstructProviderExecutor(t *testing.T) {
+	plan := testPlan()
+	plan.BatchID = "flo100-gold-a-v1"
+	plan.MonthlyBaselineAFPMilli = 0
+	plan.MonthlyMaximumAFPMilli = 135_000_000
+	plan.MaximumCashMicros = 0
+	plan.MaximumDialogueCharacters = 7
+	plan.MaximumTTSAFPMilli = 945
+	plan.TTSPreflight.CredentialAvailable = false
+	plan.OfflineOnly = true
+	gate, err := Open(plan, filepath.Join(t.TempDir(), "offline-ledger.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewExecutor(gate, &fakeSubmitter{}); providercontract.ErrorCodeOf(err) != providercontract.CodeForbidden {
+		t.Fatalf("offline executor error = %v", err)
+	}
+}
+
 func TestGateFailsClosedBeforeSubmitAcrossBudgetAndEvidenceBoundaries(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
