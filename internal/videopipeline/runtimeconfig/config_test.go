@@ -1,9 +1,12 @@
 package runtimeconfig
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 )
 
 func TestLoadControlPlane(t *testing.T) {
@@ -300,6 +303,84 @@ func TestLoadVolcengineProviderRequiresCompleteZeroCashSpeechCanary(t *testing.T
 			tt.mutate(values)
 			if _, err := load(values); err == nil {
 				t.Fatal("invalid speech canary config unexpectedly passed")
+			}
+		})
+	}
+}
+
+func TestLoadVolcengineProviderRequiresExactSpeechBatchAuthorization(t *testing.T) {
+	inputHash := strings.Repeat("a", 64)
+	batch := speechcontract.BatchAuthorization{
+		SchemaVersion:              speechcontract.SchemaVersion,
+		ParentExecutionPackageHash: strings.Repeat("d", 64),
+		ApprovalCommentID:          "10400000-0000-4000-8000-000000000030",
+		ApprovalActorID:            "10400000-0000-4000-8000-000000000031",
+		ValidUntil:                 "2026-08-31T15:59:59Z",
+		Provider:                   "volcengine_ark", ModelID: "doubao-seed-tts-2.0",
+		RouteVersion: "agent-plan-large-tts-v2", ResourceID: "seed-tts-2.0",
+		Speaker:                   AgentPlanTTSSpeakerID,
+		VoiceAssetID:              "10400000-0000-4000-8000-00000000000f",
+		ParentVoiceAssetVersionID: "10400000-0000-4000-8000-000000000010",
+		VoiceAssetVersionID:       "10400000-0000-4000-8000-000000000011",
+		VoiceAssetVersionHash:     strings.Repeat("b", 64),
+		LicenseSnapshotID:         "10400000-0000-4000-8000-000000000012",
+		LicenseSnapshotHash:       strings.Repeat("c", 64),
+		MaximumSubmits:            1, EstimatedAFPMilli: 945, MaximumAFPMilli: 1040,
+		Cues: []speechcontract.CueAuthorization{{
+			CueID: "cue-006", JobID: "speech-v2-" + inputHash[:32], InputHash: inputHash,
+			UnicodeCharacters: 7, EstimatedAFPMilli: 945, MaximumAFPMilli: 1040,
+			MaxAttempts: 1,
+		}},
+	}
+	encoded, err := json.Marshal(batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := map[string]string{
+		"ARK_API_KEY":                                   "test-runtime-credential",
+		"VIDEO_PROVIDER_SERVICE_AUTH_SECRET":            "test-service-auth-secret-32-bytes-long",
+		"VIDEO_ARTIFACT_ROOT":                           t.TempDir(),
+		"VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON": string(encoded),
+	}
+	load := func(values map[string]string) (VolcengineProvider, error) {
+		return loadVolcengineProvider(func(name string) (string, bool) {
+			value, ok := values[name]
+			return value, ok
+		})
+	}
+	cfg, err := load(valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SpeechBatchAuthorization == nil || cfg.SpeechBatchAuthorization.Cues[0].CueID != "cue-006" {
+		t.Fatalf("speech batch config = %#v", cfg.SpeechBatchAuthorization)
+	}
+	tests := []struct {
+		name   string
+		mutate func(map[string]string)
+	}{
+		{name: "unknown field", mutate: func(values map[string]string) {
+			values["VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON"] = strings.TrimSuffix(string(encoded), "}") + `,"extra":true}`
+		}},
+		{name: "combined with canary", mutate: func(values map[string]string) {
+			values["VIDEO_VOLCENGINE_TTS_CANARY_MAX_AFP_MILLI"] = "1"
+		}},
+		{name: "cash enabled", mutate: func(values map[string]string) {
+			copy := batch
+			copy.MaximumNonSubscriptionCashMicros = 1
+			changed, _ := json.Marshal(copy)
+			values["VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON"] = string(changed)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			values := make(map[string]string, len(valid))
+			for name, value := range valid {
+				values[name] = value
+			}
+			tt.mutate(values)
+			if _, err := load(values); err == nil {
+				t.Fatal("invalid speech batch config unexpectedly passed")
 			}
 		})
 	}

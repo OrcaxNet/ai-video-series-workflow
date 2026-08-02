@@ -300,7 +300,7 @@ func loadRevisionParent(
 			fmt.Errorf("decode immutable stage 1 parent execution package: %w", err),
 		)
 	}
-	if err := child.ValidateSpeechV2Revision(plan, parent); err != nil {
+	if err := child.ValidateRevision(plan, parent); err != nil {
 		return nil, stage1.UnverifiableRevisionParentError(
 			fmt.Errorf("validate immutable stage 1 execution package revision: %w", err),
 		)

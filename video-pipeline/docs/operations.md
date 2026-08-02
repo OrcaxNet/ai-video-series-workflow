@@ -114,6 +114,7 @@ publication lock，不允许执行 migration down 或让 v5 worker接管；应�
 | `VIDEO_VOLCENGINE_TTS_ENDPOINT` | Agent Plan HTTP TTS URL | 只接受套餐专属 V3 HTTP Chunked `/api/v3/plan/tts/unidirectional`；标准 `/api/v3/tts/...`、query、尾斜杠或 host 漂移均在网络调用前失败关闭；Resource ID 固定为 `seed-tts-2.0` |
 | `VIDEO_VOLCENGINE_TTS_SPEAKER` | `zh_female_vv_uranus_bigtts` | FLO-104 冻结的 vivi 2.0 / TTS 2.0 音色；任意其他值均在 Adapter 构造前失败关闭；不是 Secret |
 | `VIDEO_VOLCENGINE_TTS_CANARY_*` | 未设置 | 单次 TTS canary 的 job/input/cue、VOICE/license hash、AFP/现金上限完整 allowlist；必须全量配置，`MAX_CASH_MICROS=0`，且不能与旧 job reconciliation 同时启用 |
+| `VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON` | 未设置 | 已验收 canary 后的有序多 cue 授权；冻结父 package、批准人/评论/有效期、VOICE/license/route、逐 cue job/input/AFP/attempt 与累计上限；不能与 canary/reconciliation 同时启用 |
 | `VIDEO_VOLCENGINE_PLAN` | `agent-plan-large` | 套餐计费模式标识 |
 | `ANTHROPIC_BASE_URL` | 未设置 | 预留 Claude adapter 的显式 endpoint；M0 不启用 |
 | `ANTHROPIC_API_KEY` | 未设置 | 文本备用 Secret |
@@ -166,6 +167,16 @@ ledger 与不可变父包中。新 VOICE 的直接父版本必须等于当前 pa
 会递归证明谱系回到镜头批准的原始 VOICE；旧失败 job 永久不可重放。
 HTTP status、纯数字 Provider code、脱敏后的 `X-Api-Message` 分类及 `X-Tt-Logid` 会分别保存，
 未知 `55*` 只标为未分类 unavailable，不推断为 resource/speaker mismatch。
+
+canary 验收后，`video-stage1-authorize-speech` 可从当前 package 派生有序 speech batch
+child。工具只读 PostgreSQL/CAS 来复算 subtitle/job identity 并确认既有 canary artifact，
+没有 Adapter URL 或 Provider client；`provider_jobs` 前后必须零增量。child 会清除单 cue
+字段，冻结既有成功 cue 的完整 attempt/CAS/实测时长，并冻结剩余 cue 的顺序、唯一
+`speech-v2` job/input、逐条和累计 AFP、`MaxAttempts=1`、零现金与授权有效期。Worker
+跳过已完成 cue，严格串行剩余 cue；任一错误立即停止。重启时先 GET 同一 immutable job
+做只读 reconciliation，只有明确 `not_found` 才允许首次 POST。Adapter 要求所有前驱 job
+为带 request/connect/log/usage/零现金证据的 `succeeded`，否则在 Provider 前失败关闭；
+跨实例同 job 仍由原子 intent 保证至多一次 Provider submit。
 
 `video-live-probe` 固定为一个 1280×720、24 fps、5 秒、无同步音频的原创抽象
 镜头，`maxAttempts=1`。输出目录带原子单次提交锁；即使任务失败，也不能在同一

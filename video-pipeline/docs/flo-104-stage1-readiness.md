@@ -83,6 +83,25 @@ Provider profile/capability；Adapter 再匹配 job/input/cue/VOICE/license allo
 一段 canary 后，Finalize 会在媒体合成、Manifest 与 G3 前返回需人工检查的非重试冲突，
 不会继续提交其余 cue。跨进程相同 job 通过原子 intent/replay 保证至多一次 Provider submit。
 
+canary 经 QA 验收并取得新的明确授权后，使用独立 child package 冻结剩余 cue：
+
+```bash
+go run ./cmd/video-stage1-authorize-speech \
+  --plan video-pipeline/config/flo104-stage1-readiness.json \
+  --parent flo104-sample1-execution-package-speech-v2.json \
+  --authorization video-pipeline/config/flo104-speech-batch-authorization.json \
+  --approval-comment <approval-comment-uuid> \
+  --approval-actor <approving-agent-uuid> \
+  --approval-valid-until <RFC3339> \
+  --output flo104-sample1-execution-package-speech-batch-v1.json \
+  --report flo104-sample1-speech-batch-no-cost-report.json
+```
+
+该命令无 Provider client，必须报告 `providerCalls=0`、`providerJobDelta=0`。batch child
+保留既有 canary attempt/CAS（使用实测时长），只为未完成 cue 创建有序 job allowlist。
+Worker 严格串行且失败即停；Activity 恢复先 GET 原 job，只在明确不存在时首次 POST。
+Adapter 同时执行逐 job、累计 AFP、零现金、有效期、前驱成功和跨实例唯一消费检查。
+
 speech-v2 execution package 还必须冻结 `parentExecutionPackageHash`，且 Runner 必须同时读取
 `VIDEO_STAGE1_PARENT_EXECUTION_PACKAGE_PATH` 指向的完整只读父包。Runner 会先复算父包 hash，
 再构造唯一允许的 child 投影；只允许 Speech route/profile、VOICE binding、授权 cue、AFP/现金/

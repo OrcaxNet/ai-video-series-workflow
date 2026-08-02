@@ -3,8 +3,10 @@
 package runtimeconfig
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -12,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 	"github.com/google/uuid"
 )
 
@@ -96,6 +99,7 @@ type VolcengineProvider struct {
 	SpeechCanaryLicenseHash        string
 	SpeechCanaryMaximumAFPMilli    int64
 	SpeechCanaryMaximumCashMicros  int64
+	SpeechBatchAuthorization       *speechcontract.BatchAuthorization
 	MaxSpeechBytes                 int64
 	PlanName                       string
 	PricingVersion                 string
@@ -282,6 +286,22 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 	if cfg.SpeechCanaryMaximumCashMicros, err = nonNegativeInt64(lookup, "VIDEO_VOLCENGINE_TTS_CANARY_MAX_CASH_MICROS", 0); err != nil {
 		return VolcengineProvider{}, err
 	}
+	if raw := value(lookup, "VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON", ""); raw != "" {
+		var authorization speechcontract.BatchAuthorization
+		decoder := json.NewDecoder(strings.NewReader(raw))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&authorization); err != nil {
+			return VolcengineProvider{}, fmt.Errorf("VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON: %w", err)
+		}
+		var extra any
+		if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+			return VolcengineProvider{}, errors.New("VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON must contain exactly one JSON value")
+		}
+		if err := authorization.Validate(); err != nil {
+			return VolcengineProvider{}, fmt.Errorf("VIDEO_VOLCENGINE_TTS_BATCH_AUTHORIZATION_JSON: %w", err)
+		}
+		cfg.SpeechBatchAuthorization = &authorization
+	}
 	if cfg.RequestTimeout, err = duration(lookup, "VIDEO_VOLCENGINE_REQUEST_TIMEOUT", cfg.RequestTimeout); err != nil {
 		return VolcengineProvider{}, err
 	}
@@ -361,7 +381,29 @@ func loadVolcengineProvider(lookup LookupEnv) (VolcengineProvider, error) {
 			return VolcengineProvider{}, errors.New("TTS canary and legacy reconciliation cannot be enabled together")
 		}
 	}
+	if cfg.SpeechBatchAuthorization != nil {
+		if canaryConfigured || cfg.SpeechRetryJobID != "" {
+			return VolcengineProvider{}, errors.New("TTS batch authorization cannot be combined with canary or reconciliation settings")
+		}
+		batch := cfg.SpeechBatchAuthorization
+		if !sameProvider(batch.Provider, "volcengine_ark") || batch.ModelID != cfg.SpeechModel ||
+			batch.RouteVersion != "agent-plan-large-tts-v2" ||
+			batch.ResourceID != "seed-tts-2.0" || batch.Speaker != cfg.SpeechSpeaker {
+			return VolcengineProvider{}, errors.New("TTS batch authorization route does not match the configured Agent Plan adapter")
+		}
+	}
 	return cfg, nil
+}
+
+func sameProvider(left, right string) bool {
+	normalize := func(value string) string {
+		value = strings.ToLower(strings.TrimSpace(value))
+		if value == "volcengine" {
+			return "volcengine_ark"
+		}
+		return value
+	}
+	return normalize(left) == normalize(right)
 }
 
 func lowercaseSHA256(value string) bool {

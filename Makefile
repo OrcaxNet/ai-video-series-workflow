@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-stage1-readiness video-stage1-materialize-test video-stage1-revoice-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-stage1-readiness video-stage1-materialize-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -52,6 +52,11 @@ video-stage1-materialize-test:
 # Build/test only. The revoice command has no Provider client or Adapter URL.
 video-stage1-revoice-test:
 	go test ./cmd/video-stage1-revoice ./internal/videopipeline/stage1materialize ./internal/videopipeline/postproduction ./internal/videopipeline/volcengineprovider
+
+# Build/test only. The batch materializer has no Provider client and contract
+# tests assert ordered fail-closed submission.
+video-stage1-speech-batch-test:
+	go test -race ./cmd/video-stage1-authorize-speech ./internal/videopipeline/speechcontract ./internal/videopipeline/stage1materialize ./internal/videopipeline/postproduction ./internal/videopipeline/volcengineprovider
 
 # Build-only QA gate: does not start a container or contact an adapter.
 video-stage1-runner-build:

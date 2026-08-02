@@ -223,6 +223,54 @@ func (p ExecutionPackage) ValidateSpeechV2Revision(plan Plan, parent ExecutionPa
 	return nil
 }
 
+// ValidateSpeechBatchRevision proves that a child package only replaces the
+// consumed single-cue canary with an ordered batch authorization and immutable
+// completed-attempt evidence. The frozen VOICE, license, route, video runs,
+// subtitle revision, output policy, and gates must remain byte-for-byte stable.
+func (p ExecutionPackage) ValidateSpeechBatchRevision(plan Plan, parent ExecutionPackage) error {
+	if err := parent.Validate(plan); err != nil {
+		return fmt.Errorf("validate parent execution package: %w", err)
+	}
+	if err := p.Validate(plan); err != nil {
+		return fmt.Errorf("validate child execution package: %w", err)
+	}
+	if p.ParentExecutionPackageHash != parent.ContentHash {
+		return errors.New("speech batch revision is bound to another parent package")
+	}
+	if p.PostProduction.Config.SpeechBatchAuthorization == nil ||
+		p.PostProduction.Config.SpeechBatchAuthorization.ParentExecutionPackageHash != parent.ContentHash {
+		return errors.New("speech batch authorization is not bound to the immediate parent package")
+	}
+	expected := parent
+	expected.ParentExecutionPackageHash = parent.ContentHash
+	expected.PostProduction.Config.SpeechAuthorizedCueID = ""
+	expected.PostProduction.Config.SpeechMaximumAFPMilli = 0
+	expected.PostProduction.Config.SpeechMaximumCashMicros = 0
+	expected.PostProduction.Config.SpeechMaxAttempts = 0
+	expected.PostProduction.Config.SpeechBatchAuthorization =
+		p.PostProduction.Config.SpeechBatchAuthorization
+	expected.PostProduction.Config.SpeechCompletedAttempts =
+		p.PostProduction.Config.SpeechCompletedAttempts
+	expected.PostProduction.TraceID = parent.PostProduction.TraceID + "-speech-batch-v1"
+	expected, err := SealExecutionPackage(expected)
+	if err != nil {
+		return err
+	}
+	if expected.ContentHash != p.ContentHash {
+		return errors.New("speech batch revision contains fields outside the approved projection")
+	}
+	return nil
+}
+
+// ValidateRevision dispatches to the exact immutable projection declared by
+// the child package while keeping legacy speech-v2 canary revisions readable.
+func (p ExecutionPackage) ValidateRevision(plan Plan, parent ExecutionPackage) error {
+	if p.PostProduction.Config.SpeechBatchAuthorization != nil {
+		return p.ValidateSpeechBatchRevision(plan, parent)
+	}
+	return p.ValidateSpeechV2Revision(plan, parent)
+}
+
 func (j FrozenJob) validate(plan Plan) error {
 	for name, value := range map[string]string{
 		"shotId": j.ShotID, "attemptId": j.AttemptID, "idempotencyKey": j.IdempotencyKey,

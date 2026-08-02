@@ -10,6 +10,7 @@ import (
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 	"go.temporal.io/sdk/temporal"
 	"go.temporal.io/sdk/workflow"
 )
@@ -176,6 +177,8 @@ type PostProductionConfig struct {
 	SpeechMaximumAFPMilli         int64                              `json:"speechMaximumAfpMilli,omitempty"`
 	SpeechMaximumCashMicros       int64                              `json:"speechMaximumNonSubscriptionCashMicros,omitempty"`
 	SpeechMaxAttempts             int                                `json:"speechMaxAttempts,omitempty"`
+	SpeechBatchAuthorization      *speechcontract.BatchAuthorization `json:"speechBatchAuthorization,omitempty"`
+	SpeechCompletedAttempts       []postproduction.ProviderAttempt   `json:"speechCompletedAttempts,omitempty"`
 	SubtitleLanguage              string                             `json:"subtitleLanguage"`
 	BurnSubtitles                 bool                               `json:"burnSubtitles"`
 	BackgroundAudioAssetVersionID string                             `json:"backgroundAudioAssetVersionId,omitempty"`
@@ -211,6 +214,8 @@ func (c PostProductionConfig) Validate() error {
 		MaximumAFPMilli:                  c.SpeechMaximumAFPMilli,
 		MaximumNonSubscriptionCashMicros: c.SpeechMaximumCashMicros,
 		MaxAttempts:                      c.SpeechMaxAttempts,
+		BatchAuthorization:               c.SpeechBatchAuthorization,
+		CompletedAttempts:                c.SpeechCompletedAttempts,
 	}).Validate(); err != nil {
 		return err
 	}

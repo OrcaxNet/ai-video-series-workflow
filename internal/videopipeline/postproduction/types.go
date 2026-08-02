@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 	"github.com/google/uuid"
 )
 
@@ -159,17 +160,19 @@ func sameSpeechProvider(left, right string) bool {
 }
 
 type SpeechConfig struct {
-	Route                            providercontract.ModelSnapshot `json:"route"`
-	ProviderProfileID                string                         `json:"providerProfileId"`
-	BudgetApprovalID                 string                         `json:"budgetApprovalId"`
-	BudgetMaximumMicros              int64                          `json:"budgetMaximumMicros"`
-	BudgetCurrency                   string                         `json:"budgetCurrency"`
-	IdentityVersion                  string                         `json:"identityVersion,omitempty"`
-	Voice                            *SpeechVoiceBinding            `json:"voice,omitempty"`
-	AuthorizedCueID                  string                         `json:"authorizedCueId,omitempty"`
-	MaximumAFPMilli                  int64                          `json:"maximumAfpMilli,omitempty"`
-	MaximumNonSubscriptionCashMicros int64                          `json:"maximumNonSubscriptionCashMicros,omitempty"`
-	MaxAttempts                      int                            `json:"maxAttempts,omitempty"`
+	Route                            providercontract.ModelSnapshot     `json:"route"`
+	ProviderProfileID                string                             `json:"providerProfileId"`
+	BudgetApprovalID                 string                             `json:"budgetApprovalId"`
+	BudgetMaximumMicros              int64                              `json:"budgetMaximumMicros"`
+	BudgetCurrency                   string                             `json:"budgetCurrency"`
+	IdentityVersion                  string                             `json:"identityVersion,omitempty"`
+	Voice                            *SpeechVoiceBinding                `json:"voice,omitempty"`
+	AuthorizedCueID                  string                             `json:"authorizedCueId,omitempty"`
+	MaximumAFPMilli                  int64                              `json:"maximumAfpMilli,omitempty"`
+	MaximumNonSubscriptionCashMicros int64                              `json:"maximumNonSubscriptionCashMicros,omitempty"`
+	MaxAttempts                      int                                `json:"maxAttempts,omitempty"`
+	BatchAuthorization               *speechcontract.BatchAuthorization `json:"batchAuthorization,omitempty"`
+	CompletedAttempts                []ProviderAttempt                  `json:"completedAttempts,omitempty"`
 }
 
 func (s SpeechConfig) Validate() error {
@@ -197,6 +200,28 @@ func (s SpeechConfig) Validate() error {
 	}
 	if err := s.Voice.Validate(s.Route); err != nil {
 		return err
+	}
+	if s.BatchAuthorization != nil {
+		if strings.TrimSpace(s.AuthorizedCueID) != "" || s.MaximumAFPMilli != 0 ||
+			s.MaximumNonSubscriptionCashMicros != 0 || s.MaxAttempts != 0 {
+			return errors.New("speech-v2 batch cannot retain the single-cue canary fields")
+		}
+		if err := s.BatchAuthorization.Validate(); err != nil {
+			return err
+		}
+		batch := s.BatchAuthorization
+		if !sameSpeechProvider(batch.Provider, s.Route.Provider) ||
+			batch.ModelID != s.Route.ModelID || batch.RouteVersion != s.Route.RouteVersion ||
+			batch.ResourceID != s.Voice.ResourceID || batch.Speaker != s.Voice.Speaker ||
+			batch.VoiceAssetID != s.Voice.AssetID ||
+			batch.ParentVoiceAssetVersionID != s.Voice.ParentAssetVersionID ||
+			batch.VoiceAssetVersionID != s.Voice.AssetVersionID ||
+			batch.VoiceAssetVersionHash != s.Voice.AssetVersionHash ||
+			batch.LicenseSnapshotID != s.Voice.LicenseSnapshotID ||
+			batch.LicenseSnapshotHash != s.Voice.LicenseSnapshotHash {
+			return errors.New("speech-v2 batch route, VOICE, or license drifted from the frozen configuration")
+		}
+		return nil
 	}
 	if strings.TrimSpace(s.AuthorizedCueID) == "" {
 		return errors.New("speech-v2 requires one explicitly authorized cue")
@@ -319,6 +344,9 @@ func (r Request) Validate() error {
 		}
 	}
 	if err := r.Speech.Validate(); err != nil {
+		return err
+	}
+	if err := validateSpeechAuthorizationCoverage(r); err != nil {
 		return err
 	}
 	if err := r.Output.Validate(); err != nil {

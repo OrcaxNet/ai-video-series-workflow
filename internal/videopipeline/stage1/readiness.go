@@ -270,7 +270,7 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArt
 		return err
 	}
 	if ledger.ExecutionPackageHash == package_.ContentHash {
-		if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
+		if err := package_.ValidateRevision(g.plan, parentArtifact[0]); err != nil {
 			return UnverifiableRevisionParentError(err)
 		}
 		if ledger.SupersededExecutionPackageHash != package_.ParentExecutionPackageHash ||
@@ -289,7 +289,7 @@ func (g *Gate) BindExecutionPackageRevision(package_ ExecutionPackage, parentArt
 		}
 		return UnverifiableRevisionParentError(errors.New("stage 1 ledger is not bound to the revision parent package"))
 	}
-	if err := package_.ValidateSpeechV2Revision(g.plan, parentArtifact[0]); err != nil {
+	if err := package_.ValidateRevision(g.plan, parentArtifact[0]); err != nil {
 		return UnverifiableRevisionParentError(err)
 	}
 	if ledger.ControlledRetryPackageHash != "" {

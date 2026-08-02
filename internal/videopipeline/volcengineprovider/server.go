@@ -28,6 +28,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 )
 
 const (
@@ -331,6 +332,12 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		authorizedRetry = true
+	}
+	if !ok && request.Capability == providercontract.CapabilitySpeech {
+		if err := s.validateSpeechBatchSequence(request); err != nil {
+			writeProviderError(w, err)
+			return
+		}
 	}
 	upstreamRequest, err := s.resolveProviderAssets(request.Request)
 	if err != nil {
@@ -1082,6 +1089,9 @@ func (s *Server) validateJob(request providercontract.JobRequest, idempotencyKey
 }
 
 func (s *Server) validateSpeechCanary(request providercontract.JobRequest) error {
+	if s.config.SpeechBatchAuthorization != nil {
+		return s.validateSpeechBatch(request)
+	}
 	if !strings.HasPrefix(request.JobID, "speech-v2-") && !speechCanaryConfigured(s.config) {
 		return nil
 	}
@@ -1120,6 +1130,129 @@ func (s *Server) validateSpeechCanary(request providercontract.JobRequest) error
 	}
 	if err := s.validateSpeechCanaryVoiceDescriptor(voice); err != nil {
 		return err
+	}
+	return nil
+}
+
+func (s *Server) validateSpeechBatch(request providercontract.JobRequest) error {
+	batch := s.config.SpeechBatchAuthorization
+	if batch == nil || batch.Validate() != nil {
+		return speechBatchViolation()
+	}
+	validUntil, err := time.Parse(time.RFC3339, batch.ValidUntil)
+	if err != nil || !s.now().UTC().Before(validUntil) {
+		return safeError(providercontract.CodeForbidden, "speech batch authorization expired", false)
+	}
+	var authorization *speechcontract.CueAuthorization
+	for index := range batch.Cues {
+		if batch.Cues[index].JobID == request.JobID {
+			authorization = &batch.Cues[index]
+			break
+		}
+	}
+	if authorization == nil || request.InputHash != authorization.InputHash ||
+		request.Request.RequestID != authorization.JobID ||
+		request.Request.IdempotencyKey != authorization.JobID ||
+		request.Request.PromptSnapshotID == "" ||
+		!strings.HasSuffix(request.Request.PromptSnapshotID, ":"+authorization.CueID) ||
+		request.Request.Budget.MaxAttempts != authorization.MaxAttempts ||
+		request.Request.Output.Format != "mp3" ||
+		batch.MaximumNonSubscriptionCashMicros != 0 {
+		return speechBatchViolation()
+	}
+	characters := len([]rune(strings.TrimSpace(request.Request.Prompt)))
+	predictedAFPMilli := int64(characters) * ttsAFPMilliPerChar
+	if characters != authorization.UnicodeCharacters ||
+		predictedAFPMilli != authorization.EstimatedAFPMilli ||
+		predictedAFPMilli > authorization.MaximumAFPMilli {
+		return speechBatchViolation()
+	}
+	if len(request.Request.Assets) != 1 {
+		return speechBatchViolation()
+	}
+	voice := request.Request.Assets[0]
+	if voice.ID != batch.VoiceAssetID || voice.Revision != batch.VoiceAssetVersionID ||
+		voice.SHA256 != batch.VoiceAssetVersionHash ||
+		voice.URI != "cas://sha256/"+batch.VoiceAssetVersionHash ||
+		voice.Kind != providercontract.ModalityAudio ||
+		voice.Role != providercontract.AssetRoleReferenceAudio ||
+		voice.MediaType != "audio/x-voice-profile+json" ||
+		voice.LicenseReference != batch.LicenseSnapshotID+":"+batch.LicenseSnapshotHash {
+		return speechBatchViolation()
+	}
+	return s.validateSpeechBatchVoiceDescriptor(voice, *batch)
+}
+
+func (s *Server) validateSpeechBatchVoiceDescriptor(
+	voice providercontract.AssetRef,
+	batch speechcontract.BatchAuthorization,
+) error {
+	object, err := s.store.Open(voice.SHA256)
+	if err != nil {
+		return speechBatchViolation()
+	}
+	content, readErr := io.ReadAll(io.LimitReader(object, maxSpeechVoiceDescriptorBytes+1))
+	closeErr := object.Close()
+	if readErr != nil || closeErr != nil || len(content) == 0 || len(content) > maxSpeechVoiceDescriptorBytes {
+		return speechBatchViolation()
+	}
+	digest := sha256.Sum256(content)
+	if hex.EncodeToString(digest[:]) != voice.SHA256 ||
+		(voice.SizeBytes > 0 && voice.SizeBytes != int64(len(content))) {
+		return speechBatchViolation()
+	}
+	var descriptor speechVoiceDescriptor
+	if err := json.Unmarshal(content, &descriptor); err != nil ||
+		descriptor.SchemaVersion != "v2" || descriptor.Provider != batch.Provider ||
+		descriptor.ModelID != batch.ModelID || descriptor.ResourceID != batch.ResourceID ||
+		descriptor.Speaker != batch.Speaker || descriptor.RouteVersion != batch.RouteVersion ||
+		descriptor.VoiceClone == nil || *descriptor.VoiceClone ||
+		descriptor.InternalMVPOnly == nil || !*descriptor.InternalMVPOnly ||
+		descriptor.ParentAssetVersionID != batch.ParentVoiceAssetVersionID ||
+		descriptor.AssetVersionID != batch.VoiceAssetVersionID ||
+		descriptor.LicenseSnapshotID != batch.LicenseSnapshotID ||
+		!lowercaseSHA256(descriptor.RevisionInputHash) {
+		return speechBatchViolation()
+	}
+	return nil
+}
+
+func (s *Server) validateSpeechBatchSequence(request providercontract.JobRequest) error {
+	batch := s.config.SpeechBatchAuthorization
+	if batch == nil {
+		return nil
+	}
+	current := -1
+	for index, cue := range batch.Cues {
+		if cue.JobID == request.JobID {
+			current = index
+			break
+		}
+	}
+	if current < 0 {
+		return speechBatchViolation()
+	}
+	var consumed int64
+	for index := 0; index < current; index++ {
+		prior := batch.Cues[index]
+		record, found, err := s.loadRecord(prior.JobID)
+		if err != nil {
+			return err
+		}
+		if !found || record.Response.State != providercontract.StatusSucceeded ||
+			record.Response.JobID != prior.JobID || record.Response.Usage.Unit != "milli_afp" ||
+			strings.TrimSpace(record.Response.RequestID) == "" ||
+			strings.TrimSpace(record.Response.ConnectID) == "" ||
+			strings.TrimSpace(record.Response.LogID) == "" ||
+			record.Response.Usage.OutputUnits <= 0 ||
+			record.Response.Usage.OutputUnits > prior.MaximumAFPMilli ||
+			record.Response.Cost.ActualMicros == nil || *record.Response.Cost.ActualMicros != 0 {
+			return safeError(providercontract.CodeConflict, "speech batch is not ready for this ordered cue", false)
+		}
+		consumed += record.Response.Usage.OutputUnits
+	}
+	if consumed+batch.Cues[current].EstimatedAFPMilli > batch.MaximumAFPMilli {
+		return safeError(providercontract.CodeBudgetExceeded, "speech batch cumulative AFP ceiling would be exceeded", false)
 	}
 	return nil
 }
@@ -1224,6 +1357,14 @@ func speechCanaryViolation() *providercontract.Error {
 	)
 }
 
+func speechBatchViolation() *providercontract.Error {
+	return safeError(
+		providercontract.CodeInvalidRequest,
+		"speech job is outside the frozen ordered batch authorization",
+		false,
+	)
+}
+
 func acceptedProviderIdentity(provider string) bool {
 	return provider == "volcengine_ark" || provider == "VOLCENGINE"
 }
@@ -1250,9 +1391,16 @@ func (s *Server) synthesizeSpeech(
 	if err != nil {
 		return response, nil, err
 	}
+	if strings.TrimSpace(result.RequestID) == "" || strings.TrimSpace(result.ConnectID) == "" ||
+		strings.TrimSpace(result.LogID) == "" {
+		return response, nil, safeError(providercontract.CodeUnavailable, "Agent Plan TTS trace evidence is incomplete", false)
+	}
 	usage, err := TTSUsageAttributes(result.UsageTokens)
 	if err != nil {
 		return response, nil, safeError(providercontract.CodeUnavailable, "Agent Plan TTS usage evidence is invalid", false)
+	}
+	if err := s.validateSpeechBatchUsage(request, usage); err != nil {
+		return response, nil, err
 	}
 	if len(result.Audio) == 0 {
 		return response, nil, safeError(providercontract.CodeUnavailable, "Agent Plan TTS returned no audio bytes", false)
@@ -1289,6 +1437,41 @@ func (s *Server) synthesizeSpeech(
 		return response, inspection, speechInspectionError()
 	}
 	return response, inspection, nil
+}
+
+func (s *Server) validateSpeechBatchUsage(
+	request providercontract.JobRequest,
+	usage providercontract.Usage,
+) error {
+	batch := s.config.SpeechBatchAuthorization
+	if batch == nil {
+		return nil
+	}
+	current := -1
+	for index, cue := range batch.Cues {
+		if cue.JobID == request.JobID {
+			current = index
+			if usage.OutputUnits > cue.MaximumAFPMilli {
+				return safeError(providercontract.CodeBudgetExceeded, "speech cue exceeded its AFP ceiling", false)
+			}
+			break
+		}
+	}
+	if current < 0 {
+		return speechBatchViolation()
+	}
+	consumed := usage.OutputUnits
+	for index := 0; index < current; index++ {
+		record, ok, err := s.loadRecord(batch.Cues[index].JobID)
+		if err != nil || !ok || record.Response.State != providercontract.StatusSucceeded {
+			return safeError(providercontract.CodeConflict, "speech batch prior usage is unavailable", false)
+		}
+		consumed += record.Response.Usage.OutputUnits
+	}
+	if consumed > batch.MaximumAFPMilli {
+		return safeError(providercontract.CodeBudgetExceeded, "speech batch exceeded its cumulative AFP ceiling", false)
+	}
+	return nil
 }
 
 func newSpeechDurationQC(requested, measured int64) *speechDurationQC {

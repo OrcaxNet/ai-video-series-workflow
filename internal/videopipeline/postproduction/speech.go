@@ -12,6 +12,7 @@ import (
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/mockprovider"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/speechcontract"
 )
 
 type SpeechRequest struct {
@@ -116,8 +117,17 @@ func (p *HTTPSpeechProvider) Synthesize(
 	if input.Evidence != EvidenceMockOnly && input.Evidence != EvidenceLive {
 		return ProviderAttempt{}, errors.New("speech submission requires mock_only or live_provider_call evidence")
 	}
-	if input.Config.IdentityVersion == SpeechIdentityV2 && input.Cue.ID != input.Config.AuthorizedCueID {
-		return ProviderAttempt{}, errors.New("speech-v2 cue is outside the single authorized canary")
+	var cueAuthorization speechcontract.CueAuthorization
+	if input.Config.IdentityVersion == SpeechIdentityV2 {
+		if input.Config.BatchAuthorization != nil {
+			var ok bool
+			cueAuthorization, _, ok = input.Config.BatchAuthorization.Cue(input.Cue.ID)
+			if !ok {
+				return ProviderAttempt{}, errors.New("speech-v2 cue is outside the ordered batch authorization")
+			}
+		} else if input.Cue.ID != input.Config.AuthorizedCueID {
+			return ProviderAttempt{}, errors.New("speech-v2 cue is outside the single authorized canary")
+		}
 	}
 	identity, err := DeriveSpeechJobIdentity(input)
 	if err != nil {
@@ -132,10 +142,18 @@ func (p *HTTPSpeechProvider) Synthesize(
 	var assets []providercontract.AssetRef
 	if input.Config.IdentityVersion == SpeechIdentityV2 {
 		modelHint = input.Config.Voice.Speaker
+		maximumAFPMilli := input.Config.MaximumAFPMilli
 		maxAttempts = input.Config.MaxAttempts
+		if input.Config.BatchAuthorization != nil {
+			maximumAFPMilli = cueAuthorization.MaximumAFPMilli
+			maxAttempts = cueAuthorization.MaxAttempts
+			if identity.JobID != cueAuthorization.JobID || identity.InputHash != cueAuthorization.InputHash {
+				return ProviderAttempt{}, errors.New("speech-v2 cue identity drifted from the ordered batch authorization")
+			}
+		}
 		format = "mp3"
 		predictedAFPMilli := int64(len([]rune(strings.TrimSpace(input.Cue.Text)))) * 135
-		if predictedAFPMilli <= 0 || predictedAFPMilli > input.Config.MaximumAFPMilli {
+		if predictedAFPMilli <= 0 || predictedAFPMilli > maximumAFPMilli {
 			return ProviderAttempt{}, errors.New("speech-v2 cue exceeds the frozen AFP ceiling")
 		}
 		assets = []providercontract.AssetRef{{
@@ -193,18 +211,33 @@ func (p *HTTPSpeechProvider) Synthesize(
 		BudgetReservation: reservation,
 		TraceID:           input.TraceID,
 	}
-	response, err := mockprovider.Submit(ctx, p.Client, p.Endpoint, jobRequest)
-	if err != nil {
-		return ProviderAttempt{}, err
+	var response providercontract.JobResponse
+	submitted := false
+	if input.Config.BatchAuthorization != nil {
+		// A restarted Activity reconciles the immutable job with GET first. It
+		// must never issue another POST after an ambiguous or consumed submit.
+		response, err = mockprovider.Get(ctx, p.Client, p.Endpoint, jobID)
+		if err != nil && providercontract.ErrorCodeOf(err) != providercontract.CodeNotFound {
+			return ProviderAttempt{}, err
+		}
 	}
-	submitted := true
+	if input.Config.BatchAuthorization == nil || providercontract.ErrorCodeOf(err) == providercontract.CodeNotFound {
+		response, err = mockprovider.Submit(ctx, p.Client, p.Endpoint, jobRequest)
+		if err != nil {
+			return ProviderAttempt{}, err
+		}
+		submitted = true
+	}
 	defer func() {
-		if submitted && ctx.Err() != nil {
+		if submitted && input.Config.BatchAuthorization == nil && ctx.Err() != nil {
 			cancelCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_, _ = mockprovider.Cancel(cancelCtx, p.Client, p.Endpoint, jobID)
 		}
 	}()
+	if err := stopOnAmbiguousSpeechState(response); err != nil {
+		return ProviderAttempt{}, err
+	}
 	for !providercontract.Terminal(response.State) {
 		timer := time.NewTimer(p.pollInterval())
 		select {
@@ -219,8 +252,8 @@ func (p *HTTPSpeechProvider) Synthesize(
 		if err != nil {
 			return ProviderAttempt{}, err
 		}
-		if response.State == providercontract.StatusRequiresAction {
-			return ProviderAttempt{}, errors.New("speech provider job requires operator action")
+		if err := stopOnAmbiguousSpeechState(response); err != nil {
+			return ProviderAttempt{}, err
 		}
 	}
 	submitted = false
@@ -275,6 +308,19 @@ func (p *HTTPSpeechProvider) Synthesize(
 	return attempt, nil
 }
 
+func stopOnAmbiguousSpeechState(response providercontract.JobResponse) error {
+	if response.State != providercontract.StatusUnknown &&
+		response.State != providercontract.StatusRequiresAction {
+		return nil
+	}
+	return &providercontract.Error{
+		Code: providercontract.CodeUnavailable, Retryable: false,
+		SafeMessage:     "speech provider result requires read-only reconciliation",
+		RequiresAction:  true,
+		SuggestedAction: "inspect the immutable job receipt without submitting again",
+	}
+}
+
 func (p *HTTPSpeechProvider) pollInterval() time.Duration {
 	if p.PollInterval <= 0 {
 		return 500 * time.Millisecond
@@ -284,12 +330,20 @@ func (p *HTTPSpeechProvider) pollInterval() time.Duration {
 
 func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error {
 	var expectedJobID string
+	maximumAFPMilli := input.Config.MaximumAFPMilli
 	if input.Config.IdentityVersion == SpeechIdentityV2 {
 		identity, err := DeriveSpeechJobIdentity(input)
 		if err != nil {
 			return err
 		}
 		expectedJobID = identity.JobID
+		if input.Config.BatchAuthorization != nil {
+			authorization, _, ok := input.Config.BatchAuthorization.Cue(input.Cue.ID)
+			if !ok || authorization.JobID != identity.JobID || authorization.InputHash != identity.InputHash {
+				return errors.New("speech-v2 attempt is outside the ordered batch authorization")
+			}
+			maximumAFPMilli = authorization.MaximumAFPMilli
+		}
 	}
 	switch {
 	case attempt.CueID != input.Cue.ID:
@@ -334,7 +388,7 @@ func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error
 		}
 	}
 	if input.Config.IdentityVersion == SpeechIdentityV2 {
-		if attempt.Usage.OutputUnits > input.Config.MaximumAFPMilli {
+		if attempt.Usage.OutputUnits > maximumAFPMilli {
 			return errors.New("speech-v2 attempt exceeds the frozen AFP ceiling")
 		}
 		if attempt.Cost.ActualMicros == nil || *attempt.Cost.ActualMicros != 0 ||
@@ -344,6 +398,101 @@ func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error
 		}
 	}
 	return nil
+}
+
+func validateSpeechAuthorizationCoverage(request Request) error {
+	batch := request.Speech.BatchAuthorization
+	if batch == nil {
+		if len(request.Speech.CompletedAttempts) != 0 {
+			return errors.New("completed speech attempts require an ordered batch authorization")
+		}
+		return nil
+	}
+	completed := make(map[string]ProviderAttempt, len(request.Speech.CompletedAttempts))
+	for index, attempt := range request.Speech.CompletedAttempts {
+		if _, duplicate := completed[attempt.CueID]; duplicate {
+			return fmt.Errorf("duplicate completed speech cue %q", attempt.CueID)
+		}
+		completed[attempt.CueID] = attempt
+		if err := validateCompletedAttempt(request, attempt); err != nil {
+			return fmt.Errorf("completed speech attempt %d: %w", index, err)
+		}
+	}
+	authorizedIndex := 0
+	seenCompleted := 0
+	for _, cue := range request.Subtitle.Cues {
+		if _, ok := completed[cue.ID]; ok {
+			seenCompleted++
+			continue
+		}
+		if authorizedIndex >= len(batch.Cues) || batch.Cues[authorizedIndex].CueID != cue.ID {
+			return errors.New("speech batch cues must exactly match remaining subtitle cues in timeline order")
+		}
+		authorization := batch.Cues[authorizedIndex]
+		if authorization.UnicodeCharacters != len([]rune(strings.TrimSpace(cue.Text))) {
+			return fmt.Errorf("speech batch cue %q character count drifted", cue.ID)
+		}
+		identity, err := DeriveSpeechJobIdentity(SpeechRequest{
+			EpisodeRevisionID: request.EpisodeRevisionID,
+			SubtitleRevision:  request.Subtitle,
+			Cue:               cue,
+			Config:            request.Speech,
+		})
+		if err != nil {
+			return err
+		}
+		if authorization.JobID != identity.JobID || authorization.InputHash != identity.InputHash {
+			return fmt.Errorf("speech batch cue %q identity drifted", cue.ID)
+		}
+		authorizedIndex++
+	}
+	if authorizedIndex != len(batch.Cues) || seenCompleted != len(completed) {
+		return errors.New("speech batch contains cues outside the frozen subtitle revision")
+	}
+	return nil
+}
+
+func validateCompletedAttempt(request Request, attempt ProviderAttempt) error {
+	var cue *Cue
+	for index := range request.Subtitle.Cues {
+		if request.Subtitle.Cues[index].ID == attempt.CueID {
+			cue = &request.Subtitle.Cues[index]
+			break
+		}
+	}
+	if cue == nil {
+		return errors.New("completed speech cue is absent from the subtitle revision")
+	}
+	identity, err := DeriveSpeechJobIdentity(SpeechRequest{
+		EpisodeRevisionID: request.EpisodeRevisionID,
+		SubtitleRevision:  request.Subtitle,
+		Cue:               *cue,
+		Config:            request.Speech,
+	})
+	if err != nil {
+		return err
+	}
+	switch {
+	case attempt.JobID != identity.JobID:
+		return errors.New("completed speech job identity drifted")
+	case attempt.CueID != cue.ID || strings.TrimSpace(attempt.RequestID) == "" ||
+		strings.TrimSpace(attempt.UpstreamTaskID) == "" || strings.TrimSpace(attempt.ConnectID) == "" ||
+		strings.TrimSpace(attempt.LogID) == "":
+		return errors.New("completed speech attempt identity is incomplete")
+	case attempt.Model != request.Speech.Route || attempt.Evidence != request.Evidence:
+		return errors.New("completed speech attempt route or evidence drifted")
+	case attempt.Usage.GeneratedChars != int64(len([]rune(strings.TrimSpace(cue.Text)))) ||
+		attempt.Usage.OutputUnits != attempt.Usage.GeneratedChars*135 ||
+		attempt.Usage.Unit != "milli_afp":
+		return errors.New("completed speech attempt usage is invalid")
+	case attempt.Cost.ActualMicros == nil || *attempt.Cost.ActualMicros != 0 ||
+		attempt.Cost.BillingMode != "subscription_included" ||
+		attempt.Cost.Currency != request.Speech.BudgetCurrency:
+		return errors.New("completed speech attempt lacks zero-cash evidence")
+	case attempt.Artifact.Kind != "dialogue_segment" || attempt.Artifact.DurationMillis <= 0:
+		return errors.New("completed speech attempt artifact is invalid")
+	}
+	return attempt.Artifact.Validate()
 }
 
 func negativeUsage(usage providercontract.Usage) bool {

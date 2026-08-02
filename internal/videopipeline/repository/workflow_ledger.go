@@ -2688,6 +2688,8 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			MaximumAFPMilli:                  input.Config.SpeechMaximumAFPMilli,
 			MaximumNonSubscriptionCashMicros: input.Config.SpeechMaximumCashMicros,
 			MaxAttempts:                      input.Config.SpeechMaxAttempts,
+			BatchAuthorization:               input.Config.SpeechBatchAuthorization,
+			CompletedAttempts:                input.Config.SpeechCompletedAttempts,
 		},
 		Output: postproduction.OutputPolicy{
 			Width: 1280, Height: 720, FPS: 24, Format: "mp4",
@@ -4666,6 +4668,24 @@ func (p *Postgres) validateSpeechV2Configuration(
 	if err != nil {
 		return errors.New("speech provider profile must be a UUID")
 	}
+	authorizationClause := ""
+	arguments := []any{
+		episodeRevisionID, assetID, parentVersionID, versionID, licenseID,
+		profileID, voice.AssetVersionHash, voice.Provider, voice.ModelID,
+		voice.ResourceID, voice.Speaker, config.SpeechRoute.RouteVersion,
+		voice.LicenseSnapshotHash, config.SpeechRoute.CapabilityHash,
+	}
+	if config.SpeechBatchAuthorization == nil {
+		authorizationClause = `
+		  AND pcs.limits->>'authorizedCueId' = $15
+		  AND (pcs.limits->>'maximumAfpMilli')::bigint = $16
+		  AND (pcs.limits->>'maximumNonSubscriptionCashMicros')::bigint = $17
+		  AND (pcs.limits->>'maxAttempts')::integer = $18`
+		arguments = append(arguments,
+			config.SpeechAuthorizedCueID, config.SpeechMaximumAFPMilli,
+			config.SpeechMaximumCashMicros, config.SpeechMaxAttempts,
+		)
+	}
 	var matched int
 	err = queryer.QueryRow(ctx, `
 		SELECT 1
@@ -4719,17 +4739,9 @@ func (p *Postgres) validateSpeechV2Configuration(
 		  AND (pcs.expires_at IS NULL OR pcs.expires_at > now())
 		  AND pcs.limits->>'resourceId' = $10
 		  AND pcs.limits->>'defaultSpeaker' = $11
-		  AND pcs.limits->>'authorizedCueId' = $15
-		  AND (pcs.limits->>'maximumAfpMilli')::bigint = $16
-		  AND (pcs.limits->>'maximumNonSubscriptionCashMicros')::bigint = $17
-		  AND (pcs.limits->>'maxAttempts')::integer = $18
+`+authorizationClause+`
 		FOR SHARE OF er, ep, source_asset, parent, av, ls, pp, pcs`,
-		episodeRevisionID, assetID, parentVersionID, versionID, licenseID,
-		profileID, voice.AssetVersionHash, voice.Provider, voice.ModelID,
-		voice.ResourceID, voice.Speaker, config.SpeechRoute.RouteVersion,
-		voice.LicenseSnapshotHash, config.SpeechRoute.CapabilityHash,
-		config.SpeechAuthorizedCueID, config.SpeechMaximumAFPMilli,
-		config.SpeechMaximumCashMicros, config.SpeechMaxAttempts,
+		arguments...,
 	).Scan(&matched)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return controlplane.NewPolicyError(
