@@ -416,6 +416,15 @@ func (a *Activities) executeProviderJob(
 				},
 			)
 			if observationErr != nil {
+				// Workflow cancellation can arrive after the provider request has
+				// already failed but before this best-effort UNKNOWN projection can
+				// open its transaction. Preserve the provider failure in that race:
+				// Temporal must record the in-flight ActivityFailure (with
+				// RetryState=CancelRequested), while the cancellation compensator
+				// owns durable reconciliation of the same stable JobID.
+				if ctx.Err() != nil {
+					return ProviderResult{}, classifyProviderError(err)
+				}
 				return ProviderResult{}, classifyPostProductionError(observationErr)
 			}
 		}
@@ -451,6 +460,9 @@ func (a *Activities) executeProviderJob(
 					},
 				)
 				if observationErr != nil {
+					if ctx.Err() != nil {
+						return ProviderResult{}, classifyProviderError(err)
+					}
 					return ProviderResult{}, classifyPostProductionError(observationErr)
 				}
 			}
