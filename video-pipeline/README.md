@@ -46,10 +46,31 @@ make video-down
 | `http://localhost:18080/health/ready` | PostgreSQL、Temporal、CAS、Provider Adapter 联合就绪 |
 | `http://localhost:18080/api/v1/system/info` | 纯远程生成基线 |
 | `http://localhost:18080/api/v1/providers/status` | 不泄密的四类能力配置状态 |
+| `http://localhost:4173` | 创作者体验操作台（Compose/OrbStack） |
 | `http://localhost:8090/v1/capabilities` | Mock 能力快照 |
 | `http://localhost:8090/v1/jobs` | Mock Provider 任务协议 |
 | `localhost:7233` | Temporal gRPC |
 | `localhost:55432` | PostgreSQL |
+
+### OrbStack + Agent Plan 常驻体验
+
+在仓库根目录执行：
+
+```bash
+ARK_API_KEY=<由运行环境或 Secret Store 注入> make video-orbstack-up
+make video-orbstack-status
+```
+
+启动目标要求当前 Docker context 为 `orbstack`，自动生成至少 32 字节的 Adapter ↔
+Worker 内部 HMAC Secret，并把视频/语音路由冻结到 `volcengine-provider:8091`。服务
+使用命名卷保存 PostgreSQL、Temporal 和 CAS 数据，并通过 `restart: unless-stopped`
+随 OrbStack 恢复。命令使用显式服务清单，因此不会意外运行产生真实 Provider 任务的
+`live-probe`。
+
+打开 `http://127.0.0.1:4173` 可完整体验 PoC 操作流程。当前前端仍以确定性 Mock
+projection 执行创建、审核、异常注入与锁版；它只从控制面读取 Agent Plan 配置状态。
+这是有意的安全边界：尚未加载真实不可变 production binding 前，UI 不会把 PoC
+按钮转换为付费 Provider 调用。
 
 启用 Temporal UI：
 

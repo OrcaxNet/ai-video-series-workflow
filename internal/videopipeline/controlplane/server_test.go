@@ -112,6 +112,7 @@ func TestServer_ProviderStatusSupportsNoKeyDryRun(t *testing.T) {
 		"ARK_API_KEY",
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
+		"VIDEO_LIVE_PROVIDER_CONFIGURED",
 	} {
 		t.Setenv(name, "")
 	}
@@ -139,6 +140,36 @@ func TestServer_ProviderStatusSupportsNoKeyDryRun(t *testing.T) {
 			capability.LiveEvidence != "not_configured" || capability.MockEvidence != "mock_only" {
 			t.Fatalf("no-key capability = %#v", capability)
 		}
+	}
+}
+
+func TestServer_ProviderStatusSupportsCredentialIsolatedLiveAdapter(t *testing.T) {
+	t.Setenv("ARK_API_KEY", "")
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_AUTH_TOKEN", "")
+	t.Setenv("VIDEO_LIVE_PROVIDER_CONFIGURED", "true")
+
+	server := NewWithDependencies(runtimeconfig.ControlPlane{Version: "test"}, nil)
+	recorder := httptest.NewRecorder()
+	server.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, APIBase+"/providers/status", nil))
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", recorder.Code, recorder.Body.String())
+	}
+	var body struct {
+		Mode         string                     `json:"mode"`
+		Capabilities []providerCapabilityStatus `json:"capabilities"`
+	}
+	if err := json.NewDecoder(recorder.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	for _, capability := range body.Capabilities {
+		if !capability.LiveConfigured || capability.LiveCallsEnabled || capability.LiveEvidence != "pending_key_validation" {
+			t.Fatalf("credential-isolated capability = %#v", capability)
+		}
+	}
+	if body.Mode != "dry-run" {
+		t.Fatalf("mode = %q, want dry-run until provider readiness is validated", body.Mode)
 	}
 }
 

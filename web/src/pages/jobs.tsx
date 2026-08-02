@@ -42,6 +42,7 @@ export function JobsPage() {
   const historicalJobs = state.jobs.length - currentJobs.length;
   const estimated = currentJobs.reduce((sum, job) => sum + (job.costMicros ?? 0), 0) / 1_000_000;
   const completeEnabled = state.gates.G2.state === "APPROVED";
+  const agentPlanConfigured = state.capabilities.some((capability) => capability.liveConfigured);
 
   return (
     <div className="page page-jobs">
@@ -69,8 +70,16 @@ export function JobsPage() {
         </div>
         <div>
           <span className="eyebrow">执行模式</span>
-          <h2>Mock only · 真实火山调用 pending_key</h2>
-          <p>四种能力均可 Dry-run；liveConfigured=false，任何 Secret 都不会进入浏览器、日志、trace 或 fixture。</p>
+          <h2>
+            {agentPlanConfigured
+              ? "Agent Plan 已注入 · 创作交互为 Mock 演练"
+              : "Mock only · 真实火山调用 pending_key"}
+          </h2>
+          <p>
+            {agentPlanConfigured
+              ? "控制面已识别后端 live adapter；浏览器不接收 Key，当前 PoC 写操作仍使用确定性 fixture，不产生付费调用。"
+              : "四种能力均可 Dry-run；liveConfigured=false，任何 Secret 都不会进入浏览器、日志、trace 或 fixture。"}
+          </p>
         </div>
         <div className="provider-caps">
           {state.capabilities.map((capability) => (
