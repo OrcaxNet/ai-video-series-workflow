@@ -1149,6 +1149,15 @@ func (p *Postgres) CreateGenerationRun(
 	if err != nil {
 		return controlplane.Stored[controlplane.Operation]{}, controlplane.NewNotFoundError("shot", shotIDRaw)
 	}
+	budgetApprovalID, err := uuid.Parse(command.BudgetApprovalID)
+	if err != nil {
+		return controlplane.Stored[controlplane.Operation]{}, controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"budgetApprovalId is invalid",
+			"use the exact approved budget decision",
+		)
+	}
+	canonicalBudgetApprovalID := budgetApprovalID.String()
 	runID := uuid.New()
 	attemptID := uuid.New()
 	operationID := uuid.New()
@@ -1294,7 +1303,7 @@ func (p *Postgres) CreateGenerationRun(
 			return controlplane.Stored[controlplane.Operation]{}, err
 		}
 		if err := requireBudgetApproval(
-			ctx, tx, command.BudgetApprovalID, seriesID, episodeID,
+			ctx, tx, canonicalBudgetApprovalID, seriesID, episodeID,
 			command.GenerationPlanID, "VIDEO", planRecord.BudgetLimit,
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, err
@@ -1341,7 +1350,7 @@ func (p *Postgres) CreateGenerationRun(
 				 trace_id, created_by, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, 'VALIDATED', NULLIF($8, ''), false, $9, $10, $11, $12)`,
 			runID, shotSpecID, promptID, profileID, workflowID, runDigest, command.CreativeAttempt,
-			command.FallbackReasonCode, command.BudgetApprovalID, traceID, command.Actor.ActorID, now,
+			command.FallbackReasonCode, canonicalBudgetApprovalID, traceID, command.Actor.ActorID, now,
 		); err != nil {
 			return controlplane.Stored[controlplane.Operation]{}, translateWriteError("insert generation run", err)
 		}

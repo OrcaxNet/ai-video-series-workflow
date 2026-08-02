@@ -857,6 +857,9 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 	}
 	record.Response.State = upstream.Status
 	record.Response.Error = upstream.Error
+	if upstream.Output != nil {
+		record.Response.Usage = upstream.Output.Usage
+	}
 	if err := s.updateRecord(jobID, record); err != nil {
 		record.Response = previous
 		writeProviderError(w, err)

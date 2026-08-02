@@ -100,6 +100,9 @@ type providerPreparationLedgerFixture struct {
 	resolveCalls   int
 	prepareErr     error
 	prepareCalls   int
+	prepared       PreparedProviderJob
+	reconcileOnly  bool
+	observations   []ProviderJobObservation
 }
 
 func (l *providerPreparationLedgerFixture) ResolvePromptSnapshot(
@@ -116,7 +119,23 @@ func (l *providerPreparationLedgerFixture) PrepareProviderJob(
 	ExecuteProviderJobInput,
 ) (PreparedProviderJob, error) {
 	l.prepareCalls++
-	return PreparedProviderJob{}, l.prepareErr
+	prepared := l.prepared
+	prepared.ReconcileOnly = l.reconcileOnly
+	return prepared, l.prepareErr
+}
+
+func (l *providerPreparationLedgerFixture) RecordProviderJobObservation(
+	_ context.Context,
+	_ WorkflowStep,
+	_ ExecuteProviderJobInput,
+	observation ProviderJobObservation,
+) error {
+	l.observations = append(l.observations, observation)
+	if observation.State == "UNKNOWN" || observation.State == "RUNNING" ||
+		observation.UpstreamTaskID != "" {
+		l.reconcileOnly = true
+	}
+	return nil
 }
 
 type postProductionLedgerFixture struct {
@@ -364,7 +383,7 @@ func TestActivities_CancelProviderJobConvergesWithoutCallingUnpreparedProvider(t
 	if err := encoded.Get(&result); err != nil {
 		t.Fatalf("decode result: %v", err)
 	}
-	if result.State != "CANCELLED" || result.ErrorCode != "" {
+	if result.State != "CANCELLED" || !result.NoRemoteTask || result.ErrorCode != "" {
 		t.Fatalf("result = %#v", result)
 	}
 	if ledger.preparedCalls != 1 || len(ledger.recorded) != 1 ||
@@ -380,6 +399,7 @@ func TestActivities_CancelProviderJobConvergesWithoutCallingUnpreparedProvider(t
 func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t *testing.T) {
 	t.Parallel()
 	providerCalls := 0
+	actualMicros := int64(20)
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		providerCalls++
 		if r.Method != http.MethodPost ||
@@ -391,7 +411,15 @@ func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t 
 			JobID:          "provider-job-run-prepared",
 			RunID:          "run-prepared",
 			UpstreamTaskID: "upstream-1",
+			RequestID:      "request-1",
 			State:          providercontract.StatusCancelled,
+			Usage: providercontract.Usage{
+				InputUnits: 2, OutputUnits: 3, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
 		}); err != nil {
 			t.Fatalf("encode provider response: %v", err)
 		}
@@ -427,7 +455,9 @@ func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t 
 
 	firstWorker := NewProductionActivities(provider.URL, journal, ledger, nil)
 	first := execute(firstWorker)
-	if first.State != "CANCELLED" || providerCalls != 1 ||
+	if first.State != "CANCELLED" || first.RequestID != "request-1" ||
+		first.Cost.ActualMicros == nil || *first.Cost.ActualMicros != 20 ||
+		first.Usage.InputUnits != 2 || providerCalls != 1 ||
 		ledger.preparedCalls != 1 || len(ledger.recorded) != 1 ||
 		len(journal.output) == 0 {
 		t.Fatalf(
@@ -446,7 +476,7 @@ func TestActivities_CancelProviderJobReplaysAfterResponseLossAndWorkerRestart(t 
 	journal.replayCompleted = true
 	secondWorker := NewProductionActivities(provider.URL, journal, ledger, nil)
 	second := execute(secondWorker)
-	if second != first {
+	if !reflect.DeepEqual(second, first) {
 		t.Fatalf("replayed result = %#v, want %#v", second, first)
 	}
 	if providerCalls != 1 || ledger.preparedCalls != 1 || len(ledger.recorded) != 1 {
@@ -490,6 +520,53 @@ func TestActivities_CancelProviderJobKeepsUnknownRetryable(t *testing.T) {
 	}
 }
 
+func TestActivities_CancelProviderJobConvergesOnFailedTerminalCost(t *testing.T) {
+	t.Parallel()
+	actualMicros := int64(12)
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+			JobID: "provider-job-run-provider-failed", RunID: "run-provider-failed",
+			State: providercontract.StatusFailed,
+			Usage: providercontract.Usage{
+				InputUnits: 1, OutputUnits: 2, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+			Error: &providercontract.Error{Code: providercontract.CodeModelUnavailable},
+		})
+	}))
+	defer provider.Close()
+	ledger := &cancellationLedgerFixture{prepared: true}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	encoded, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "reconcile-failed-operation",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-provider-failed"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY", TraceID: "provider-failed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result CancelProviderResult
+	if err := encoded.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if result.State != "FAILED" ||
+		result.ErrorCode != string(providercontract.CodeModelUnavailable) ||
+		result.Cost.ActualMicros == nil || *result.Cost.ActualMicros != 12 ||
+		len(ledger.recorded) != 1 || ledger.recorded[0].State != "FAILED" {
+		t.Fatalf("failed cancellation reconciliation = result:%#v recorded:%#v", result, ledger.recorded)
+	}
+}
+
 func TestActivities_CancelProviderJobTreatsAuthoritativeAbsenceAsCancelled(t *testing.T) {
 	t.Parallel()
 	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -524,8 +601,8 @@ func TestActivities_CancelProviderJobTreatsAuthoritativeAbsenceAsCancelled(t *te
 	if err := encoded.Get(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result.State != "CANCELLED" || len(ledger.recorded) != 1 ||
-		ledger.recorded[0].State != "CANCELLED" {
+	if result.State != "CANCELLED" || !result.NoRemoteTask || len(ledger.recorded) != 1 ||
+		ledger.recorded[0].State != "CANCELLED" || !ledger.recorded[0].NoRemoteTask {
 		t.Fatalf("result=%#v recorded=%#v", result, ledger.recorded)
 	}
 }
@@ -806,6 +883,107 @@ func TestActivities_ExecuteProviderJobUsesLiveAdapterAndReturnsMeasuredCASArtifa
 	encoded, _ := json.Marshal(result)
 	if strings.Contains(string(encoded), "signature=") || strings.Contains(string(encoded), download.URL) {
 		t.Fatalf("Activity result leaked signed transport URL: %s", encoded)
+	}
+}
+
+func TestActivities_ExecuteProviderJobNeverResubmitsAfterAmbiguousPaidBoundary(t *testing.T) {
+	t.Parallel()
+	runID := "b5787943-28a8-43c8-a4b8-401b85ad7a9d"
+	approvalID := "39d1c01b-bf34-413b-893a-9eb7f8e48a69"
+	inputHash := strings.Repeat("a", 64)
+	capabilityHash := strings.Repeat("b", 64)
+	route := providercontract.ModelSnapshot{
+		CapabilityAlias: string(providercontract.CapabilityVideo),
+		Provider:        "MOCK", ModelID: "fixture-video-v1",
+		RouteVersion: "route-v1", CapabilityHash: capabilityHash,
+		Verification: "test",
+	}
+	prompt := PromptSnapshotRef{
+		ID: "prompt-ambiguous", Digest: strings.Repeat("c", 64),
+		PositivePrompt: "immutable ambiguous submission fixture",
+		Context: providercontract.ContextRefs{
+			SeriesSnapshotID: "series", EpisodeSnapshotID: "episode",
+			SceneSnapshotID: "scene", ShotSnapshotID: "shot",
+		},
+		Output: providercontract.OutputSpec{
+			Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+			FPS: 24, DurationMillis: 5_000, Format: "mp4",
+		},
+	}
+	budget := providercontract.BudgetEnvelope{
+		EstimatedCostMicros: 50, MaxCostMicros: 50, MaxAttempts: 1,
+	}
+	reservation, err := providercontract.BindBudgetReservation(
+		providercontract.BudgetReservation{
+			ReservationID: "993d4ba9-c37a-4536-a985-0859584274f3",
+			Currency:      "CNY", AmountMicros: 50, PricingVersion: "pricing-v1",
+			ConfirmedBy: approvalID,
+		},
+		providercontract.BudgetBindingInput{
+			RunID: runID, InputHash: inputHash, Model: route, Budget: budget,
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := ExecuteProviderJobInput{
+		Run:    GenerationRunRef{RunID: runID, RunSpecDigest: inputHash, Attempt: 1},
+		Prompt: prompt, Route: route, BudgetApprovalID: strings.ToUpper(approvalID),
+		BudgetMaximumMicros: 50, BudgetCurrency: "CNY",
+		TraceID: "trace-ambiguous-submit", PersistProductTruth: true,
+	}
+	var submits atomic.Int32
+	var gets atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPost:
+			submits.Add(1)
+			// Simulate a paid task accepted upstream while the adapter loses the
+			// response. Retrying this endpoint would create a second paid attempt.
+			http.Error(w, "accepted response lost", http.StatusServiceUnavailable)
+		case http.MethodGet:
+			call := gets.Add(1)
+			if call%2 == 0 {
+				http.Error(w, "poll unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+				JobID: "provider-job-" + runID, RunID: runID,
+				UpstreamTaskID: "upstream-ambiguous-1", RequestID: "request-ambiguous-1",
+				State: providercontract.StatusRunning, Model: route,
+			})
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer provider.Close()
+	ledger := &providerPreparationLedgerFixture{
+		resolvedPrompt: prompt,
+		prepared: PreparedProviderJob{
+			Budget: budget, BudgetReservation: reservation,
+		},
+	}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	for attempt := 0; attempt < 4; attempt++ {
+		env := suite.NewTestActivityEnvironment()
+		env.RegisterActivity(activities.ExecuteProviderJob)
+		if _, err := env.ExecuteActivity(activities.ExecuteProviderJob, input); err == nil {
+			t.Fatalf("attempt %d unexpectedly succeeded", attempt+1)
+		}
+	}
+	if submits.Load() != 1 {
+		t.Fatalf("paid POST calls = %d, want 1", submits.Load())
+	}
+	if gets.Load() != 6 {
+		t.Fatalf("stable JobID GET calls = %d, want 6", gets.Load())
+	}
+	if len(ledger.observations) < 7 ||
+		ledger.observations[0].State != "UNKNOWN" ||
+		ledger.observations[0].ErrorCode != "PROVIDER_SUBMISSION_PENDING" ||
+		!ledger.reconcileOnly {
+		t.Fatalf("durable reconciliation observations = %#v", ledger.observations)
 	}
 }
 

@@ -364,7 +364,12 @@ func (p *fakeProvider) Cancel(context.Context, string) (providercontract.Job, er
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.cancelCount++
-	return providercontract.Job{ID: "cgt-live-1", Status: providercontract.StatusCancelled}, nil
+	return providercontract.Job{
+		ID: "cgt-live-1", Status: providercontract.StatusCancelled,
+		Output: &providercontract.Output{Usage: providercontract.Usage{
+			InputTokens: 7, VideoTokens: 125_000, GeneratedMillis: 2_500,
+		}},
+	}, nil
 }
 
 const testServiceAuthSecret = "test-service-auth-secret-32-bytes-long"
@@ -465,6 +470,44 @@ func TestServer_SubmitPollDownloadAndCASWithoutTransportLeak(t *testing.T) {
 	afterRestart := postJob(t, restartedServer.URL, request)
 	if afterRestart.State != providercontract.StatusSucceeded || provider.submitCount != 1 {
 		t.Fatalf("restart replay = %#v, submit count = %d", afterRestart, provider.submitCount)
+	}
+}
+
+func TestServer_CancelPreservesTerminalUsage(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider := &fakeProvider{}
+	adapter, err := New(testLiveConfig(), provider, store, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(adapter.Handler())
+	defer server.Close()
+	request := testJobRequest(t)
+	_ = postJob(t, server.URL, request)
+	req, err := http.NewRequest(
+		http.MethodPost, server.URL+"/v1/jobs/"+request.JobID+"/cancel", nil,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := authenticatedTestClient(t).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var cancelled providercontract.JobResponse
+	if err := json.NewDecoder(response.Body).Decode(&cancelled); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusAccepted ||
+		cancelled.State != providercontract.StatusCancelled ||
+		cancelled.Usage.InputTokens != 7 || cancelled.Usage.VideoTokens != 125_000 ||
+		cancelled.Usage.GeneratedMillis != 2_500 || cancelled.Cost.ActualMicros == nil {
+		t.Fatalf("cancelled response = status:%d value:%#v", response.StatusCode, cancelled)
 	}
 }
 

@@ -1252,6 +1252,14 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				t, ctx, store, fmt.Sprintf("budget-race-%d", index+1),
 				raceCommands[index],
 			)
+		// Semantically identical UUID spellings must share one cumulative
+		// approval bucket, including under concurrent reservation pressure.
+		switch index % 3 {
+		case 1:
+			raceDispatches[index].BudgetApprovalID = strings.ToUpper(raceBudgetID.String())
+		case 2:
+			raceDispatches[index].BudgetApprovalID = strings.ReplaceAll(raceBudgetID.String(), "-", "")
+		}
 	}
 	raceErrors := make([]error, raceFanout)
 	var raceWait sync.WaitGroup
@@ -1348,7 +1356,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_RELEASE",
 			TraceID:    raceSteps[winner].TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -1400,6 +1408,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	wrongReleaseID := uuid.New()
 	extraReleaseID := uuid.New()
+	extraAdjustmentID := uuid.New()
 	releaseDrifts := []releaseDriftCase{
 		{
 			name: "missing RELEASE",
@@ -1521,6 +1530,21 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraReleaseID)
 			},
 		},
+		{
+			name: "unexpected ADJUSTMENT",
+			mutate: func(t *testing.T) {
+				mustExec(t, ctx, pool, `
+					INSERT INTO video_pipeline.cost_ledger
+						(id, provider_job_id, budget_reservation_id, entry_type,
+						 amount_micros, currency, pricing_rule_version, verified)
+					VALUES ($1, $2, $3, 'ADJUSTMENT', 1, 'CNY', 'pricing-v1', true)`,
+					extraAdjustmentID, winnerJobID, winnerReservationID,
+				)
+			},
+			restore: func(t *testing.T) {
+				mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraAdjustmentID)
+			},
+		},
 	}
 	for _, releaseDrift := range releaseDrifts {
 		releaseDrift := releaseDrift
@@ -1534,7 +1558,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 					ReasonCode: "INTEGRATION_RELEASE",
 					TraceID:    raceSteps[winner].TraceID,
 				},
-				orchestration.CancelProviderResult{State: "CANCELLED"},
+				orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 			)
 			var domain *controlplane.DomainError
 			if !errors.As(replayErr, &domain) || domain.Code != controlplane.CodeRevisionConflict {
@@ -2180,13 +2204,291 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 						ReasonCode: "INTEGRATION_DRIFT_SECONDARY_CLEANUP",
 						TraceID:    secondStep.TraceID,
 					},
-					orchestration.CancelProviderResult{State: "CANCELLED"},
+					orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 				); err != nil {
 					t.Fatal(err)
 				}
 			}
 		})
 	}
+
+	t.Run("public run persists canonical budget approval UUID", func(t *testing.T) {
+		clonedShotID, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		canonicalApproval := command.BudgetApprovalID
+		command.BudgetApprovalID = strings.ReplaceAll(
+			strings.ToUpper(command.BudgetApprovalID), "-", "",
+		)
+		requestHash, err := digestValue(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		created, err := store.CreateGenerationRun(
+			ctx, clonedShotID, 1, command,
+			controlplane.Idempotency{
+				Scope: "canonical-public-run:" + clonedShotID,
+				Key:   uuid.NewString(), RequestHash: requestHash,
+			},
+			"canonical-public-run",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var persistedApproval string
+		if err := pool.QueryRow(ctx, `
+			SELECT budget_approval_id
+			FROM video_pipeline.generation_runs
+			WHERE id = $1`,
+			created.Value.AggregateID,
+		).Scan(&persistedApproval); err != nil {
+			t.Fatal(err)
+		}
+		if persistedApproval != canonicalApproval {
+			t.Fatalf("persisted approval = %q, want %q", persistedApproval, canonicalApproval)
+		}
+	})
+
+	t.Run("confirmed cancellation settles actual cost and releases only unused budget", func(t *testing.T) {
+		_, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		cancelStep, cancelRun, cancelDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "cancel-with-actual-cost", command,
+		)
+		if _, err := store.PrepareProviderJob(ctx, cancelStep, cancelDispatch); err != nil {
+			t.Fatal(err)
+		}
+		actualMicros := int64(20)
+		cancelResult := orchestration.CancelProviderResult{
+			State: "CANCELLED", UpstreamTaskID: "cancel-cost-task",
+			RequestID: "cancel-cost-request",
+			Usage: providercontract.Usage{
+				InputUnits: 2, OutputUnits: 3, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		}
+		cancelInput := orchestration.CancelProviderJobInput{
+			Dispatch: cancelDispatch, ReasonCode: "INTEGRATION_CANCEL_WITH_COST",
+			TraceID: cancelStep.TraceID,
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, cancelResult,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var runState, attemptState, jobState, reservationState string
+		var actualCount, releaseCount int
+		var actualAmount, releaseAmount int64
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       COUNT(*) FILTER (WHERE cl.entry_type = 'ACTUAL'),
+			       COUNT(*) FILTER (WHERE cl.entry_type = 'RELEASE'),
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'ACTUAL'), 0),
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'RELEASE'), 0)
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl
+			  ON cl.provider_job_id = pj.id AND cl.entry_type IN ('ACTUAL', 'RELEASE')
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status`,
+			cancelRun.RunID,
+		).Scan(
+			&runState, &attemptState, &jobState, &reservationState,
+			&actualCount, &releaseCount, &actualAmount, &releaseAmount,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if runState != "CANCELLED" || attemptState != "CANCELLED" ||
+			jobState != "CANCELLED" || reservationState != "SETTLED" ||
+			actualCount != 1 || releaseCount != 1 ||
+			actualAmount != 20 || releaseAmount != 30 {
+			t.Fatalf(
+				"costed cancellation = run:%s attempt:%s job:%s reservation:%s actual:%d/%d release:%d/%d",
+				runState, attemptState, jobState, reservationState,
+				actualCount, actualAmount, releaseCount, releaseAmount,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, cancelResult,
+		); err != nil {
+			t.Fatalf("exact costed cancellation replay: %v", err)
+		}
+		drifted := cancelResult
+		driftedActual := int64(19)
+		drifted.Cost.ActualMicros = &driftedActual
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, drifted,
+		); err == nil {
+			t.Fatal("costed cancellation replay accepted changed actual cost")
+		}
+	})
+
+	t.Run("confirmed Provider failure settles cost without release escape", func(t *testing.T) {
+		_, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		failureStep, failureRun, failureDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "provider-failed-with-cost", command,
+		)
+		if _, err := store.PrepareProviderJob(ctx, failureStep, failureDispatch); err != nil {
+			t.Fatal(err)
+		}
+		actualMicros := int64(12)
+		failureResult := orchestration.CancelProviderResult{
+			State: "FAILED", UpstreamTaskID: "failed-cost-task",
+			RequestID: "failed-cost-request", ErrorCode: "model_unavailable",
+			Usage: providercontract.Usage{
+				InputUnits: 1, OutputUnits: 2, Unit: "mock-units",
+			},
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		}
+		failureInput := orchestration.CancelProviderJobInput{
+			Dispatch: failureDispatch, ReasonCode: "RECONCILE_HISTORY",
+			TraceID: failureStep.TraceID,
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, failureResult,
+		); err != nil {
+			t.Fatal(err)
+		}
+		var runState, failureClass, jobState, reservationState string
+		var actualAmount, releaseAmount int64
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, gr.failure_class, pj.state, br.status,
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'ACTUAL'), 0),
+			       COALESCE(SUM(cl.amount_micros) FILTER (WHERE cl.entry_type = 'RELEASE'), 0)
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl
+			  ON cl.provider_job_id = pj.id AND cl.entry_type IN ('ACTUAL', 'RELEASE')
+			WHERE gr.id = $1
+			GROUP BY gr.state, gr.failure_class, pj.state, br.status`,
+			failureRun.RunID,
+		).Scan(
+			&runState, &failureClass, &jobState, &reservationState,
+			&actualAmount, &releaseAmount,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if runState != "FAILED" || failureClass != "TRANSIENT" ||
+			jobState != "FAILED" || reservationState != "SETTLED" ||
+			actualAmount != 12 || releaseAmount != 38 {
+			t.Fatalf(
+				"failed Provider settlement = run:%s class:%s job:%s reservation:%s actual:%d release:%d",
+				runState, failureClass, jobState, reservationState,
+				actualAmount, releaseAmount,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, failureResult,
+		); err != nil {
+			t.Fatalf("exact Provider failure replay: %v", err)
+		}
+	})
+
+	t.Run("ambiguous submit persists recover-only state and stable identities", func(t *testing.T) {
+		_, command := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		observationStep, observationRun, observationDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "ambiguous-submit-observation", command,
+		)
+		prepared, err := store.PrepareProviderJob(
+			ctx, observationStep, observationDispatch,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if prepared.ReconcileOnly {
+			t.Fatal("new Provider allocation started recover-only")
+		}
+		observationDispatch.BudgetApprovalID = strings.ToUpper(
+			observationDispatch.BudgetApprovalID,
+		)
+		if err := store.RecordProviderJobObservation(
+			ctx, observationStep, observationDispatch,
+			orchestration.ProviderJobObservation{
+				State: "UNKNOWN", ErrorCode: "PROVIDER_SUBMISSION_PENDING",
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		replayed, err := store.PrepareProviderJob(
+			ctx, observationStep, observationDispatch,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !replayed.ReconcileOnly {
+			t.Fatal("ambiguous paid boundary allowed another Provider submit")
+		}
+		if err := store.RecordProviderJobObservation(
+			ctx, observationStep, observationDispatch,
+			orchestration.ProviderJobObservation{
+				State: "RUNNING", UpstreamTaskID: "stable-observation-task",
+				RequestID: "stable-observation-request",
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.RecordProviderJobObservation(
+			ctx, observationStep, observationDispatch,
+			orchestration.ProviderJobObservation{
+				State: "UNKNOWN", ErrorCode: "PROVIDER_POLL_UNKNOWN",
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		var runState, attemptState, jobState, reservationState string
+		var upstreamTaskID, requestID string
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       pj.upstream_task_id, pj.upstream_request_id
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			WHERE gr.id = $1`,
+			observationRun.RunID,
+		).Scan(
+			&runState, &attemptState, &jobState, &reservationState,
+			&upstreamTaskID, &requestID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if runState != "RECONCILING" || attemptState != "RECONCILING" ||
+			jobState != "UNKNOWN" || reservationState != "RESERVED" ||
+			upstreamTaskID != "stable-observation-task" ||
+			requestID != "stable-observation-request" {
+			t.Fatalf(
+				"ambiguous observation = run:%s attempt:%s job:%s reservation:%s task:%s request:%s",
+				runState, attemptState, jobState, reservationState,
+				upstreamTaskID, requestID,
+			)
+		}
+		if err := store.RecordProviderCancellation(
+			ctx, observationStep,
+			orchestration.CancelProviderJobInput{
+				Dispatch:   observationDispatch,
+				ReasonCode: "INTEGRATION_OBSERVATION_CLEANUP",
+				TraceID:    observationStep.TraceID,
+			},
+			orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
+		); err != nil {
+			t.Fatal(err)
+		}
+	})
 
 	_, cancelRaceCommand := cloneIntegrationShotCommand(
 		t, ctx, pool, store, shotID.String(), publicCommand,
@@ -2207,7 +2509,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_CANCEL_FIRST",
 			TraceID:    cancelRaceStep.TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -2347,7 +2649,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_CONFLICT_CLEANUP",
 			TraceID:    artifactConflictStep.TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -2697,6 +2999,31 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if !reflect.DeepEqual(replayedPreparedProvider, preparedProvider) {
 		t.Fatal("exact prepared Provider job replay changed the durable allocation")
 	}
+	t.Run("RESERVED allocation rejects unexpected ledger entry", func(t *testing.T) {
+		runUUID := uuid.MustParse(run.RunID)
+		jobID := uuid.NewSHA1(runUUID, []byte("provider-job"))
+		reservationID := uuid.NewSHA1(runUUID, []byte("budget-reservation"))
+		extraID := uuid.New()
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'ADJUSTMENT', 1, 'CNY', 'pricing-v1', true)`,
+			extraID, jobID, reservationID,
+		)
+		if _, err := store.PrepareProviderJob(ctx, step, dispatch); err == nil {
+			t.Fatal("RESERVED replay accepted an unexpected ADJUSTMENT")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("unexpected RESERVED ledger error = %#v", err)
+			}
+		}
+		mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraID)
+		if _, err := store.PrepareProviderJob(ctx, step, dispatch); err != nil {
+			t.Fatalf("exact RESERVED replay after repair: %v", err)
+		}
+	})
 	// A late Temporal Activity replay can arrive after completion has already
 	// frozen both product records. It must recover the exact durable job rather
 	// than allocate a second paid boundary or reject the workflow's history.
@@ -3397,6 +3724,19 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				uuid.New(), providerJobID, providerReservationID,
 			)
 		}},
+		{name: "unexpected ESTIMATE ledger", mutate: func(t *testing.T) {
+			extraID := uuid.New()
+			t.Cleanup(func() {
+				mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, extraID)
+			})
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ESTIMATE', 1, 'CNY', 'pricing-v1', true)`,
+				extraID, providerJobID, providerReservationID,
+			)
+		}},
 	}
 	for _, test := range reservationProjectionDrifts {
 		test := test
@@ -3689,7 +4029,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ReasonCode: "INTEGRATION_SUCCESS_FIRST",
 			TraceID:    step.TraceID,
 		},
-		orchestration.CancelProviderResult{State: "CANCELLED"},
+		orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
 	); err != nil {
 		t.Fatal(err)
 	}

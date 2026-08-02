@@ -296,6 +296,40 @@ func TestVolcengineProvider_PollMapsAgentPlanResponse(t *testing.T) {
 	}
 }
 
+func TestVolcengineProvider_PollPreservesCancelledUsage(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{
+			"id":"cgt-cancelled-1",
+			"model":"doubao-seedance-2.0",
+			"status":"cancelled",
+			"created_at":1800000000,
+			"updated_at":1800000005,
+			"duration":2,
+			"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":125000}
+		}`)
+	}))
+	defer server.Close()
+	provider, err := NewVolcengineProvider(VolcengineConfig{
+		BaseURL: server.URL,
+		APIKey:  strings.Join([]string{"test", "runtime", "credential"}, "-"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := provider.Poll(t.Context(), "cgt-cancelled-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != StatusCancelled || job.Output == nil ||
+		job.Output.Usage.InputTokens != 3 || job.Output.Usage.OutputTokens != 4 ||
+		job.Output.Usage.VideoTokens != 125_000 ||
+		job.Output.Usage.GeneratedMillis != 2_000 || len(job.Output.Assets) != 0 {
+		t.Fatalf("cancelled Provider usage = %#v", job)
+	}
+}
+
 func TestVolcengineProvider_ParsesRetryAfter(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 7, 30, 1, 0, 0, 0, time.UTC)

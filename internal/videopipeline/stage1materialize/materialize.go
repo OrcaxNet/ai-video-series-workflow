@@ -528,6 +528,10 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	}
 	now := time.Now().UTC()
 	ids := p.product.Reserved
+	// UUID aliases are valid transport spellings but may not become distinct
+	// TEXT budget buckets in persisted product truth.
+	ids.VideoBudgetApprovalID = mustUUID(ids.VideoBudgetApprovalID).String()
+	ids.SpeechBudgetApprovalID = mustUUID(ids.SpeechBudgetApprovalID).String()
 	providerOutput := p.product.SharedPrompt.Output.providerSpec()
 	exec := func(label, query string, args ...any) error {
 		if _, err := tx.Exec(ctx, query, args...); err != nil {

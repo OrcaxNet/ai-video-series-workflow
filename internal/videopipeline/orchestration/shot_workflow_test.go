@@ -113,6 +113,37 @@ func TestShotProductionWorkflowCancellationWinsProviderNetworkFailure(t *testing
 	}
 }
 
+func TestShotProductionWorkflowProviderFailureReconcilesWithoutFinalRelease(t *testing.T) {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestWorkflowEnvironment()
+	var finalized FinalizeShotRunInput
+	cancelCalls := 0
+	registerShotActivities(env, &finalized, &cancelCalls)
+	env.OnActivity(
+		ActivityExecuteProviderJob,
+		mock.Anything,
+		mock.Anything,
+	).Return(
+		ProviderResult{},
+		temporal.NewNonRetryableApplicationError(
+			"provider poll history is ambiguous", "PROVIDER_OUTCOME_UNKNOWN", nil,
+		),
+	).Once()
+
+	env.ExecuteWorkflow(ShotProductionWorkflow, shotWorkflowTestInput())
+
+	if env.GetWorkflowError() == nil {
+		t.Fatal("workflow error = nil, want original Provider failure")
+	}
+	if cancelCalls != 1 {
+		t.Fatalf("reconciliation calls = %d, want 1", cancelCalls)
+	}
+	if finalized.State != "" {
+		t.Fatalf("ambiguous Provider failure released via finalizer: %#v", finalized)
+	}
+	env.AssertExpectations(t)
+}
+
 func TestShotProductionWorkflowPauseWinningProviderCompletionReplaysBeforeQC(t *testing.T) {
 	var suite testsuite.WorkflowTestSuite
 	env := suite.NewTestWorkflowEnvironment()

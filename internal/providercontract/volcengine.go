@@ -520,8 +520,22 @@ func (t volcVideoTask) toJob(providerRequestID string) Job {
 	if t.Error != nil {
 		job.Error = MapHTTPError(http.StatusBadRequest, t.Error.Code, providerRequestID, t.Error.Message)
 	}
-	if job.Status == StatusSucceeded {
+	if job.Status.Terminal() {
 		durationSeconds := int64(t.Duration)
+		output := &Output{
+			Usage: Usage{
+				InputTokens:     t.Usage.PromptTokens,
+				OutputTokens:    t.Usage.CompletionTokens,
+				VideoTokens:     t.Usage.TotalTokens,
+				GeneratedMillis: durationSeconds * 1000,
+			},
+		}
+		// Providers may meter work before a terminal cancellation or failure.
+		// Preserve that usage even though those outcomes have no output asset.
+		if job.Status != StatusSucceeded {
+			job.Output = output
+			return job
+		}
 		fps := t.FramesPerSecond
 		if fps == 0 && t.Frames > 0 && durationSeconds > 0 {
 			fps = int((int64(t.Frames) + durationSeconds/2) / durationSeconds)
@@ -530,20 +544,12 @@ func (t volcVideoTask) toJob(providerRequestID string) Job {
 		if format == "" {
 			format = "mp4"
 		}
-		output := &Output{
-			Actual: OutputSpec{
-				Resolution:     t.Resolution,
-				AspectRatio:    t.Ratio,
-				FPS:            fps,
-				DurationMillis: int(durationSeconds * 1000),
-				Format:         format,
-			},
-			Usage: Usage{
-				InputTokens:     t.Usage.PromptTokens,
-				OutputTokens:    t.Usage.CompletionTokens,
-				VideoTokens:     t.Usage.TotalTokens,
-				GeneratedMillis: durationSeconds * 1000,
-			},
+		output.Actual = OutputSpec{
+			Resolution:     t.Resolution,
+			AspectRatio:    t.Ratio,
+			FPS:            fps,
+			DurationMillis: int(durationSeconds * 1000),
+			Format:         format,
 		}
 		videoURL := firstNonEmpty(t.OutputURL, t.Content.VideoURL)
 		lastFrameURL := firstNonEmpty(t.LastFrameURL, t.Content.LastFrameURL)

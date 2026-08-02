@@ -686,6 +686,21 @@ type PreparedProviderJob struct {
 	Budget            providercontract.BudgetEnvelope    `json:"budget"`
 	BudgetReservation providercontract.BudgetReservation `json:"budgetReservation"`
 	ProductTruth      PreparedProductTruth               `json:"productTruth"`
+	// ReconcileOnly is derived from the durable Provider job projection on
+	// Activity replay. It is intentionally excluded from the immutable request
+	// snapshot: once a submit may have crossed the paid boundary, retries poll
+	// the stable JobID instead of issuing another POST.
+	ReconcileOnly bool `json:"-"`
+}
+
+// ProviderJobObservation freezes the paid-boundary state before an Activity
+// can fail or retry. UNKNOWN is a reconciliation state, never proof that the
+// upstream task failed or can be released.
+type ProviderJobObservation struct {
+	State          string `json:"state"`
+	UpstreamTaskID string `json:"upstreamTaskId,omitempty"`
+	RequestID      string `json:"requestId,omitempty"`
+	ErrorCode      string `json:"errorCode,omitempty"`
 }
 
 // PreparedProductTruth echoes the exact immutable PostgreSQL facts that were
