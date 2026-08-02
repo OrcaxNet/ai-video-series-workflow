@@ -22,6 +22,20 @@ make video-smoke
 make video-down
 ```
 
+OrbStack 常驻体验（需要调用环境中已有 Agent Plan `ARK_API_KEY`）：
+
+```bash
+make video-orbstack-up
+open http://127.0.0.1:4173
+```
+
+该入口会启动创作操作台、控制面、Worker、PostgreSQL、Temporal、Mock Provider
+与 Agent Plan Live Adapter，全部长驻服务均使用 `restart: unless-stopped`。它显式排除
+会提交付费任务的 `live-probe` 与一次性 Stage 1 runner；界面中的创作操作仍是可复现
+Mock 演练，但 Provider 配置状态来自真实本地控制面，Key 只注入 Live Adapter，绝不
+进入浏览器或仓库。查看容器状态使用 `make video-orbstack-status`，停止并保留数据卷
+使用 `make video-orbstack-down`。
+
 只验证 Provider 契约和 `pending_key` 预检：
 
 ```bash

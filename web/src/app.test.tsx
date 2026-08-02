@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { describe, expect, it } from "vitest";
 import { MockControlPlaneApi, type ControlPlaneApi } from "./api/control-plane";
 import { App } from "./app";
-import type { CreateJobAttemptInput, CreateJobAttemptResult } from "./domain";
+import type { CreateJobAttemptInput, CreateJobAttemptResult, ProviderCapability } from "./domain";
 import { createInitialState, gates, jobs } from "./mock-data";
 import { StudioProvider, useStudio } from "./studio-store";
 
@@ -73,6 +73,23 @@ class LostFirstResponseApi extends MockControlPlaneApi {
   }
 }
 
+class AgentPlanExperienceApi extends MockControlPlaneApi {
+  override async getProviderStatus(): Promise<ProviderCapability[]> {
+    return [
+      {
+        alias: "video.primary",
+        liveConfigured: true,
+        liveCallsEnabled: false,
+        dryRunAvailable: true,
+        mockAvailable: true,
+        defaultProvider: "volcengine_ark",
+        liveEvidence: "pending_key_validation",
+        mockEvidence: "mock_only",
+      },
+    ];
+  }
+}
+
 function SynchronousDuplicateAttemptProbe() {
   const { actions } = useStudio();
   return (
@@ -95,6 +112,17 @@ describe("creator studio", () => {
     expect(screen.getByText("Mock only", { selector: ".mode-pill strong" })).toBeInTheDocument();
     expect(screen.getByText("live pending_key")).toBeInTheDocument();
     expect(screen.getByText(/不能把结果当作真实生成质量/)).toBeInTheDocument();
+  });
+
+  it("shows an injected Agent Plan without presenting rehearsal actions as live calls", async () => {
+    renderStudio(new AgentPlanExperienceApi());
+
+    await waitFor(() => {
+      expect(screen.getByText("Agent Plan 已配置", { selector: ".mode-pill strong" })).toBeInTheDocument();
+    });
+    fireEvent.click(screen.getByRole("button", { name: "任务中心" }));
+    expect(screen.getByText("Agent Plan 已注入 · 创作交互为 Mock 演练")).toBeInTheDocument();
+    expect(screen.getByText(/当前 PoC 写操作仍使用确定性 fixture，不产生付费调用/)).toBeInTheDocument();
   });
 
   it("does not expose downstream gate review before G1 is approved", async () => {
