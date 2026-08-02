@@ -20,17 +20,20 @@ import (
 )
 
 const (
-	SchemaVersion                  = "v1"
-	LedgerSchemaVersion            = "v3"
-	FormalVideoModel               = "doubao-seedance-2.0"
-	RequiredPrimaryJobs            = 10
-	MaximumControlledRetries       = 1
-	MaximumNewProviderJobs         = 11
-	MaximumVideoTokens       int64 = 1_200_000
-	MaximumMonthlyAFPMilli   int64 = 38_000_000
-	MaximumCashMicros        int64 = 20_000_000
-	MaximumDialogueChars     int64 = 600
-	MaximumAFPDriftBPS             = 1_000
+	SchemaVersion                    = "v1"
+	LedgerSchemaVersion              = "v3"
+	FormalVideoModel                 = "doubao-seedance-2.0"
+	RequiredPrimaryJobs              = 10
+	MaximumControlledRetries         = 1
+	MaximumNewProviderJobs           = 11
+	MaximumVideoTokens         int64 = 1_200_000
+	MaximumMonthlyAFPMilli     int64 = 38_000_000
+	MaximumCashMicros          int64 = 20_000_000
+	MaximumDialogueChars       int64 = 600
+	MaximumAFPDriftBPS               = 1_000
+	FLO100MonthlyAFPCapMilli   int64 = 135_000_000
+	FLO100BatchAVideoAFPMilli  int64 = 30_306_870
+	FLO100BatchASpeechAFPMilli int64 = 1_039
 )
 
 var requiredEvidence = []string{
@@ -60,6 +63,11 @@ type Plan struct {
 	// deliberately rejecting a live credential or Provider authorization.
 	// The zero value preserves the fixed FLO-104 sample-1 contract.
 	OfflineOnly bool `json:"offlineOnly,omitempty"`
+	// SubscriptionIncludedOnly selects the FLO-100 live contract: Agent Plan
+	// AFP is reserved independently while every non-subscription CNY value is
+	// fixed at zero. It is intentionally distinct from both legacy live and
+	// offline materialization policies.
+	SubscriptionIncludedOnly bool `json:"subscriptionIncludedOnly,omitempty"`
 }
 
 type TTSPreflight struct {
@@ -76,7 +84,13 @@ type TTSPreflight struct {
 
 func (p Plan) Validate() error {
 	if p.OfflineOnly {
+		if p.SubscriptionIncludedOnly {
+			return errors.New("stage 1 plan cannot be both offline and subscription-live")
+		}
 		return p.validateOffline()
+	}
+	if p.SubscriptionIncludedOnly {
+		return p.validateSubscriptionIncluded()
 	}
 	switch {
 	case p.SchemaVersion != SchemaVersion:
@@ -125,6 +139,54 @@ func (p Plan) Validate() error {
 	sort.Strings(gotEvidence)
 	if strings.Join(gotEvidence, "\x00") != strings.Join(requiredEvidence, "\x00") {
 		return errors.New("stage 1 plan does not require the complete evidence set")
+	}
+	return nil
+}
+
+func (p Plan) validateSubscriptionIncluded() error {
+	switch {
+	case p.SchemaVersion != SchemaVersion:
+		return errors.New("stage 1 schemaVersion must be v1")
+	case p.BatchID != "flo100-gold-a-v1":
+		return errors.New("subscription-live activation is restricted to FLO-100 batch A")
+	case p.VideoModel != FormalVideoModel:
+		return errors.New("FLO-100 live activation must use doubao-seedance-2.0")
+	case len(p.PrimaryShotIDs) != RequiredPrimaryJobs:
+		return fmt.Errorf("FLO-100 live activation requires exactly %d primary shots", RequiredPrimaryJobs)
+	case p.MaximumNewJobs != MaximumNewProviderJobs || p.MaximumControlledRetries != MaximumControlledRetries:
+		return errors.New("FLO-100 live activation must be capped at 10 primary jobs plus one controlled retry")
+	case p.MaximumVideoTokens != MaximumVideoTokens:
+		return errors.New("FLO-100 live video token cap must equal 1200000")
+	case p.MonthlyBaselineAFPMilli != 0 || p.MonthlyMaximumAFPMilli != FLO100MonthlyAFPCapMilli:
+		return errors.New("FLO-100 live monthly AFP baseline/cap must equal 0/135000 AFP")
+	case p.ReferenceJobAFPMilli <= 0 || p.MaximumAFPDriftBPS != MaximumAFPDriftBPS:
+		return errors.New("FLO-100 live reference AFP and 10 percent drift limit are required")
+	case p.MaximumCashMicros != 0:
+		return errors.New("FLO-100 live activation must cap non-subscription cash at zero")
+	case p.MaximumDialogueCharacters != 7 || p.MaximumTTSAFPMilli != FLO100BatchASpeechAFPMilli:
+		return errors.New("FLO-100 batch A speech must be capped at seven characters and 1.039 AFP")
+	case !p.TTSPreflight.CompletedNoCost || p.TTSPreflight.Provider != "volcengine_ark" ||
+		p.TTSPreflight.Model != "doubao-seed-tts-2.0" || p.TTSPreflight.Region != "cn-beijing" ||
+		p.TTSPreflight.ResourceID != "seed-tts-2.0" ||
+		p.TTSPreflight.CredentialReference != "ARK_API_KEY" || !p.TTSPreflight.CredentialAvailable ||
+		p.TTSPreflight.Pricing != "1350_afp_per_10000_chars" ||
+		p.TTSPreflight.UsageAttribution != "provider_usage_tokens_per_request":
+		return errors.New("FLO-100 live activation requires the complete Agent Plan TTS preflight")
+	}
+	seen := make(map[string]struct{}, len(p.PrimaryShotIDs))
+	for _, shotID := range p.PrimaryShotIDs {
+		if strings.TrimSpace(shotID) == "" {
+			return errors.New("FLO-100 live shot IDs cannot be empty")
+		}
+		if _, duplicate := seen[shotID]; duplicate {
+			return fmt.Errorf("duplicate FLO-100 live shot ID %q", shotID)
+		}
+		seen[shotID] = struct{}{}
+	}
+	gotEvidence := append([]string(nil), p.RequiredEvidence...)
+	sort.Strings(gotEvidence)
+	if strings.Join(gotEvidence, "\x00") != strings.Join(requiredEvidence, "\x00") {
+		return errors.New("FLO-100 live plan does not require the complete evidence set")
 	}
 	return nil
 }

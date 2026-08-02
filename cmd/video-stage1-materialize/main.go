@@ -33,6 +33,7 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	flags.SetOutput(stderr)
 	var files stage1materialize.Files
 	var planPath, outputPath, reportPath, formalRoot, expectedPackageHash string
+	var liveAuthorizationPath, expectedLiveAuthorizationHash, sourceCodeCommit, livePlanOutput string
 	var approvalComment, approvalActor, approvalValidUntil string
 	flags.StringVar(&files.Product, "product", "", "fixed product-input JSON")
 	flags.StringVar(&files.Source, "source", "", "fixed source text")
@@ -41,6 +42,10 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	flags.StringVar(&planPath, "plan", "", "Stage 1 readiness plan")
 	flags.StringVar(&formalRoot, "formal-pack", "", "FLO-100 formal offline package directory (A/B/C mode)")
 	flags.StringVar(&expectedPackageHash, "expected-package-hash", "", "independently pinned FLO-100 package content hash")
+	flags.StringVar(&liveAuthorizationPath, "live-authorization", "", "external FLO-100 A-only live authorization JSON")
+	flags.StringVar(&expectedLiveAuthorizationHash, "expected-live-authorization-hash", "", "independently pinned live authorization SHA-256")
+	flags.StringVar(&sourceCodeCommit, "source-code-commit", "", "candidate live implementation full Git SHA")
+	flags.StringVar(&livePlanOutput, "live-plan-output", "", "subscription-live readiness plan output")
 	flags.StringVar(&outputPath, "output", "", "prompt-free execution package output, or output directory in formal-pack mode")
 	flags.StringVar(&reportPath, "report", "", "offline materialization report output")
 	flags.StringVar(&approvalComment, "approval-comment", "", "ADMIN approval comment UUID")
@@ -52,8 +57,17 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	if flags.NArg() != 0 || outputPath == "" || reportPath == "" {
 		return errors.New("output and report are required")
 	}
-	formalMode := formalRoot != ""
-	if formalMode {
+	liveMode := liveAuthorizationPath != ""
+	formalMode := formalRoot != "" && !liveMode
+	if liveMode {
+		if formalRoot == "" || expectedPackageHash == "" || expectedLiveAuthorizationHash == "" ||
+			sourceCodeCommit == "" || livePlanOutput == "" {
+			return errors.New("formal-pack, expected-package-hash, expected-live-authorization-hash, source-code-commit, and live-plan-output are required in live mode")
+		}
+		if files.Product != "" || files.Source != "" || files.Safety != "" || files.Visual != "" || planPath != "" {
+			return errors.New("live mode cannot be combined with legacy product, source, safety, visual, or plan inputs")
+		}
+	} else if formalMode {
 		if files.Product != "" || files.Source != "" || files.Safety != "" || files.Visual != "" || planPath != "" {
 			return errors.New("formal-pack mode cannot be combined with legacy product, source, safety, visual, or plan inputs")
 		}
@@ -89,6 +103,31 @@ func run(ctx context.Context, args []string, stderr io.Writer, lookup func(strin
 	}
 	approval := stage1materialize.Approval{
 		CommentID: approvalComment, ActorID: approvalActor, ValidUntil: validUntil.UTC(),
+	}
+	if liveMode {
+		plan, package_, report, err := stage1materialize.MaterializeFLO100Live(
+			ctx, pool, cas, stage1materialize.LiveOptions{
+				Formal: stage1materialize.FormalOptions{
+					Root: formalRoot, ExpectedPackageHash: expectedPackageHash, Approval: approval,
+				},
+				AuthorizationPath:         liveAuthorizationPath,
+				ExpectedAuthorizationHash: expectedLiveAuthorizationHash,
+				SourceCodeCommit:          sourceCodeCommit,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if err := writeJSONAtomically(livePlanOutput, plan); err != nil {
+			return fmt.Errorf("write live readiness plan: %w", err)
+		}
+		if err := writeJSONAtomically(outputPath, package_); err != nil {
+			return fmt.Errorf("write live execution package: %w", err)
+		}
+		if err := writeJSONAtomically(reportPath, report); err != nil {
+			return fmt.Errorf("write live verification report: %w", err)
+		}
+		return nil
 	}
 	if formalMode {
 		packages, report, err := stage1materialize.MaterializeFLO100(ctx, pool, cas, stage1materialize.FormalOptions{

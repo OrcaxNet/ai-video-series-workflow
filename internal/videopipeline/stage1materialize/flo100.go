@@ -1730,6 +1730,7 @@ func formalProjectionHash(
 		formalUUID("capability:image:" + formalRendererHash),
 	}
 	generationProfileIDs := make([]uuid.UUID, 0, len(prepared.batches))
+	offlineRunIDs := make([]uuid.UUID, 0, 30)
 	decisionIDs := []uuid.UUID{formalUUID("gate:g1:all-assets")}
 	licenseIDs := make([]uuid.UUID, 0, len(prepared.assets.Versions))
 	expectedApprovalBindings := len(prepared.assets.Versions)
@@ -1744,6 +1745,9 @@ func formalProjectionHash(
 			formalUUID("gate:safety:"+batch.product.BatchID),
 		)
 		expectedApprovalBindings += len(batch.assetVersionIDs) + 23
+		for _, job := range batch.intent.PrimaryJobs {
+			offlineRunIDs = append(offlineRunIDs, mustUUID(job.RunID))
+		}
 		for _, shot := range batch.product.Shots {
 			expectedPromptAssets += len(shot.AssetVersionIDs)
 		}
@@ -1783,15 +1787,15 @@ func formalProjectionHash(
 		{"prompts", 30, `SELECT to_jsonb(ps) FROM video_pipeline.prompt_snapshots ps JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY ps.id`, []any{seriesID}},
 		{"prompt_inputs", 180, `SELECT to_jsonb(psi) FROM video_pipeline.prompt_snapshot_inputs psi JOIN video_pipeline.prompt_snapshots ps ON ps.id=psi.prompt_snapshot_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY psi.prompt_snapshot_id,psi.input_type,psi.dependency_role`, []any{seriesID}},
 		{"prompt_assets", expectedPromptAssets, `SELECT to_jsonb(psa) FROM video_pipeline.prompt_snapshot_assets psa JOIN video_pipeline.prompt_snapshots ps ON ps.id=psa.prompt_snapshot_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY psa.prompt_snapshot_id,psa.alias`, []any{seriesID}},
-		{"runs", 30, `SELECT to_jsonb(gr) FROM video_pipeline.generation_runs gr JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY gr.id`, []any{seriesID}},
-		{"attempts", 30, `SELECT to_jsonb(ga) FROM video_pipeline.generation_attempts ga JOIN video_pipeline.generation_runs gr ON gr.id=ga.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY ga.id`, []any{seriesID}},
+		{"runs", 30, `SELECT to_jsonb(gr) FROM video_pipeline.generation_runs gr WHERE gr.id=ANY($1) ORDER BY gr.id`, []any{offlineRunIDs}},
+		{"attempts", 30, `SELECT to_jsonb(ga) FROM video_pipeline.generation_attempts ga WHERE ga.generation_run_id=ANY($1) ORDER BY ga.id`, []any{offlineRunIDs}},
 		{"operation_requests", 3, `SELECT to_jsonb(o) FROM video_pipeline.operation_requests o WHERE aggregate_id=$1 AND operation_type='CREATE_GENERATION_PLAN' ORDER BY id`, []any{seriesID}},
 		{"idempotency_records", 3, `SELECT to_jsonb(i) FROM video_pipeline.idempotency_records i WHERE scope='flo100-formal-materialize' ORDER BY idempotency_key`, nil},
 		{"budget_reviews", 6, `SELECT to_jsonb(r) FROM video_pipeline.review_tasks r WHERE series_id=$1 AND review_type='BUDGET' ORDER BY id`, []any{seriesID}},
 		{"formal_audits", 66, `SELECT to_jsonb(a) FROM video_pipeline.audit_events a WHERE reason_code='FLO100_FORMAL_OFFLINE_V1' ORDER BY id`, nil},
-		{"provider_jobs", 0, `SELECT to_jsonb(pj) FROM video_pipeline.provider_jobs pj JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id JOIN video_pipeline.generation_runs gr ON gr.id=ga.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY pj.id`, []any{seriesID}},
-		{"budget_reservations", 0, `SELECT to_jsonb(br) FROM video_pipeline.budget_reservations br JOIN video_pipeline.generation_runs gr ON gr.id=br.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY br.id`, []any{seriesID}},
-		{"cost_ledger", 0, `SELECT to_jsonb(cl) FROM video_pipeline.cost_ledger cl JOIN video_pipeline.provider_jobs pj ON pj.id=cl.provider_job_id JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id JOIN video_pipeline.generation_runs gr ON gr.id=ga.generation_run_id JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes s ON s.id=sh.scene_id JOIN video_pipeline.episodes e ON e.id=s.episode_id WHERE e.series_id=$1 ORDER BY cl.id`, []any{seriesID}},
+		{"provider_jobs", 0, `SELECT to_jsonb(pj) FROM video_pipeline.provider_jobs pj JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id WHERE ga.generation_run_id=ANY($1) ORDER BY pj.id`, []any{offlineRunIDs}},
+		{"budget_reservations", 0, `SELECT to_jsonb(br) FROM video_pipeline.budget_reservations br WHERE br.generation_run_id=ANY($1) ORDER BY br.id`, []any{offlineRunIDs}},
+		{"cost_ledger", 0, `SELECT to_jsonb(cl) FROM video_pipeline.cost_ledger cl JOIN video_pipeline.provider_jobs pj ON pj.id=cl.provider_job_id JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id WHERE ga.generation_run_id=ANY($1) ORDER BY cl.id`, []any{offlineRunIDs}},
 	}
 	snapshot := formalProjectionSnapshot{
 		SchemaVersion: "flo100.formal-projection.v1", OfflinePackageHash: prepared.manifest.ContentHash,
@@ -1863,7 +1867,6 @@ func verifyFormal(
 	queries := map[string]string{
 		"shots":      `SELECT count(*) FROM video_pipeline.shot_spec_revisions ssr JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes sc ON sc.id=sh.scene_id JOIN video_pipeline.episodes ep ON ep.id=sc.episode_id WHERE ep.series_id=$1`,
 		"prompts":    `SELECT count(*) FROM video_pipeline.prompt_snapshots ps JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes sc ON sc.id=sh.scene_id JOIN video_pipeline.episodes ep ON ep.id=sc.episode_id WHERE ep.series_id=$1`,
-		"runs":       `SELECT count(*) FROM video_pipeline.generation_runs gr JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=gr.shot_spec_revision_id JOIN video_pipeline.shots sh ON sh.id=ssr.shot_id JOIN video_pipeline.scenes sc ON sc.id=sh.scene_id JOIN video_pipeline.episodes ep ON ep.id=sc.episode_id WHERE ep.series_id=$1`,
 		"assets":     `SELECT count(*) FROM video_pipeline.asset_versions av JOIN video_pipeline.assets a ON a.id=av.asset_id WHERE a.series_id=$1`,
 		"pending_g1": `SELECT count(*) FROM video_pipeline.approval_decisions WHERE series_id=$1 AND gate='G1' AND decision='RETURNED'`,
 		"pending_g2": `SELECT count(*) FROM video_pipeline.approval_decisions WHERE series_id=$1 AND gate='G2' AND decision='RETURNED'`,
@@ -1875,7 +1878,7 @@ func verifyFormal(
 		}
 		counts[name] = count
 	}
-	if counts["shots"] != 30 || counts["prompts"] != 30 || counts["runs"] != 30 ||
+	if counts["shots"] != 30 || counts["prompts"] != 30 ||
 		counts["assets"] != 8 || counts["pending_g1"] != 1 || counts["pending_g2"] != 3 {
 		return FormalReport{}, fmt.Errorf("formal database counts are incomplete: %v", counts)
 	}
@@ -1884,6 +1887,15 @@ func verifyFormal(
 		for _, job := range package_.PrimaryJobs {
 			runIDs = append(runIDs, mustUUID(job.Run.RunID))
 		}
+	}
+	var offlineRunCount int64
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.generation_runs WHERE id=ANY($1)`, runIDs).
+		Scan(&offlineRunCount); err != nil {
+		return FormalReport{}, err
+	}
+	counts["runs"] = offlineRunCount
+	if offlineRunCount != 30 {
+		return FormalReport{}, fmt.Errorf("formal database run count is incomplete: %d", offlineRunCount)
 	}
 	var providerJobs, reservations, cost int64
 	if err := tx.QueryRow(ctx, `

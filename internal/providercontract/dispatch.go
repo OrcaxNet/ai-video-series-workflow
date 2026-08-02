@@ -214,11 +214,8 @@ func validateBudgetBindingInput(input BudgetBindingInput) error {
 	if err := input.Model.Validate(alias); err != nil {
 		return fmt.Errorf("budget binding model: %w", err)
 	}
-	if input.Budget.EstimatedCostMicros < 0 ||
-		input.Budget.MaxCostMicros <= 0 ||
-		input.Budget.EstimatedCostMicros > input.Budget.MaxCostMicros ||
-		input.Budget.MaxAttempts < 1 {
-		return errors.New("budget binding requires a valid estimate envelope")
+	if err := input.Budget.Validate(); err != nil {
+		return fmt.Errorf("budget binding requires a valid estimate envelope: %w", err)
 	}
 	return nil
 }

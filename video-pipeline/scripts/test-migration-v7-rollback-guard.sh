@@ -28,8 +28,15 @@ run_migrate() {
 
 version_before="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_before="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_before}" = "7"
+test "${version_before}" = "9"
 test "${dirty_before}" = "f"
+test "$(psql_value 'SELECT COUNT(*) FROM video_pipeline.stage1_live_activations;')" = "0"
+
+# This regression specifically exercises the v7 guard. Migrations v8 and v9
+# permit rollback only before live/retry activation, so a clean smoke database
+# can move to v7 for the probe and is restored to the latest version afterwards.
+run_migrate down 2 >/dev/null
+test "$(psql_value 'SELECT version FROM public.schema_migrations;')" = "7"
 
 lineage_before="$(psql_value "
   SELECT COUNT(*)
@@ -96,7 +103,7 @@ run_migrate up >/dev/null 2>&1
 
 version_recovered="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_recovered="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_recovered}" = "7"
+test "${version_recovered}" = "9"
 test "${dirty_recovered}" = "f"
 test "$(psql_value "
   SELECT COUNT(*)
@@ -104,4 +111,4 @@ test "$(psql_value "
   WHERE input_type = 'GENERATION_PROFILE';
 ")" = "${lineage_before}"
 
-echo "v7 protected rollback dirty-state recovery passed"
+echo "v7 protected rollback dirty-state recovery passed; migration v9 restored"

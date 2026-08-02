@@ -48,3 +48,58 @@ make video-flo100-materialize-integration-test
 ```
 
 The test asserts the fresh materialization, replay stability, 3/30/8 counts, 30 intent idempotency keys, tamper rejection without a durable side effect, and zero Provider jobs/reservations/cost entries. It also commits and restores three negative SQL probes—enabling the video profile for live use, raising the GOLD-A budget, and approving an asset while G1 remains returned—and requires each replay to fail without emitting a package, report, or durable audit.
+
+## A-only live activation
+
+FLO-165 adds a separate live projection; it does not update the offline rows or
+their canonical seal. The live materializer accepts only the exact A-only
+authorization envelope, persists the 8 G1 assets, 10 G2 shots and SAFETY
+bindings, and emits an independently sealed readiness plan and execution
+package. B, C and Stage 4 remain disabled.
+
+```sh
+VIDEO_POSTGRES_DSN='postgres://…' \
+VIDEO_ARTIFACT_ROOT='./artifacts/flo100-live-cas' \
+go run ./cmd/video-stage1-materialize \
+  --formal-pack './FLO-100-stage3-offline-pack-v1' \
+  --expected-package-hash '68f0a07e2ea2cd2740da07daca3bb2ce2d1a7572ed9a8756cd73101db7fbd835' \
+  --live-authorization './FLO-100-batch-a-live-authorization-v1.json' \
+  --expected-live-authorization-hash '<independently pinned sha256>' \
+  --source-code-commit '<full candidate git sha>' \
+  --live-plan-output './artifacts/flo100-live/readiness-plan.json' \
+  --output './artifacts/flo100-live/execution-package.json' \
+  --report './artifacts/flo100-live/verification-report.json' \
+  --approval-comment '5b92b347-3ce9-4e7b-831a-1f00d1454d78' \
+  --approval-actor '16bbc49e-750f-432d-9ba4-b33ef6812026' \
+  --approval-valid-until '2026-08-31T15:59:59Z'
+```
+
+Materialization never contacts a Provider. If the authorization's fixed merge
+commit differs from `--source-code-commit`, the live package and projection are
+still available for independent review, but no submit authorization is created.
+The built runner also verifies its clean Go VCS revision against the package, so
+a matching JSON field alone cannot authorize drifted code.
+
+At the first actual paid boundary, PostgreSQL locks the Agent Plan account,
+requires a quota snapshot no older than 300 seconds, and atomically reserves
+30,306.870 AFP video plus 1.039 AFP speech. The request is accepted only as
+`subscription_included_only` with zero non-subscription CNY cash; monthly usage
+plus external and local conservative reservations must not exceed 135,000 AFP.
+There is no automatic retry or provider switch.
+
+Provider-free integration coverage:
+
+```sh
+VIDEO_TEST_POSTGRES_DSN='postgres://…' \
+VIDEO_TEST_POSTGRES_DSN_SECONDARY='postgres://…' \
+VIDEO_TEST_FLO100_PACK_PATH='./FLO-100-stage3-offline-pack-v1' \
+VIDEO_TEST_FLO100_LIVE_AUTHORIZATION_PATH='./FLO-100-batch-a-live-authorization-v1.json' \
+make video-flo100-live-activation-integration-test
+```
+
+Both DSNs must point to independently migrated, otherwise empty PostgreSQL v8
+databases. The test requires their readiness-plan, execution-package and live
+projection hashes to match before it continues with same-database replay and
+the fail-closed rejection of code,
+authorization, package, projection, route, scope, cash and quota drift before
+any provider job, cash reservation, cost row or external request is created.

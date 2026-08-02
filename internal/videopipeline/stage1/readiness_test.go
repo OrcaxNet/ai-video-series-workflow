@@ -433,6 +433,35 @@ func TestOfflinePlanRejectsCredentialOrCashAuthorization(t *testing.T) {
 	}
 }
 
+func TestSubscriptionLivePlanIsStrictlyBatchAAndZeroCash(t *testing.T) {
+	t.Parallel()
+	plan := testPlan()
+	plan.BatchID = "flo100-gold-a-v1"
+	plan.MonthlyBaselineAFPMilli = 0
+	plan.MonthlyMaximumAFPMilli = FLO100MonthlyAFPCapMilli
+	plan.MaximumCashMicros = 0
+	plan.MaximumDialogueCharacters = 7
+	plan.MaximumTTSAFPMilli = FLO100BatchASpeechAFPMilli
+	plan.TTSPreflight.CredentialAvailable = true
+	plan.SubscriptionIncludedOnly = true
+	if err := plan.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, mutate := range []func(*Plan){
+		func(p *Plan) { p.BatchID = "flo100-gold-b-v1" },
+		func(p *Plan) { p.MaximumCashMicros = 1 },
+		func(p *Plan) { p.OfflineOnly = true },
+		func(p *Plan) { p.MaximumControlledRetries = 2 },
+		func(p *Plan) { p.MaximumVideoTokens++ },
+	} {
+		candidate := plan
+		mutate(&candidate)
+		if err := candidate.Validate(); err == nil {
+			t.Fatal("drifted subscription-live plan was accepted")
+		}
+	}
+}
+
 func TestOfflinePlanCannotConstructProviderExecutor(t *testing.T) {
 	plan := testPlan()
 	plan.BatchID = "flo100-gold-a-v1"

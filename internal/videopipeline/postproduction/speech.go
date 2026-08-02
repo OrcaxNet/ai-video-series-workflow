@@ -111,7 +111,9 @@ func (p *HTTPSpeechProvider) Synthesize(
 	if err := input.Config.Validate(); err != nil {
 		return ProviderAttempt{}, err
 	}
-	if input.BudgetMicros <= 0 || input.BudgetMicros > input.Config.BudgetMaximumMicros {
+	subscription := input.Config.BillingMode == providercontract.BillingModeSubscriptionIncludedOnly
+	if subscription && input.BudgetMicros != 0 ||
+		!subscription && (input.BudgetMicros <= 0 || input.BudgetMicros > input.Config.BudgetMaximumMicros) {
 		return ProviderAttempt{}, errors.New("cue speech budget is outside the approved envelope")
 	}
 	if input.Evidence != EvidenceMockOnly && input.Evidence != EvidenceLive {
@@ -140,6 +142,13 @@ func (p *HTTPSpeechProvider) Synthesize(
 	maxAttempts := 2
 	format := "wav"
 	var assets []providercontract.AssetRef
+	predictedAFPMilli := int64(len([]rune(strings.TrimSpace(input.Cue.Text)))) * 135
+	if subscription {
+		maxAttempts = 1
+		if predictedAFPMilli <= 0 || predictedAFPMilli > input.Config.MaximumAFPMilli {
+			return ProviderAttempt{}, errors.New("subscription speech cue exceeds the frozen AFP ceiling")
+		}
+	}
 	if input.Config.IdentityVersion == SpeechIdentityV2 {
 		modelHint = input.Config.Voice.Speaker
 		maximumAFPMilli := input.Config.MaximumAFPMilli
@@ -152,7 +161,6 @@ func (p *HTTPSpeechProvider) Synthesize(
 			}
 		}
 		format = "mp3"
-		predictedAFPMilli := int64(len([]rune(strings.TrimSpace(input.Cue.Text)))) * 135
 		if predictedAFPMilli <= 0 || predictedAFPMilli > maximumAFPMilli {
 			return ProviderAttempt{}, errors.New("speech-v2 cue exceeds the frozen AFP ceiling")
 		}
@@ -166,6 +174,15 @@ func (p *HTTPSpeechProvider) Synthesize(
 			MediaType: "audio/x-voice-profile+json",
 		}}
 	}
+	budget := providercontract.BudgetEnvelope{
+		EstimatedCostMicros: input.BudgetMicros,
+		MaxCostMicros:       input.BudgetMicros,
+		MaxAttempts:         maxAttempts,
+	}
+	if subscription {
+		budget.BillingMode = providercontract.BillingModeSubscriptionIncludedOnly
+		budget.ReservedAFPMilli = predictedAFPMilli
+	}
 	generationRequest := providercontract.GenerationRequest{
 		RequestID:        jobID,
 		IdempotencyKey:   jobID,
@@ -178,11 +195,7 @@ func (p *HTTPSpeechProvider) Synthesize(
 			DurationMillis: int(input.Cue.EndMillis - input.Cue.StartMillis),
 			Format:         format,
 		},
-		Budget: providercontract.BudgetEnvelope{
-			EstimatedCostMicros: input.BudgetMicros,
-			MaxCostMicros:       input.BudgetMicros,
-			MaxAttempts:         maxAttempts,
-		},
+		Budget: budget,
 	}
 	reservation, err := providercontract.BindBudgetReservation(
 		providercontract.BudgetReservation{
@@ -395,6 +408,13 @@ func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error
 			attempt.Cost.BillingMode != "subscription_included" ||
 			input.Config.MaximumNonSubscriptionCashMicros != 0 {
 			return errors.New("speech-v2 attempt lacks zero-cash Agent Plan evidence")
+		}
+	}
+	if input.Config.BillingMode == providercontract.BillingModeSubscriptionIncludedOnly {
+		if attempt.Usage.OutputUnits > input.Config.MaximumAFPMilli ||
+			attempt.Cost.ActualMicros == nil || *attempt.Cost.ActualMicros != 0 ||
+			attempt.Cost.EstimatedMicros != 0 || attempt.Cost.BillingMode != "subscription_included" {
+			return errors.New("subscription speech attempt lacks exact zero-cash AFP evidence")
 		}
 	}
 	return nil

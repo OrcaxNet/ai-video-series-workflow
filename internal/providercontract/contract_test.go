@@ -82,6 +82,35 @@ func TestGenerationRequest_Validate(t *testing.T) {
 	}
 }
 
+func TestGenerationRequestValidateSubscriptionIncludedBudget(t *testing.T) {
+	t.Parallel()
+	request := testGenerationRequest()
+	request.Budget = BudgetEnvelope{
+		MaxAttempts: 1, BillingMode: BillingModeSubscriptionIncludedOnly,
+		ReservedAFPMilli: 2_504_700,
+	}
+	if err := request.Validate(); err != nil {
+		t.Fatalf("subscription-included request was rejected: %v", err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*BudgetEnvelope)
+	}{
+		{name: "missing AFP", mutate: func(b *BudgetEnvelope) { b.ReservedAFPMilli = 0 }},
+		{name: "nonzero cash", mutate: func(b *BudgetEnvelope) { b.MaxCostMicros = 1 }},
+		{name: "unknown billing mode", mutate: func(b *BudgetEnvelope) { b.BillingMode = "free" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := request
+			test.mutate(&candidate.Budget)
+			if err := candidate.Validate(); err == nil {
+				t.Fatal("invalid subscription budget was accepted")
+			}
+		})
+	}
+}
+
 func TestMapHTTPError(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

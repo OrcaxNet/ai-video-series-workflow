@@ -165,6 +165,7 @@ type SpeechConfig struct {
 	BudgetApprovalID                 string                             `json:"budgetApprovalId"`
 	BudgetMaximumMicros              int64                              `json:"budgetMaximumMicros"`
 	BudgetCurrency                   string                             `json:"budgetCurrency"`
+	BillingMode                      string                             `json:"billingMode,omitempty"`
 	IdentityVersion                  string                             `json:"identityVersion,omitempty"`
 	Voice                            *SpeechVoiceBinding                `json:"voice,omitempty"`
 	AuthorizedCueID                  string                             `json:"authorizedCueId,omitempty"`
@@ -179,14 +180,20 @@ func (s SpeechConfig) Validate() error {
 	if err := s.Route.Validate(providercontract.CapabilitySpeech); err != nil {
 		return fmt.Errorf("speech route: %w", err)
 	}
+	subscription := s.BillingMode == providercontract.BillingModeSubscriptionIncludedOnly
 	switch {
 	case strings.TrimSpace(s.ProviderProfileID) == "":
 		return errors.New("speech provider profile is required")
 	case strings.TrimSpace(s.BudgetApprovalID) == "":
 		return errors.New("speech budget approval is required")
 	case s.BudgetMaximumMicros < 0 ||
-		(s.BudgetMaximumMicros == 0 && s.Route.Verification != providercontract.PendingKey):
+		(s.BudgetMaximumMicros == 0 && !subscription && s.Route.Verification != providercontract.PendingKey):
 		return errors.New("speech budget maximum must be positive unless the route is quota-pending and cash-locked")
+	case s.BillingMode != "" && !subscription:
+		return errors.New("speech billing mode is unsupported")
+	case subscription && (s.BudgetMaximumMicros != 0 || s.MaximumAFPMilli <= 0 ||
+		s.MaximumNonSubscriptionCashMicros != 0 || s.MaxAttempts != 1):
+		return errors.New("subscription speech requires zero cash, positive AFP, and one attempt")
 	case len(s.BudgetCurrency) != 3:
 		return errors.New("speech budget currency must be an ISO 4217 code")
 	}

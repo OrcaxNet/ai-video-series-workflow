@@ -94,7 +94,7 @@ go vet ./...
 1. 无 Key 时四类 live capability 均为 `liveConfigured=false`，Dry-run/Mock 可用；
 2. 相同 JobID/输入只得到一个上游任务；
 3. Mock 任务经 polling 归档到 `cas://sha256/...`；
-4. PostgreSQL migration v7 clean、46 张控制面表、不可变 trigger、CAS retention guard、预算审批精确绑定与 FLO-102 Prompt 谱系表存在；
+4. PostgreSQL migration v9 clean、至少 53 张控制面表、不可变 trigger、CAS retention guard、预算审批精确绑定、FLO-102 Prompt 谱系与 FLO-165 live/AFP/controlled-retry 权威表存在；
 5. 并发相同幂等键只提交一份 Series/audit/outbox，不同请求冲突，策略失败整体回滚；
 6. Activity journal 结果可重放且输入漂移被拒绝；
 7. 工作流投影可从 Prompt 一直查询到冻结路由、实际媒体规格、成本、审核与锁定 Manifest；
