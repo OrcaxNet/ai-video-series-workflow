@@ -401,10 +401,31 @@ func validateProviderAttempt(input SpeechRequest, attempt ProviderAttempt) error
 }
 
 func validateSpeechAuthorizationCoverage(request Request) error {
+	selected := request.SpeechCueIDs()
 	batch := request.Speech.BatchAuthorization
 	if batch == nil {
-		if len(request.Speech.CompletedAttempts) != 0 {
-			return errors.New("completed speech attempts require an ordered batch authorization")
+		if len(request.Speech.CompletedAttempts) == 0 {
+			return nil
+		}
+		// A crash may happen after the final authorized submit but before the
+		// post-production manifest commits. In that completed-only replay there
+		// are no remaining paid calls to authorize. Accept only a complete,
+		// strictly validated, one-to-one set of persisted Provider attempts.
+		completed := make(map[string]struct{}, len(request.Speech.CompletedAttempts))
+		for index, attempt := range request.Speech.CompletedAttempts {
+			if _, duplicate := completed[attempt.CueID]; duplicate {
+				return fmt.Errorf("duplicate completed speech cue %q", attempt.CueID)
+			}
+			if _, required := selected[attempt.CueID]; !required {
+				return fmt.Errorf("completed speech cue %q is not selected for replacement", attempt.CueID)
+			}
+			if err := validateCompletedAttempt(request, attempt); err != nil {
+				return fmt.Errorf("completed speech attempt %d: %w", index, err)
+			}
+			completed[attempt.CueID] = struct{}{}
+		}
+		if len(completed) != len(selected) {
+			return errors.New("completed-only replay must cover every selected speech cue")
 		}
 		return nil
 	}
@@ -421,6 +442,9 @@ func validateSpeechAuthorizationCoverage(request Request) error {
 	authorizedIndex := 0
 	seenCompleted := 0
 	for _, cue := range request.Subtitle.Cues {
+		if _, required := selected[cue.ID]; !required {
+			continue
+		}
 		if _, ok := completed[cue.ID]; ok {
 			seenCompleted++
 			continue

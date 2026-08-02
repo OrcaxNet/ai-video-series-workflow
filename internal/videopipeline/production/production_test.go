@@ -192,9 +192,12 @@ func TestContextResolver_WhitelistPriorityAssetConflictAndInvalidReference(t *te
 		"camera.language": "restrained",
 	}, nil, at)
 	scene := mustContext(t, store, ScopeScene, "scene-1", map[string]string{
-		"scene.location": "observatory",
-		"scene.time":     "night",
-		"lighting":       "soft rim light",
+		"scene.location":            "observatory",
+		"scene.time":                "night",
+		"lighting":                  "soft rim light",
+		"audio.ambience.identity":   "observatory-wind",
+		"audio.ambience.version":    "ambience-v2",
+		"audio.ambience.continuity": "required",
 	}, nil, at)
 	shot := mustContext(t, store, ScopeShot, "shot-1", map[string]string{
 		"camera.framing":  "medium",
@@ -209,6 +212,10 @@ func TestContextResolver_WhitelistPriorityAssetConflictAndInvalidReference(t *te
 	}
 	if effective.Values["visual.palette"] != "moonlit blue" || effective.Origins["visual.palette"] != ScopeEpisode {
 		t.Fatalf("context priority = %#v / %#v", effective.Values, effective.Origins)
+	}
+	if effective.Values["audio.ambience.identity"] != "observatory-wind" ||
+		effective.Origins["audio.ambience.identity"] != ScopeScene {
+		t.Fatalf("ambience Scene Context = %#v / %#v", effective.Values, effective.Origins)
 	}
 	if len(effective.OrderedAssets()) != 1 || effective.OrderedAssets()[0].Revision != lin.Revision.ID {
 		t.Fatalf("resolved assets = %#v", effective.Assets)
@@ -254,6 +261,12 @@ func TestPromptCompiler_ContinuityDiffAndRegistryImmutability(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if first.Output.AudioStrategy != providercontract.AudioStrategyNativePreferred ||
+		!first.Output.GenerateAudio || first.Output.AudioDelivery != providercontract.NativeAudioMix ||
+		first.ModelPayload["generate_audio"] != true ||
+		first.ModelPayload["audio_strategy"] != string(providercontract.AudioStrategyNativePreferred) {
+		t.Fatalf("new prompt did not freeze native audio defaults: %#v %#v", first.Output, first.ModelPayload)
 	}
 	replay, err := compiler.Compile(PromptCompileInput{
 		ShotRevision:         shotRevision,

@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	PromptSchemaVersion   = "v1"
-	PromptCompilerVersion = "prompt-compiler-v2"
+	PromptSchemaVersion         = "v1"
+	PromptCompilerVersion       = "prompt-compiler-v3-native-audio"
+	legacyPromptCompilerVersion = "prompt-compiler-v2"
 )
 
 type PromptAssetBinding struct {
@@ -74,7 +75,7 @@ func (p PromptSnapshot) Ref() RevisionRef {
 // (RevisionNumber) from the content identity.
 func (p PromptSnapshot) ValidateIntegrity() error {
 	if p.SchemaVersion != PromptSchemaVersion ||
-		p.CompilerVersion != PromptCompilerVersion ||
+		(p.CompilerVersion != PromptCompilerVersion && p.CompilerVersion != legacyPromptCompilerVersion) ||
 		!nonEmpty(p.ID, p.TemplateRef, p.GenerationProfileRef, p.PositivePrompt) ||
 		p.CreatedAt.IsZero() {
 		return validationf("complete immutable prompt snapshot is required")
@@ -225,6 +226,7 @@ func (c *PromptCompiler) Compile(input PromptCompileInput) (PromptSnapshot, erro
 	if !nonEmpty(input.TemplateRef, input.GenerationProfileRef) || input.CreatedAt.IsZero() {
 		return PromptSnapshot{}, validationf("template, generation profile, and creation time are required")
 	}
+	input.Output = input.Output.WithNativeAudioDefault()
 	if err := validateOutput(input.Output, input.Shot.DurationMillis); err != nil {
 		return PromptSnapshot{}, err
 	}
@@ -319,6 +321,9 @@ func (c *PromptCompiler) Compile(input PromptCompileInput) (PromptSnapshot, erro
 		"aspect_ratio":        input.Output.AspectRatio,
 		"resolution":          input.Output.Resolution,
 		"fps":                 input.Output.FPS,
+		"generate_audio":      input.Output.GenerateAudio,
+		"audio_strategy":      input.Output.AudioStrategy,
+		"audio_delivery":      input.Output.AudioDelivery,
 		"continuity": map[string]any{
 			"previous_prompt_hash": previousHash,
 			"tail_frame_hash":      tailFrameHash,
@@ -401,6 +406,9 @@ func validateOutput(output providercontract.OutputSpec, shotDuration int) error 
 		output.AspectRatio == "" || output.FPS <= 0 || output.DurationMillis != shotDuration ||
 		output.Format == "" {
 		return validationf("complete output specification must match the shot duration")
+	}
+	if err := output.ValidateAudio(providercontract.ModalityVideo); err != nil {
+		return validationf("video audio output is invalid: %v", err)
 	}
 	return nil
 }

@@ -124,7 +124,11 @@ func (p *Postgres) ValidateWorkerUpgradeReadiness(ctx context.Context) error {
 		  'RECONCILING', 'REQUIRES_ACTION', 'CANCEL_REQUESTED', 'PAUSED'
 		)
 		  AND (
-		    ps.compiler_version NOT IN ('control-plane-compiler-v1', 'stage1-product-input-v1')
+		    ps.compiler_version NOT IN (
+		      'control-plane-compiler-v1',
+		      'control-plane-compiler-v2-native-audio',
+		      'stage1-product-input-v1'
+		    )
 		    OR (
 		      ps.compiler_version = 'stage1-product-input-v1'
 		      AND NOT EXISTS (

@@ -62,6 +62,7 @@ type OrchestratorWorker struct {
 	SpeechProviderAdapterURL  string
 	PostgresDSN               string
 	ArtifactRoot              string
+	AudioAnalyzerCommand      string
 }
 
 // MockProvider configures the deterministic, no-key provider fixture.
@@ -187,6 +188,7 @@ func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 		ProviderServiceAuthSecret: value(os.LookupEnv, "VIDEO_PROVIDER_SERVICE_AUTH_SECRET", ""),
 		SpeechProviderAdapterURL:  value(os.LookupEnv, "VIDEO_SPEECH_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
 		ArtifactRoot:              value(os.LookupEnv, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
+		AudioAnalyzerCommand:      value(os.LookupEnv, "VIDEO_AUDIO_ANALYZER_COMMAND", ""),
 	}
 	if err := validateDialAddress(cfg.TemporalAddress); err != nil {
 		return OrchestratorWorker{}, fmt.Errorf("VIDEO_TEMPORAL_ADDRESS: %w", err)

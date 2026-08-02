@@ -55,16 +55,73 @@ func (a Artifact) Validate() error {
 }
 
 type Clip struct {
-	RunID               string   `json:"runId"`
-	ShotSpecRevisionID  string   `json:"shotSpecRevisionId"`
-	ShotSpecHash        string   `json:"shotSpecHash"`
-	PromptSnapshotID    string   `json:"promptSnapshotId"`
-	PromptSnapshotHash  string   `json:"promptSnapshotHash"`
-	ContextSnapshotID   string   `json:"contextSnapshotId"`
-	ContextSnapshotHash string   `json:"contextSnapshotHash"`
-	Artifact            Artifact `json:"artifact"`
-	DurationMillis      int64    `json:"durationMillis"`
-	LicenseReference    string   `json:"licenseReference"`
+	RunID               string                 `json:"runId"`
+	ShotSpecRevisionID  string                 `json:"shotSpecRevisionId"`
+	ShotSpecHash        string                 `json:"shotSpecHash"`
+	PromptSnapshotID    string                 `json:"promptSnapshotId"`
+	PromptSnapshotHash  string                 `json:"promptSnapshotHash"`
+	ContextSnapshotID   string                 `json:"contextSnapshotId"`
+	ContextSnapshotHash string                 `json:"contextSnapshotHash"`
+	Artifact            Artifact               `json:"artifact"`
+	DurationMillis      int64                  `json:"durationMillis"`
+	LicenseReference    string                 `json:"licenseReference"`
+	ProviderVideo       *ProviderVideoEvidence `json:"providerVideo,omitempty"`
+	Ambience            *AmbienceBinding       `json:"ambience,omitempty"`
+	LipSyncRequired     bool                   `json:"lipSyncRequired"`
+}
+
+// AmbienceBinding is derived from the approved Scene Context. Identity and
+// version are immutable design facts, not values inferred from the waveform.
+// ContinuityIntoNext makes only the intended adjacent cuts release gates.
+type AmbienceBinding struct {
+	Identity           string `json:"identity"`
+	Version            string `json:"version"`
+	ContinuityIntoNext bool   `json:"continuityIntoNext"`
+}
+
+func (a AmbienceBinding) Validate() error {
+	if strings.TrimSpace(a.Identity) == "" || strings.TrimSpace(a.Version) == "" {
+		return errors.New("ambience identity and version are required")
+	}
+	return nil
+}
+
+// ProviderVideoEvidence freezes the paid job and model that produced the
+// original MP4. AudioDelivery is truthful: native_mix never means that a
+// dialogue/ambience stem exists.
+type ProviderVideoEvidence struct {
+	ProviderJobID     string                               `json:"providerJobId"`
+	ProviderRequestID string                               `json:"providerRequestId"`
+	Provider          string                               `json:"provider"`
+	Model             string                               `json:"model"`
+	Version           string                               `json:"version"`
+	GenerateAudio     bool                                 `json:"generateAudio"`
+	AudioDelivery     providercontract.NativeAudioDelivery `json:"audioDelivery"`
+	Usage             providercontract.Usage               `json:"usage"`
+	Cost              providercontract.Cost                `json:"cost"`
+}
+
+func (p ProviderVideoEvidence) Validate() error {
+	if strings.TrimSpace(p.ProviderJobID) == "" || strings.TrimSpace(p.ProviderRequestID) == "" ||
+		strings.TrimSpace(p.Provider) == "" || strings.TrimSpace(p.Model) == "" ||
+		strings.TrimSpace(p.Version) == "" {
+		return errors.New("Provider video audio provenance is incomplete")
+	}
+	if !p.GenerateAudio {
+		if p.AudioDelivery != "" && p.AudioDelivery != providercontract.NativeAudioNone {
+			return errors.New("Provider video without generateAudio cannot declare native audio")
+		}
+		return nil
+	}
+	if !p.AudioDelivery.Valid() || p.AudioDelivery == providercontract.NativeAudioNone {
+		return errors.New("Provider video generateAudio evidence requires a native audio delivery")
+	}
+	if p.Usage.InputUnits < 0 || p.Usage.OutputUnits < 0 || p.Usage.VideoTokens < 0 ||
+		p.Usage.GeneratedMillis < 0 || p.Cost.EstimatedMicros < 0 ||
+		(p.Cost.ActualMicros != nil && *p.Cost.ActualMicros < 0) {
+		return errors.New("Provider video usage or cost evidence is invalid")
+	}
+	return nil
 }
 
 func (c Clip) Validate() error {
@@ -85,6 +142,16 @@ func (c Clip) Validate() error {
 	}
 	if c.Artifact.Kind != "shot_video" {
 		return errors.New("clip artifact kind must be shot_video")
+	}
+	if c.ProviderVideo != nil {
+		if err := c.ProviderVideo.Validate(); err != nil {
+			return err
+		}
+	}
+	if c.Ambience != nil {
+		if err := c.Ambience.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -175,6 +242,31 @@ type SpeechConfig struct {
 	CompletedAttempts                []ProviderAttempt                  `json:"completedAttempts,omitempty"`
 }
 
+func (s SpeechConfig) Empty() bool {
+	return s.Route == (providercontract.ModelSnapshot{}) &&
+		strings.TrimSpace(s.ProviderProfileID) == "" &&
+		strings.TrimSpace(s.BudgetApprovalID) == "" &&
+		s.BudgetMaximumMicros == 0 && strings.TrimSpace(s.BudgetCurrency) == "" &&
+		s.IdentityVersion == "" && s.Voice == nil && s.AuthorizedCueID == "" &&
+		s.MaximumAFPMilli == 0 && s.MaximumNonSubscriptionCashMicros == 0 &&
+		s.MaxAttempts == 0 && s.BatchAuthorization == nil && len(s.CompletedAttempts) == 0
+}
+
+type CueFallback struct {
+	CueID                   string `json:"cueId"`
+	Reason                  string `json:"reason"`
+	OriginalNativeMixSHA256 string `json:"originalNativeMixSha256"`
+	ReplacementRevisionID   string `json:"replacementRevisionId"`
+}
+
+func (f CueFallback) Validate() error {
+	if strings.TrimSpace(f.CueID) == "" || strings.TrimSpace(f.Reason) == "" ||
+		!validDigest(f.OriginalNativeMixSHA256) || strings.TrimSpace(f.ReplacementRevisionID) == "" {
+		return errors.New("cue fallback requires cue, reason, original native mix hash, and replacement revision")
+	}
+	return nil
+}
+
 func (s SpeechConfig) Validate() error {
 	if err := s.Route.Validate(providercontract.CapabilitySpeech); err != nil {
 		return fmt.Errorf("speech route: %w", err)
@@ -220,6 +312,13 @@ func (s SpeechConfig) Validate() error {
 			batch.LicenseSnapshotID != s.Voice.LicenseSnapshotID ||
 			batch.LicenseSnapshotHash != s.Voice.LicenseSnapshotHash {
 			return errors.New("speech-v2 batch route, VOICE, or license drifted from the frozen configuration")
+		}
+		return nil
+	}
+	if len(s.CompletedAttempts) > 0 {
+		if strings.TrimSpace(s.AuthorizedCueID) != "" || s.MaximumAFPMilli != 0 ||
+			s.MaximumNonSubscriptionCashMicros != 0 || s.MaxAttempts != 0 {
+			return errors.New("completed-only speech replay cannot authorize another paid submit")
 		}
 		return nil
 	}
@@ -285,22 +384,53 @@ func (p OutputPolicy) Validate() error {
 }
 
 type Request struct {
-	SchemaVersion       string           `json:"schemaVersion"`
-	Evidence            string           `json:"evidence"`
-	EpisodeRevisionID   string           `json:"episodeRevisionId"`
-	EpisodeRevisionHash string           `json:"episodeRevisionHash"`
-	RunIDs              []string         `json:"runIds"`
-	Clips               []Clip           `json:"clips"`
-	Subtitle            SubtitleRevision `json:"subtitleRevision"`
-	BackgroundAudio     *Artifact        `json:"backgroundAudio,omitempty"`
-	Speech              SpeechConfig     `json:"speech"`
-	Output              OutputPolicy     `json:"output"`
-	Gates               []GateBinding    `json:"gates"`
-	TraceID             string           `json:"traceId"`
+	SchemaVersion       string                         `json:"schemaVersion"`
+	Evidence            string                         `json:"evidence"`
+	EpisodeRevisionID   string                         `json:"episodeRevisionId"`
+	EpisodeRevisionHash string                         `json:"episodeRevisionHash"`
+	RunIDs              []string                       `json:"runIds"`
+	Clips               []Clip                         `json:"clips"`
+	Subtitle            SubtitleRevision               `json:"subtitleRevision"`
+	BackgroundAudio     *Artifact                      `json:"backgroundAudio,omitempty"`
+	AudioStrategy       providercontract.AudioStrategy `json:"audioStrategy,omitempty"`
+	CueFallbacks        []CueFallback                  `json:"cueFallbacks,omitempty"`
+	Speech              SpeechConfig                   `json:"speech"`
+	Output              OutputPolicy                   `json:"output"`
+	Gates               []GateBinding                  `json:"gates"`
+	TraceID             string                         `json:"traceId"`
 	// AuthorizePaidSubmit is an activity-local callback and is deliberately
 	// excluded from durable request/manifest JSON. The worker invokes it
 	// immediately before every provider submission.
 	AuthorizePaidSubmit func(context.Context, Cue) error `json:"-"`
+}
+
+func (r Request) ResolvedAudioStrategy() providercontract.AudioStrategy {
+	if r.AudioStrategy.Valid() {
+		return r.AudioStrategy
+	}
+	if r.Speech.Empty() {
+		return providercontract.AudioStrategyNativePreferred
+	}
+	return providercontract.AudioStrategyTTSRequired
+}
+
+func (r Request) RequiresSpeech() bool {
+	return r.ResolvedAudioStrategy() == providercontract.AudioStrategyTTSRequired ||
+		len(r.CueFallbacks) > 0
+}
+
+func (r Request) SpeechCueIDs() map[string]struct{} {
+	selected := make(map[string]struct{})
+	if r.ResolvedAudioStrategy() == providercontract.AudioStrategyTTSRequired {
+		for _, cue := range r.Subtitle.Cues {
+			selected[cue.ID] = struct{}{}
+		}
+		return selected
+	}
+	for _, fallback := range r.CueFallbacks {
+		selected[fallback.CueID] = struct{}{}
+	}
+	return selected
 }
 
 func (r Request) Validate() error {
@@ -332,6 +462,47 @@ func (r Request) Validate() error {
 		}
 		total += r.Clips[i].DurationMillis
 	}
+	strategy := r.ResolvedAudioStrategy()
+	if r.AudioStrategy != "" && !r.AudioStrategy.Valid() {
+		return fmt.Errorf("unsupported audioStrategy %q", r.AudioStrategy)
+	}
+	if strategy == providercontract.AudioStrategyHybrid && len(r.CueFallbacks) == 0 {
+		return errors.New("hybrid audio strategy requires at least one cue fallback")
+	}
+	if strategy == providercontract.AudioStrategyTTSRequired && len(r.CueFallbacks) != 0 {
+		return errors.New("tts_required already replaces every cue and cannot carry local fallbacks")
+	}
+	if strategy.RequiresNativeAudio() {
+		for index, clip := range r.Clips {
+			if clip.ProviderVideo == nil || !clip.ProviderVideo.GenerateAudio {
+				return fmt.Errorf("clip %d lacks Provider-native audio provenance", index)
+			}
+			if clip.Ambience == nil {
+				return fmt.Errorf("clip %d lacks frozen Scene Context ambience", index)
+			}
+			if r.Evidence == EvidenceLive &&
+				(clip.ProviderVideo.Cost.ActualMicros == nil || !clip.ProviderVideo.Cost.Verified) {
+				return fmt.Errorf("clip %d lacks verified Provider usage/cost evidence", index)
+			}
+		}
+	}
+	seenFallbacks := make(map[string]struct{}, len(r.CueFallbacks))
+	knownCues := make(map[string]struct{}, len(r.Subtitle.Cues))
+	for _, cue := range r.Subtitle.Cues {
+		knownCues[cue.ID] = struct{}{}
+	}
+	for index, fallback := range r.CueFallbacks {
+		if err := fallback.Validate(); err != nil {
+			return fmt.Errorf("cue fallback %d: %w", index, err)
+		}
+		if _, ok := knownCues[fallback.CueID]; !ok {
+			return fmt.Errorf("cue fallback %q is outside the subtitle revision", fallback.CueID)
+		}
+		if _, duplicate := seenFallbacks[fallback.CueID]; duplicate {
+			return fmt.Errorf("duplicate cue fallback %q", fallback.CueID)
+		}
+		seenFallbacks[fallback.CueID] = struct{}{}
+	}
 	if err := r.Subtitle.Validate(total); err != nil {
 		return fmt.Errorf("subtitle revision: %w", err)
 	}
@@ -343,11 +514,15 @@ func (r Request) Validate() error {
 			return errors.New("background audio artifact kind must be background_audio")
 		}
 	}
-	if err := r.Speech.Validate(); err != nil {
-		return err
-	}
-	if err := validateSpeechAuthorizationCoverage(r); err != nil {
-		return err
+	if r.RequiresSpeech() {
+		if err := r.Speech.Validate(); err != nil {
+			return err
+		}
+		if err := validateSpeechAuthorizationCoverage(r); err != nil {
+			return err
+		}
+	} else if !r.Speech.Empty() {
+		return errors.New("native_preferred without fallback must not carry a Speech/TTS configuration")
 	}
 	if err := r.Output.Validate(); err != nil {
 		return err
@@ -389,13 +564,20 @@ type ProviderAttempt struct {
 }
 
 type QCReport struct {
-	State                     string   `json:"state"`
-	SubtitleCERPercent        *float64 `json:"subtitleCerPercent,omitempty"`
-	SubtitleBoundaryP95Millis *int64   `json:"subtitleBoundaryP95Millis,omitempty"`
-	AudioVideoStartP95Millis  *int64   `json:"audioVideoStartP95Millis,omitempty"`
-	ActualDurationMillis      int64    `json:"actualDurationMillis"`
-	ManualTimingRequired      bool     `json:"manualTimingRequired"`
-	MeasurementEvidence       string   `json:"measurementEvidence"`
+	State                        string   `json:"state"`
+	SubtitleCERPercent           *float64 `json:"subtitleCerPercent,omitempty"`
+	SubtitleBoundaryP95Millis    *int64   `json:"subtitleBoundaryP95Millis,omitempty"`
+	AudioVideoStartP95Millis     *int64   `json:"audioVideoStartP95Millis,omitempty"`
+	LipSyncP95Millis             *int64   `json:"lipSyncP95Millis,omitempty"`
+	AmbienceHardSilenceMaxMillis *int64   `json:"ambienceHardSilenceMaxMillis,omitempty"`
+	IntegratedLoudnessLUFS       *float64 `json:"integratedLoudnessLufs,omitempty"`
+	TruePeakDBTP                 *float64 `json:"truePeakDbtp,omitempty"`
+	AnalysisRevision             string   `json:"analysisRevision,omitempty"`
+	AnalysisHash                 string   `json:"analysisHash,omitempty"`
+	BlockedRunIDs                []string `json:"blockedRunIds,omitempty"`
+	ActualDurationMillis         int64    `json:"actualDurationMillis"`
+	ManualTimingRequired         bool     `json:"manualTimingRequired"`
+	MeasurementEvidence          string   `json:"measurementEvidence"`
 }
 
 type ServiceComponent struct {
@@ -409,19 +591,23 @@ type ServiceComponent struct {
 }
 
 type Result struct {
-	SchemaVersion     string            `json:"schemaVersion"`
-	Evidence          string            `json:"evidence"`
-	EpisodeRevisionID string            `json:"episodeRevisionId"`
-	Subtitle          Artifact          `json:"subtitle"`
-	Dialogue          Artifact          `json:"dialogue"`
-	FinalVideo        Artifact          `json:"finalVideo"`
-	Manifest          Artifact          `json:"manifest"`
-	ServiceBOM        Artifact          `json:"serviceBom"`
-	SpeechAttempts    []ProviderAttempt `json:"speechAttempts"`
-	QC                QCReport          `json:"qc"`
-	CommandPlanHash   string            `json:"commandPlanHash"`
-	ManifestHash      string            `json:"manifestHash"`
-	ServiceBOMHash    string            `json:"serviceBomHash"`
+	SchemaVersion     string                         `json:"schemaVersion"`
+	Evidence          string                         `json:"evidence"`
+	EpisodeRevisionID string                         `json:"episodeRevisionId"`
+	Subtitle          Artifact                       `json:"subtitle"`
+	Dialogue          Artifact                       `json:"dialogue,omitzero"`
+	NativeMixes       []Artifact                     `json:"nativeMixes,omitempty"`
+	FinalMix          Artifact                       `json:"finalMix"`
+	AudioQC           Artifact                       `json:"audioQc,omitzero"`
+	AudioStrategy     providercontract.AudioStrategy `json:"audioStrategy"`
+	FinalVideo        Artifact                       `json:"finalVideo"`
+	Manifest          Artifact                       `json:"manifest"`
+	ServiceBOM        Artifact                       `json:"serviceBom"`
+	SpeechAttempts    []ProviderAttempt              `json:"speechAttempts"`
+	QC                QCReport                       `json:"qc"`
+	CommandPlanHash   string                         `json:"commandPlanHash"`
+	ManifestHash      string                         `json:"manifestHash"`
+	ServiceBOMHash    string                         `json:"serviceBomHash"`
 }
 
 func (r Result) Validate() error {
@@ -431,13 +617,21 @@ func (r Result) Validate() error {
 	if r.Evidence != EvidenceMockOnly && r.Evidence != EvidenceLive {
 		return errors.New("completed post-production evidence must be mock_only or live_provider_call")
 	}
-	for _, artifact := range []Artifact{r.Subtitle, r.Dialogue, r.FinalVideo, r.Manifest, r.ServiceBOM} {
+	artifacts := []Artifact{r.Subtitle, r.FinalMix, r.FinalVideo, r.Manifest, r.ServiceBOM}
+	if r.Dialogue.Kind != "" {
+		artifacts = append(artifacts, r.Dialogue)
+	}
+	artifacts = append(artifacts, r.NativeMixes...)
+	if r.AudioQC.Kind != "" {
+		artifacts = append(artifacts, r.AudioQC)
+	}
+	for _, artifact := range artifacts {
 		if err := artifact.Validate(); err != nil {
 			return err
 		}
 	}
 	if r.Subtitle.Kind != "subtitle_srt" ||
-		r.Dialogue.Kind != "dialogue_audio" ||
+		r.FinalMix.Kind != "final_mix" ||
 		r.FinalVideo.Kind != "final_video" ||
 		r.Manifest.Kind != "postproduction_manifest" ||
 		r.ServiceBOM.Kind != "service_bom" {
@@ -447,8 +641,33 @@ func (r Result) Validate() error {
 		r.FinalVideo.Width <= 0 || r.FinalVideo.Height <= 0 || r.FinalVideo.FPS <= 0 {
 		return errors.New("post-production final video media specification is incomplete")
 	}
-	if r.Dialogue.DurationMillis <= 0 || r.Dialogue.DurationMillis != r.FinalVideo.DurationMillis {
-		return errors.New("dialogue duration must match the final video duration")
+	if !r.AudioStrategy.Valid() {
+		return errors.New("post-production result requires an explicit audio strategy")
+	}
+	if r.FinalMix.DurationMillis <= 0 || r.FinalMix.DurationMillis != r.FinalVideo.DurationMillis {
+		return errors.New("final mix duration must match the final video duration")
+	}
+	if r.Dialogue.Kind != "" && (r.Dialogue.Kind != "dialogue_audio" ||
+		r.Dialogue.DurationMillis <= 0 || r.Dialogue.DurationMillis != r.FinalVideo.DurationMillis) {
+		return errors.New("real dialogue stem duration must match the final video duration")
+	}
+	if r.Dialogue.Kind == "" && len(r.SpeechAttempts) != 0 {
+		return errors.New("TTS attempts require a real dialogue stem")
+	}
+	if r.AudioStrategy.RequiresNativeAudio() && len(r.NativeMixes) == 0 {
+		return errors.New("native audio strategy requires extracted native_mix artifacts")
+	}
+	if r.AudioStrategy.RequiresNativeAudio() && r.AudioQC.Kind != "audio_qc_report" {
+		return errors.New("native audio strategy requires immutable audio_qc_report evidence")
+	}
+	if r.AudioStrategy == providercontract.AudioStrategyTTSRequired &&
+		(len(r.NativeMixes) != 0 || r.AudioQC.Kind != "") {
+		return errors.New("tts_required result cannot claim Provider-native audio evidence")
+	}
+	for _, mix := range r.NativeMixes {
+		if mix.Kind != "native_mix" || mix.DurationMillis <= 0 {
+			return errors.New("native audio artifacts must be truthful native_mix tracks")
+		}
 	}
 	if !validDigest(r.CommandPlanHash) || !validDigest(r.ManifestHash) ||
 		!validDigest(r.ServiceBOMHash) {

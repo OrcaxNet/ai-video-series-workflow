@@ -13,7 +13,7 @@ import (
 const (
 	// AlgorithmRevision is part of the formal Stage 1 finalization identity.
 	// Bump it whenever post-production bytes or QC semantics change.
-	AlgorithmRevision = "audio-timing-v4"
+	AlgorithmRevision = "native-audio-postproduction-v5"
 
 	timingSilenceThresholdDB = -40
 	timingMinimumSilenceMS   = int64(20)

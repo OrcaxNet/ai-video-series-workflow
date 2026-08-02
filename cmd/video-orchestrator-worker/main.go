@@ -82,7 +82,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("configure FFmpeg post-production: %v", err)
 	}
-	postProduction, err := postproduction.NewService(speech, media, artifacts)
+	var analyzers []postproduction.AudioAnalyzer
+	if cfg.AudioAnalyzerCommand != "" {
+		analyzer, analyzerErr := postproduction.NewCommandAudioAnalyzer(cfg.AudioAnalyzerCommand, artifacts)
+		if analyzerErr != nil {
+			log.Fatalf("configure native audio analyzer: %v", analyzerErr)
+		}
+		analyzers = append(analyzers, analyzer)
+	}
+	postProduction, err := postproduction.NewService(speech, media, artifacts, analyzers...)
 	if err != nil {
 		log.Fatalf("configure episode post-production: %v", err)
 	}

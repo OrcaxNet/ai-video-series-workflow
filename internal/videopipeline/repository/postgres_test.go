@@ -3,6 +3,7 @@ package repository
 import (
 	"errors"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
@@ -131,6 +132,172 @@ func TestRequireExecutionPolicyFailsClosed(t *testing.T) {
 			var domain *controlplane.DomainError
 			if !errors.As(err, &domain) || domain.Code != test.code {
 				t.Fatalf("error = %#v, want code %s", err, test.code)
+			}
+		})
+	}
+}
+
+func TestRequireNativeAudioCapabilityFailsBeforePaidSubmit(t *testing.T) {
+	t.Parallel()
+	output := providercontract.OutputSpec{
+		AudioStrategy: providercontract.AudioStrategyNativePreferred,
+		GenerateAudio: true,
+		AudioDelivery: providercontract.NativeAudioMix,
+	}
+	tests := []struct {
+		name   string
+		limits map[string]any
+		output providercontract.OutputSpec
+		code   controlplane.ErrorCode
+	}{
+		{
+			name: "native mix supported",
+			limits: map[string]any{
+				"supportsNativeAudio": true,
+				"nativeAudioDelivery": string(providercontract.NativeAudioMix),
+			},
+			output: output,
+		},
+		{name: "missing discovery evidence", limits: map[string]any{}, output: output, code: controlplane.CodeCapability},
+		{
+			name: "stems cannot be inferred from mix",
+			limits: map[string]any{
+				"supportsNativeAudio": true,
+				"nativeAudioDelivery": string(providercontract.NativeAudioMix),
+			},
+			output: func() providercontract.OutputSpec {
+				value := output
+				value.AudioDelivery = providercontract.NativeAudioStems
+				return value
+			}(),
+			code: controlplane.CodeCapability,
+		},
+		{
+			name: "invalid immutable prompt",
+			limits: map[string]any{
+				"supportsNativeAudio": true,
+				"nativeAudioDelivery": string(providercontract.NativeAudioMix),
+			},
+			output: providercontract.OutputSpec{AudioStrategy: providercontract.AudioStrategyNativePreferred},
+			code:   controlplane.CodeRevisionConflict,
+		},
+		{
+			name:   "explicit tts requires no native capability",
+			limits: map[string]any{},
+			output: providercontract.OutputSpec{AudioStrategy: providercontract.AudioStrategyTTSRequired},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			err := requireNativeAudioCapability(test.limits, test.output)
+			if test.code == "" {
+				if err != nil {
+					t.Fatalf("requireNativeAudioCapability() error = %v", err)
+				}
+				return
+			}
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != test.code {
+				t.Fatalf("error = %#v, want code %s", err, test.code)
+			}
+		})
+	}
+}
+
+func TestAmbienceFromSceneContextFreezesIdentityVersionAndContinuity(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		payload        string
+		wantIdentity   string
+		wantVersion    string
+		wantContinuity bool
+		wantExplicit   bool
+		wantErr        bool
+	}{
+		{
+			name: "context identity fallback", payload: `{}`,
+			wantIdentity: "scene-context:scene-context-v1", wantVersion: strings.Repeat("a", 64),
+		},
+		{
+			name:         "explicit flattened values",
+			payload:      `{"values":{"audio.ambience.identity":"rain-courtyard","audio.ambience.version":"rain-v3","audio.ambience.continuity":"required"}}`,
+			wantIdentity: "rain-courtyard", wantVersion: "rain-v3", wantContinuity: true, wantExplicit: true,
+		},
+		{
+			name:         "explicit cut",
+			payload:      `{"values":{"audio.ambience.identity":"room","audio.ambience.version":"v1","audio.ambience.continuity":false}}`,
+			wantIdentity: "room", wantVersion: "v1", wantExplicit: true,
+		},
+		{name: "partial binding", payload: `{"values":{"audio.ambience.identity":"room"}}`, wantErr: true},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, explicit, err := ambienceFromSceneContext(
+				"scene-context-v1", strings.Repeat("a", 64), []byte(test.payload),
+			)
+			if test.wantErr {
+				if err == nil {
+					t.Fatalf("ambienceFromSceneContext() = %#v, want error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Identity != test.wantIdentity || got.Version != test.wantVersion ||
+				got.ContinuityIntoNext != test.wantContinuity || explicit != test.wantExplicit {
+				t.Fatalf("binding=%#v explicit=%t", got, explicit)
+			}
+		})
+	}
+}
+
+func TestLipSyncRequiredFromFrozenShotCinematography(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		cinematography string
+		narrative      string
+		want           bool
+	}{
+		{
+			name:           "explicit closeup policy",
+			cinematography: `{"lipSyncRequired":true}`,
+			narrative:      `{"dialogue":[{"id":"cue-1"}]}`,
+			want:           true,
+		},
+		{
+			name:           "front closeup inference",
+			cinematography: `{"shotSize":"close-up","angle":"frontal"}`,
+			narrative:      `{"dialogue":[{"id":"cue-1"}]}`,
+			want:           true,
+		},
+		{
+			name:           "closeup without dialogue",
+			cinematography: `{"shotSize":"close-up","angle":"front"}`,
+			narrative:      `{}`,
+		},
+		{
+			name:           "explicit opt out",
+			cinematography: `{"lipSyncRequired":false,"shotSize":"close-up","angle":"front"}`,
+			narrative:      `{"dialogue":[{"id":"cue-1"}]}`,
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := lipSyncRequiredFromShot([]byte(test.cinematography), []byte(test.narrative))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != test.want {
+				t.Fatalf("lipSyncRequiredFromShot() = %t, want %t", got, test.want)
 			}
 		})
 	}

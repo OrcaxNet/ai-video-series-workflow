@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
@@ -18,25 +19,49 @@ type Executor interface {
 }
 
 type Service struct {
-	Speech SpeechProvider
-	Media  MediaProcessor
-	Store  *artifactstore.Store
+	Speech   SpeechProvider
+	Media    MediaProcessor
+	Store    *artifactstore.Store
+	Analyzer AudioAnalyzer
 }
 
 func NewService(
 	speech SpeechProvider,
 	media MediaProcessor,
 	store *artifactstore.Store,
+	analyzers ...AudioAnalyzer,
 ) (*Service, error) {
-	if speech == nil || media == nil || store == nil {
-		return nil, errors.New("speech provider, media processor, and artifact store are required")
+	if media == nil || store == nil {
+		return nil, errors.New("media processor and artifact store are required")
 	}
-	return &Service{Speech: speech, Media: media, Store: store}, nil
+	if len(analyzers) > 1 {
+		return nil, errors.New("at most one audio analyzer may be configured")
+	}
+	service := &Service{Speech: speech, Media: media, Store: store}
+	if len(analyzers) == 1 {
+		service.Analyzer = analyzers[0]
+	}
+	return service, nil
 }
 
 func (s *Service) Finalize(ctx context.Context, request Request) (Result, error) {
 	if err := request.Validate(); err != nil {
 		return Result{}, err
+	}
+	// A hybrid replacement is a second pass over already-extracted native
+	// evidence. Reject a missing source hash before any paid TTS authorization.
+	for _, fallback := range request.CueFallbacks {
+		exists, err := s.Store.Exists(fallback.OriginalNativeMixSHA256)
+		if err != nil {
+			return Result{}, fmt.Errorf("verify cue %q native mix: %w", fallback.CueID, err)
+		}
+		if !exists {
+			return Result{}, &providercontract.Error{
+				Code: providercontract.CodeConflict, Retryable: false, RequiresAction: true,
+				SafeMessage:     "cue fallback references a missing original native mix",
+				SuggestedAction: "run native audio extraction/QC first and freeze its CAS hash",
+			}
+		}
 	}
 	if request.Evidence == EvidencePendingKey {
 		return Result{}, ErrPendingKey
@@ -54,13 +79,17 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		return Result{}, err
 	}
 
-	attempts := make([]ProviderAttempt, 0, len(request.Subtitle.Cues))
-	if len(request.Subtitle.Cues) > 0 {
+	selectedCues := request.SpeechCueIDs()
+	attempts := make([]ProviderAttempt, 0, len(selectedCues))
+	if len(selectedCues) > 0 {
+		if s.Speech == nil {
+			return Result{}, errors.New("selected TTS cues require a configured speech provider")
+		}
 		completed := make(map[string]ProviderAttempt, len(request.Speech.CompletedAttempts))
 		for _, attempt := range request.Speech.CompletedAttempts {
 			completed[attempt.CueID] = attempt
 		}
-		paidCueCount := len(request.Subtitle.Cues) - len(completed)
+		paidCueCount := len(selectedCues) - len(completed)
 		if paidCueCount == 0 {
 			paidCueCount = 1
 		}
@@ -72,6 +101,9 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		paidIndex := 0
 		var batchAFPMilli int64
 		for _, cue := range request.Subtitle.Cues {
+			if _, selected := selectedCues[cue.ID]; !selected {
+				continue
+			}
 			if attempt, ok := completed[cue.ID]; ok {
 				attempts = append(attempts, attempt)
 				continue
@@ -145,6 +177,50 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 	if err != nil {
 		return Result{}, err
 	}
+	if err := validateRenderedFallbackLineage(request, rendered.NativeMixes); err != nil {
+		return Result{}, err
+	}
+	if request.ResolvedAudioStrategy().RequiresNativeAudio() {
+		if s.Analyzer == nil {
+			return Result{}, &providercontract.Error{
+				Code: providercontract.CodeUnavailable, Retryable: false, RequiresAction: true,
+				SafeMessage:     "native audio requires the approved ASR/lip/ambience analyzer",
+				SuggestedAction: "configure the frozen analyzer before opening G3",
+			}
+		}
+		analysisRequest := AudioAnalysisRequest{
+			Request: request, NativeMixes: rendered.NativeMixes,
+			FinalMix: rendered.FinalMix, FinalVideo: rendered.FinalVideo,
+		}
+		if rendered.Dialogue.Kind != "" {
+			analysisRequest.Dialogue = &rendered.Dialogue
+		}
+		analysis, err := s.Analyzer.Analyze(ctx, analysisRequest)
+		if err != nil {
+			return Result{}, fmt.Errorf("analyze native audio: %w", err)
+		}
+		rendered.QC, err = EvaluateAudioQuality(request, rendered, analysis)
+		qcEvidenceBytes, encodeErr := canonicalJSON(map[string]any{
+			"schemaVersion": AudioAnalysisSchemaVersion,
+			"revision":      AudioQCRevision,
+			"analysis":      analysis,
+			"qc":            rendered.QC,
+		})
+		if encodeErr != nil {
+			return Result{}, fmt.Errorf("encode audio QC evidence: %w", encodeErr)
+		}
+		rendered.AudioQC, encodeErr = s.commitBytes(ctx, qcEvidenceBytes, Artifact{
+			Kind: "audio_qc_report", MediaType: "application/vnd.video-series.audio-qc+json",
+		})
+		if encodeErr != nil {
+			return Result{}, encodeErr
+		}
+		if err != nil {
+			return Result{}, &AudioQualityError{
+				Report: rendered.QC, Evidence: rendered.AudioQC, Cause: err,
+			}
+		}
+	}
 	components, err := buildComponents(request, rendered)
 	if err != nil {
 		return Result{}, err
@@ -167,20 +243,29 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		return Result{}, err
 	}
 
+	outputs := []Artifact{subtitleArtifact, rendered.FinalMix, rendered.FinalVideo, serviceBOM}
+	if rendered.AudioQC.Kind != "" {
+		outputs = append(outputs, rendered.AudioQC)
+	}
+	if rendered.Dialogue.Kind != "" {
+		outputs = append(outputs, rendered.Dialogue)
+	}
+	outputs = append(outputs, rendered.NativeMixes...)
 	manifestPayload := map[string]any{
-		"schemaVersion":       SchemaVersion,
-		"evidence":            request.Evidence,
-		"episodeRevisionId":   request.EpisodeRevisionID,
-		"episodeRevisionHash": request.EpisodeRevisionHash,
-		"runIds":              request.RunIDs,
-		"clips":               request.Clips,
-		"subtitleRevision":    request.Subtitle,
-		"speechConfig":        request.Speech,
-		"speechAttempts":      attempts,
-		"outputPolicy":        request.Output.withDefaults(),
-		"outputs": []Artifact{
-			subtitleArtifact, rendered.Dialogue, rendered.FinalVideo, serviceBOM,
-		},
+		"schemaVersion":                   SchemaVersion,
+		"evidence":                        request.Evidence,
+		"episodeRevisionId":               request.EpisodeRevisionID,
+		"episodeRevisionHash":             request.EpisodeRevisionHash,
+		"runIds":                          request.RunIDs,
+		"clips":                           request.Clips,
+		"backgroundAudio":                 request.BackgroundAudio,
+		"audioStrategy":                   request.ResolvedAudioStrategy(),
+		"cueFallbacks":                    request.CueFallbacks,
+		"subtitleRevision":                request.Subtitle,
+		"speechConfig":                    request.Speech,
+		"speechAttempts":                  attempts,
+		"outputPolicy":                    request.Output.withDefaults(),
+		"outputs":                         outputs,
 		"gates":                           request.Gates,
 		"qc":                              rendered.QC,
 		"audioTimingCorrections":          rendered.AudioTimingCorrections,
@@ -206,6 +291,10 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		EpisodeRevisionID: request.EpisodeRevisionID,
 		Subtitle:          subtitleArtifact,
 		Dialogue:          rendered.Dialogue,
+		NativeMixes:       rendered.NativeMixes,
+		FinalMix:          rendered.FinalMix,
+		AudioQC:           rendered.AudioQC,
+		AudioStrategy:     request.ResolvedAudioStrategy(),
 		FinalVideo:        rendered.FinalVideo,
 		Manifest:          manifest,
 		ServiceBOM:        serviceBOM,
@@ -219,6 +308,26 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		return Result{}, err
 	}
 	return result, nil
+}
+
+func validateRenderedFallbackLineage(request Request, mixes []Artifact) error {
+	if len(request.CueFallbacks) == 0 {
+		return nil
+	}
+	known := make(map[string]struct{}, len(mixes))
+	for _, mix := range mixes {
+		known[mix.Digest] = struct{}{}
+	}
+	for _, fallback := range request.CueFallbacks {
+		if _, ok := known[fallback.OriginalNativeMixSHA256]; !ok {
+			return &providercontract.Error{
+				Code: providercontract.CodeConflict, Retryable: false, RequiresAction: true,
+				SafeMessage:     "cue fallback native mix differs from the rendered Provider source",
+				SuggestedAction: "freeze a new fallback revision against the current native mix hash",
+			}
+		}
+	}
+	return nil
 }
 
 func (s *Service) commitBytes(
@@ -240,10 +349,6 @@ func (s *Service) commitBytes(
 }
 
 func buildComponents(request Request, rendered RenderResult) ([]ServiceComponent, error) {
-	speechHash, err := digestJSON(request.Speech)
-	if err != nil {
-		return nil, err
-	}
 	ffmpegHash, err := digestJSON(map[string]any{
 		"version":         rendered.FFmpegVersion,
 		"commandPlanHash": rendered.CommandPlanHash,
@@ -260,13 +365,20 @@ func buildComponents(request Request, rendered RenderResult) ([]ServiceComponent
 	}
 	components := []ServiceComponent{
 		{
+			Name:       "audio-strategy",
+			Kind:       "policy",
+			Version:    string(request.ResolvedAudioStrategy()),
+			Evidence:   request.Evidence,
+			ConfigHash: rendered.CommandPlanHash,
+		},
+		{
 			Name:       "speech-provider",
 			Kind:       "provider",
 			Provider:   request.Speech.Route.Provider,
 			Model:      request.Speech.Route.ModelID,
 			Version:    request.Speech.Route.RouteVersion,
 			Evidence:   request.Evidence,
-			ConfigHash: speechHash,
+			ConfigHash: "",
 		},
 		{
 			Name:       "ffmpeg",
@@ -282,6 +394,49 @@ func buildComponents(request Request, rendered RenderResult) ([]ServiceComponent
 			Evidence:   "runtime_binary",
 			ConfigHash: ffprobeHash,
 		},
+	}
+	if !request.RequiresSpeech() {
+		components = slices.DeleteFunc(components, func(component ServiceComponent) bool {
+			return component.Name == "speech-provider"
+		})
+	} else {
+		speechHash, err := digestJSON(request.Speech)
+		if err != nil {
+			return nil, err
+		}
+		for index := range components {
+			if components[index].Name == "speech-provider" {
+				components[index].ConfigHash = speechHash
+			}
+		}
+	}
+	if request.ResolvedAudioStrategy().RequiresNativeAudio() {
+		components = append(components, ServiceComponent{
+			Name: "audio-qc", Kind: "quality-gate", Version: AudioQCRevision,
+			Evidence: request.Evidence, ConfigHash: rendered.QC.AnalysisHash,
+		})
+		for index, clip := range request.Clips {
+			providerHash, err := digestJSON(clip.ProviderVideo)
+			if err != nil {
+				return nil, err
+			}
+			components = append(components, ServiceComponent{
+				Name: fmt.Sprintf("provider-native-audio-%03d", index+1), Kind: "provider",
+				Provider: clip.ProviderVideo.Provider, Model: clip.ProviderVideo.Model,
+				Version: clip.ProviderVideo.Version, Evidence: request.Evidence,
+				ConfigHash: providerHash,
+			})
+		}
+	}
+	if request.BackgroundAudio != nil {
+		backgroundHash, err := digestJSON(request.BackgroundAudio)
+		if err != nil {
+			return nil, err
+		}
+		components = append(components, ServiceComponent{
+			Name: "background-audio", Kind: "licensed-asset", Version: request.BackgroundAudio.Digest,
+			Evidence: request.Evidence, ConfigHash: backgroundHash,
+		})
 	}
 	sort.Slice(components, func(i, j int) bool { return components[i].Name < components[j].Name })
 	return components, nil

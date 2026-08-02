@@ -84,7 +84,14 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 				SupportsPolling:  alias == providercontract.CapabilityVideo,
 				SupportsCallback: alias == providercontract.CapabilityVideo,
 				SupportsCancel:   alias == providercontract.CapabilityVideo,
-				Verification:     "mock_only",
+				NativeAudioDelivery: func() providercontract.NativeAudioDelivery {
+					if alias == providercontract.CapabilityVideo {
+						return providercontract.NativeAudioMix
+					}
+					return ""
+				}(),
+				SupportsAudioDrivenVideo: alias == providercontract.CapabilityVideo,
+				Verification:             "mock_only",
 			},
 			Configured:      true,
 			Enabled:         true,
@@ -178,14 +185,15 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		actual = request.BudgetReservation.AmountMicros
 	}
 	response := providercontract.JobResponse{
-		JobID:          request.JobID,
-		RunID:          request.RunID,
-		UpstreamTaskID: "mock-task-" + hex.EncodeToString(sum[:8]),
-		RequestID:      "mock-request-" + hex.EncodeToString(sum[8:16]),
-		State:          state,
-		Progress:       0,
-		Model:          request.Model,
-		Usage:          providercontract.Usage{InputUnits: 100, OutputUnits: 25, Unit: "mock-units"},
+		JobID:           request.JobID,
+		RunID:           request.RunID,
+		UpstreamTaskID:  "mock-task-" + hex.EncodeToString(sum[:8]),
+		RequestID:       "mock-request-" + hex.EncodeToString(sum[8:16]),
+		State:           state,
+		Progress:        0,
+		Model:           request.Model,
+		RequestedOutput: &request.Request.Output,
+		Usage:           providercontract.Usage{InputUnits: 100, OutputUnits: 25, Unit: "mock-units"},
 		Cost: providercontract.Cost{
 			EstimatedMicros:  request.BudgetReservation.AmountMicros,
 			ActualMicros:     &actual,
@@ -317,6 +325,9 @@ func (s *Server) complete(record *jobRecord) {
 		"jobId":         record.Request.JobID,
 		"inputHash":     record.Request.InputHash,
 		"modelSnapshot": record.Request.Model,
+		"generateAudio": record.Request.Request.Output.GenerateAudio,
+		"audioStrategy": record.Request.Request.Output.ResolvedAudioStrategy(),
+		"audioDelivery": record.Request.Request.Output.AudioDelivery,
 	})
 	artifact, err := s.store.Put(context.Background(), bytes.NewReader(payload))
 	if err != nil {
@@ -326,11 +337,17 @@ func (s *Server) complete(record *jobRecord) {
 	}
 	record.Response.State = providercontract.StatusSucceeded
 	record.Response.Progress = 100
+	role := providercontract.AssetRoleOutput
+	if record.Request.Request.Output.GenerateAudio && record.Request.Capability == providercontract.CapabilityVideo {
+		// The MP4 remains the Provider original. native_mix is extracted and
+		// committed separately during deterministic post-production.
+		role = providercontract.AssetRoleProviderOriginal
+	}
 	record.Response.Artifacts = []providercontract.AssetRef{{
 		ID:               "asset-" + artifact.Digest[:16],
 		Revision:         artifact.Digest,
 		Kind:             record.Request.Capability.Modality(),
-		Role:             providercontract.AssetRoleOutput,
+		Role:             role,
 		URI:              artifact.URI,
 		SHA256:           artifact.Digest,
 		LicenseReference: "mock-fixture-license",
@@ -392,11 +409,14 @@ func limitsFor(alias string) map[string]any {
 	switch alias {
 	case string(providercontract.CapabilityVideo):
 		return map[string]any{
-			"durationsSeconds":   []int{4, 5, 6, 10, 15},
-			"ratios":             []string{"16:9", "9:16"},
-			"resolutions":        []string{"480p", "720p", "1080p"},
-			"asynchronous":       true,
-			"maximumConcurrency": 1,
+			"durationsSeconds":         []int{4, 5, 6, 10, 15},
+			"ratios":                   []string{"16:9", "9:16"},
+			"resolutions":              []string{"480p", "720p", "1080p"},
+			"asynchronous":             true,
+			"maximumConcurrency":       1,
+			"supportsNativeAudio":      true,
+			"nativeAudioDelivery":      string(providercontract.NativeAudioMix),
+			"supportsAudioDrivenVideo": true,
 		}
 	case string(providercontract.CapabilityImage):
 		return map[string]any{"maximumReferences": 4, "returns": []string{"url", "base64"}}

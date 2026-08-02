@@ -469,6 +469,13 @@ func (r *GenerationRunner) Execute(ctx context.Context, input GenerationInput) (
 			if commitErr != nil {
 				return r.fail(record, commitErr)
 			}
+			// The Provider MP4 is the immutable source of truth for native
+			// dialogue, ambience, effects, and music. Name it explicitly after
+			// CAS commit so downstream extraction never mistakes it for a
+			// disposable presentation output.
+			if request.Output.GenerateAudio && stored.Kind == providercontract.ModalityVideo {
+				stored.Role = providercontract.AssetRoleProviderOriginal
+			}
 			committed = append(committed, stored)
 		}
 		job.Output.Assets = committed
@@ -633,6 +640,9 @@ func selectCapability(capabilities []providercontract.Capability, route provider
 			continue
 		}
 		if capability.MaxDurationMillis > 0 && output.DurationMillis > capability.MaxDurationMillis {
+			continue
+		}
+		if err := capability.SupportsOutputAudio(output); err != nil {
 			continue
 		}
 		return capability, nil

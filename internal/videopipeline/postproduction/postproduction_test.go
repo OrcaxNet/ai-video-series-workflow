@@ -9,6 +9,7 @@ import (
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/cerevaluation"
 )
 
 func TestSubtitleRevisionIsImmutableAndRendersCanonicalUTF8(t *testing.T) {
@@ -97,8 +98,8 @@ func TestBuildCommandPlanIsDeterministicAndDoesNotInterpolateDialogue(t *testing
 	t.Parallel()
 	request := mustRequest(t, EvidenceMockOnly)
 	attempts := []ProviderAttempt{
-		{Artifact: testArtifact("dialogue_segment", "audio/wav", "d")},
-		{Artifact: testArtifact("dialogue_segment", "audio/wav", "e")},
+		{CueID: "cue-1", Artifact: testArtifact("dialogue_segment", "audio/wav", "d")},
+		{CueID: "cue-2", Artifact: testArtifact("dialogue_segment", "audio/wav", "e")},
 	}
 	first, err := BuildCommandPlan(request, attempts, "ffmpeg")
 	if err != nil {
@@ -229,6 +230,159 @@ func TestServiceReauthorizesBeforeEveryPaidSpeechSubmission(t *testing.T) {
 	}
 }
 
+func TestNativeAudioFinalizationMakesZeroSpeechCallsAndNoFakeDialogueStem(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	speech := &fakeSpeech{store: store}
+	analyzer := &fakeAudioAnalyzer{}
+	service, err := NewService(speech, &fakeMedia{store: store}, store, analyzer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := nativeAudioRequest(t)
+	result, err := service.Finalize(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speech.calls != 0 || len(result.SpeechAttempts) != 0 {
+		t.Fatalf("native pass made speech calls=%d attempts=%d", speech.calls, len(result.SpeechAttempts))
+	}
+	if result.Dialogue.Kind != "" {
+		t.Fatalf("native mix was mislabeled as dialogue stem: %#v", result.Dialogue)
+	}
+	if len(result.NativeMixes) != len(request.Clips) || result.FinalMix.Kind != "final_mix" ||
+		result.AudioQC.Kind != "audio_qc_report" ||
+		result.AudioStrategy != providercontract.AudioStrategyNativePreferred {
+		t.Fatalf("native artifacts/result incomplete: %#v", result)
+	}
+	if analyzer.calls != 1 || result.QC.State != "AUDIO_CONTRACT_PASSED" {
+		t.Fatalf("analyzer calls=%d qc=%#v", analyzer.calls, result.QC)
+	}
+}
+
+func TestHybridAudioSynthesizesOnlyFrozenFallbackAndReusesCompletedAttempt(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	speech := &speechV2CanaryFake{store: store}
+	service, err := NewService(speech, &fakeMedia{store: store}, store, &fakeAudioAnalyzer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := nativeAudioRequest(t)
+	v2 := speechV2Request(t)
+	request.EpisodeRevisionID = v2.EpisodeRevisionID
+	request.Subtitle = v2.SubtitleRevision
+	request.AudioStrategy = providercontract.AudioStrategyHybrid
+	request.Speech = v2.Config
+	request.Speech.BatchAuthorization = batchForSpeechRequest(t, request, request.Subtitle.Cues[:1])
+	request.Speech.AuthorizedCueID = ""
+	request.Speech.MaximumAFPMilli = 0
+	request.Speech.MaximumNonSubscriptionCashMicros = 0
+	request.Speech.MaxAttempts = 0
+	originalMix, err := store.Put(t.Context(), strings.NewReader("native-mix:"+request.RunIDs[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.CueFallbacks = []CueFallback{{
+		CueID: request.Subtitle.Cues[0].ID, Reason: "native cue failed CER gate",
+		OriginalNativeMixSHA256: originalMix.Digest,
+		ReplacementRevisionID:   "fallback-revision-v1",
+	}}
+	first, err := service.Finalize(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speech.calls != 1 || len(first.SpeechAttempts) != 1 || first.SpeechAttempts[0].CueID != request.Subtitle.Cues[0].ID {
+		t.Fatalf("fallback calls=%d attempts=%#v", speech.calls, first.SpeechAttempts)
+	}
+	if first.Dialogue.Kind != "dialogue_audio" {
+		t.Fatal("real fallback dialogue was not retained as an independent stem")
+	}
+	request.Speech.CompletedAttempts = append([]ProviderAttempt(nil), first.SpeechAttempts...)
+	request.Speech.BatchAuthorization = nil
+	second, err := service.Finalize(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if speech.calls != 1 || second.FinalVideo.Digest != first.FinalVideo.Digest ||
+		second.FinalMix.Digest != first.FinalMix.Digest {
+		t.Fatalf("replay resubmitted speech or drifted media: calls=%d first=%#v second=%#v", speech.calls, first.FinalVideo, second.FinalVideo)
+	}
+}
+
+func TestHybridAudioMissingNativeSourceFailsBeforeSpeechSubmit(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	speech := &fakeSpeech{store: store}
+	service, err := NewService(speech, &fakeMedia{store: store}, store, &fakeAudioAnalyzer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := nativeAudioRequest(t)
+	request.AudioStrategy = providercontract.AudioStrategyHybrid
+	request.Speech = mustRequest(t, EvidenceMockOnly).Speech
+	request.CueFallbacks = []CueFallback{{
+		CueID: request.Subtitle.Cues[0].ID, Reason: "failed native QC",
+		OriginalNativeMixSHA256: strings.Repeat("f", 64),
+		ReplacementRevisionID:   "fallback-revision-v1",
+	}}
+	_, err = service.Finalize(t.Context(), request)
+	if providercontract.ErrorCodeOf(err) != providercontract.CodeConflict || speech.calls != 0 {
+		t.Fatalf("Finalize() error=%v speech calls=%d", err, speech.calls)
+	}
+}
+
+func TestNativeAudioLipSyncFailureBlocksOnlyMeasuredRun(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	analyzer := &fakeAudioAnalyzer{lipOffsetMillis: lipSyncLimitMillis + 1}
+	service, err := NewService(nil, &fakeMedia{store: store}, store, analyzer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Finalize(t.Context(), nativeAudioRequest(t))
+	if providercontract.ErrorCodeOf(err) != providercontract.CodeConflict ||
+		!strings.Contains(err.Error(), "native audio quality failed") {
+		t.Fatalf("Finalize() error = %v", err)
+	}
+	var quality *AudioQualityError
+	if !errors.As(err, &quality) || quality.Evidence.Kind != "audio_qc_report" ||
+		len(quality.Report.BlockedRunIDs) != 2 {
+		t.Fatalf("quality failure lost exact CAS/run evidence: %#v", quality)
+	}
+}
+
+func TestNativeAudioAmbienceHardSilenceBlocksG3(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	analyzer := &fakeAudioAnalyzer{ambienceHardSilenceMillis: ambienceSilenceLimitMS + 1}
+	service, err := NewService(nil, &fakeMedia{store: store}, store, analyzer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Finalize(t.Context(), nativeAudioRequest(t))
+	var quality *AudioQualityError
+	if !errors.As(err, &quality) || quality.Report.AmbienceHardSilenceMaxMillis == nil ||
+		*quality.Report.AmbienceHardSilenceMaxMillis != ambienceSilenceLimitMS+1 {
+		t.Fatalf("ambience failure evidence = %#v error=%v", quality, err)
+	}
+}
+
 func TestServiceRejectsProviderEvidenceDrift(t *testing.T) {
 	t.Parallel()
 	store, err := artifactstore.New(t.TempDir())
@@ -301,27 +455,53 @@ func (f *fakeMedia) Render(
 	ctx context.Context,
 	request Request,
 	_ []byte,
-	_ []ProviderAttempt,
+	attempts []ProviderAttempt,
 ) (RenderResult, error) {
 	f.calls++
-	dialogue, err := f.store.Put(ctx, strings.NewReader("dialogue:"+request.Subtitle.ContentHash))
-	if err != nil {
-		return RenderResult{}, err
+	var dialogueArtifact Artifact
+	if len(attempts) > 0 {
+		dialogue, err := f.store.Put(ctx, strings.NewReader("dialogue:"+request.Subtitle.ContentHash))
+		if err != nil {
+			return RenderResult{}, err
+		}
+		dialogueArtifact = Artifact{
+			Kind: "dialogue_audio", Digest: dialogue.Digest, URI: dialogue.URI,
+			MediaType: "audio/wav", SizeBytes: dialogue.Size, DurationMillis: request.DurationMillis(),
+		}
 	}
 	video, err := f.store.Put(ctx, strings.NewReader("video:"+request.EpisodeRevisionHash))
 	if err != nil {
 		return RenderResult{}, err
 	}
 	planHash, _ := digestJSON(map[string]any{"request": request.EpisodeRevisionHash})
+	finalMix, err := f.store.Put(ctx, strings.NewReader("final-mix:"+request.EpisodeRevisionHash))
+	if err != nil {
+		return RenderResult{}, err
+	}
+	nativeMixes := make([]Artifact, 0, len(request.Clips))
+	if request.ResolvedAudioStrategy().RequiresNativeAudio() {
+		for _, clip := range request.Clips {
+			mix, err := f.store.Put(ctx, strings.NewReader("native-mix:"+clip.RunID))
+			if err != nil {
+				return RenderResult{}, err
+			}
+			nativeMixes = append(nativeMixes, Artifact{
+				Kind: "native_mix", Digest: mix.Digest, URI: mix.URI,
+				MediaType: "audio/wav", SizeBytes: mix.Size, DurationMillis: clip.DurationMillis,
+			})
+		}
+	}
 	return RenderResult{
-		Dialogue: Artifact{
-			Kind: "dialogue_audio", Digest: dialogue.Digest, URI: dialogue.URI,
-			MediaType: "audio/wav", SizeBytes: dialogue.Size, DurationMillis: request.DurationMillis(),
-		},
+		Dialogue:    dialogueArtifact,
+		NativeMixes: nativeMixes,
 		FinalVideo: Artifact{
 			Kind: "final_video", Digest: video.Digest, URI: video.URI,
 			MediaType: "video/mp4", SizeBytes: video.Size, DurationMillis: request.DurationMillis(),
 			Width: 1280, Height: 720, FPS: 24,
+		},
+		FinalMix: Artifact{
+			Kind: "final_mix", Digest: finalMix.Digest, URI: finalMix.URI,
+			MediaType: "audio/wav", SizeBytes: finalMix.Size, DurationMillis: request.DurationMillis(),
 		},
 		CommandPlanHash: planHash,
 		QC: QCReport{
@@ -401,4 +581,84 @@ func testArtifact(kind, mediaType, seed string) Artifact {
 		MediaType: mediaType, SizeBytes: 10, DurationMillis: 1_500,
 		Width: 1280, Height: 720, FPS: 24,
 	}
+}
+
+type fakeAudioAnalyzer struct {
+	calls                     int
+	lipOffsetMillis           int64
+	ambienceHardSilenceMillis int64
+}
+
+func (f *fakeAudioAnalyzer) Analyze(_ context.Context, input AudioAnalysisRequest) (AudioAnalysis, error) {
+	f.calls++
+	sources := []string{input.FinalMix.Digest}
+	for _, mix := range input.NativeMixes {
+		sources = append(sources, mix.Digest)
+	}
+	if input.Dialogue != nil {
+		sources = append(sources, input.Dialogue.Digest)
+	}
+	timings := make([]CueTimingMeasurement, 0, len(input.Request.Subtitle.Cues))
+	lip := make([]LipSyncMeasurement, 0, len(input.Request.Subtitle.Cues))
+	transcript := ""
+	for index, cue := range input.Request.Subtitle.Cues {
+		runID := input.Request.RunIDs[min(index, len(input.Request.RunIDs)-1)]
+		timings = append(timings, CueTimingMeasurement{
+			CueID: cue.ID, SpeechStartMillis: cue.StartMillis, SpeechEndMillis: cue.EndMillis,
+		})
+		lip = append(lip, LipSyncMeasurement{
+			RunID: runID, CueID: cue.ID, Required: true,
+			AudioStartMillis: cue.StartMillis, AudioEndMillis: cue.EndMillis,
+			MouthStartMillis: cue.StartMillis + f.lipOffsetMillis,
+			MouthEndMillis:   cue.EndMillis + f.lipOffsetMillis,
+		})
+		transcript += cue.Text
+	}
+	transitions := make([]AmbienceTransitionMeasurement, 0, max(len(input.Request.RunIDs)-1, 0))
+	for index := 1; index < len(input.Request.RunIDs); index++ {
+		from := input.Request.Clips[index-1].Ambience
+		to := input.Request.Clips[index].Ambience
+		hardSilence := f.ambienceHardSilenceMillis
+		if hardSilence == 0 {
+			hardSilence = 20
+		}
+		transitions = append(transitions, AmbienceTransitionMeasurement{
+			FromRunID: input.Request.RunIDs[index-1], ToRunID: input.Request.RunIDs[index],
+			ContinuityRequired: from.ContinuityIntoNext,
+			FromIdentity:       from.Identity, FromVersion: from.Version,
+			ToIdentity: to.Identity, ToVersion: to.Version,
+			HardSilenceMillis: hardSilence, LoudnessDeltaLUFS: 0.2,
+		})
+	}
+	analysis := AudioAnalysis{
+		SchemaVersion: AudioAnalysisSchemaVersion, AnalysisID: "analysis-v1",
+		Analyzer: "fixture-audio-analyzer", AnalyzerVersion: "fixture-v1",
+		Evidence: input.Request.Evidence, ASR: cerevaluation.FrozenASRConfig(),
+		Transcript: transcript, SourceHashes: sources, CueTimings: timings,
+		LipSync: lip, AmbienceTransitions: transitions, AudioVideoStartMillis: []int64{0},
+		IntegratedLUFS: -16, TruePeakDBTP: -1.2,
+	}
+	analysis.ContentHash, _ = digestJSON(analysis.digestInput())
+	return analysis, nil
+}
+
+func nativeAudioRequest(t *testing.T) Request {
+	t.Helper()
+	request := mustRequest(t, EvidenceMockOnly)
+	request.AudioStrategy = providercontract.AudioStrategyNativePreferred
+	request.Speech = SpeechConfig{}
+	for index := range request.Clips {
+		request.Clips[index].ProviderVideo = &ProviderVideoEvidence{
+			ProviderJobID:     "provider-job-" + request.Clips[index].RunID,
+			ProviderRequestID: "provider-request-" + request.Clips[index].RunID,
+			Provider:          "fixture-video", Model: "fixture-native-audio-v1", Version: "route-v1",
+			GenerateAudio: true, AudioDelivery: providercontract.NativeAudioMix,
+		}
+		request.Clips[index].Ambience = &AmbienceBinding{
+			Identity: "room-tone-main", Version: "ambience-v1",
+			ContinuityIntoNext: index+1 < len(request.Clips),
+		}
+		request.Clips[index].LipSyncRequired = true
+	}
+	return request
 }
