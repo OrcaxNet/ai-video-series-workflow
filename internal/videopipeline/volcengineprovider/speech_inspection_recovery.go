@@ -330,26 +330,9 @@ func (s *Server) reconcileSpeechInspection(
 	requestHash string,
 	record *jobRecord,
 ) (providercontract.JobResponse, bool, error) {
-	if result, ok, err := s.loadSpeechInspectionResult(jobID); err != nil {
+	if restored, err := s.restoreSpeechInspectionResult(jobID, requestHash, record); err != nil {
 		return providercontract.JobResponse{}, true, err
-	} else if ok {
-		receipt, receiptOK, receiptErr := s.loadSpeechInspectionReceipt(jobID)
-		if receiptErr != nil {
-			return providercontract.JobResponse{}, true, receiptErr
-		}
-		if result.RequestHash != requestHash ||
-			result.Duration.RequestedMillis != int64(record.Expected.DurationMillis) ||
-			!receiptOK || validateSpeechInspectionResultBinding(result, receipt) != nil {
-			return providercontract.JobResponse{}, true, safeError(
-				providercontract.CodeUnavailable,
-				"speech inspection result does not match the durable job intent",
-				false,
-			)
-		}
-		applySpeechInspectionResult(record, result)
-		if err := s.updateRecord(jobID, record); err != nil {
-			return providercontract.JobResponse{}, true, err
-		}
+	} else if restored {
 		return record.Response, true, nil
 	}
 
@@ -380,40 +363,23 @@ func (s *Server) reconcileSpeechInspection(
 	// A competing Adapter may have published the immutable success marker
 	// between our first read and checkpoint repair. Re-read it before media
 	// inspection so a stale failure can never overwrite completed truth.
-	if result, ok, err := s.loadSpeechInspectionResult(jobID); err != nil {
+	if restored, err := s.restoreSpeechInspectionResult(jobID, requestHash, record); err != nil {
 		return providercontract.JobResponse{}, true, err
-	} else if ok {
-		completedReceipt, receiptOK, receiptErr := s.loadSpeechInspectionReceipt(jobID)
-		if receiptErr != nil {
-			return providercontract.JobResponse{}, true, receiptErr
-		}
-		if result.RequestHash != requestHash ||
-			result.Duration.RequestedMillis != int64(record.Expected.DurationMillis) ||
-			!receiptOK || validateSpeechInspectionResultBinding(result, completedReceipt) != nil {
-			return providercontract.JobResponse{}, true, safeError(
-				providercontract.CodeUnavailable,
-				"speech inspection result does not match the durable job intent",
-				false,
-			)
-		}
-		applySpeechInspectionResult(record, result)
-		if err := s.updateRecord(jobID, record); err != nil {
-			return providercontract.JobResponse{}, true, err
-		}
+	} else if restored {
 		return record.Response, true, nil
 	}
 
 	committed, err := s.store.Resolve(ctx, receipt.Artifact.SHA256)
 	if err != nil || committed.Digest != receipt.Artifact.SHA256 ||
 		committed.URI != receipt.Artifact.URI || committed.Size != receipt.Artifact.SizeBytes {
-		record.SpeechInspection.State = "requires_action"
-		return record.Response, true, nil
+		response, persistErr := s.persistSpeechInspectionRequiresAction(jobID, requestHash, record)
+		return response, true, persistErr
 	}
 	measured, err := s.inspector.Inspect(ctx, committed.Path)
 	if err != nil || receipt.Artifact.MediaType != "audio/mpeg" ||
 		validateMeasuredSpeech(measured, record.Expected) != nil {
-		record.SpeechInspection.State = "requires_action"
-		return record.Response, true, nil
+		response, persistErr := s.persistSpeechInspectionRequiresAction(jobID, requestHash, record)
+		return response, true, persistErr
 	}
 
 	artifact := receipt.Artifact
@@ -445,6 +411,65 @@ func (s *Server) reconcileSpeechInspection(
 		return providercontract.JobResponse{}, true, err
 	}
 	return record.Response, true, nil
+}
+
+// restoreSpeechInspectionResult applies the immutable success marker to the
+// mutable registry. The marker is the cross-process monotonic completion point
+// and therefore wins over every pending or fail-closed checkpoint.
+func (s *Server) restoreSpeechInspectionResult(
+	jobID string,
+	requestHash string,
+	record *jobRecord,
+) (bool, error) {
+	result, ok, err := s.loadSpeechInspectionResult(jobID)
+	if err != nil || !ok {
+		return false, err
+	}
+	receipt, receiptOK, err := s.loadSpeechInspectionReceipt(jobID)
+	if err != nil {
+		return false, err
+	}
+	if result.RequestHash != requestHash ||
+		result.Duration.RequestedMillis != int64(record.Expected.DurationMillis) ||
+		!receiptOK || validateSpeechInspectionResultBinding(result, receipt) != nil {
+		return false, safeError(
+			providercontract.CodeUnavailable,
+			"speech inspection result does not match the durable job intent",
+			false,
+		)
+	}
+	applySpeechInspectionResult(record, result)
+	if err := s.updateRecord(jobID, record); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// persistSpeechInspectionRequiresAction durably exposes an unrecoverable CAS
+// or inspection failure while preserving the receipt's auditable CAS identity.
+// Success is checked both before and after the atomic registry rename so a
+// competing Adapter cannot be rolled back after publishing its immutable
+// completion marker.
+func (s *Server) persistSpeechInspectionRequiresAction(
+	jobID string,
+	requestHash string,
+	record *jobRecord,
+) (providercontract.JobResponse, error) {
+	if restored, err := s.restoreSpeechInspectionResult(jobID, requestHash, record); err != nil {
+		return providercontract.JobResponse{}, err
+	} else if restored {
+		return record.Response, nil
+	}
+	record.SpeechInspection.State = string(providercontract.StatusRequiresAction)
+	if err := s.updateRecord(jobID, record); err != nil {
+		return providercontract.JobResponse{}, err
+	}
+	if restored, err := s.restoreSpeechInspectionResult(jobID, requestHash, record); err != nil {
+		return providercontract.JobResponse{}, err
+	} else if restored {
+		return record.Response, nil
+	}
+	return record.Response, nil
 }
 
 func applySpeechInspectionResult(record *jobRecord, result speechInspectionResult) {

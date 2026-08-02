@@ -32,6 +32,23 @@ func (i *failOnceSpeechInspector) Inspect(context.Context, string) (MediaSpec, e
 	return i.spec, nil
 }
 
+type blockingSpeechInspector struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+	err     error
+}
+
+func (i *blockingSpeechInspector) Inspect(ctx context.Context, _ string) (MediaSpec, error) {
+	i.once.Do(func() { close(i.entered) })
+	select {
+	case <-i.release:
+		return MediaSpec{}, i.err
+	case <-ctx.Done():
+		return MediaSpec{}, ctx.Err()
+	}
+}
+
 func TestSpeechInspectionFailureRecoversInProcessWithoutProviderReplay(t *testing.T) {
 	t.Parallel()
 	store, err := artifactstore.New(t.TempDir())
@@ -222,6 +239,10 @@ func TestSpeechInspectionRecoveryFailsClosedForUnavailableOrNoncompliantCAS(t *t
 			name:      "measured format mismatch",
 			inspector: fixedInspector{spec: MediaSpec{DurationMillis: 2_000, Format: "wav"}},
 		},
+		{
+			name:      "measured duration invalid",
+			inspector: fixedInspector{spec: MediaSpec{DurationMillis: 0, Format: "mp3"}},
+		},
 	}
 	for _, test := range tests {
 		test := test
@@ -280,10 +301,85 @@ func TestSpeechInspectionRecoveryFailsClosedForUnavailableOrNoncompliantCAS(t *t
 			}
 			persisted, ok, err := restarted.loadRecordFromDisk(request.JobID)
 			if err != nil || !ok || persisted.SpeechInspection == nil ||
+				persisted.SpeechInspection.State != string(providercontract.StatusRequiresAction) ||
 				persisted.SpeechInspection.Artifact.SHA256 != artifact.Digest {
 				t.Fatalf("auditable CAS reference = %#v, ok=%v err=%v", persisted, ok, err)
 			}
 		})
+	}
+}
+
+func TestSpeechInspectionFailureCannotOverwritePublishedSuccess(t *testing.T) {
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testLiveConfig()
+	cfg.SpeechModel = AgentPlanTTSModelID
+	speech := &fakeSpeechSynthesizer{}
+	first, err := New(cfg, &fakeProvider{}, store, Options{
+		Speech: speech, Inspector: fixedInspector{err: errors.New("fixture inspection failure")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstHTTP := httptest.NewServer(first.Handler())
+	request := testSpeechJobRequest(t)
+	if status := submitSpeechJobStatus(t, firstHTTP.URL, request); status != http.StatusServiceUnavailable {
+		firstHTTP.Close()
+		t.Fatalf("first status = %d, want 503", status)
+	}
+	firstHTTP.Close()
+
+	inspector := &blockingSpeechInspector{
+		entered: make(chan struct{}), release: make(chan struct{}),
+		err: errors.New("fixture delayed inspection failure"),
+	}
+	bad, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech, Inspector: inspector})
+	if err != nil {
+		t.Fatal(err)
+	}
+	good, err := New(cfg, &fakeProvider{}, store, Options{Speech: speech, Inspector: fakeSpeechInspector()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	badHTTP := httptest.NewServer(bad.Handler())
+	defer badHTTP.Close()
+	goodHTTP := httptest.NewServer(good.Handler())
+	defer goodHTTP.Close()
+	body, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	type recoveryResult struct {
+		response providercontract.JobResponse
+		err      error
+	}
+	failedRecovery := make(chan recoveryResult, 1)
+	go func() {
+		response, err := postSpeechRecovery(
+			authenticatedTestClient(t), badHTTP.URL, request.JobID, body,
+		)
+		failedRecovery <- recoveryResult{response: response, err: err}
+	}()
+	<-inspector.entered
+
+	succeeded := postJob(t, goodHTTP.URL, request)
+	if succeeded.State != providercontract.StatusSucceeded || len(succeeded.Artifacts) != 1 {
+		t.Fatalf("successful competing recovery = %#v", succeeded)
+	}
+	close(inspector.release)
+	delayed := <-failedRecovery
+	if delayed.err != nil {
+		t.Fatal(delayed.err)
+	}
+	if delayed.response.State != providercontract.StatusSucceeded || len(delayed.response.Artifacts) != 1 {
+		t.Fatalf("delayed failure response = %#v", delayed.response)
+	}
+	persisted, ok, err := bad.loadRecordFromDisk(request.JobID)
+	if err != nil || !ok || persisted.Response.State != providercontract.StatusSucceeded ||
+		persisted.SpeechInspection == nil || persisted.SpeechInspection.State != speechInspectionSucceeded {
+		t.Fatalf("persisted monotonic success = %#v, ok=%v err=%v", persisted, ok, err)
 	}
 }
 
