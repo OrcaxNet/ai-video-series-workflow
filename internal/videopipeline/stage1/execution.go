@@ -163,9 +163,16 @@ func (p ExecutionPackage) Validate(plan Plan) error {
 	if _, err := uuid.Parse(post.GenerationPlanID); err != nil {
 		return errors.New("post-production generationPlanId must be a UUID")
 	}
-	if !post.Config.Enabled || post.Config.Evidence != postproduction.EvidenceLive ||
+	wantEvidence := postproduction.EvidenceLive
+	if plan.OfflineOnly {
+		wantEvidence = postproduction.EvidencePendingKey
+	}
+	if post.Config.Evidence != wantEvidence ||
 		!post.Config.BurnSubtitles || !post.Config.EnforcePoCDuration {
 		return errors.New("formal stage 1 post-production must freeze live evidence, subtitles, and PoC duration")
+	}
+	if !post.Config.Enabled && (!plan.OfflineOnly || plan.MaximumDialogueCharacters != 0) {
+		return errors.New("formal stage 1 post-production may be disabled only for an offline zero-dialogue package")
 	}
 	if err := post.Config.Validate(); err != nil {
 		return fmt.Errorf("stage 1 post-production package: %w", err)
@@ -306,8 +313,9 @@ func (j FrozenJob) validate(plan Plan) error {
 		j.Route.ModelID != plan.VideoModel || j.Route.Verification != providercontract.PendingKey {
 		return errors.New("route must freeze the approved formal video capability")
 	}
-	if j.BudgetMaximumMicros <= 0 || j.BudgetCurrency != "CNY" {
-		return errors.New("frozen VIDEO budget must be positive CNY")
+	if (!plan.OfflineOnly && j.BudgetMaximumMicros <= 0) ||
+		(plan.OfflineOnly && j.BudgetMaximumMicros != 0) || j.BudgetCurrency != "CNY" {
+		return errors.New("frozen VIDEO budget must match the approved CNY cash boundary")
 	}
 	if j.EstimatedVideoTokens <= 0 || j.PredictedAFPMilli <= 0 ||
 		j.EstimatedNonSubscriptionCashMicros < 0 {
