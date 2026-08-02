@@ -10,7 +10,7 @@ services:
     volumes:
       - video-postgres:/var/lib/postgresql/data
     ports:
-      - "${VIDEO_POSTGRES_PORT:-55432}:5432"
+      - "${VIDEO_BIND_ADDRESS:-127.0.0.1}:${VIDEO_POSTGRES_PORT:-55432}:5432"
     healthcheck:
       test:
         - CMD-SHELL
@@ -45,7 +45,7 @@ services:
       POSTGRES_PWD: ${VIDEO_POSTGRES_PASSWORD:-video-local-only}
       POSTGRES_SEEDS: postgres
     ports:
-      - "${VIDEO_TEMPORAL_PORT:-7233}:7233"
+      - "${VIDEO_BIND_ADDRESS:-127.0.0.1}:${VIDEO_TEMPORAL_PORT:-7233}:7233"
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,7 +67,7 @@ services:
       TEMPORAL_ADDRESS: temporal:7233
       TEMPORAL_CORS_ORIGINS: http://localhost:${VIDEO_TEMPORAL_UI_PORT:-8233}
     ports:
-      - "${VIDEO_TEMPORAL_UI_PORT:-8233}:8080"
+      - "${VIDEO_BIND_ADDRESS:-127.0.0.1}:${VIDEO_TEMPORAL_UI_PORT:-8233}:8080"
     depends_on:
       temporal:
         condition: service_healthy
@@ -89,7 +89,7 @@ services:
     volumes:
       - video-artifacts:/var/lib/video-pipeline/artifacts
     ports:
-      - "${VIDEO_MOCK_PROVIDER_PORT:-8090}:8090"
+      - "${VIDEO_BIND_ADDRESS:-127.0.0.1}:${VIDEO_MOCK_PROVIDER_PORT:-8090}:8090"
     healthcheck:
       test:
         - CMD
@@ -299,11 +299,12 @@ services:
       VIDEO_TEMPORAL_TASK_QUEUE: video-production-v1
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
       VIDEO_PROVIDER_ADAPTER_URL: ${VIDEO_PROVIDER_ADAPTER_URL:-http://mock-provider:8090}
+      VIDEO_LIVE_PROVIDER_CONFIGURED: ${VIDEO_LIVE_PROVIDER_CONFIGURED:-false}
       VIDEO_REQUIRE_DEPENDENCIES: "true"
     volumes:
       - video-artifacts:/var/lib/video-pipeline/artifacts
     ports:
-      - "${VIDEO_CONTROL_PLANE_PORT:-18080}:8080"
+      - "${VIDEO_BIND_ADDRESS:-127.0.0.1}:${VIDEO_CONTROL_PLANE_PORT:-18080}:8080"
     depends_on:
       postgres:
         condition: service_healthy
@@ -321,6 +322,39 @@ services:
         - -O
         - /dev/null
         - http://127.0.0.1:8080/health/ready
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [video-backplane]
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    restart: unless-stopped
+
+  studio:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        VITE_STUDIO_MODE: local-experience
+        VITE_API_BASE: /api/v1
+    image: ai-video-series-studio:${VIDEO_BUILD_VERSION:-dev}
+    ports:
+      - "${VIDEO_BIND_ADDRESS:-127.0.0.1}:${VIDEO_STUDIO_PORT:-4173}:8080"
+    depends_on:
+      control-plane:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - -q
+        - -O
+        - /dev/null
+        - http://127.0.0.1:8080/health/studio
       interval: 5s
       timeout: 3s
       retries: 20

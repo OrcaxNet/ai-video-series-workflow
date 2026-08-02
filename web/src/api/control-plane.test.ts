@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiProblem, type ApprovalInput, type CreateJobAttemptInput, type GateId } from "../domain";
 import { gates, jobs } from "../mock-data";
-import { HttpControlPlaneApi, MockControlPlaneApi } from "./control-plane";
+import { HttpControlPlaneApi, LocalExperienceControlPlaneApi, MockControlPlaneApi } from "./control-plane";
 
 const input = (
   gateId: GateId,
@@ -472,5 +472,43 @@ describe("HttpControlPlaneApi", () => {
       errorCode: "LIVE_PROJECTION_BINDINGS_REQUIRED",
     });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("LocalExperienceControlPlaneApi", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("loads live provider status while retaining deterministic rehearsal mutations", async () => {
+    const providerStatus = {
+      capabilities: [
+        {
+          alias: "video.primary",
+          liveConfigured: true,
+          liveCallsEnabled: false,
+          dryRunAvailable: true,
+          mockAvailable: true,
+          defaultProvider: "volcengine_ark",
+          liveEvidence: "pending_key_validation",
+          mockEvidence: "mock_only",
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify(providerStatus), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const api = new LocalExperienceControlPlaneApi("/api/v1");
+
+    await expect(api.getProviderStatus()).resolves.toEqual(providerStatus.capabilities);
+    await expect(api.createSeries(projectInput, "local-experience-project")).resolves.toMatchObject({
+      state: "ACCEPTED",
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledWith("/api/v1/providers/status", expect.any(Object));
   });
 });

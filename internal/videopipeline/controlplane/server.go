@@ -213,7 +213,11 @@ type providerCapabilityStatus struct {
 }
 
 func (s *Server) providerStatus(w http.ResponseWriter, _ *http.Request) {
-	arkConfigured := anyEnvironmentSet("ARK_API_KEY")
+	// Credential-isolated deployments do not give the control plane the Ark
+	// secret. The non-secret marker is set only when Compose also starts and
+	// routes to the live adapter; it reports configuration, never validation.
+	arkConfigured := anyEnvironmentSet("ARK_API_KEY") ||
+		strings.EqualFold(strings.TrimSpace(os.Getenv("VIDEO_LIVE_PROVIDER_CONFIGURED")), "true")
 	claudeConfigured := anyEnvironmentSet("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 	statuses := []providerCapabilityStatus{
