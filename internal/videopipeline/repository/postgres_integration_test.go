@@ -2745,6 +2745,80 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if linkedPostArtifacts != 5 {
 		t.Fatalf("linked post-production artifacts = %d, want 5", linkedPostArtifacts)
 	}
+	// A corrected post-production revision commonly reuses the exact UTF-8 SRT
+	// bytes while producing new dialogue/video/manifest bytes. The CAS artifact
+	// must remain valid for both historical manifest hashes, and the new
+	// Generation Manifest projection must expose the selected current binding.
+	revisedPostResult := postResult
+	revisedPostResult.Dialogue = putPostArtifact(
+		"dialogue_audio", "audio/wav", "revised fixture dialogue "+episodeRevisionID.String(),
+		5_000, 0, 0, 0,
+	)
+	revisedPostResult.FinalVideo = putPostArtifact(
+		"final_video", "video/mp4", "revised fixture final video "+episodeRevisionID.String(),
+		5_000, 1280, 720, 24,
+	)
+	revisedPostResult.Manifest = putPostArtifact(
+		"postproduction_manifest",
+		"application/vnd.video-series.postproduction-manifest+json",
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q,"revision":2}`,
+			episodeRevisionID.String(),
+		),
+		0, 0, 0, 0,
+	)
+	revisedPostResult.ServiceBOM = putPostArtifact(
+		"service_bom",
+		"application/vnd.video-series.service-bom+json",
+		fmt.Sprintf(
+			`{"schemaVersion":"v1","evidence":"mock_only","episodeRevisionId":%q,"revision":2,"components":[]}`,
+			episodeRevisionID.String(),
+		),
+		0, 0, 0, 0,
+	)
+	revisedPostResult.ManifestHash = revisedPostResult.Manifest.Digest
+	revisedPostResult.ServiceBOMHash = revisedPostResult.ServiceBOM.Digest
+	revisedPostResult.CommandPlanHash = strings.Repeat("e", 64)
+	if err := store.CommitEpisodePostProduction(ctx, step, finalizeInput, revisedPostResult); err != nil {
+		t.Fatalf("commit corrected post-production revision with reused SRT: %v", err)
+	}
+	revisedManifestPayload, err := store.BuildEpisodeManifest(ctx, step, orchestration.CreateGate3Input{
+		EpisodeRevisionID: episodeRevisionID.String(), RunIDs: []string{run.RunID},
+		GenerationPlanID:              plan.Value.GenerationPlanID,
+		PostProductionManifestHash:    revisedPostResult.ManifestHash,
+		BackgroundAudioAssetVersionID: musicAssetVersionID.String(),
+		TraceID:                       step.TraceID,
+	})
+	if err != nil {
+		t.Fatalf("build corrected Generation Manifest with reused SRT: %v", err)
+	}
+	var revisedManifest struct {
+		ProviderExecutions []struct {
+			Artifacts []struct {
+				ContentHash string `json:"content_hash"`
+				MediaSpec   struct {
+					Kind                       string `json:"kind"`
+					PostProductionManifestHash string `json:"postProductionManifestHash"`
+				} `json:"media_spec"`
+			} `json:"artifacts"`
+		} `json:"providerExecutions"`
+	}
+	if err := json.Unmarshal(revisedManifestPayload, &revisedManifest); err != nil {
+		t.Fatal(err)
+	}
+	foundReusedSubtitle := false
+	for _, execution := range revisedManifest.ProviderExecutions {
+		for _, artifact := range execution.Artifacts {
+			if artifact.ContentHash == postResult.Subtitle.Digest &&
+				artifact.MediaSpec.Kind == "subtitle_srt" &&
+				artifact.MediaSpec.PostProductionManifestHash == revisedPostResult.ManifestHash {
+				foundReusedSubtitle = true
+			}
+		}
+	}
+	if !foundReusedSubtitle {
+		t.Fatal("corrected Generation Manifest omitted the reused SRT current binding")
+	}
 	oldPostManifestHash := fixtureDigest("old post-production manifest")
 	oldFinalVideoHash := fixtureDigest("old final video")
 	oldSubtitleHash := fixtureDigest("old subtitle")

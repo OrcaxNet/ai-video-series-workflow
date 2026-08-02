@@ -2839,8 +2839,9 @@ func (p *Postgres) CommitEpisodePostProduction(
 				"kind": output.artifact.Kind, "durationMillis": output.artifact.DurationMillis,
 				"width": output.artifact.Width, "height": output.artifact.Height,
 				"fps": output.artifact.FPS, "evidence": result.Evidence,
-				"postProductionManifestHash": result.ManifestHash,
-				"speechCost":                 speechCost,
+				"postProductionManifestHash":   result.ManifestHash,
+				"postProductionManifestHashes": []string{result.ManifestHash},
+				"speechCost":                   speechCost,
 			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO video_pipeline.artifacts
@@ -2885,6 +2886,36 @@ func (p *Postgres) CommitEpisodePostProduction(
 				return struct{}{}, fmt.Errorf(
 					"artifact %s content hash is already bound to incompatible metadata",
 					output.artifact.Kind,
+				)
+			}
+			// Content-addressed artifacts such as an unchanged UTF-8 SRT can be
+			// reused by a later post-production revision. Preserve the original
+			// singular binding for historical manifests and append the new
+			// revision to an explicit membership set.
+			if _, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.artifacts
+				SET media_spec = jsonb_set(
+				      media_spec,
+				      '{postProductionManifestHashes}',
+				      CASE
+				        WHEN jsonb_typeof(media_spec->'postProductionManifestHashes') = 'array'
+				          THEN media_spec->'postProductionManifestHashes'
+				        ELSE '[]'::jsonb
+				      END || jsonb_build_array($2::text),
+				      true
+				    )
+				WHERE id = $1
+				  AND COALESCE(media_spec->>'postProductionManifestHash', '') <> $2
+				  AND NOT (
+				    CASE
+				      WHEN jsonb_typeof(media_spec->'postProductionManifestHashes') = 'array'
+				        THEN media_spec->'postProductionManifestHashes'
+				      ELSE '[]'::jsonb
+				    END ? $2
+				  )`, artifactID, result.ManifestHash); err != nil {
+				return struct{}{}, fmt.Errorf(
+					"bind reused %s artifact to post-production revision: %w",
+					output.artifact.Kind, err,
 				)
 			}
 			for _, runID := range runIDs {
@@ -3003,10 +3034,21 @@ func (p *Postgres) BuildEpisodeManifest(
 			  'artifacts', COALESCE((
 			    SELECT jsonb_agg(
 			      to_jsonb(a) || jsonb_build_object(
-			        'role', ra.role,
-			        'media_spec', a.media_spec || jsonb_build_object(
-			          'kind', COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video')
-			        )
+				        'role', ra.role,
+				        'media_spec', a.media_spec || jsonb_build_object(
+				          'kind', COALESCE(NULLIF(a.media_spec->>'kind', ''), 'shot_video'),
+				          'postProductionManifestHash', CASE
+				            WHEN $3 <> '' AND (
+				              a.media_spec->>'postProductionManifestHash' = $3
+				              OR CASE
+				                WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+				                  THEN a.media_spec->'postProductionManifestHashes'
+				                ELSE '[]'::jsonb
+				              END ? $3
+				            ) THEN $3
+				            ELSE a.media_spec->>'postProductionManifestHash'
+				          END
+				        )
 			      )
 			      ORDER BY ra.role, a.id
 			    )
@@ -3019,7 +3061,14 @@ func (p *Postgres) BuildEpisodeManifest(
 			        NOT (a.media_spec ? 'postProductionManifestHash')
 			        OR (
 			          $3 <> ''
-			          AND a.media_spec->>'postProductionManifestHash' = $3
+			          AND (
+			            a.media_spec->>'postProductionManifestHash' = $3
+			            OR CASE
+			              WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+			                THEN a.media_spec->'postProductionManifestHashes'
+			              ELSE '[]'::jsonb
+			            END ? $3
+			          )
 			        )
 			      )
 			  ), '[]'::jsonb),
@@ -3156,7 +3205,14 @@ func (p *Postgres) BuildEpisodeManifest(
 		    OR
 		    ($2 <> ''
 		     AND a.media_spec->>'kind' = 'final_video'
-		     AND a.media_spec->>'postProductionManifestHash' = $2)
+		     AND (
+		       a.media_spec->>'postProductionManifestHash' = $2
+		       OR CASE
+		         WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+		           THEN a.media_spec->'postProductionManifestHashes'
+		         ELSE '[]'::jsonb
+		       END ? $2
+		     ))
 		  )
 		ORDER BY a.artifact_uri`,
 		runIDs, input.PostProductionManifestHash,
@@ -3676,7 +3732,14 @@ func requireActivePostProductionArtifacts(
 		FROM video_pipeline.run_artifacts ra
 		JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
 		WHERE ra.generation_run_id = ANY($1::uuid[])
-		  AND a.media_spec->>'postProductionManifestHash' = $2
+		  AND (
+		    a.media_spec->>'postProductionManifestHash' = $2
+		    OR CASE
+		      WHEN jsonb_typeof(a.media_spec->'postProductionManifestHashes') = 'array'
+		        THEN a.media_spec->'postProductionManifestHashes'
+		      ELSE '[]'::jsonb
+		    END ? $2
+		  )
 		  AND a.status = 'ACTIVE'
 		ORDER BY ra.generation_run_id, a.media_spec->>'kind', a.id
 		FOR SHARE OF ra, a`,
