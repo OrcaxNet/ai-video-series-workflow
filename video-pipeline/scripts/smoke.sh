@@ -32,7 +32,7 @@ migration_dirty="$(docker exec "${postgres_container}" psql -U video -d video_pi
 test "${migration_version}" = "9"
 test "${migration_dirty}" = "f"
 table_count="$(docker exec "${postgres_container}" psql -U video -d video_pipeline -Atc "SELECT count(*) FROM information_schema.tables WHERE table_schema='video_pipeline';")"
-test "${table_count}" -ge 52
+test "${table_count}" -ge 53
 
 postgres_user="${VIDEO_POSTGRES_USER:-video}"
 postgres_password="${VIDEO_POSTGRES_PASSWORD:-video-local-only}"
