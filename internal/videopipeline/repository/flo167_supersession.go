@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
@@ -18,6 +19,7 @@ import (
 const (
 	flo167A01ActualAFPMilli      int64 = 2_007_900
 	flo167RemainingVideoAFPMilli int64 = 28_298_970
+	flo167LegacyTerminalHash           = "7ea9cfb63b3c54fa46583cf5abdb0bc67d323eead9ab4f45e9187e9700dcf0e0"
 )
 
 type flo167PaidBoundary struct {
@@ -127,12 +129,13 @@ func requireFLO167Supersession(
 	}
 	var package_ stage1.FLO167SupersessionPackage
 	var projection stage1.FLO167CanonicalProjection
-	if err := json.Unmarshal(packageJSON, &package_); err != nil || package_.Validate() != nil ||
-		json.Unmarshal(projectionJSON, &projection) != nil || projection.Validate() != nil ||
+	if err := json.Unmarshal(packageJSON, &package_); err != nil ||
+		json.Unmarshal(projectionJSON, &projection) != nil || stage1.ValidateFLO167Artifacts(package_, projection) != nil ||
 		projection.ContentHash != projectionHash || projection.SupersessionPackageHash != packageHash ||
 		!reflect.DeepEqual(projection.Shots, package_.Shots) ||
 		package_.ContentHash != packageHash || package_.LegacyExecutionPackageHash != authority.ExecutionPackageHash ||
-		package_.LegacyProjectionHash != authority.ProjectionHash || package_.LegacyAuthorizationHash != authority.SourceAuthorizationHash {
+		package_.LegacyProjectionHash != authority.ProjectionHash || package_.LegacyAuthorizationHash != authority.SourceAuthorizationHash ||
+		package_.LegacyTerminalLedgerHash != flo167LegacyTerminalHash {
 		return nil, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "FLO-167 package is invalid or differs from legacy lineage")
 	}
 	packageShot, ok := package_.Shot(shot.ShotID)
@@ -174,6 +177,20 @@ func requireFLO167Supersession(
 	if state == "v3_authorized_A02_A10" && shot.ShotID != "GOLD-A02" {
 		return nil, controlplane.NewPolicyError(controlplane.CodeForbidden, "FLO-167 continuation must begin with GOLD-A02", "submit the exact next shot")
 	}
+	if authority.Run.Ordinal > 2 {
+		var priorTerminalCount int
+		if err := tx.QueryRow(ctx, `SELECT count(*)
+			FROM video_pipeline.stage1_live_supersession_terminal_ledger tl
+			JOIN video_pipeline.stage1_live_supersession_shots ss
+			  ON ss.supersession_id=tl.supersession_id AND ss.shot_id=tl.shot_id
+			WHERE tl.supersession_id=$1 AND ss.ordinal >= 2 AND ss.ordinal < $2`,
+			result.SupersessionID, authority.Run.Ordinal).Scan(&priorTerminalCount); err != nil {
+			return nil, fmt.Errorf("verify FLO-167 continuation order: %w", err)
+		}
+		if priorTerminalCount != authority.Run.Ordinal-2 {
+			return nil, controlplane.NewPolicyError(controlplane.CodeForbidden, "FLO-167 continuation has an unfinished prior shot", "complete each shot in ordinal order")
+		}
+	}
 	var completedSet []string
 	if err := json.Unmarshal(completedSetJSON, &completedSet); err != nil {
 		return nil, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "FLO-167 completed set is invalid")
@@ -198,23 +215,34 @@ func reserveFLO167AFP(
 		return nil
 	}
 	snapshot := input.SubscriptionQuotaSnapshot
-	if snapshot == nil || snapshot.SchemaVersion != flo100QuotaSchema || snapshot.CapturedAt.IsZero() ||
+	if snapshot == nil || snapshot.SchemaVersion != flo100QuotaSchema || strings.TrimSpace(snapshot.Source) == "" || snapshot.CapturedAt.IsZero() ||
 		snapshot.CapturedAt.After(now.Add(30*time.Second)) || now.Sub(snapshot.CapturedAt) > 300*time.Second ||
 		snapshot.AccountID == "" || snapshot.Profile != flo100AgentPlanProfile || snapshot.Region != flo100AgentPlanRegion ||
 		snapshot.BillingMode != "subscription_included_only" ||
 		snapshot.MonthlyUsedAFPMilli < 0 || snapshot.MonthlyTotalAFPMilli <= 0 || snapshot.ExternalReservedAFPMilli < 0 ||
 		snapshot.FiveHourUsedAFPMilli < 0 || snapshot.FiveHourTotalAFPMilli <= 0 ||
-		snapshot.WeeklyUsedAFPMilli < 0 || snapshot.WeeklyTotalAFPMilli <= 0 {
+		snapshot.WeeklyUsedAFPMilli < 0 || snapshot.WeeklyTotalAFPMilli <= 0 ||
+		snapshot.FiveHourUsedAFPMilli > snapshot.FiveHourTotalAFPMilli ||
+		snapshot.WeeklyUsedAFPMilli > snapshot.WeeklyTotalAFPMilli ||
+		snapshot.MonthlyUsedAFPMilli > snapshot.MonthlyTotalAFPMilli {
 		return controlplane.NewPolicyError(controlplane.CodeBudgetExceeded, "FLO-167 quota snapshot is stale or incomplete", "refresh quota within 300 seconds")
 	}
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7100167)`); err != nil {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(7100165)`); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(ctx, `UPDATE video_pipeline.stage1_agent_plan_afp_reservations
+		SET status='RELEASED' WHERE activation_id=$1 AND status='RESERVED'`, authority.ActivationID); err != nil {
+		return fmt.Errorf("release superseded FLO-100 AFP reservation: %w", err)
+	}
 	var otherReserved int64
-	if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(total_afp_milli),0)
-		FROM video_pipeline.stage1_live_supersession_afp_reservations
-		WHERE account_id=$1 AND profile=$2 AND region=$3 AND status='RESERVED' AND supersession_id<>$4`,
-		snapshot.AccountID, snapshot.Profile, snapshot.Region, boundary.SupersessionID).Scan(&otherReserved); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(total_afp_milli),0) FROM (
+		SELECT total_afp_milli FROM video_pipeline.stage1_agent_plan_afp_reservations
+		 WHERE account_id=$1 AND profile=$2 AND region=$3 AND status='RESERVED' AND activation_id<>$5
+		UNION ALL
+		SELECT total_afp_milli FROM video_pipeline.stage1_live_supersession_afp_reservations
+		 WHERE account_id=$1 AND profile=$2 AND region=$3 AND status='RESERVED' AND supersession_id<>$4
+		) reservations`, snapshot.AccountID, snapshot.Profile, snapshot.Region, boundary.SupersessionID,
+		authority.ActivationID).Scan(&otherReserved); err != nil {
 		return fmt.Errorf("read FLO-167 concurrent reservations: %w", err)
 	}
 	required := flo167RemainingVideoAFPMilli + flo100SpeechAFPMilli
@@ -275,12 +303,8 @@ func reserveFLO167AFP(
 		storedSpeech != flo100SpeechAFPMilli || storedStatus != "RESERVED" {
 		return controlplane.NewConflictError(controlplane.CodeRevisionConflict, "existing FLO-167 inherited reservation drifted")
 	}
-	// All A02-A10 submissions inherit the first reservation. Fresh quota is
-	// still captured per submit, while the immutable reservation retains its
-	// original evidence snapshot.
-	if storedSnapshotID != snapshotID {
-		boundary.QuotaSnapshotID = storedSnapshotID
-	}
+	// The reservation retains its first evidence snapshot; the submission uses
+	// the fresh snapshot captured for this exact paid-boundary transaction.
 	if _, err := tx.Exec(ctx, `UPDATE video_pipeline.stage1_live_supersessions
 		SET state='quota_reserved' WHERE id=$1 AND state='v3_authorized_A02_A10'`, boundary.SupersessionID); err != nil {
 		return err

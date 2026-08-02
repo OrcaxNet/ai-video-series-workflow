@@ -123,6 +123,23 @@ func (s *runnerTruthFixture) PrepareProviderJob(
 		BudgetCurrency:      frozen.BudgetCurrency,
 		ProviderProfileID:   frozen.ProviderProfileID, Route: frozen.Route,
 	}
+	if input.ExpectedProductTruth != nil && input.ExpectedProductTruth.SupersessionPackageHash != "" {
+		expected := input.ExpectedProductTruth
+		truth.LiveActivationID = expected.LiveActivationID
+		truth.ExecutionPackageHash = expected.ExecutionPackageHash
+		truth.SourceCodeCommit = expected.SourceCodeCommit
+		truth.EstimatedVideoTokens = expected.EstimatedVideoTokens
+		truth.PredictedAFPMilli = expected.PredictedAFPMilli
+		truth.BillingMode = expected.BillingMode
+		truth.SupersessionPackageHash = expected.SupersessionPackageHash
+		truth.DurationPricing = expected.DurationPricing
+		truth.RouteBindingHash = expected.RouteBindingHash
+		truth.G1BindingHash = expected.G1BindingHash
+		truth.G2BindingHash = expected.G2BindingHash
+		truth.SafetyBindingHash = expected.SafetyBindingHash
+		truth.CanonicalInputHash = expected.CanonicalInputHash
+		truth.SemanticInputHash = expected.SemanticInputHash
+	}
 	if s.productTruthDrift {
 		truth.GenerationPlanID = uuid.NewString()
 	}
@@ -871,6 +888,60 @@ func TestRunnerRejectsControlledRetryBeforePromotingSpeechV2Package(t *testing.T
 	}
 }
 
+func TestNewRunnerWithFLO167SupersessionSubmitsA02AfterLegacyA01(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	plan := testFLO167Plan()
+	legacy := testFLO167LegacyExecutionPackage(t, plan)
+	supersession := validFLO167Package(t)
+	supersession.LegacyExecutionPackageHash = legacy.ContentHash
+	supersession.LegacyAuthorizationHash = legacy.LiveActivation.SourceAuthorizationHash
+	var err error
+	supersession, err = SealFLO167SupersessionPackage(supersession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := Open(plan, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindExecutionPackage(legacy.ContentHash); err != nil {
+		t.Fatal(err)
+	}
+	a01 := attemptFromFrozen(legacy.PrimaryJobs[0], nil)
+	if _, err := gate.Authorize(a01); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Complete(a01.IdempotencyKey, Completion{State: "TERMINAL_SUCCEEDED", ProviderTaskID: "legacy-a01",
+		ActualVideoTokens: 87_300, ActualAFPMilli: 2_007_900, EvidenceComplete: true}); err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	fixture := &runnerAdapterFixture{job: successfulRunnerJob(digest)}
+	server := httptest.NewServer(http.HandlerFunc(fixture.handler))
+	defer server.Close()
+	adapter, err := NewAdapterSubmitter(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := NewRunnerWithFLO167Supersession(gate, adapter,
+		runnerArtifactFixture{digests: map[string]bool{digest: true}},
+		&runnerTruthFixture{executionPackage: legacy}, legacy, supersession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := runner.Submit(context.Background(), SubmitInput{ShotID: "GOLD-A02"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ProviderTaskID == "" {
+		t.Fatal("A02 submission returned no provider task")
+	}
+	_, posts := fixture.counts()
+	if posts != 1 {
+		t.Fatalf("provider posts=%d, want 1", posts)
+	}
+}
+
 func newTestRunner(t *testing.T, path string, server *httptest.Server, digest string) *Runner {
 	t.Helper()
 	gate, err := Open(testPlan(), path)
@@ -922,6 +993,53 @@ func successfulRunnerJob(digest string) providercontract.JobResponse {
 			BillingMode: "subscription", Verified: true,
 		},
 	}
+}
+
+func testFLO167Plan() Plan {
+	plan := testPlan()
+	plan.BatchID = "flo100-gold-a-v1"
+	plan.PrimaryShotIDs = SortedFLO167ShotIDs()
+	plan.MonthlyBaselineAFPMilli = 0
+	plan.MonthlyMaximumAFPMilli = FLO100MonthlyAFPCapMilli
+	plan.MaximumCashMicros = 0
+	plan.MaximumDialogueCharacters = 7
+	plan.MaximumTTSAFPMilli = FLO100BatchASpeechAFPMilli
+	plan.SubscriptionIncludedOnly = true
+	return plan
+}
+
+func testFLO167LegacyExecutionPackage(t *testing.T, plan Plan) ExecutionPackage {
+	t.Helper()
+	package_ := testExecutionPackage(t)
+	package_.BatchID = plan.BatchID
+	package_.PrimaryJobs = append([]FrozenJob(nil), package_.PrimaryJobs...)
+	package_.PostProduction.RunIDs = append([]string(nil), package_.PostProduction.RunIDs...)
+	for index := range package_.PrimaryJobs {
+		package_.PrimaryJobs[index].ShotID = plan.PrimaryShotIDs[index]
+		package_.PrimaryJobs[index].BudgetMaximumMicros = 0
+		package_.PrimaryJobs[index].EstimatedNonSubscriptionCashMicros = 0
+		package_.PrimaryJobs[index].BillingMode = providercontract.BillingModeSubscriptionIncludedOnly
+		package_.PrimaryJobs[index].ActivityID = "submit-" + plan.PrimaryShotIDs[index]
+		package_.PrimaryJobs[index].TraceID = "flo100-" + plan.PrimaryShotIDs[index]
+	}
+	package_.LiveActivation = &LiveActivationBinding{
+		ActivationID:                uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo167-activation")).String(),
+		OfflineExecutionPackageHash: strings.Repeat("1", 64),
+		SourceAuthorizationHash:     strings.Repeat("2", 64),
+		SourceCodeCommit:            strings.Repeat("3", 40),
+		G1DecisionID:                uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo167-g1")).String(),
+		G2DecisionID:                uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo167-g2")).String(),
+		SafetyDecisionID:            uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo167-safety")).String(),
+	}
+	var err error
+	package_, err = SealExecutionPackage(package_)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := package_.Validate(plan); err != nil {
+		t.Fatal(err)
+	}
+	return package_
 }
 
 func testExecutionPackage(t *testing.T) ExecutionPackage {

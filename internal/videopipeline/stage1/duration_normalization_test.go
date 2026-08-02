@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -158,6 +159,48 @@ func TestFLO167CanonicalMaterializationIsStable(t *testing.T) {
 	var deliveredProjection FLO167CanonicalProjection
 	if json.Unmarshal(projectionBytes, &deliveredProjection) != nil || !reflect.DeepEqual(deliveredProjection, projection) {
 		t.Fatal("delivered projection differs from independently materialized frozen evidence")
+	}
+}
+
+func TestValidateFLO167ArtifactsRejectsIndependentlyResealedTerminalHash(t *testing.T) {
+	package_ := validFLO167Package(t)
+	projection := validFLO167Projection(t, package_)
+	package_.LegacyTerminalLedgerHash = strings.Repeat("f", 64)
+	var err error
+	package_, err = SealFLO167SupersessionPackage(package_)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateFLO167Artifacts(package_, projection); err == nil {
+		t.Fatal("independently resealed terminal hash was accepted")
+	}
+}
+
+func TestGateFLO167UsesDurationBindingForLegacyAndNewAttempts(t *testing.T) {
+	plan := testPlan()
+	plan.PrimaryShotIDs = SortedFLO167ShotIDs()
+	gate, err := Open(plan, filepath.Join(t.TempDir(), "ledger.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := Attempt{AttemptID: "legacy-a01", ShotID: "GOLD-A01", IdempotencyKey: "legacy-a01",
+		EstimatedVideoTokens: 87_300, PredictedAFPMilli: FLO167ReferenceAFPMilli}
+	if _, err := gate.Authorize(legacy); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Complete(legacy.IdempotencyKey, Completion{ProviderTaskID: "legacy-task", ActualVideoTokens: 87_300,
+		ActualAFPMilli: 2_007_900, EvidenceComplete: true, State: "TERMINAL_SUCCEEDED"}); err != nil {
+		t.Fatal(err)
+	}
+	package_ := validFLO167Package(t)
+	if err := gate.BindFLO167Supersession(package_); err != nil {
+		t.Fatal(err)
+	}
+	a02, _ := package_.Shot("GOLD-A02")
+	decision, err := gate.Inspect(Attempt{AttemptID: "v3-a02", ShotID: "GOLD-A02", IdempotencyKey: "v3-a02",
+		EstimatedVideoTokens: 100_000, PredictedAFPMilli: a02.Pricing.ExpectedAFPMilli})
+	if err != nil || decision != DecisionSubmit {
+		t.Fatalf("duration-normalized A02 decision=%s err=%v", decision, err)
 	}
 }
 

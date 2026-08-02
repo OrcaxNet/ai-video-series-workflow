@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"reflect"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
 )
@@ -36,14 +35,8 @@ func run(args []string, output io.Writer) error {
 		if err := decodeFile(args[2], &projection); err != nil {
 			return fmt.Errorf("read FLO-167 canonical projection: %w", err)
 		}
-		if err := package_.Validate(); err != nil {
+		if err := stage1.ValidateFLO167Artifacts(package_, projection); err != nil {
 			return err
-		}
-		if err := projection.Validate(); err != nil {
-			return err
-		}
-		if projection.SupersessionPackageHash != package_.ContentHash || !reflect.DeepEqual(projection.Shots, package_.Shots) {
-			return errors.New("FLO-167 package and projection bindings differ")
 		}
 		return encodePackage(output, projection)
 	}

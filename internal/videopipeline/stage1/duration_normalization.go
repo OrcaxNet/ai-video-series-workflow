@@ -217,6 +217,32 @@ func (p FLO167CanonicalProjection) Validate() error {
 	return nil
 }
 
+// ValidateFLO167Artifacts verifies the package and projection as one authority.
+// In particular, the frozen A01 ledger hash may not be independently replaced
+// and resealed in either artifact.
+func ValidateFLO167Artifacts(package_ FLO167SupersessionPackage, projection FLO167CanonicalProjection) error {
+	if err := package_.Validate(); err != nil {
+		return err
+	}
+	if err := projection.Validate(); err != nil {
+		return err
+	}
+	if projection.SupersessionPackageHash != package_.ContentHash ||
+		!equalFLO167Shots(projection.Shots, package_.Shots) {
+		return errors.New("FLO-167 package and projection bindings differ")
+	}
+	if package_.LegacyTerminalLedgerHash != projection.A01Terminal.LedgerSHA256 {
+		return errors.New("FLO-167 legacy terminal ledger hash differs between package and projection")
+	}
+	return nil
+}
+
+func equalFLO167Shots(left, right []FLO167ShotBinding) bool {
+	leftJSON, leftErr := json.Marshal(left)
+	rightJSON, rightErr := json.Marshal(right)
+	return leftErr == nil && rightErr == nil && string(leftJSON) == string(rightJSON)
+}
+
 func (p FLO167SupersessionPackage) Shot(shotID string) (FLO167ShotBinding, bool) {
 	for _, shot := range p.Shots {
 		if shot.ShotID == shotID {

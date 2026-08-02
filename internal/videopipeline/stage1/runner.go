@@ -191,6 +191,11 @@ func newRunner(
 			return nil, err
 		}
 	}
+	if supersession != nil {
+		if err := gate.BindFLO167Supersession(*supersession); err != nil {
+			return nil, err
+		}
+	}
 	executor, err := NewExecutor(gate, adapter)
 	if err != nil {
 		return nil, err

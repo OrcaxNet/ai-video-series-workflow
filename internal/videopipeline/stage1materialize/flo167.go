@@ -19,6 +19,7 @@ const (
 	flo167LegacyAuthorizationHash = "7bf55cad2a4f81f54eb6617bbab81fd21f789785ce1176213014f5833ce4ac25"
 	flo167LegacyExecutionHash     = "6a7c03ed869c427d23cc6b669e7938ba271c8343b3e4627e85cd93ea50fffd2e"
 	flo167LegacyProjectionHash    = "c0d2d316867c79d1ebc419dec3a68fe29c947cd184d21a2b11e45c6224013202"
+	flo167LegacyTerminalHash      = "7ea9cfb63b3c54fa46583cf5abdb0bc67d323eead9ab4f45e9187e9700dcf0e0"
 	flo167LegacyStopHash          = "dd1954608254791425d7574fe7333d1c1d7cd77cb843572f79d84a3dbeadea76"
 )
 
@@ -59,16 +60,16 @@ func MaterializeFLO167Supersession(ctx context.Context, pool *pgxpool.Pool, inpu
 	if err != nil {
 		return errors.New("legacy activation id must be a UUID")
 	}
-	if err := input.Package.Validate(); err != nil {
-		return fmt.Errorf("validate FLO-167 package: %w", err)
+	if err := stage1.ValidateFLO167Artifacts(input.Package, input.Projection); err != nil {
+		return fmt.Errorf("validate FLO-167 artifacts: %w", err)
 	}
-	if err := input.Projection.Validate(); err != nil || input.Projection.SupersessionPackageHash != input.Package.ContentHash ||
-		!reflect.DeepEqual(input.Projection.Shots, input.Package.Shots) || input.CreatedAt.IsZero() {
+	if input.CreatedAt.IsZero() {
 		return errors.New("FLO-167 projection hash or creation time is invalid")
 	}
 	if input.Package.LegacyAuthorizationHash != flo167LegacyAuthorizationHash ||
 		input.Package.LegacyExecutionPackageHash != flo167LegacyExecutionHash ||
 		input.Package.LegacyProjectionHash != flo167LegacyProjectionHash ||
+		input.Package.LegacyTerminalLedgerHash != flo167LegacyTerminalHash ||
 		input.Package.LegacyStopEvidenceHash != flo167LegacyStopHash {
 		return errors.New("FLO-167 package does not reference the frozen v2 lineage")
 	}
@@ -95,6 +96,9 @@ func MaterializeFLO167Supersession(ctx context.Context, pool *pgxpool.Pool, inpu
 	}
 	if authHash != flo167LegacyAuthorizationHash || executionHash != flo167LegacyExecutionHash || projectionHash != flo167LegacyProjectionHash {
 		return errors.New("stored FLO-167 legacy activation drifted")
+	}
+	if err := verifyFLO167LegacyTerminal(ctx, tx, activationID, input.Projection.A01Terminal); err != nil {
+		return err
 	}
 	supersessionID := uuid.NewSHA1(activationID, []byte("flo167-duration-normalized-v3"))
 	if _, err := tx.Exec(ctx, `INSERT INTO video_pipeline.stage1_live_supersessions
@@ -169,6 +173,52 @@ func MaterializeFLO167Supersession(ctx context.Context, pool *pgxpool.Pool, inpu
 		return errors.New("FLO-167 materialization does not contain exactly ten shots")
 	}
 	return tx.Commit(ctx)
+}
+
+func verifyFLO167LegacyTerminal(
+	ctx context.Context,
+	tx pgx.Tx,
+	activationID uuid.UUID,
+	expected stage1.FLO167LegacyTerminal,
+) error {
+	var rowCount int
+	var taskID, requestID, state, artifactHash string
+	var videoTokens, actualCashMicros int64
+	err := tx.QueryRow(ctx, `
+		SELECT count(*) OVER (),pj.upstream_task_id,pj.upstream_request_id,pj.state,
+		       a.content_hash,
+		       COALESCE((a.media_spec->'usage'->>'video_tokens')::bigint,0),
+		       cl.amount_micros
+		FROM video_pipeline.stage1_live_activation_runs ar
+		JOIN video_pipeline.generation_runs gr ON gr.id=ar.run_id
+		JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id=ar.run_id
+		JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id=ga.id
+		JOIN video_pipeline.budget_reservations br ON br.id=pj.budget_reservation_id
+		JOIN video_pipeline.run_artifacts ra ON ra.generation_run_id=ar.run_id AND ra.role='OUTPUT'
+		JOIN video_pipeline.artifacts a ON a.id=ra.artifact_id
+		JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id=pj.id AND cl.entry_type='ACTUAL' AND cl.verified
+		WHERE ar.activation_id=$1 AND ar.ordinal=1
+		  AND gr.state='SUCCEEDED' AND ga.state='SUCCEEDED' AND pj.state='SUCCEEDED'
+		  AND br.status='SETTLED' AND a.status='ACTIVE'
+		  AND a.artifact_uri='cas://sha256/'||a.content_hash
+		  AND cl.budget_reservation_id=br.id AND cl.currency='CNY'
+		  AND cl.units=$2 AND cl.unit_name='video_tokens'
+		  AND cl.pricing_rule_version=br.pricing_rule_version
+		  AND (SELECT count(*) FROM video_pipeline.provider_jobs p WHERE p.generation_attempt_id=ga.id)=1
+		  AND (SELECT count(*) FROM video_pipeline.run_artifacts r WHERE r.generation_run_id=ar.run_id AND r.role='OUTPUT')=1
+		  AND (SELECT count(*) FROM video_pipeline.cost_ledger c
+		       WHERE c.provider_job_id=pj.id AND c.entry_type='ACTUAL')=1`, activationID, expected.ActualVideoTokens).Scan(
+		&rowCount, &taskID, &requestID, &state, &artifactHash, &videoTokens, &actualCashMicros,
+	)
+	if err != nil {
+		return fmt.Errorf("verify frozen FLO-167 A01 terminal facts: %w", err)
+	}
+	if rowCount != 1 || state != "SUCCEEDED" || taskID != expected.ProviderTaskID ||
+		requestID != expected.ProviderRequestID || artifactHash != expected.ArtifactSHA256 ||
+		videoTokens != expected.ActualVideoTokens || actualCashMicros != expected.ActualCashMicros {
+		return errors.New("stored FLO-167 A01 terminal facts differ from the canonical projection")
+	}
+	return nil
 }
 
 // AuthorizeFLO167Supersession imports an independently issued, exact-scope v3

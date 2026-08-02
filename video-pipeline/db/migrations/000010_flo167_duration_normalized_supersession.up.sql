@@ -130,7 +130,9 @@ CREATE TABLE stage1_live_supersession_terminal_ledger (
     semantic_input_hash CHAR(64) NOT NULL CHECK (semantic_input_hash ~ '^[0-9a-f]{64}$'),
     terminal_hash CHAR(64) NOT NULL UNIQUE CHECK (terminal_hash ~ '^[0-9a-f]{64}$'),
     terminal_at TIMESTAMPTZ NOT NULL,
-    PRIMARY KEY (supersession_id, shot_id)
+    PRIMARY KEY (supersession_id, shot_id),
+    FOREIGN KEY (supersession_id, shot_id)
+        REFERENCES stage1_live_supersession_submissions(supersession_id, shot_id)
 );
 
 CREATE TRIGGER stage1_live_supersession_immutable_update BEFORE UPDATE ON stage1_live_supersessions

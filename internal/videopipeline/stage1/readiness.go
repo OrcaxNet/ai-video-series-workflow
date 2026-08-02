@@ -305,6 +305,7 @@ type Gate struct {
 	path                       string
 	executionPackageHash       string
 	controlledRetryPackageHash string
+	flo167Supersession         *FLO167SupersessionPackage
 	mu                         sync.Mutex
 }
 
@@ -359,6 +360,28 @@ func (g *Gate) BindExecutionPackage(contentHash string) error {
 		g.executionPackageHash = previous
 		return err
 	}
+	return nil
+}
+
+// BindFLO167Supersession switches local AFP drift validation from the obsolete
+// v2 uniform estimate to the immutable per-shot v3 duration binding. The
+// package is deliberately process-local: PostgreSQL remains the durable
+// authorization boundary, while every production Runner must explicitly bind
+// the exact package before it can construct its Executor.
+func (g *Gate) BindFLO167Supersession(package_ FLO167SupersessionPackage) error {
+	if err := package_.Validate(); err != nil {
+		return fmt.Errorf("validate FLO-167 supersession gate binding: %w", err)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.flo167Supersession != nil && g.flo167Supersession.ContentHash != package_.ContentHash {
+		return providerError(providercontract.CodeConflict, "stage 1 gate is bound to another FLO-167 supersession")
+	}
+	copy := package_
+	copy.Shots = append([]FLO167ShotBinding(nil), package_.Shots...)
+	copy.Authorization.CompletedSet = append([]string(nil), package_.Authorization.CompletedSet...)
+	copy.Authorization.AllowedSubmitSet = append([]string(nil), package_.Authorization.AllowedSubmitSet...)
+	g.flo167Supersession = &copy
 	return nil
 }
 
@@ -599,9 +622,18 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 			!record.EvidenceComplete {
 			return providerError(providercontract.CodeForbidden, "previous stage 1 provider evidence is incomplete")
 		}
-		if record.ActualAFPMilli > 0 && exceedsDrift(
-			record.ActualAFPMilli, record.PredictedAFPMilli, g.plan.MaximumAFPDriftBPS,
-		) {
+		expectedAFPMilli := record.PredictedAFPMilli
+		maximumDriftBPS := int64(g.plan.MaximumAFPDriftBPS)
+		if g.flo167Supersession != nil {
+			binding, ok := g.flo167Supersession.Shot(record.ShotID)
+			if !ok {
+				return providerError(providercontract.CodeForbidden, "previous stage 1 record has no FLO-167 pricing binding")
+			}
+			expectedAFPMilli = binding.Pricing.ExpectedAFPMilli
+			maximumDriftBPS = binding.Pricing.MaximumDriftBPS
+		}
+		withinDrift, driftErr := AFPWithinDrift(record.ActualAFPMilli, expectedAFPMilli, maximumDriftBPS)
+		if record.ActualAFPMilli > 0 && (driftErr != nil || !withinDrift) {
 			return providerError(providercontract.CodeBudgetExceeded, "a completed stage 1 job exceeded the 10 percent AFP drift limit")
 		}
 	}
@@ -621,7 +653,12 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 		ledger.ReservedVideoTokens+attempt.EstimatedVideoTokens > g.plan.MaximumVideoTokens {
 		return providerError(providercontract.CodeBudgetExceeded, "stage 1 video token cap would be exceeded")
 	}
-	if attempt.PredictedAFPMilli <= 0 || exceedsDrift(
+	if g.flo167Supersession != nil {
+		binding, ok := g.flo167Supersession.Shot(attempt.ShotID)
+		if !ok || attempt.PredictedAFPMilli != binding.Pricing.ExpectedAFPMilli {
+			return providerError(providercontract.CodeBudgetExceeded, "next stage 1 job differs from its FLO-167 duration-normalized AFP binding")
+		}
+	} else if attempt.PredictedAFPMilli <= 0 || exceedsDrift(
 		attempt.PredictedAFPMilli, g.plan.ReferenceJobAFPMilli, g.plan.MaximumAFPDriftBPS,
 	) {
 		return providerError(providercontract.CodeBudgetExceeded, "next stage 1 job AFP prediction exceeds the 10 percent drift limit")
