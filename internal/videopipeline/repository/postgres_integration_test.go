@@ -2464,7 +2464,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		RunState, RunFinishedAt, ShotState        string
 		JobState, TaskID, RequestID, JobUpdatedAt string
 		JobTerminalAt, ArtifactStatus             string
-		OutputCount, QCCount, LedgerCount         int
+		OutputCount, QCCount, JobLedgerCount      int
+		ReservationLedgerCount                    int
 	}
 	providerRunID := uuid.MustParse(run.RunID)
 	providerJobID := uuid.NewSHA1(providerRunID, []byte("provider-job"))
@@ -2473,6 +2474,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	)
 	actualLedgerID := uuid.NewSHA1(providerJobID, []byte("actual-cost"))
 	releaseLedgerID := uuid.NewSHA1(providerJobID, []byte("unused-reservation-release"))
+	reservationLedgerID := uuid.NewSHA1(providerJobID, []byte("reservation-cost"))
 	readTerminalProjection := func(
 		t *testing.T,
 		runID string,
@@ -2493,7 +2495,9 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			       (SELECT COUNT(*) FROM video_pipeline.qc_reports
 			        WHERE generation_run_id = gr.id),
 			       (SELECT COUNT(*) FROM video_pipeline.cost_ledger
-			        WHERE provider_job_id = pj.id)
+			        WHERE provider_job_id = pj.id),
+			       (SELECT COUNT(*) FROM video_pipeline.cost_ledger
+			        WHERE budget_reservation_id = pj.budget_reservation_id)
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.shot_spec_revisions ssr
 			  ON ssr.id = gr.shot_spec_revision_id
@@ -2508,7 +2512,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			&projection.JobState, &projection.TaskID, &projection.RequestID,
 			&projection.JobUpdatedAt, &projection.JobTerminalAt,
 			&projection.ArtifactStatus, &projection.OutputCount,
-			&projection.QCCount, &projection.LedgerCount,
+			&projection.QCCount, &projection.JobLedgerCount,
+			&projection.ReservationLedgerCount,
 		); err != nil {
 			t.Fatal(err)
 		}
@@ -2635,8 +2640,9 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		mustExec(t, ctx, pool, `
 			DELETE FROM video_pipeline.cost_ledger
 			WHERE id IN ($1, $2)
-			   OR (provider_job_id = $3 AND entry_type IN ('ACTUAL', 'RELEASE'))`,
-			actualLedgerID, releaseLedgerID, providerJobID,
+			   OR ((provider_job_id = $3 OR budget_reservation_id = $4)
+			       AND entry_type IN ('ACTUAL', 'RELEASE'))`,
+			actualLedgerID, releaseLedgerID, providerJobID, providerReservationID,
 		)
 		mustExec(t, ctx, pool, `
 			INSERT INTO video_pipeline.cost_ledger
@@ -2648,6 +2654,324 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 				($2, $3, $4, 'RELEASE', 10, 'CNY', NULL, NULL, 'pricing-v1', true)`,
 			actualLedgerID, releaseLedgerID, providerJobID, providerReservationID,
 		)
+	}
+	var reservationEstimatePayload []byte
+	if err := pool.QueryRow(ctx, `
+		SELECT estimate_payload
+		FROM video_pipeline.budget_reservations
+		WHERE id = $1`,
+		providerReservationID,
+	).Scan(&reservationEstimatePayload); err != nil {
+		t.Fatal(err)
+	}
+	var otherRunID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT ga.generation_run_id
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.id = pj.generation_attempt_id
+		WHERE pj.id = $1`,
+		otherJobID,
+	).Scan(&otherRunID); err != nil {
+		t.Fatal(err)
+	}
+	restoreDurableReservationProjection := func(t *testing.T) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.provider_jobs
+			SET budget_reservation_id = CASE
+			  WHEN id = $1 THEN $2::uuid
+			  WHEN id = $3 THEN $4::uuid
+			  ELSE budget_reservation_id
+			END
+			WHERE id IN ($1, $3)`,
+			providerJobID, providerReservationID, otherJobID, otherReservationID,
+		)
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.budget_reservations
+			WHERE generation_run_id = $1 AND id <> $2`,
+			providerRunID, providerReservationID,
+		)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.budget_reservations
+			SET generation_run_id = $2, amount_micros = 50,
+			    currency = 'CNY', pricing_rule_version = 'pricing-v1',
+			    estimate_payload = $3, status = 'SETTLED',
+			    confirmed_by = $4, confirmed_at = created_at
+			WHERE id = $1`,
+			providerReservationID, providerRunID,
+			reservationEstimatePayload, dispatch.BudgetApprovalID,
+		)
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.cost_ledger
+			WHERE id = $1
+			   OR ((provider_job_id = $2 OR budget_reservation_id = $3)
+			       AND entry_type = 'RESERVATION')`,
+			reservationLedgerID, providerJobID, providerReservationID,
+		)
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'RESERVATION', 50, 'CNY', 'pricing-v1', true)`,
+			reservationLedgerID, providerJobID, providerReservationID,
+		)
+	}
+	readDurablePaidProjection := func(t *testing.T) string {
+		t.Helper()
+		var projection string
+		if err := pool.QueryRow(ctx, `
+			SELECT jsonb_build_object(
+			  'reservations', COALESCE((
+			    SELECT jsonb_agg(to_jsonb(br) ORDER BY br.id)
+			    FROM video_pipeline.budget_reservations br
+			    WHERE br.id = $1 OR br.generation_run_id = $2
+			  ), '[]'::jsonb),
+			  'jobs', COALESCE((
+			    SELECT jsonb_agg(to_jsonb(pj) ORDER BY pj.id)
+			    FROM video_pipeline.provider_jobs pj
+			    WHERE pj.id = $3 OR pj.budget_reservation_id = $1
+			  ), '[]'::jsonb),
+			  'ledger', COALESCE((
+			    SELECT jsonb_agg(to_jsonb(cl) ORDER BY cl.id)
+			    FROM video_pipeline.cost_ledger cl
+			    WHERE cl.provider_job_id = $3 OR cl.budget_reservation_id = $1
+			       OR cl.id IN ($4, $5, $6)
+			  ), '[]'::jsonb)
+			)::text`,
+			providerReservationID, providerRunID, providerJobID,
+			reservationLedgerID, actualLedgerID, releaseLedgerID,
+		).Scan(&projection); err != nil {
+			t.Fatal(err)
+		}
+		return projection
+	}
+	assertReservationReplayConflictWithoutWrites := func(t *testing.T) {
+		t.Helper()
+		beforeTerminal := readTerminalProjection(
+			t, run.RunID, providerJobID, providerResult.ArtifactDigest,
+		)
+		beforePaid := readDurablePaidProjection(t)
+		if _, err := store.PrepareProviderJob(ctx, step, dispatch); err == nil {
+			t.Fatal("prepared Provider replay accepted a drifted durable reservation")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("prepared reservation replay error = %#v", err)
+			}
+		}
+		if err := store.CompletePreparedProviderJob(
+			ctx, step, run.RunID, providerResult,
+		); err == nil {
+			t.Fatal("terminal Provider replay accepted a drifted durable reservation")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("terminal reservation replay error = %#v", err)
+			}
+		}
+		afterTerminal := readTerminalProjection(
+			t, run.RunID, providerJobID, providerResult.ArtifactDigest,
+		)
+		afterPaid := readDurablePaidProjection(t)
+		if !reflect.DeepEqual(afterTerminal, beforeTerminal) || afterPaid != beforePaid {
+			t.Fatalf(
+				"durable reservation changed on rejected replay:\nterminal before=%#v\nterminal after=%#v\npaid before=%s\npaid after=%s",
+				beforeTerminal, afterTerminal, beforePaid, afterPaid,
+			)
+		}
+	}
+	reservationProjectionDrifts := []struct {
+		name   string
+		mutate func(*testing.T)
+	}{
+		{name: "reservation run", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET generation_run_id = $2 WHERE id = $1`, providerReservationID, otherRunID)
+		}},
+		{name: "reservation amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET amount_micros = 49 WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET currency = 'USD' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET pricing_rule_version = 'drift-v1' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation estimate payload", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET estimate_payload = jsonb_set(estimate_payload, '{estimatedMicros}', '49') WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation confirmer", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_by = 'drift-approval' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "missing reservation confirmer", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_by = NULL WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation confirmation time", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_at = confirmed_at + interval '1 second' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "missing reservation confirmation time", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET confirmed_at = NULL WHERE id = $1`, providerReservationID)
+		}},
+		{name: "reservation status", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.budget_reservations SET status = 'RESERVED' WHERE id = $1`, providerReservationID)
+		}},
+		{name: "extra run reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.budget_reservations
+					(id, generation_run_id, amount_micros, currency,
+					 pricing_rule_version, estimate_payload, status,
+					 confirmed_by, confirmed_at)
+				VALUES ($1, $2, 50, 'CNY', 'pricing-v1', $3,
+				        'SETTLED', $4, now())`,
+				uuid.New(), providerRunID, reservationEstimatePayload, dispatch.BudgetApprovalID,
+			)
+		}},
+		{name: "extra job reservation binding", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.provider_jobs SET budget_reservation_id = $2 WHERE id = $1`, otherJobID, providerReservationID)
+		}},
+		{name: "missing RESERVATION ledger", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "non-deterministic RESERVATION ledger id", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET id = $2 WHERE id = $1`, reservationLedgerID, uuid.New())
+		}},
+		{name: "RESERVATION ledger job", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, reservationLedgerID, otherJobID)
+		}},
+		{name: "RESERVATION ledger reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, reservationLedgerID, otherReservationID)
+		}},
+		{name: "RESERVATION ledger type", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'ADJUSTMENT' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 49 WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'USD' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger units", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = 1 WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger unit name", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = 'drift-units' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'drift-v1' WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "RESERVATION ledger verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, reservationLedgerID)
+		}},
+		{name: "duplicate RESERVATION ledger", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'RESERVATION', 50, 'CNY', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+	}
+	for _, test := range reservationProjectionDrifts {
+		test := test
+		t.Run("Provider replay rejects "+test.name+" drift", func(t *testing.T) {
+			t.Cleanup(func() {
+				restoreDurableReservationProjection(t)
+				restoreSuccessfulCostProjection(t)
+				restoreTerminalProjection(t, run.RunID)
+			})
+			test.mutate(t)
+			prepareTerminalRepairWindow(t, run.RunID)
+			assertReservationReplayConflictWithoutWrites(t)
+		})
+	}
+
+	cumulativeCommand := publicCommand
+	cumulativeCommand.CreativeAttempt = 2
+	_, cumulativeRun, cumulativeDispatch := createIntegrationWorkflowRun(
+		t, ctx, store, "cumulative-binding-probe", cumulativeCommand,
+	)
+	cumulativeCostDrifts := []struct {
+		name   string
+		mutate func(*testing.T)
+	}{
+		{name: "other job borrows reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, units, unit_name,
+					 pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ACTUAL', 0, 'CNY', 0, 'mock-units', 'pricing-v1', true)`,
+				uuid.New(), otherJobID, providerReservationID,
+			)
+		}},
+		{name: "non-deterministic ACTUAL id", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET id = $2 WHERE id = $1`, actualLedgerID, uuid.New())
+		}},
+		{name: "missing ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "duplicate ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, units, unit_name,
+					 pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ACTUAL', 40, 'CNY', 30, 'mock-units', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+		{name: "ACTUAL amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 0 WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, actualLedgerID)
+		}},
+	}
+	for _, test := range cumulativeCostDrifts {
+		test := test
+		t.Run("cumulative allocation rejects "+test.name, func(t *testing.T) {
+			t.Cleanup(func() {
+				restoreSuccessfulCostProjection(t)
+			})
+			test.mutate(t)
+			providerCallsBefore := videoProviderCalls.Load()
+			_, activityErr := videoActivityEnvironment.ExecuteActivity(
+				videoActivities.ExecuteProviderJob, cumulativeDispatch,
+			)
+			var applicationErr *temporal.ApplicationError
+			if !errors.As(activityErr, &applicationErr) ||
+				applicationErr.Type() != string(controlplane.CodeRevisionConflict) ||
+				!applicationErr.NonRetryable() {
+				t.Fatalf("cumulative allocation Activity error = %#v", activityErr)
+			}
+			var reservations, jobs, ledger int
+			if err := pool.QueryRow(ctx, `
+				SELECT
+				  (SELECT COUNT(*) FROM video_pipeline.budget_reservations
+				   WHERE generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.provider_jobs pj
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1),
+				  (SELECT COUNT(*) FROM video_pipeline.cost_ledger cl
+				   JOIN video_pipeline.provider_jobs pj ON pj.id = cl.provider_job_id
+				   JOIN video_pipeline.generation_attempts ga
+				     ON ga.id = pj.generation_attempt_id
+				   WHERE ga.generation_run_id = $1)`,
+				cumulativeRun.RunID,
+			).Scan(&reservations, &jobs, &ledger); err != nil {
+				t.Fatal(err)
+			}
+			if reservations != 0 || jobs != 0 || ledger != 0 ||
+				videoProviderCalls.Load() != providerCallsBefore {
+				t.Fatalf(
+					"rejected cumulative allocation side effects = reservations:%d jobs:%d ledger:%d provider:%d→%d",
+					reservations, jobs, ledger,
+					providerCallsBefore, videoProviderCalls.Load(),
+				)
+			}
+		})
 	}
 	costProjectionDrifts := []struct {
 		name   string
