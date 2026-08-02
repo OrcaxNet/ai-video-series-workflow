@@ -20,17 +20,19 @@ import (
 )
 
 const (
-	SchemaVersion                  = "v1"
-	LedgerSchemaVersion            = "v3"
-	FormalVideoModel               = "doubao-seedance-2.0"
-	RequiredPrimaryJobs            = 10
-	MaximumControlledRetries       = 1
-	MaximumNewProviderJobs         = 11
-	MaximumVideoTokens       int64 = 1_200_000
-	MaximumMonthlyAFPMilli   int64 = 38_000_000
-	MaximumCashMicros        int64 = 20_000_000
-	MaximumDialogueChars     int64 = 600
-	MaximumAFPDriftBPS             = 1_000
+	SchemaVersion                    = "v1"
+	NativeSchemaVersion              = "flo154.native-readiness.v1"
+	NativeProductSchemaVersion       = "flo154.native-sample.v1"
+	LedgerSchemaVersion              = "v3"
+	FormalVideoModel                 = "doubao-seedance-2.0"
+	RequiredPrimaryJobs              = 10
+	MaximumControlledRetries         = 1
+	MaximumNewProviderJobs           = 11
+	MaximumVideoTokens         int64 = 1_200_000
+	MaximumMonthlyAFPMilli     int64 = 38_000_000
+	MaximumCashMicros          int64 = 20_000_000
+	MaximumDialogueChars       int64 = 600
+	MaximumAFPDriftBPS               = 1_000
 )
 
 var requiredEvidence = []string{
@@ -38,28 +40,47 @@ var requiredEvidence = []string{
 	"provider_ids", "qc", "redaction_scan", "service_bom", "usage_cost",
 }
 
+var nativeRequiredEvidence = []string{
+	"analyzer_hashes", "artifact_hashes", "generation_manifest",
+	"license_consent_gate", "provider_ids", "qc", "redaction_scan",
+	"service_bom", "usage_cost", "zero_paid_boundary",
+}
+
 type Plan struct {
-	SchemaVersion             string       `json:"schemaVersion"`
-	BatchID                   string       `json:"batchId"`
-	VideoModel                string       `json:"videoModel"`
-	PrimaryShotIDs            []string     `json:"primaryShotIds"`
-	MaximumNewJobs            int          `json:"maximumNewProviderJobs"`
-	MaximumControlledRetries  int          `json:"maximumControlledRetries"`
-	MaximumVideoTokens        int64        `json:"maximumVideoTokens"`
-	MonthlyBaselineAFPMilli   int64        `json:"monthlyBaselineAfpMilli"`
-	MonthlyMaximumAFPMilli    int64        `json:"monthlyMaximumAfpMilli"`
-	ReferenceJobAFPMilli      int64        `json:"referenceJobAfpMilli"`
-	MaximumAFPDriftBPS        int          `json:"maximumAfpDriftBasisPoints"`
-	MaximumCashMicros         int64        `json:"maximumNonSubscriptionCashMicros"`
-	MaximumDialogueCharacters int64        `json:"maximumDialogueCharacters"`
-	MaximumTTSAFPMilli        int64        `json:"maximumTtsAfpMilli"`
-	RequiredEvidence          []string     `json:"requiredEvidence"`
-	TTSPreflight              TTSPreflight `json:"ttsPreflight"`
+	SchemaVersion             string                `json:"schemaVersion"`
+	BatchID                   string                `json:"batchId"`
+	VideoModel                string                `json:"videoModel"`
+	PrimaryShotIDs            []string              `json:"primaryShotIds"`
+	MaximumNewJobs            int                   `json:"maximumNewProviderJobs"`
+	MaximumControlledRetries  int                   `json:"maximumControlledRetries"`
+	MaximumVideoTokens        int64                 `json:"maximumVideoTokens"`
+	MonthlyBaselineAFPMilli   int64                 `json:"monthlyBaselineAfpMilli"`
+	MonthlyMaximumAFPMilli    int64                 `json:"monthlyMaximumAfpMilli"`
+	ReferenceJobAFPMilli      int64                 `json:"referenceJobAfpMilli"`
+	MaximumAFPDriftBPS        int                   `json:"maximumAfpDriftBasisPoints"`
+	MaximumCashMicros         int64                 `json:"maximumNonSubscriptionCashMicros"`
+	MaximumDialogueCharacters int64                 `json:"maximumDialogueCharacters"`
+	MaximumTTSAFPMilli        int64                 `json:"maximumTtsAfpMilli"`
+	RequiredEvidence          []string              `json:"requiredEvidence"`
+	TTSPreflight              TTSPreflight          `json:"ttsPreflight"`
+	NativeAudio               *NativeAudioPreflight `json:"nativeAudio,omitempty"`
 	// OfflineOnly selects the parameterized formal-package policy. It permits
 	// zero-cash, quota-pending packages to be sealed for independent QA, while
 	// deliberately rejecting a live credential or Provider authorization.
 	// The zero value preserves the fixed FLO-104 sample-1 contract.
 	OfflineOnly bool `json:"offlineOnly,omitempty"`
+}
+
+// NativeAudioPreflight makes the FLO-154 zero-TTS execution boundary explicit.
+// It is absent from the immutable FLO-104 plan, preserving the old validation
+// and package hash behavior.
+type NativeAudioPreflight struct {
+	ProductSchema        string                               `json:"productSchema"`
+	AudioStrategy        providercontract.AudioStrategy       `json:"audioStrategy"`
+	GenerateAudio        bool                                 `json:"generateAudio"`
+	AudioDelivery        providercontract.NativeAudioDelivery `json:"audioDelivery"`
+	MaximumSpeechSubmits int                                  `json:"maximumSpeechSubmits"`
+	AnalyzerSealSHA256   string                               `json:"analyzerSealSha256"`
 }
 
 type TTSPreflight struct {
@@ -75,6 +96,9 @@ type TTSPreflight struct {
 }
 
 func (p Plan) Validate() error {
+	if p.SchemaVersion == NativeSchemaVersion {
+		return p.validateNative()
+	}
 	if p.OfflineOnly {
 		return p.validateOffline()
 	}
@@ -125,6 +149,69 @@ func (p Plan) Validate() error {
 	sort.Strings(gotEvidence)
 	if strings.Join(gotEvidence, "\x00") != strings.Join(requiredEvidence, "\x00") {
 		return errors.New("stage 1 plan does not require the complete evidence set")
+	}
+	return nil
+}
+
+func (p Plan) IsNativeOnly() bool {
+	return p.SchemaVersion == NativeSchemaVersion && p.NativeAudio != nil
+}
+
+func (p Plan) validateNative() error {
+	switch {
+	case strings.TrimSpace(p.BatchID) == "" || p.BatchID == "flo104-sample-1":
+		return errors.New("FLO-154 native plan requires an independent batchId")
+	case p.VideoModel != FormalVideoModel:
+		return errors.New("FLO-154 native sample must use doubao-seedance-2.0")
+	case len(p.PrimaryShotIDs) != RequiredPrimaryJobs:
+		return fmt.Errorf("FLO-154 native sample requires exactly %d primary shots", RequiredPrimaryJobs)
+	case p.MaximumNewJobs != MaximumNewProviderJobs || p.MaximumControlledRetries != MaximumControlledRetries:
+		return errors.New("FLO-154 native sample must be capped at 10 primary jobs plus one controlled retry")
+	case p.MaximumVideoTokens != MaximumVideoTokens:
+		return errors.New("FLO-154 native sample video token cap must equal 1200000")
+	case p.MonthlyBaselineAFPMilli < 0 || p.MonthlyBaselineAFPMilli >= p.MonthlyMaximumAFPMilli:
+		return errors.New("FLO-154 native AFP baseline is invalid")
+	case p.MonthlyMaximumAFPMilli != MaximumMonthlyAFPMilli:
+		return errors.New("FLO-154 native AFP cap must equal 38000 AFP")
+	case p.ReferenceJobAFPMilli <= 0 || p.MaximumAFPDriftBPS != MaximumAFPDriftBPS:
+		return errors.New("FLO-154 native reference AFP and 10 percent drift limit are required")
+	case p.MaximumCashMicros != MaximumCashMicros:
+		return errors.New("FLO-154 native non-subscription cash cap must equal 20 CNY")
+	case p.MaximumDialogueCharacters != MaximumDialogueChars:
+		return errors.New("FLO-154 native dialogue must be capped at 600 Unicode characters")
+	case p.MaximumTTSAFPMilli != 0:
+		return errors.New("FLO-154 native sample must reserve zero TTS AFP")
+	case p.TTSPreflight != (TTSPreflight{}):
+		return errors.New("FLO-154 native sample must omit the TTS preflight")
+	case p.NativeAudio == nil:
+		return errors.New("FLO-154 native analyzer and output boundary is required")
+	case p.NativeAudio.ProductSchema != NativeProductSchemaVersion:
+		return errors.New("FLO-154 native product schema is invalid")
+	case p.NativeAudio.AudioStrategy != providercontract.AudioStrategyNativePreferred ||
+		!p.NativeAudio.GenerateAudio ||
+		p.NativeAudio.AudioDelivery != providercontract.NativeAudioMix:
+		return errors.New("FLO-154 native plan must freeze native_preferred generateAudio=true native_mix")
+	case p.NativeAudio.MaximumSpeechSubmits != 0:
+		return errors.New("FLO-154 native plan must cap Speech/TTS submits at zero")
+	case !validLowerDigest(p.NativeAudio.AnalyzerSealSHA256):
+		return errors.New("FLO-154 native plan requires a frozen analyzer seal SHA-256")
+	}
+	seen := make(map[string]struct{}, len(p.PrimaryShotIDs))
+	for _, shotID := range p.PrimaryShotIDs {
+		if strings.TrimSpace(shotID) == "" {
+			return errors.New("FLO-154 native shot IDs cannot be empty")
+		}
+		if _, duplicate := seen[shotID]; duplicate {
+			return fmt.Errorf("duplicate FLO-154 native shot ID %q", shotID)
+		}
+		seen[shotID] = struct{}{}
+	}
+	gotEvidence := append([]string(nil), p.RequiredEvidence...)
+	sort.Strings(gotEvidence)
+	wantEvidence := append([]string(nil), nativeRequiredEvidence...)
+	sort.Strings(wantEvidence)
+	if strings.Join(gotEvidence, "\x00") != strings.Join(wantEvidence, "\x00") {
+		return errors.New("FLO-154 native plan does not require the complete evidence set")
 	}
 	return nil
 }

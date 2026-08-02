@@ -1012,6 +1012,17 @@ components:
           minimum: 1000
         format:
           type: string
+        audioStrategy:
+          type: string
+          enum: [native_preferred, tts_required, hybrid]
+          description: Frozen audio source policy. Newly compiled video prompts default to native_preferred.
+        generateAudio:
+          type: boolean
+          description: Must be true for native_preferred or hybrid video generation.
+        audioDelivery:
+          type: string
+          enum: [none, native_mix, native_stems]
+          description: Requested truthful Provider delivery; native_mix is not an independent dialogue stem.
     StartProductionRequest:
       type: object
       additionalProperties: false
@@ -1054,7 +1065,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [enabled, evidence, speechRouteSnapshot, speechBudgetApprovalId, speechBudgetLimit, subtitleLanguage, burnSubtitles, enforcePoCDuration]
+        [enabled, evidence, subtitleLanguage, burnSubtitles, enforcePoCDuration]
       properties:
         enabled:
           type: boolean
@@ -1062,10 +1073,34 @@ components:
           type: string
           enum: [mock_only, live_provider_call, pending_key]
           description: pending_key fails closed before any paid speech submission.
+        audioStrategy:
+          type: string
+          enum: [native_preferred, tts_required, hybrid]
+          default: native_preferred
+          description: native_preferred makes zero TTS calls; hybrid permits only explicitly frozen cue replacements.
+        cueFallbacks:
+          type: array
+          description: Required only for hybrid; every entry binds the replaced cue to its original native mix and replacement revision.
+          items:
+            type: object
+            additionalProperties: false
+            required: [cueId, reason, originalNativeMixSha256, replacementRevisionId]
+            properties:
+              cueId:
+                type: string
+                minLength: 1
+              reason:
+                type: string
+                minLength: 1
+              originalNativeMixSha256:
+                $ref: "#/components/schemas/SHA256"
+              replacementRevisionId:
+                type: string
+                minLength: 1
         speechRouteSnapshot:
           allOf:
             - $ref: "#/components/schemas/ModelRouteSnapshot"
-          description: Frozen speech.primary provider capability; credentials remain runtime-only.
+          description: Required only by tts_required/hybrid. Frozen speech.primary provider capability; credentials remain runtime-only.
         speechBudgetApprovalId:
           type: string
           format: uuid

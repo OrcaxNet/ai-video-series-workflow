@@ -116,6 +116,33 @@ func TestLoadMockProviderDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadOrchestratorWorkerRequiresCompleteAnalyzerSeal(t *testing.T) {
+	t.Setenv("VIDEO_TEMPORAL_ADDRESS", "127.0.0.1:7233")
+	t.Setenv("VIDEO_TEMPORAL_NAMESPACE", "fixture")
+	t.Setenv("VIDEO_TEMPORAL_TASK_QUEUE", "fixture")
+	t.Setenv("VIDEO_PROVIDER_ADAPTER_URL", "http://127.0.0.1:8090")
+	t.Setenv("VIDEO_SPEECH_PROVIDER_ADAPTER_URL", "http://127.0.0.1:8090")
+	t.Setenv("VIDEO_POSTGRES_ADDRESS", "127.0.0.1:5432")
+	t.Setenv("VIDEO_POSTGRES_DSN", "postgres://fixture:fixture@127.0.0.1:5432/fixture")
+	t.Setenv("VIDEO_ARTIFACT_ROOT", t.TempDir())
+	t.Setenv("VIDEO_AUDIO_ANALYZER_COMMAND", "/opt/flo154/analyzer")
+	t.Setenv("VIDEO_AUDIO_ANALYZER_ROOT", "")
+	t.Setenv("VIDEO_AUDIO_ANALYZER_SEAL", "")
+	if _, err := LoadOrchestratorWorker(); err == nil || !strings.Contains(err.Error(), "must be configured together") {
+		t.Fatalf("LoadOrchestratorWorker(partial analyzer) error = %v", err)
+	}
+	t.Setenv("VIDEO_AUDIO_ANALYZER_ROOT", "/opt/flo154")
+	t.Setenv("VIDEO_AUDIO_ANALYZER_SEAL", "/opt/flo154/seal.json")
+	cfg, err := LoadOrchestratorWorker()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AudioAnalyzerCommand != "/opt/flo154/analyzer" ||
+		cfg.AudioAnalyzerRoot != "/opt/flo154" || cfg.AudioAnalyzerSeal != "/opt/flo154/seal.json" {
+		t.Fatalf("analyzer configuration = %#v", cfg)
+	}
+}
+
 func TestLoadVolcengineProviderRequiresExplicitKeyAndUsesAgentPlanDefaults(t *testing.T) {
 	base := map[string]string{
 		"VIDEO_ARTIFACT_ROOT": t.TempDir(),

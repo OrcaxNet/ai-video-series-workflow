@@ -24,11 +24,11 @@ func TestOutputInputProviderSpecPreservesProductFields(t *testing.T) {
 
 func TestValidateIDsRejectsDuplicateReservedIdentity(t *testing.T) {
 	product := productWithUniqueIDs()
-	if err := validateIDs(product); err != nil {
+	if err := validateIDs(product, false); err != nil {
 		t.Fatalf("valid fixed identity set rejected: %v", err)
 	}
 	product.Shots[9].RunID = product.Shots[0].RunID
-	if err := validateIDs(product); err == nil {
+	if err := validateIDs(product, false); err == nil {
 		t.Fatal("duplicate frozen run identity was accepted")
 	}
 }

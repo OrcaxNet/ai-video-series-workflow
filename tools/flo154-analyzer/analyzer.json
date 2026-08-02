@@ -1,0 +1,14 @@
+{
+  "schemaVersion": "flo154.audio-analyzer-config.v1",
+  "name": "flo154-faster-whisper-opencv-avsync",
+  "version": "1.0.0",
+  "modelPath": "models/faster-whisper-large-v3-turbo",
+  "faceCascadePath": "models/haarcascade_frontalface_default.xml",
+  "avSyncModelPath": "models/av-sync-correlation-v1.json",
+  "ffmpegPath": "bin/ffmpeg",
+  "ffprobePath": "bin/ffprobe",
+  "environmentInventoryPath": "config/python-environment.json",
+  "mouthSampleFps": 24,
+  "mouthMotionThreshold": 0.004,
+  "silenceDbfs": -60
+}

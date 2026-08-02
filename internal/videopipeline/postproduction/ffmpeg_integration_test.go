@@ -164,6 +164,48 @@ func TestFFmpegProcessor_RendersDeterministicDelivery(t *testing.T) {
 		mockResult.FinalVideo.FPS != 24 || mockResult.FinalVideo.DurationMillis != 2_000 {
 		t.Fatalf("unexpected mock final media spec: %#v", mockResult.FinalVideo)
 	}
+
+	// Native audio is extracted from each immutable Provider MP4 and retained
+	// as a mix. With no failed cue, no TTS input or fake Dialogue stem exists.
+	nativeRequest := mockRequest
+	nativeRequest.AudioStrategy = providercontract.AudioStrategyNativePreferred
+	nativeRequest.Speech = SpeechConfig{}
+	nativeRequest.Clips = append([]Clip(nil), mockRequest.Clips...)
+	for index := range nativeRequest.Clips {
+		nativeRequest.Clips[index].ProviderVideo = &ProviderVideoEvidence{
+			ProviderJobID:     "job-" + nativeRequest.Clips[index].RunID,
+			ProviderRequestID: "request-" + nativeRequest.Clips[index].RunID,
+			Provider:          "mock", Model: "native-audio-fixture", Version: "v1",
+			GenerateAudio: true, AudioDelivery: providercontract.NativeAudioMix,
+		}
+		nativeRequest.Clips[index].Ambience = &AmbienceBinding{
+			Identity: "integration-room-tone", Version: "v1",
+			ContinuityIntoNext: index+1 < len(nativeRequest.Clips),
+		}
+		nativeRequest.Clips[index].LipSyncRequired = true
+	}
+	nativeResult, err := processor.Render(ctx, nativeRequest, subtitleBytes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nativeReplay, err := processor.Render(ctx, nativeRequest, subtitleBytes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nativeResult.Dialogue.Kind != "" || len(nativeResult.NativeMixes) != 2 ||
+		nativeResult.FinalMix.Kind != "final_mix" {
+		t.Fatalf("unexpected native audio artifacts: %#v", nativeResult)
+	}
+	if nativeReplay.FinalVideo.Digest != nativeResult.FinalVideo.Digest ||
+		nativeReplay.FinalMix.Digest != nativeResult.FinalMix.Digest ||
+		nativeReplay.NativeMixes[0].Digest != nativeResult.NativeMixes[0].Digest ||
+		nativeReplay.CommandPlanHash != nativeResult.CommandPlanHash {
+		t.Fatalf("native FFmpeg output is not deterministic: first=%#v replay=%#v", nativeResult, nativeReplay)
+	}
+	for _, mix := range nativeResult.NativeMixes {
+		assertCommittedAudioSpec(t, store, mix, 1_000, 48_000, 2)
+	}
+	assertCommittedAudioSpec(t, store, nativeResult.FinalMix, 2_000, 48_000, 2)
 }
 
 func assertCommittedAudioSpec(

@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "flo154.av-sync-correlation.v1",
+  "version": "1.0.0",
+  "maximumLagMillis": 500,
+  "minimumCorrelation": 0.05,
+  "feature": "mono-rms-to-mouth-region-frame-difference",
+  "estimator": "normalized-cross-correlation"
+}

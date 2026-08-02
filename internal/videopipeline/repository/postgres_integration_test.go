@@ -497,7 +497,7 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			 status, effective_at)
 		VALUES
 			($1, $2, 'video.primary', 'fixture-video-v1', 'route-v1',
-			 ARRAY['text'], '{"unitPriceMicros":10,"remainingCalls":100,"allowedTerritories":["CN"],"productForms":["INTERNAL_PREVIEW","COMMERCIAL_RELEASE"],"contentSafetyPolicyVersions":["safety-v1"]}', 'pricing-v1', $3,
+			 ARRAY['text'], '{"unitPriceMicros":10,"remainingCalls":100,"supportsNativeAudio":true,"nativeAudioDelivery":"native_mix","allowedTerritories":["CN"],"productForms":["INTERNAL_PREVIEW","COMMERCIAL_RELEASE"],"contentSafetyPolicyVersions":["safety-v1"]}', 'pricing-v1', $3,
 			 'ACTIVE', now()),
 			($4, $2, 'text.primary', 'fixture-text-v1', 'route-v1',
 			 ARRAY['text'], '{"unitPriceMicros":1,"remainingCalls":100,"allowedTerritories":["CN"],"productForms":["INTERNAL_PREVIEW"],"contentSafetyPolicyVersions":["safety-v1"]}', 'text-pricing-v1', $5,
@@ -4506,6 +4506,11 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			"dialogue_audio", "audio/wav", "fixture dialogue "+episodeRevisionID.String(),
 			5_000, 0, 0, 0,
 		),
+		FinalMix: putPostArtifact(
+			"final_mix", "audio/wav", "fixture final mix "+episodeRevisionID.String(),
+			5_000, 0, 0, 0,
+		),
+		AudioStrategy: providercontract.AudioStrategyTTSRequired,
 		FinalVideo: putPostArtifact(
 			"final_video", "video/mp4", "fixture final video "+episodeRevisionID.String(),
 			5_000, 1280, 720, 24,
@@ -4607,9 +4612,10 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	if err := pool.QueryRow(ctx, `
 		SELECT COUNT(*)
 		FROM video_pipeline.artifacts
-		WHERE content_hash IN ($1, $2, $3, $4, $5)`,
+		WHERE content_hash IN ($1, $2, $3, $4, $5, $6)`,
 		postResult.FinalVideo.Digest,
 		postResult.Dialogue.Digest,
+		postResult.FinalMix.Digest,
 		postResult.Subtitle.Digest,
 		postResult.Manifest.Digest,
 		postResult.ServiceBOM.Digest,
@@ -4633,8 +4639,8 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	).Scan(&linkedPostArtifacts); err != nil {
 		t.Fatal(err)
 	}
-	if linkedPostArtifacts != 5 {
-		t.Fatalf("linked post-production artifacts = %d, want 5", linkedPostArtifacts)
+	if linkedPostArtifacts != 6 {
+		t.Fatalf("linked post-production artifacts = %d, want 6", linkedPostArtifacts)
 	}
 	// final_video is intentionally another OUTPUT binding for every source run.
 	// Terminal Provider replay must compare only the immutable shot_video output,

@@ -28,6 +28,7 @@ const (
 
 type fakeRecord struct {
 	job       Job
+	output    OutputSpec
 	pollCount int
 }
 
@@ -56,23 +57,25 @@ func NewFakeProvider(scenario FakeScenario) *FakeProvider {
 
 func (f *FakeProvider) Discover(context.Context) ([]Capability, error) {
 	return []Capability{{
-		Provider:               "fake",
-		ModelFamily:            "fake-video-v1",
-		ModelVersion:           "fixture-1",
-		InputModalities:        []Modality{ModalityText, ModalityImage},
-		OutputModality:         ModalityVideo,
-		Async:                  true,
-		SupportsPolling:        true,
-		SupportsCallback:       true,
-		SupportsCancel:         true,
-		SupportsReferenceImage: true,
-		SupportsLastFrame:      true,
-		Resolutions:            []string{"720p"},
-		AspectRatios:           []string{"16:9"},
-		MinDurationMillis:      4_000,
-		MaxDurationMillis:      6_000,
-		NativeFPS:              []int{24},
-		Verification:           "mock_only",
+		Provider:                 "fake",
+		ModelFamily:              "fake-video-v1",
+		ModelVersion:             "fixture-1",
+		InputModalities:          []Modality{ModalityText, ModalityImage},
+		OutputModality:           ModalityVideo,
+		Async:                    true,
+		SupportsPolling:          true,
+		SupportsCallback:         true,
+		SupportsCancel:           true,
+		SupportsReferenceImage:   true,
+		SupportsLastFrame:        true,
+		NativeAudioDelivery:      NativeAudioMix,
+		SupportsAudioDrivenVideo: true,
+		Resolutions:              []string{"720p"},
+		AspectRatios:             []string{"16:9"},
+		MinDurationMillis:        4_000,
+		MaxDurationMillis:        6_000,
+		NativeFPS:                []int{24},
+		Verification:             "mock_only",
 	}}, nil
 }
 
@@ -134,7 +137,7 @@ func (f *FakeProvider) Submit(ctx context.Context, request GenerationRequest) (J
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
-	f.records[id] = &fakeRecord{job: job}
+	f.records[id] = &fakeRecord{job: job, output: request.Output}
 	f.idempotency[request.IdempotencyKey] = id
 
 	// Recovery simulates an upstream timeout after it accepted the task. The
@@ -186,6 +189,9 @@ func (f *FakeProvider) Poll(ctx context.Context, id string) (Job, error) {
 				FPS:            24,
 				DurationMillis: 5_000,
 				Format:         "mp4",
+				GenerateAudio:  record.output.GenerateAudio,
+				AudioStrategy:  record.output.AudioStrategy,
+				AudioDelivery:  record.output.AudioDelivery,
 			},
 			Usage: Usage{
 				VideoTokens:        250_000,

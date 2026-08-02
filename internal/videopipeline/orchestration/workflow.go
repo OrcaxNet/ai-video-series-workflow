@@ -166,6 +166,9 @@ type QCResult struct {
 type PostProductionConfig struct {
 	Enabled                       bool                               `json:"enabled"`
 	Evidence                      string                             `json:"evidence"`
+	AudioStrategy                 providercontract.AudioStrategy     `json:"audioStrategy,omitempty"`
+	AnalyzerSealSHA256            string                             `json:"analyzerSealSha256,omitempty"`
+	CueFallbacks                  []postproduction.CueFallback       `json:"cueFallbacks,omitempty"`
 	SpeechRoute                   providercontract.ModelSnapshot     `json:"speechRoute"`
 	SpeechProviderProfileID       string                             `json:"speechProviderProfileId"`
 	SpeechBudgetApprovalID        string                             `json:"speechBudgetApprovalId"`
@@ -185,28 +188,8 @@ type PostProductionConfig struct {
 	EnforcePoCDuration            bool                               `json:"enforcePoCDuration"`
 }
 
-func (c PostProductionConfig) Validate() error {
-	if !c.Enabled {
-		return nil
-	}
-	if err := c.SpeechRoute.Validate(providercontract.CapabilitySpeech); err != nil {
-		return errors.New("a frozen speech.primary route is required")
-	}
-	if c.Evidence != postproduction.EvidenceMockOnly &&
-		c.Evidence != postproduction.EvidenceLive &&
-		c.Evidence != postproduction.EvidencePendingKey {
-		return errors.New("post-production evidence is invalid")
-	}
-	if c.SpeechProviderProfileID == "" || c.SpeechBudgetApprovalID == "" ||
-		c.SpeechBudgetMaximumMicros < 0 ||
-		(c.SpeechBudgetMaximumMicros == 0 && c.SpeechRoute.Verification != providercontract.PendingKey) ||
-		len(c.SpeechBudgetCurrency) != 3 {
-		return errors.New("post-production speech profile and approved budget are required")
-	}
-	if c.SubtitleLanguage == "" {
-		return errors.New("post-production subtitle language is required")
-	}
-	if err := (postproduction.SpeechConfig{
+func (c PostProductionConfig) SpeechConfiguration() postproduction.SpeechConfig {
+	return postproduction.SpeechConfig{
 		Route: c.SpeechRoute, ProviderProfileID: c.SpeechProviderProfileID,
 		BudgetApprovalID:    c.SpeechBudgetApprovalID,
 		BudgetMaximumMicros: c.SpeechBudgetMaximumMicros,
@@ -218,10 +201,73 @@ func (c PostProductionConfig) Validate() error {
 		MaxAttempts:                      c.SpeechMaxAttempts,
 		BatchAuthorization:               c.SpeechBatchAuthorization,
 		CompletedAttempts:                c.SpeechCompletedAttempts,
-	}).Validate(); err != nil {
-		return err
+	}
+}
+
+func (c PostProductionConfig) ResolvedAudioStrategy() providercontract.AudioStrategy {
+	if c.AudioStrategy.Valid() {
+		return c.AudioStrategy
+	}
+	if c.SpeechConfiguration().Empty() {
+		return providercontract.AudioStrategyNativePreferred
+	}
+	return providercontract.AudioStrategyTTSRequired
+}
+
+func (c PostProductionConfig) RequiresSpeech() bool {
+	return c.ResolvedAudioStrategy() == providercontract.AudioStrategyTTSRequired ||
+		len(c.CueFallbacks) > 0
+}
+
+func (c PostProductionConfig) Validate() error {
+	if !c.Enabled {
+		return nil
+	}
+	if c.Evidence != postproduction.EvidenceMockOnly &&
+		c.Evidence != postproduction.EvidenceLive &&
+		c.Evidence != postproduction.EvidencePendingKey {
+		return errors.New("post-production evidence is invalid")
+	}
+	if c.AudioStrategy != "" && !c.AudioStrategy.Valid() {
+		return errors.New("post-production audio strategy is invalid")
+	}
+	if c.AnalyzerSealSHA256 != "" && !validWorkflowDigest(c.AnalyzerSealSHA256) {
+		return errors.New("post-production analyzer seal SHA-256 is invalid")
+	}
+	if c.ResolvedAudioStrategy() == providercontract.AudioStrategyHybrid && len(c.CueFallbacks) == 0 {
+		return errors.New("hybrid post-production requires at least one cue fallback")
+	}
+	if c.ResolvedAudioStrategy() == providercontract.AudioStrategyTTSRequired && len(c.CueFallbacks) != 0 {
+		return errors.New("tts_required cannot carry local cue fallbacks")
+	}
+	if c.SubtitleLanguage == "" {
+		return errors.New("post-production subtitle language is required")
+	}
+	if c.RequiresSpeech() {
+		if err := c.SpeechConfiguration().Validate(); err != nil {
+			return err
+		}
+	} else if !c.SpeechConfiguration().Empty() {
+		return errors.New("native_preferred without fallback must omit Speech/TTS configuration")
+	}
+	for index, fallback := range c.CueFallbacks {
+		if err := fallback.Validate(); err != nil {
+			return fmt.Errorf("cue fallback %d: %w", index, err)
+		}
 	}
 	return nil
+}
+
+func validWorkflowDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
 }
 
 // Stage1FinalizationWorkflow completes the already-generated formal Stage 1

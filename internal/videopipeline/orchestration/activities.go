@@ -205,7 +205,7 @@ func (a *Activities) CompilePrompt(ctx context.Context, input CompilePromptInput
 			Output: providercontract.OutputSpec{
 				Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
 				FPS: 24, DurationMillis: 5_000, Format: "mp4",
-			},
+			}.WithNativeAudioDefault(),
 			InputRevisionHashes: map[string]string{"shot_spec": digest},
 		}, nil
 	})
@@ -536,6 +536,13 @@ func validateProviderJobResponse(
 		response.Model != request.Model {
 		return temporal.NewNonRetryableApplicationError(
 			"provider response differs from the immutable dispatch",
+			string(controlplane.CodeRevisionConflict),
+			nil,
+		)
+	}
+	if response.RequestedOutput != nil && *response.RequestedOutput != request.Request.Output {
+		return temporal.NewNonRetryableApplicationError(
+			"provider response audio/output echo differs from immutable dispatch",
 			string(controlplane.CodeRevisionConflict),
 			nil,
 		)

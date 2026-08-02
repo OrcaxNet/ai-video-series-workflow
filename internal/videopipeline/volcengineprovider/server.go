@@ -191,9 +191,11 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 			OutputModality: providercontract.ModalityVideo,
 			Async:          true, SupportsPolling: true, SupportsCancel: true,
 			SupportsReferenceImage: true, SupportsLastFrame: true,
-			Resolutions:       []string{"480p", "720p", "1080p"},
-			AspectRatios:      []string{"16:9", "9:16", "4:3", "3:4", "21:9"},
-			MinDurationMillis: 4_000, MaxDurationMillis: 15_000,
+			NativeAudioDelivery:      providercontract.NativeAudioMix,
+			SupportsAudioDrivenVideo: true,
+			Resolutions:              []string{"480p", "720p", "1080p"},
+			AspectRatios:             []string{"16:9", "9:16", "4:3", "3:4", "21:9"},
+			MinDurationMillis:        4_000, MaxDurationMillis: 15_000,
 			NativeFPS: []int{24}, Verification: providercontract.PendingKey,
 		},
 		Configured: true, Enabled: true, Mode: "live",
@@ -201,8 +203,11 @@ func (s *Server) capabilities(w http.ResponseWriter, _ *http.Request) {
 		SnapshotHash: hex.EncodeToString(sum[:]),
 		EffectiveAt:  s.now().UTC(),
 		Limits: map[string]any{
-			"maximumConcurrency": 1,
-			"billingMode":        "subscription",
+			"maximumConcurrency":       1,
+			"billingMode":              "subscription",
+			"supportsNativeAudio":      true,
+			"nativeAudioDelivery":      string(providercontract.NativeAudioMix),
+			"supportsAudioDrivenVideo": true,
 		},
 		SupportedInputs: []string{"text", "image-reference", "tail-frame"},
 	}}
@@ -484,7 +489,7 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 	response := providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		UpstreamTaskID: upstream.ID, RequestID: upstream.ProviderRequestID,
-		State: upstream.Status, Model: request.Model,
+		State: upstream.Status, Model: request.Model, RequestedOutput: &request.Request.Output,
 		Cost: s.subscriptionCost(request),
 	}
 	if response.State == "" {
@@ -495,8 +500,9 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		intent.Response = providercontract.JobResponse{
 			JobID: request.JobID, RunID: request.RunID,
 			State: providercontract.StatusRequiresAction, Model: request.Model,
-			Cost:  s.subscriptionCost(request),
-			Error: safeError(providercontract.CodeUnavailable, "provider submit result requires operator reconciliation", false),
+			RequestedOutput: &request.Request.Output,
+			Cost:            s.subscriptionCost(request),
+			Error:           safeError(providercontract.CodeUnavailable, "provider submit result requires operator reconciliation", false),
 		}
 		writeProviderError(w, err)
 		return
@@ -630,7 +636,8 @@ func (s *Server) pendingResponse(request providercontract.JobRequest) providerco
 	return providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		State: providercontract.StatusUnknown, Model: request.Model,
-		Cost: s.subscriptionCost(request),
+		RequestedOutput: &request.Request.Output,
+		Cost:            s.subscriptionCost(request),
 	}
 }
 
@@ -1380,7 +1387,8 @@ func (s *Server) synthesizeSpeech(
 	response := providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		State: providercontract.StatusUnknown, Model: request.Model,
-		Cost: s.subscriptionCost(request),
+		RequestedOutput: &request.Request.Output,
+		Cost:            s.subscriptionCost(request),
 	}
 	result, err := s.speech.Synthesize(ctx, SpeechSynthesisRequest{
 		Text: request.Request.Prompt, Speaker: request.Request.ModelHint,
@@ -1414,7 +1422,8 @@ func (s *Server) synthesizeSpeech(
 		UpstreamTaskID: result.ConnectID, RequestID: result.RequestID,
 		ConnectID: result.ConnectID, LogID: result.LogID,
 		State: providercontract.StatusRequiresAction, Model: request.Model,
-		Usage: usage, Cost: s.subscriptionCost(request),
+		RequestedOutput: &request.Request.Output,
+		Usage:           usage, Cost: s.subscriptionCost(request),
 		Error: speechInspectionError(),
 	}
 	inspection := &speechInspectionCheckpoint{

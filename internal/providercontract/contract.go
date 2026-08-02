@@ -55,12 +55,18 @@ func (s JobStatus) rank() int {
 type AssetRole string
 
 const (
-	AssetRoleReferenceImage AssetRole = "reference_image"
-	AssetRoleReferenceVideo AssetRole = "reference_video"
-	AssetRoleReferenceAudio AssetRole = "reference_audio"
-	AssetRoleFirstFrame     AssetRole = "first_frame"
-	AssetRoleLastFrame      AssetRole = "last_frame"
-	AssetRoleOutput         AssetRole = "output"
+	AssetRoleReferenceImage   AssetRole = "reference_image"
+	AssetRoleReferenceVideo   AssetRole = "reference_video"
+	AssetRoleReferenceAudio   AssetRole = "reference_audio"
+	AssetRoleFirstFrame       AssetRole = "first_frame"
+	AssetRoleLastFrame        AssetRole = "last_frame"
+	AssetRoleOutput           AssetRole = "output"
+	AssetRoleProviderOriginal AssetRole = "provider_original"
+	AssetRoleNativeMix        AssetRole = "native_mix"
+	AssetRoleDialogueStem     AssetRole = "dialogue_stem"
+	AssetRoleAmbienceStem     AssetRole = "ambience_stem"
+	AssetRoleBackgroundMusic  AssetRole = "background_music_stem"
+	AssetRoleFinalMix         AssetRole = "final_mix"
 )
 
 // AssetRef points to an immutable, authorized asset revision. URI is a
@@ -91,14 +97,16 @@ type ContextRefs struct {
 }
 
 type OutputSpec struct {
-	Width          int    `json:"width,omitempty"`
-	Height         int    `json:"height,omitempty"`
-	Resolution     string `json:"resolution,omitempty"`
-	AspectRatio    string `json:"aspect_ratio,omitempty"`
-	FPS            int    `json:"fps,omitempty"`
-	DurationMillis int    `json:"duration_millis,omitempty"`
-	Format         string `json:"format,omitempty"`
-	GenerateAudio  bool   `json:"generate_audio,omitempty"`
+	Width          int                 `json:"width,omitempty"`
+	Height         int                 `json:"height,omitempty"`
+	Resolution     string              `json:"resolution,omitempty"`
+	AspectRatio    string              `json:"aspect_ratio,omitempty"`
+	FPS            int                 `json:"fps,omitempty"`
+	DurationMillis int                 `json:"duration_millis,omitempty"`
+	Format         string              `json:"format,omitempty"`
+	GenerateAudio  bool                `json:"generate_audio,omitempty"`
+	AudioStrategy  AudioStrategy       `json:"audio_strategy,omitempty"`
+	AudioDelivery  NativeAudioDelivery `json:"audio_delivery,omitempty"`
 }
 
 // GenerationRequest is the stable request consumed by every provider adapter.
@@ -138,6 +146,9 @@ func (r GenerationRequest) Validate() error {
 		return errors.New("estimated_cost_micros must not exceed max_cost_micros")
 	case r.Budget.MaxAttempts < 1:
 		return errors.New("max_attempts must be positive")
+	}
+	if err := r.Output.ValidateAudio(r.Modality); err != nil {
+		return err
 	}
 	for _, asset := range r.Assets {
 		if asset.ID == "" || asset.Revision == "" || asset.SHA256 == "" ||
@@ -189,23 +200,25 @@ type Job struct {
 }
 
 type Capability struct {
-	Provider               string     `json:"provider"`
-	ModelFamily            string     `json:"model_family"`
-	ModelVersion           string     `json:"model_version,omitempty"`
-	InputModalities        []Modality `json:"input_modalities"`
-	OutputModality         Modality   `json:"output_modality"`
-	Async                  bool       `json:"async"`
-	SupportsPolling        bool       `json:"supports_polling"`
-	SupportsCallback       bool       `json:"supports_callback"`
-	SupportsCancel         bool       `json:"supports_cancel"`
-	SupportsReferenceImage bool       `json:"supports_reference_image"`
-	SupportsLastFrame      bool       `json:"supports_last_frame"`
-	Resolutions            []string   `json:"resolutions,omitempty"`
-	AspectRatios           []string   `json:"aspect_ratios,omitempty"`
-	MinDurationMillis      int        `json:"min_duration_millis,omitempty"`
-	MaxDurationMillis      int        `json:"max_duration_millis,omitempty"`
-	NativeFPS              []int      `json:"native_fps,omitempty"`
-	Verification           string     `json:"verification"`
+	Provider                 string              `json:"provider"`
+	ModelFamily              string              `json:"model_family"`
+	ModelVersion             string              `json:"model_version,omitempty"`
+	InputModalities          []Modality          `json:"input_modalities"`
+	OutputModality           Modality            `json:"output_modality"`
+	Async                    bool                `json:"async"`
+	SupportsPolling          bool                `json:"supports_polling"`
+	SupportsCallback         bool                `json:"supports_callback"`
+	SupportsCancel           bool                `json:"supports_cancel"`
+	SupportsReferenceImage   bool                `json:"supports_reference_image"`
+	SupportsLastFrame        bool                `json:"supports_last_frame"`
+	NativeAudioDelivery      NativeAudioDelivery `json:"native_audio_delivery,omitempty"`
+	SupportsAudioDrivenVideo bool                `json:"supports_audio_driven_video,omitempty"`
+	Resolutions              []string            `json:"resolutions,omitempty"`
+	AspectRatios             []string            `json:"aspect_ratios,omitempty"`
+	MinDurationMillis        int                 `json:"min_duration_millis,omitempty"`
+	MaxDurationMillis        int                 `json:"max_duration_millis,omitempty"`
+	NativeFPS                []int               `json:"native_fps,omitempty"`
+	Verification             string              `json:"verification"`
 }
 
 type Callback struct {

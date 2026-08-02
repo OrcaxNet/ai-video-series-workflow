@@ -5,6 +5,10 @@
 *.out
 coverage.out
 
+# Python tooling
+__pycache__/
+*.py[cod]
+
 # Local environment and generated evidence
 .env
 video-pipeline/.env.video

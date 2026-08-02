@@ -319,19 +319,20 @@ func (r JobRequest) Validate() error {
 // JobResponse is safe to persist in ProviderJob and Generation Manifest. A
 // provider's temporary signed URL is consumed before an output is committed.
 type JobResponse struct {
-	JobID          string        `json:"job_id"`
-	RunID          string        `json:"run_id"`
-	UpstreamTaskID string        `json:"upstream_task_id"`
-	RequestID      string        `json:"request_id"`
-	ConnectID      string        `json:"connect_id,omitempty"`
-	LogID          string        `json:"log_id,omitempty"`
-	State          JobStatus     `json:"state"`
-	Progress       int           `json:"progress"`
-	Model          ModelSnapshot `json:"model_snapshot"`
-	Artifacts      []AssetRef    `json:"artifacts"`
-	Usage          Usage         `json:"usage"`
-	Cost           Cost          `json:"cost"`
-	Error          *Error        `json:"error,omitempty"`
+	JobID           string        `json:"job_id"`
+	RunID           string        `json:"run_id"`
+	UpstreamTaskID  string        `json:"upstream_task_id"`
+	RequestID       string        `json:"request_id"`
+	ConnectID       string        `json:"connect_id,omitempty"`
+	LogID           string        `json:"log_id,omitempty"`
+	State           JobStatus     `json:"state"`
+	Progress        int           `json:"progress"`
+	Model           ModelSnapshot `json:"model_snapshot"`
+	Artifacts       []AssetRef    `json:"artifacts"`
+	Usage           Usage         `json:"usage"`
+	Cost            Cost          `json:"cost"`
+	RequestedOutput *OutputSpec   `json:"requested_output,omitempty"`
+	Error           *Error        `json:"error,omitempty"`
 }
 
 func Terminal(state JobStatus) bool { return state.Terminal() }

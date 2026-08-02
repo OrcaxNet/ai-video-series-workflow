@@ -112,7 +112,7 @@ func (p *Postgres) CompilePromptSnapshot(
 			Width: width, Height: height, Resolution: fmt.Sprintf("%dp", height),
 			AspectRatio: aspectRatioFromProfile(aspectProfile), FPS: fps,
 			DurationMillis: durationMillis, Format: "mp4",
-		}
+		}.WithNativeAudioDefault()
 		inputHashes := map[string]string{
 			"shot_spec":          shotHash,
 			"generation_profile": profileHash,
@@ -149,6 +149,7 @@ func (p *Postgres) CompilePromptSnapshot(
 		}
 
 		promptHash, err := workflowPromptHash(
+			"control-plane-compiler-v2-native-audio",
 			input.ShotSpecRevisionID,
 			input.GenerationProfileRef,
 			effectiveHash,
@@ -167,7 +168,7 @@ func (p *Postgres) CompilePromptSnapshot(
 				 effective_context_snapshot_id, asset_version_refs, positive_prompt, negative_prompt,
 				 model_payload, normalized_input_hash, content_hash, output_spec,
 				 input_revision_hashes)
-			VALUES ($1, $2, 'v1', 'control-plane-compiler-v1', 'video.prompt.v1',
+			VALUES ($1, $2, 'v1', 'control-plane-compiler-v2-native-audio', 'video.prompt.v1',
 			        $3, $4, $5, '', $6, $7, $7, $8, $9)
 			ON CONFLICT (shot_spec_revision_id, content_hash) DO NOTHING`,
 			promptID, shotID, effectiveID, assetIDs, string(narrative),
@@ -302,7 +303,10 @@ func loadExactPromptSnapshot(
 		return orchestration.PromptSnapshotRef{}, fmt.Errorf("read immutable prompt snapshot: %w", err)
 	}
 	if schemaVersion != "v1" ||
-		compilerVersion != "control-plane-compiler-v1" && compilerVersion != "stage1-product-input-v1" {
+		compilerVersion != "control-plane-compiler-v1" &&
+			compilerVersion != "control-plane-compiler-v2-native-audio" &&
+			compilerVersion != "stage1-product-input-v1" &&
+			compilerVersion != "flo154-native-materializer-v1" {
 		return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"prompt snapshot compiler identity is not executable",
@@ -341,7 +345,7 @@ func loadExactPromptSnapshot(
 		)
 	}
 	var expectedHash string
-	if compilerVersion == "stage1-product-input-v1" {
+	if importedPromptCompiler(compilerVersion) {
 		var imported struct {
 			InputPackageHash   string `json:"inputPackageHash"`
 			OriginalPromptHash string `json:"originalPromptHash"`
@@ -370,7 +374,8 @@ func loadExactPromptSnapshot(
 				"imported prompt package evidence is incomplete",
 			)
 		}
-		expectedHash, err = ImportedPromptHash(
+		expectedHash, err = ImportedPromptHashForCompiler(
+			compilerVersion,
 			shotID.String(), profileID.String(), effectiveHash, assetIDs,
 			positivePrompt, negativePrompt, output, expectedInputRevisionHashes,
 			imported.InputPackageHash,
@@ -383,6 +388,7 @@ func loadExactPromptSnapshot(
 		}
 	} else {
 		expectedHash, err = workflowPromptHash(
+			compilerVersion,
 			shotID.String(),
 			profileID.String(),
 			effectiveHash,
@@ -397,7 +403,8 @@ func loadExactPromptSnapshot(
 	}
 	expectedID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("prompt:"+expectedHash))
 	if contentHash != expectedHash || normalizedHash != expectedHash ||
-		compilerVersion == "control-plane-compiler-v1" && promptID != expectedID {
+		(compilerVersion == "control-plane-compiler-v1" ||
+			compilerVersion == "control-plane-compiler-v2-native-audio") && promptID != expectedID {
 		return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"prompt snapshot hash or ID differs from its immutable content",
@@ -451,9 +458,34 @@ func ImportedPromptHash(
 	inputRevisionHashes map[string]string,
 	inputPackageHash string,
 ) (string, error) {
+	return ImportedPromptHashForCompiler(
+		"stage1-product-input-v1", shotSpecRevisionID,
+		generationProfileRevisionID, effectiveContextHash, assetVersionIDs,
+		positivePrompt, negativePrompt, output, inputRevisionHashes,
+		inputPackageHash,
+	)
+}
+
+// ImportedPromptHashForCompiler preserves the immutable FLO-104 importer while
+// giving FLO-154 its own executable compiler namespace and digest domain.
+func ImportedPromptHashForCompiler(
+	compilerVersion string,
+	shotSpecRevisionID string,
+	generationProfileRevisionID string,
+	effectiveContextHash string,
+	assetVersionIDs []uuid.UUID,
+	positivePrompt string,
+	negativePrompt string,
+	output providercontract.OutputSpec,
+	inputRevisionHashes map[string]string,
+	inputPackageHash string,
+) (string, error) {
+	if !importedPromptCompiler(compilerVersion) {
+		return "", errors.New("unsupported imported prompt compiler")
+	}
 	return digestValue(map[string]any{
 		"schemaVersion":             "v1",
-		"compilerVersion":           "stage1-product-input-v1",
+		"compilerVersion":           compilerVersion,
 		"shotSpecRevisionId":        shotSpecRevisionID,
 		"generationProfileRevision": generationProfileRevisionID,
 		"effectiveContextHash":      effectiveContextHash,
@@ -464,6 +496,10 @@ func ImportedPromptHash(
 		"inputRevisionHashes":       inputRevisionHashes,
 		"inputPackageHash":          inputPackageHash,
 	})
+}
+
+func importedPromptCompiler(version string) bool {
+	return version == "stage1-product-input-v1" || version == "flo154-native-materializer-v1"
 }
 
 // GenerationRunSpecDigest exposes the repository's canonical run identity to
@@ -687,6 +723,7 @@ func verifyPromptLineage(
 }
 
 func workflowPromptHash(
+	compilerVersion string,
 	shotSpecRevisionID string,
 	generationProfileRevisionID string,
 	effectiveContextHash string,
@@ -697,7 +734,7 @@ func workflowPromptHash(
 ) (string, error) {
 	return digestValue(map[string]any{
 		"schemaVersion":             "v1",
-		"compilerVersion":           "control-plane-compiler-v1",
+		"compilerVersion":           compilerVersion,
 		"shotSpecRevisionId":        shotSpecRevisionID,
 		"generationProfileRevision": generationProfileRevisionID,
 		"effectiveContextHash":      effectiveContextHash,
@@ -1540,6 +1577,9 @@ func (p *Postgres) PrepareProviderJob(
 		if err := requireExecutionPolicy(
 			capabilityLimits, plan.ExecutionPolicy, plan.Plan.ProviderCallCount,
 		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := requireNativeAudioCapability(capabilityLimits, exactPrompt.Output); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
 		unitPrice, priced := numericLimit(capabilityLimits, "unitPriceMicros")
@@ -2416,6 +2456,15 @@ func (p *Postgres) CompleteProviderJob(
 			"width": result.Width, "height": result.Height,
 			"durationMillis": result.DurationMillis,
 			"modelSnapshot":  result.Model, "usage": result.Usage, "cost": result.Cost,
+			"kind":      "shot_video",
+			"assetRole": string(providercontract.AssetRoleOutput),
+		}
+		providerOutput := preparedSnapshot.Input.Prompt.Output
+		if providerOutput.GenerateAudio {
+			mediaSpec["assetRole"] = string(providercontract.AssetRoleProviderOriginal)
+			mediaSpec["audioStrategy"] = providerOutput.ResolvedAudioStrategy()
+			mediaSpec["audioDelivery"] = providerOutput.AudioDelivery
+			mediaSpec["generateAudio"] = true
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO video_pipeline.artifacts
@@ -3894,30 +3943,45 @@ func (p *Postgres) PrepareEpisodePostProduction(
 	}
 
 	clips := make([]postproduction.Clip, 0, len(runIDs))
+	ambienceContinuityExplicit := make([]bool, 0, len(runIDs))
 	cues := make([]postproduction.Cue, 0)
 	sourceRevisionIDs := make([]string, 0, len(runIDs))
 	voiceAssetIDs := make(map[uuid.UUID]struct{})
+	requiresSpeech := input.Config.RequiresSpeech()
 	var timelineOffset int64
 	for index, runID := range runIDs {
 		var (
-			clip                           postproduction.Clip
-			narrative                      []byte
-			assetVersionRefs               []uuid.UUID
-			artifactDigest                 string
-			artifactURI                    string
-			mediaType                      string
-			licenseReference               string
-			sizeBytes                      int64
-			width, height, framesPerSecond int
+			clip                                   postproduction.Clip
+			narrative                              []byte
+			assetVersionRefs                       []uuid.UUID
+			artifactDigest                         string
+			artifactURI                            string
+			mediaType                              string
+			licenseReference                       string
+			sizeBytes                              int64
+			width, height, framesPerSecond         int
+			providerJobID, providerRequestID       string
+			modelSnapshotJSON, requestSnapshotJSON []byte
+			providerUsageJSON, providerCostJSON    []byte
+			sceneContextID, sceneContextHash       string
+			sceneContextPayload                    []byte
+			cinematography                         []byte
 		)
 		if err := p.pool.QueryRow(ctx, `
-			SELECT gr.id, ssr.id, ssr.content_hash, ssr.duration_ms, ssr.narrative,
+			SELECT gr.id, ssr.id, ssr.content_hash, ssr.duration_ms, ssr.narrative, ssr.cinematography,
 			       ssr.asset_version_refs,
 			       ps.id, ps.content_hash, ecs.id, ecs.content_hash,
+			       scene_context.id::text, scene_context.content_hash, scene_context.payload,
 			       a.content_hash, a.artifact_uri, a.media_type, a.size_bytes,
 			       COALESCE((a.media_spec->>'width')::integer, ssr.width),
 			       COALESCE((a.media_spec->>'height')::integer, ssr.height),
 			       ssr.fps,
+			       provider_evidence.id::text,
+			       COALESCE(provider_evidence.upstream_request_id, ''),
+			       provider_evidence.model_snapshot,
+			       provider_evidence.request_snapshot,
+			       COALESCE(a.media_spec->'usage', '{}'::jsonb),
+			       COALESCE(a.media_spec->'cost', '{}'::jsonb),
 			       COALESCE((
 			         SELECT string_agg(ls.license_id || ':' || ls.license_hash, ';' ORDER BY ls.id)
 			         FROM unnest(ssr.asset_version_refs) requested(id)
@@ -3941,9 +4005,25 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			JOIN video_pipeline.episode_revisions er ON er.id = $2 AND er.episode_id = ep.id
 			JOIN video_pipeline.prompt_snapshots ps ON ps.id = gr.prompt_snapshot_id
 			JOIN video_pipeline.effective_context_snapshots ecs ON ecs.id = ps.effective_context_snapshot_id
+			JOIN LATERAL (
+			  SELECT cr.id, cr.content_hash, cr.payload
+			  FROM video_pipeline.context_revisions cr
+			  WHERE cr.id = ANY(ecs.context_revision_ids)
+			    AND cr.scope_type = 'SCENE'
+			    AND cr.status = 'APPROVED'
+			  LIMIT 1
+			) scene_context ON true
 			JOIN video_pipeline.run_artifacts ra
 			  ON ra.generation_run_id = gr.id AND ra.role = 'OUTPUT'
 			JOIN video_pipeline.artifacts a ON a.id = ra.artifact_id
+			JOIN LATERAL (
+			  SELECT pj.id, pj.upstream_request_id, ga.model_snapshot, pj.request_snapshot
+			  FROM video_pipeline.generation_attempts ga
+			  JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			  WHERE ga.generation_run_id = gr.id AND pj.state = 'SUCCEEDED'
+			  ORDER BY ga.sequence DESC
+			  LIMIT 1
+			) provider_evidence ON true
 			WHERE gr.id = $1
 			  AND gr.state = 'SUCCEEDED'
 			  AND EXISTS (
@@ -3975,11 +4055,15 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			runID, episodeRevisionID,
 		).Scan(
 			&clip.RunID, &clip.ShotSpecRevisionID, &clip.ShotSpecHash,
-			&clip.DurationMillis, &narrative, &assetVersionRefs,
+			&clip.DurationMillis, &narrative, &cinematography, &assetVersionRefs,
 			&clip.PromptSnapshotID, &clip.PromptSnapshotHash,
 			&clip.ContextSnapshotID, &clip.ContextSnapshotHash,
+			&sceneContextID, &sceneContextHash, &sceneContextPayload,
 			&artifactDigest, &artifactURI, &mediaType, &sizeBytes,
-			&width, &height, &framesPerSecond, &licenseReference,
+			&width, &height, &framesPerSecond,
+			&providerJobID, &providerRequestID, &modelSnapshotJSON, &requestSnapshotJSON,
+			&providerUsageJSON, &providerCostJSON,
+			&licenseReference,
 		); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return postproduction.Request{}, controlplane.NewPolicyError(
@@ -3998,6 +4082,37 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			MediaType: mediaType, SizeBytes: sizeBytes, DurationMillis: clip.DurationMillis,
 			Width: width, Height: height, FPS: framesPerSecond,
 		}
+		var model providercontract.ModelSnapshot
+		if err := json.Unmarshal(modelSnapshotJSON, &model); err != nil {
+			return postproduction.Request{}, fmt.Errorf("decode run %s model provenance: %w", runID, err)
+		}
+		var providerRequest immutableProviderRequest
+		if err := json.Unmarshal(requestSnapshotJSON, &providerRequest); err != nil {
+			return postproduction.Request{}, fmt.Errorf("decode run %s Provider request provenance: %w", runID, err)
+		}
+		providerOutput := providerRequest.Input.Prompt.Output
+		clip.ProviderVideo = &postproduction.ProviderVideoEvidence{
+			ProviderJobID: providerJobID, ProviderRequestID: providerRequestID,
+			Provider: model.Provider, Model: model.ModelID, Version: model.RouteVersion,
+			GenerateAudio: providerOutput.GenerateAudio, AudioDelivery: providerOutput.AudioDelivery,
+		}
+		if err := json.Unmarshal(providerUsageJSON, &clip.ProviderVideo.Usage); err != nil {
+			return postproduction.Request{}, fmt.Errorf("decode run %s Provider usage: %w", runID, err)
+		}
+		if err := json.Unmarshal(providerCostJSON, &clip.ProviderVideo.Cost); err != nil {
+			return postproduction.Request{}, fmt.Errorf("decode run %s Provider cost: %w", runID, err)
+		}
+		ambience, continuityExplicit, err := ambienceFromSceneContext(
+			sceneContextID, sceneContextHash, sceneContextPayload,
+		)
+		if err != nil {
+			return postproduction.Request{}, fmt.Errorf("resolve run %s ambience context: %w", runID, err)
+		}
+		clip.Ambience = ambience
+		clip.LipSyncRequired, err = lipSyncRequiredFromShot(cinematography, narrative)
+		if err != nil {
+			return postproduction.Request{}, fmt.Errorf("resolve run %s lip-sync policy: %w", runID, err)
+		}
 		clip.LicenseReference = licenseReference
 		shotCues, err := dialogueCues(
 			narrative, clip.ShotSpecRevisionID, timelineOffset, clip.DurationMillis,
@@ -4008,14 +4123,14 @@ func (p *Postgres) PrepareEpisodePostProduction(
 		if err := collectVoiceAssetBindings(
 			shotCues,
 			assetVersionRefs,
-			input.Config.Evidence == postproduction.EvidenceLive,
+			input.Config.Evidence == postproduction.EvidenceLive && requiresSpeech,
 			voiceAssetIDs,
 		); err != nil {
 			return postproduction.Request{}, fmt.Errorf(
 				"shot %s voice authorization: %w", clip.ShotSpecRevisionID, err,
 			)
 		}
-		if input.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2 {
+		if requiresSpeech && input.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2 {
 			if input.Config.SpeechVoice == nil {
 				return postproduction.Request{}, errors.New("speech-v2 requires an immutable VOICE binding")
 			}
@@ -4043,14 +4158,25 @@ func (p *Postgres) PrepareEpisodePostProduction(
 		}
 		cues = append(cues, shotCues...)
 		clips = append(clips, clip)
+		ambienceContinuityExplicit = append(ambienceContinuityExplicit, continuityExplicit)
 		sourceRevisionIDs = append(sourceRevisionIDs, clip.ShotSpecRevisionID)
 		timelineOffset += clip.DurationMillis
 	}
-	if err := p.validateVoiceAssets(ctx, episodeRevisionID, voiceAssetIDs); err != nil {
-		return postproduction.Request{}, err
+	for index := 0; index+1 < len(clips); index++ {
+		if !ambienceContinuityExplicit[index] && clips[index].Ambience != nil &&
+			clips[index+1].Ambience != nil &&
+			clips[index].Ambience.Identity == clips[index+1].Ambience.Identity &&
+			clips[index].Ambience.Version == clips[index+1].Ambience.Version {
+			clips[index].Ambience.ContinuityIntoNext = true
+		}
 	}
-	if err := p.validateSpeechV2Configuration(ctx, p.pool, episodeRevisionID, input.Config); err != nil {
-		return postproduction.Request{}, err
+	if requiresSpeech {
+		if err := p.validateVoiceAssets(ctx, episodeRevisionID, voiceAssetIDs); err != nil {
+			return postproduction.Request{}, err
+		}
+		if err := p.validateSpeechV2Configuration(ctx, p.pool, episodeRevisionID, input.Config); err != nil {
+			return postproduction.Request{}, err
+		}
 	}
 	cueHash, err := digestValue(map[string]any{
 		"episodeRevisionId": input.EpisodeRevisionID,
@@ -4090,21 +4216,10 @@ func (p *Postgres) PrepareEpisodePostProduction(
 		Clips:               clips,
 		Subtitle:            subtitle,
 		BackgroundAudio:     background,
-		Speech: postproduction.SpeechConfig{
-			Route:                            input.Config.SpeechRoute,
-			ProviderProfileID:                input.Config.SpeechProviderProfileID,
-			BudgetApprovalID:                 input.Config.SpeechBudgetApprovalID,
-			BudgetMaximumMicros:              input.Config.SpeechBudgetMaximumMicros,
-			BudgetCurrency:                   input.Config.SpeechBudgetCurrency,
-			IdentityVersion:                  input.Config.SpeechIdentityVersion,
-			Voice:                            input.Config.SpeechVoice,
-			AuthorizedCueID:                  input.Config.SpeechAuthorizedCueID,
-			MaximumAFPMilli:                  input.Config.SpeechMaximumAFPMilli,
-			MaximumNonSubscriptionCashMicros: input.Config.SpeechMaximumCashMicros,
-			MaxAttempts:                      input.Config.SpeechMaxAttempts,
-			BatchAuthorization:               input.Config.SpeechBatchAuthorization,
-			CompletedAttempts:                input.Config.SpeechCompletedAttempts,
-		},
+		AudioStrategy:       input.Config.ResolvedAudioStrategy(),
+		AnalyzerSealSHA256:  input.Config.AnalyzerSealSHA256,
+		CueFallbacks:        append([]postproduction.CueFallback(nil), input.Config.CueFallbacks...),
+		Speech:              input.Config.SpeechConfiguration(),
 		Output: postproduction.OutputPolicy{
 			Width: 1280, Height: 720, FPS: 24, Format: "mp4",
 			BurnSubtitles: input.Config.BurnSubtitles, AudioSampleRate: 48_000,
@@ -4151,8 +4266,10 @@ func (p *Postgres) AuthorizeEpisodePostProduction(
 		); err != nil {
 			return struct{}{}, err
 		}
-		if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
-			return struct{}{}, err
+		if input.Config.RequiresSpeech() {
+			if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
+				return struct{}{}, err
+			}
 		}
 		return struct{}{}, nil
 	})
@@ -4204,8 +4321,10 @@ func (p *Postgres) CommitEpisodePostProduction(
 		); err != nil {
 			return struct{}{}, err
 		}
-		if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
-			return struct{}{}, err
+		if input.Config.RequiresSpeech() {
+			if err := p.validateSpeechV2Configuration(ctx, tx, episodeRevisionID, input.Config); err != nil {
+				return struct{}{}, err
+			}
 		}
 		var eligibleRuns int
 		if err := tx.QueryRow(ctx, `
@@ -4240,10 +4359,19 @@ func (p *Postgres) CommitEpisodePostProduction(
 		}
 		outputs := []artifactRole{
 			{artifact: result.FinalVideo, role: "OUTPUT"},
-			{artifact: result.Dialogue, role: "AUDIO"},
+			{artifact: result.FinalMix, role: "AUDIO"},
 			{artifact: result.Subtitle, role: "SUBTITLE"},
 			{artifact: result.Manifest, role: "MANIFEST"},
 			{artifact: result.ServiceBOM, role: "MANIFEST"},
+		}
+		if result.Dialogue.Kind != "" {
+			outputs = append(outputs, artifactRole{artifact: result.Dialogue, role: "AUDIO"})
+		}
+		if result.AudioQC.Kind != "" {
+			outputs = append(outputs, artifactRole{artifact: result.AudioQC, role: "MANIFEST"})
+		}
+		for _, nativeMix := range result.NativeMixes {
+			outputs = append(outputs, artifactRole{artifact: nativeMix, role: "AUDIO"})
 		}
 		for _, output := range outputs {
 			artifactID := uuid.NewSHA1(
@@ -4256,6 +4384,8 @@ func (p *Postgres) CommitEpisodePostProduction(
 				"postProductionManifestHash":   result.ManifestHash,
 				"postProductionManifestHashes": []string{result.ManifestHash},
 				"speechCost":                   speechCost,
+				"audioStrategy":                result.AudioStrategy,
+				"ttsSubmitCount":               len(result.SpeechAttempts),
 			}
 			if _, err := tx.Exec(ctx, `
 				INSERT INTO video_pipeline.artifacts
@@ -4357,8 +4487,18 @@ func (p *Postgres) CommitEpisodePostProduction(
 			map[string]any{
 				"runIds": input.RunIDs, "evidence": result.Evidence,
 				"finalVideoHash": result.FinalVideo.Digest,
+				"finalMixHash":   result.FinalMix.Digest,
 				"subtitleHash":   result.Subtitle.Digest,
 				"dialogueHash":   result.Dialogue.Digest,
+				"nativeMixHashes": func() []string {
+					hashes := make([]string, 0, len(result.NativeMixes))
+					for _, artifact := range result.NativeMixes {
+						hashes = append(hashes, artifact.Digest)
+					}
+					return hashes
+				}(),
+				"audioStrategy":  result.AudioStrategy,
+				"audioQcHash":    result.AudioQC.Digest,
 				"manifestHash":   result.ManifestHash,
 				"serviceBomHash": result.ServiceBOMHash,
 				"speechCost":     speechCost,
@@ -5475,6 +5615,178 @@ func (p *Postgres) requireCurrentEpisodeAssetRights(
 	return requireAssetLicenses(ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy)
 }
 
+func requireNativeAudioCapability(
+	limits map[string]any,
+	output providercontract.OutputSpec,
+) error {
+	if err := output.ValidateAudio(providercontract.ModalityVideo); err != nil {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the immutable Prompt has an invalid audio request: "+err.Error(),
+		)
+	}
+	if !output.ResolvedAudioStrategy().RequiresNativeAudio() {
+		return nil
+	}
+	supported, _ := limits["supportsNativeAudio"].(bool)
+	delivery, _ := limits["nativeAudioDelivery"].(string)
+	if !supported || (delivery != string(providercontract.NativeAudioMix) &&
+		delivery != string(providercontract.NativeAudioStems)) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeCapability,
+			"the frozen Provider capability cannot produce the requested native audio",
+			"refresh discovery or freeze an explicit tts_required fallback before paid submission",
+		)
+	}
+	if output.AudioDelivery == providercontract.NativeAudioStems &&
+		delivery != string(providercontract.NativeAudioStems) {
+		return controlplane.NewPolicyError(
+			controlplane.CodeCapability,
+			"the frozen Provider returns only a native mix, not independent stems",
+			"request native_mix or select a Provider that explicitly returns stems",
+		)
+	}
+	return nil
+}
+
+func ambienceFromSceneContext(
+	sceneContextID string,
+	sceneContextHash string,
+	payloadJSON []byte,
+) (*postproduction.AmbienceBinding, bool, error) {
+	if strings.TrimSpace(sceneContextID) == "" || !validImportedDigest(sceneContextHash) {
+		return nil, false, errors.New("approved Scene Context identity and hash are required")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(payloadJSON, &payload); err != nil {
+		return nil, false, fmt.Errorf("decode Scene Context payload: %w", err)
+	}
+	values := payload
+	if nested, ok := payload["values"].(map[string]any); ok {
+		values = nested
+	}
+	readString := func(key string) string {
+		value, _ := values[key].(string)
+		return strings.TrimSpace(value)
+	}
+	identity := readString("audio.ambience.identity")
+	version := readString("audio.ambience.version")
+	if audio, ok := payload["audio"].(map[string]any); ok {
+		if ambience, ok := audio["ambience"].(map[string]any); ok {
+			if identity == "" {
+				identity, _ = ambience["identity"].(string)
+				identity = strings.TrimSpace(identity)
+			}
+			if version == "" {
+				version, _ = ambience["version"].(string)
+				version = strings.TrimSpace(version)
+			}
+		}
+	}
+	if (identity == "") != (version == "") {
+		return nil, false, errors.New("Scene Context ambience must set identity and version together")
+	}
+	if identity == "" {
+		identity = "scene-context:" + sceneContextID
+		version = sceneContextHash
+	}
+	binding := &postproduction.AmbienceBinding{Identity: identity, Version: version}
+	continuityValue, continuityExplicit := values["audio.ambience.continuity"]
+	if continuityExplicit {
+		switch value := continuityValue.(type) {
+		case bool:
+			binding.ContinuityIntoNext = value
+		case string:
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "true", "required", "continuous":
+				binding.ContinuityIntoNext = true
+			case "false", "none", "cut":
+				binding.ContinuityIntoNext = false
+			default:
+				return nil, false, fmt.Errorf("unsupported ambience continuity %q", value)
+			}
+		default:
+			return nil, false, errors.New("ambience continuity must be a boolean or frozen string enum")
+		}
+	}
+	if err := binding.Validate(); err != nil {
+		return nil, false, err
+	}
+	return binding, continuityExplicit, nil
+}
+
+func lipSyncRequiredFromShot(cinematographyJSON, narrativeJSON []byte) (bool, error) {
+	var narrative struct {
+		Dialogue []json.RawMessage `json:"dialogue"`
+	}
+	if err := json.Unmarshal(narrativeJSON, &narrative); err != nil {
+		return false, fmt.Errorf("decode shot narrative: %w", err)
+	}
+	if len(narrative.Dialogue) == 0 {
+		return false, nil
+	}
+	var cinematography map[string]any
+	if err := json.Unmarshal(cinematographyJSON, &cinematography); err != nil {
+		return false, fmt.Errorf("decode shot cinematography: %w", err)
+	}
+	if value, ok := nestedBool(cinematography, "lipSyncRequired", "requiresLipSync"); ok {
+		return value, nil
+	}
+	flattened := strings.ToLower(flattenJSONStrings(cinematography))
+	closeup := strings.Contains(flattened, "close-up") ||
+		strings.Contains(flattened, "close up") || strings.Contains(flattened, "closeup") ||
+		strings.Contains(flattened, "特写") || strings.Contains(flattened, "近景")
+	frontal := strings.Contains(flattened, "front") || strings.Contains(flattened, "frontal") ||
+		strings.Contains(flattened, "正面")
+	return closeup && frontal, nil
+}
+
+func nestedBool(value any, keys ...string) (bool, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range keys {
+			if raw, ok := typed[key]; ok {
+				if result, valid := raw.(bool); valid {
+					return result, true
+				}
+			}
+		}
+		for _, nested := range typed {
+			if result, ok := nestedBool(nested, keys...); ok {
+				return result, true
+			}
+		}
+	case []any:
+		for _, nested := range typed {
+			if result, ok := nestedBool(nested, keys...); ok {
+				return result, true
+			}
+		}
+	}
+	return false, false
+}
+
+func flattenJSONStrings(value any) string {
+	parts := make([]string, 0)
+	var visit func(any)
+	visit = func(current any) {
+		switch typed := current.(type) {
+		case string:
+			parts = append(parts, typed)
+		case map[string]any:
+			for _, nested := range typed {
+				visit(nested)
+			}
+		case []any:
+			for _, nested := range typed {
+				visit(nested)
+			}
+		}
+	}
+	visit(value)
+	return strings.Join(parts, " ")
+}
+
 func (p *Postgres) requireCurrentPostProductionBudget(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -5486,12 +5798,21 @@ func (p *Postgres) requireCurrentPostProductionBudget(
 	if err != nil {
 		return err
 	}
+	if plan.EpisodeRevisionID != episodeRevisionID.String() {
+		return controlplane.NewPolicyError(
+			controlplane.CodeBudgetExceeded,
+			"post-production is outside the immutable generation plan episode",
+			"create a current plan for the exact episode",
+		)
+	}
+	if !config.RequiresSpeech() {
+		return nil
+	}
 	required := controlplane.BudgetLimit{
 		AmountMicros: config.SpeechBudgetMaximumMicros,
 		Currency:     config.SpeechBudgetCurrency,
 	}
-	if plan.EpisodeRevisionID != episodeRevisionID.String() ||
-		!sameBudgetLimit(plan.SpeechBudgetLimit, required) {
+	if !sameBudgetLimit(plan.SpeechBudgetLimit, required) {
 		return controlplane.NewPolicyError(
 			controlplane.CodeBudgetExceeded,
 			"post-production speech budget is outside the immutable generation plan",
@@ -6768,6 +7089,11 @@ func summarizeSpeechCost(
 	summary := speechCostEvidence{AttemptCount: len(attempts), Verified: len(attempts) > 0}
 	var actual int64
 	actualKnown := len(attempts) > 0
+	if len(attempts) == 0 {
+		summary.ActualMicros = &actual
+		summary.Verified = true
+		return summary, nil
+	}
 	for index, attempt := range attempts {
 		if index == 0 {
 			summary.Currency = attempt.Cost.Currency
