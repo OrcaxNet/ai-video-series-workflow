@@ -919,6 +919,7 @@ func TestGateBlocksNextSubmitOnIncompleteEvidenceOrActualAFPDrift(t *testing.T) 
 type fakeSubmitter struct {
 	mu             sync.Mutex
 	submits        int
+	recovers       int
 	tasks          map[string]string
 	submitErr      error
 	forcedRecovery *RecoveryResult
@@ -927,6 +928,7 @@ type fakeSubmitter struct {
 func (s *fakeSubmitter) Recover(_ context.Context, key string) (RecoveryResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.recovers++
 	if s.forcedRecovery != nil {
 		return *s.forcedRecovery, nil
 	}
@@ -950,6 +952,12 @@ func (s *fakeSubmitter) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.submits
+}
+
+func (s *fakeSubmitter) recoveryCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.recovers
 }
 
 func TestExecutorRecoversIdempotentlyAndNeverAutoResubmitsAmbiguousSubmit(t *testing.T) {
@@ -1175,6 +1183,9 @@ func TestPreparedProductTruthAndLedgerReservationShareCrossProcessLock(t *testin
 	}
 	if rejectedSubmitter.count() != 0 {
 		t.Fatalf("rejected product truth Provider submits=%d, want 0", rejectedSubmitter.count())
+	}
+	if rejectedSubmitter.recoveryCount() != 0 {
+		t.Fatalf("rejected product truth Provider recoveries=%d, want 0", rejectedSubmitter.recoveryCount())
 	}
 }
 

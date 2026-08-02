@@ -202,12 +202,12 @@ func verifyFLO167LegacyTerminal(
 		  AND br.status='SETTLED' AND a.status='ACTIVE'
 		  AND a.artifact_uri='cas://sha256/'||a.content_hash
 		  AND cl.budget_reservation_id=br.id AND cl.currency='CNY'
-		  AND cl.units=$2 AND cl.unit_name='video_tokens'
+		  AND cl.units=0 AND COALESCE(cl.unit_name,'')=''
 		  AND cl.pricing_rule_version=br.pricing_rule_version
 		  AND (SELECT count(*) FROM video_pipeline.provider_jobs p WHERE p.generation_attempt_id=ga.id)=1
 		  AND (SELECT count(*) FROM video_pipeline.run_artifacts r WHERE r.generation_run_id=ar.run_id AND r.role='OUTPUT')=1
 		  AND (SELECT count(*) FROM video_pipeline.cost_ledger c
-		       WHERE c.provider_job_id=pj.id AND c.entry_type='ACTUAL')=1`, activationID, expected.ActualVideoTokens).Scan(
+		       WHERE c.provider_job_id=pj.id AND c.entry_type='ACTUAL')=1`, activationID).Scan(
 		&rowCount, &taskID, &requestID, &state, &artifactHash, &videoTokens, &actualCashMicros,
 	)
 	if err != nil {

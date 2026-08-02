@@ -105,6 +105,41 @@ func TestLoadRevisionParentClassifiesArtifactFailures(t *testing.T) {
 	}
 }
 
+func TestLoadFLO167SupersessionRequiresAndValidatesBothArtifacts(t *testing.T) {
+	t.Parallel()
+	packagePath := filepath.Join("..", "..", "docs", "flo-167", "provider-free-execution-package.json")
+	projectionPath := filepath.Join("..", "..", "docs", "flo-167", "canonical-projection.json")
+	tests := []struct {
+		name      string
+		values    map[string]string
+		wantError bool
+		wantNil   bool
+	}{
+		{name: "disabled", values: map[string]string{}, wantNil: true},
+		{name: "package only", values: map[string]string{"VIDEO_STAGE1_FLO167_SUPERSESSION_PACKAGE_PATH": packagePath}, wantError: true},
+		{name: "projection only", values: map[string]string{"VIDEO_STAGE1_FLO167_PROJECTION_PATH": projectionPath}, wantError: true},
+		{name: "complete", values: map[string]string{
+			"VIDEO_STAGE1_FLO167_SUPERSESSION_PACKAGE_PATH": packagePath,
+			"VIDEO_STAGE1_FLO167_PROJECTION_PATH":           projectionPath,
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			lookup := func(name string) (string, bool) {
+				value, ok := test.values[name]
+				return value, ok
+			}
+			got, err := loadFLO167Supersession(lookup)
+			if (err != nil) != test.wantError {
+				t.Fatalf("error=%v, wantError=%t", err, test.wantError)
+			}
+			if !test.wantError && (got == nil) != test.wantNil {
+				t.Fatalf("package nil=%t, want=%t", got == nil, test.wantNil)
+			}
+		})
+	}
+}
+
 func revisionParentFixtureLookup(t *testing.T, content string) func(string) (string, bool) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "parent.json")

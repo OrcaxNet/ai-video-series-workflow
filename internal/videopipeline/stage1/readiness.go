@@ -1075,9 +1075,10 @@ func (e *Executor) Execute(ctx context.Context, attempt Attempt) (SubmitResult, 
 	return e.ExecutePrepared(ctx, attempt, nil)
 }
 
-// ExecutePrepared performs recovery first and invokes prepare only for a new
-// submit. The request returned by prepare remains in memory and never enters
-// the prompt-free Stage 1 ledger.
+// ExecutePrepared validates and durably prepares the paid boundary before any
+// adapter HTTP call. Recovery then distinguishes a previously posted job from
+// a genuinely new submit. The request returned by prepare remains in memory
+// and never enters the prompt-free Stage 1 ledger.
 func (e *Executor) ExecutePrepared(
 	ctx context.Context,
 	attempt Attempt,
@@ -1085,10 +1086,6 @@ func (e *Executor) ExecutePrepared(
 ) (SubmitResult, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	recovered, err := e.submitter.Recover(ctx, attempt.IdempotencyKey)
-	if err != nil {
-		return SubmitResult{}, err
-	}
 	decision, err := e.gate.AuthorizePrepared(attempt, func() error {
 		if prepare == nil {
 			return nil
@@ -1104,7 +1101,11 @@ func (e *Executor) ExecutePrepared(
 		return SubmitResult{}, err
 	}
 	if decision == DecisionReplay {
-		return SubmitResult{}, providerError(providercontract.CodeConflict, "terminal stage 1 attempt cannot be submitted again")
+		return SubmitResult{}, e.gate.replayError(attempt.IdempotencyKey)
+	}
+	recovered, err := e.submitter.Recover(ctx, attempt.IdempotencyKey)
+	if err != nil {
+		return SubmitResult{}, err
 	}
 	if recovered.Found {
 		if strings.TrimSpace(recovered.ProviderTaskID) == "" {
@@ -1125,6 +1126,25 @@ func (e *Executor) ExecutePrepared(
 		return SubmitResult{}, providerError(providercontract.CodeUnavailable, "stage 1 provider submit returned no task ID")
 	}
 	return result, nil
+}
+
+func (g *Gate) replayError(idempotencyKey string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	lock, err := g.acquireFileLock()
+	if err != nil {
+		return err
+	}
+	defer releaseFileLock(lock)
+	ledger, err := g.loadLocked()
+	if err != nil {
+		return err
+	}
+	record := ledger.Records[idempotencyKey]
+	if record != nil && record.ContentSafetyFailed {
+		return providerError(providercontract.CodeContentBlocked, "terminal stage 1 attempt was rejected by content safety")
+	}
+	return providerError(providercontract.CodeConflict, "terminal stage 1 attempt cannot be submitted again")
 }
 
 func ValidateDialogue(texts []string) (characters int64, afpMilli int64, err error) {
