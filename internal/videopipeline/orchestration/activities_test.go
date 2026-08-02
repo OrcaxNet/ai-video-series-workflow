@@ -91,6 +91,7 @@ type cancellationLedgerFixture struct {
 	prepared      bool
 	preparedCalls int
 	recorded      []CancelProviderResult
+	recordErr     error
 }
 
 type providerPreparationLedgerFixture struct {
@@ -246,7 +247,7 @@ func (l *cancellationLedgerFixture) RecordProviderCancellation(
 	result CancelProviderResult,
 ) error {
 	l.recorded = append(l.recorded, result)
-	return nil
+	return l.recordErr
 }
 
 func (j *activityJournalFixture) BeginWorkflowStep(
@@ -604,6 +605,101 @@ func TestActivities_CancelProviderJobTreatsAuthoritativeAbsenceAsCancelled(t *te
 	if result.State != "CANCELLED" || !result.NoRemoteTask || len(ledger.recorded) != 1 ||
 		ledger.recorded[0].State != "CANCELLED" || !ledger.recorded[0].NoRemoteTask {
 		t.Fatalf("result=%#v recorded=%#v", result, ledger.recorded)
+	}
+}
+
+func TestActivities_CancelProviderJobRetriesWhenDurableIdentityDisprovesAbsence(t *testing.T) {
+	t.Parallel()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error": providercontract.Error{
+				Code:        providercontract.CodeNotFound,
+				SafeMessage: "provider job was not found",
+			},
+		})
+	}))
+	defer provider.Close()
+
+	ledger := &cancellationLedgerFixture{
+		prepared:  true,
+		recordErr: errors.New("durable upstream task still requires reconciliation"),
+	}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	_, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "reconcile-known-upstream",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-known-upstream"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY",
+		TraceID:    "provider-registry-missing",
+	})
+	if err == nil {
+		t.Fatal("ExecuteActivity() error = nil, want retryable durable reconciliation")
+	}
+	var applicationErr *temporal.ApplicationError
+	if !errors.As(err, &applicationErr) || applicationErr.NonRetryable() {
+		t.Fatalf("ExecuteActivity() error = %#v, want retryable ApplicationError", err)
+	}
+	if len(ledger.recorded) != 1 || ledger.recorded[0].State != "CANCELLED" ||
+		!ledger.recorded[0].NoRemoteTask {
+		t.Fatalf("recorded cancellation = %#v", ledger.recorded)
+	}
+}
+
+func TestActivities_CancelProviderJobRejectsTerminalIdentityConflict(t *testing.T) {
+	t.Parallel()
+	provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		actualMicros := int64(12)
+		_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+			JobID: "provider-job-run-terminal-conflict", RunID: "run-terminal-conflict",
+			State:          providercontract.StatusFailed,
+			UpstreamTaskID: "unexpected-task",
+			RequestID:      "unexpected-request",
+			Cost: providercontract.Cost{
+				EstimatedMicros: 50, ActualMicros: &actualMicros,
+				Currency: "CNY", PricingVersion: "pricing-v1", Verified: true,
+			},
+		})
+	}))
+	defer provider.Close()
+
+	ledger := &cancellationLedgerFixture{
+		prepared: true,
+		recordErr: controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"provider terminal identity differs from the durable record",
+		),
+	}
+	activities := NewProductionActivities(provider.URL, nil, ledger, nil)
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(activities.CancelProviderJob)
+	_, err := env.ExecuteActivity(activities.CancelProviderJob, CancelProviderJobInput{
+		OperationID: "terminal-identity-conflict",
+		Dispatch: ExecuteProviderJobInput{
+			Run:                 GenerationRunRef{RunID: "run-terminal-conflict"},
+			PersistProductTruth: true,
+		},
+		ReasonCode: "RECONCILE_HISTORY",
+		TraceID:    "terminal-identity-conflict",
+	})
+	if err == nil {
+		t.Fatal("ExecuteActivity() error = nil, want non-retryable identity conflict")
+	}
+	var applicationErr *temporal.ApplicationError
+	if !errors.As(err, &applicationErr) || !applicationErr.NonRetryable() ||
+		applicationErr.Type() != string(controlplane.CodeRevisionConflict) {
+		t.Fatalf("ExecuteActivity() error = %#v, want non-retryable revision conflict", err)
+	}
+	if len(ledger.recorded) != 1 || ledger.recorded[0].State != "FAILED" {
+		t.Fatalf("recorded cancellation = %#v", ledger.recorded)
 	}
 }
 

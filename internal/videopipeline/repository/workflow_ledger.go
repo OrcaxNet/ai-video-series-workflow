@@ -5585,7 +5585,11 @@ func (p *Postgres) RecordProviderCancellation(
 	if err != nil {
 		return errors.New("runId must be a UUID")
 	}
+	requestedResult := result
+	cancellationUnconfirmed := false
 	_, err = withSerializable(ctx, p.pool, func(tx pgx.Tx) (struct{}, error) {
+		result = requestedResult
+		cancellationUnconfirmed = false
 		var currentState string
 		if err := tx.QueryRow(ctx, `
 			SELECT state
@@ -5613,6 +5617,38 @@ func (p *Postgres) RecordProviderCancellation(
 				result.State = "CANCELLED"
 				result.NoRemoteTask = true
 				result.ErrorCode = ""
+			}
+		}
+		if result.NoRemoteTask {
+			expected, exists, expectationErr := readProviderReservationExpectation(
+				ctx, tx, runID, "",
+			)
+			if expectationErr != nil {
+				return struct{}{}, expectationErr
+			}
+			if exists {
+				_, reservationStatus, identityErr := verifyProviderReservationIdentityProjection(
+					ctx, tx, expected,
+				)
+				if identityErr != nil {
+					return struct{}{}, identityErr
+				}
+				upstreamTaskID, upstreamRequestID, identityErr :=
+					readProviderUpstreamIdentity(ctx, tx, expected.JobID)
+				if identityErr != nil {
+					return struct{}{}, identityErr
+				}
+				if reservationStatus == "RESERVED" &&
+					(upstreamTaskID != "" || upstreamRequestID != "") {
+					// A missing adapter registry entry cannot prove absence after the
+					// durable paid task identity is known. Preserve the reservation
+					// and identities, and keep reconciliation retryable.
+					result = orchestration.CancelProviderResult{
+						State: "UNKNOWN", ErrorCode: "CANCEL_NOT_CONFIRMED",
+						UpstreamTaskID: upstreamTaskID, RequestID: upstreamRequestID,
+					}
+					cancellationUnconfirmed = true
+				}
 			}
 		}
 		switch result.State {
@@ -5853,7 +5889,13 @@ func (p *Postgres) RecordProviderCancellation(
 			p.now().UTC(),
 		)
 	})
-	return err
+	if err != nil {
+		return err
+	}
+	if cancellationUnconfirmed {
+		return errors.New("provider cancellation remains unconfirmed for the durable upstream task")
+	}
+	return nil
 }
 
 func settleProviderTerminalBudget(
@@ -5892,6 +5934,19 @@ func settleProviderTerminalBudget(
 	)
 	if err != nil {
 		return err
+	}
+	storedTaskID, storedRequestID, err := readProviderUpstreamIdentity(
+		ctx, tx, expected.JobID,
+	)
+	if err != nil {
+		return err
+	}
+	if (storedTaskID != "" && result.UpstreamTaskID != storedTaskID) ||
+		(storedRequestID != "" && result.RequestID != storedRequestID) {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the Provider terminal outcome differs from the durable upstream identity",
+		)
 	}
 	evidence := map[string]any{
 		"code": errorCode, "providerCost": result.Cost,
@@ -6031,8 +6086,8 @@ func verifyProviderTerminalEvidence(
 		SELECT state = $2
 		   AND error_code = $3
 		   AND error_snapshot = $4::jsonb
-		   AND ($5 = '' OR upstream_task_id = $5)
-		   AND ($6 = '' OR upstream_request_id = $6)
+		   AND upstream_task_id IS NOT DISTINCT FROM NULLIF($5, '')
+		   AND upstream_request_id IS NOT DISTINCT FROM NULLIF($6, '')
 		FROM video_pipeline.provider_jobs
 		WHERE id = $1
 		FOR SHARE`,
@@ -6048,6 +6103,30 @@ func verifyProviderTerminalEvidence(
 		)
 	}
 	return nil
+}
+
+func readProviderUpstreamIdentity(
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+) (string, string, error) {
+	var upstreamTaskID, upstreamRequestID string
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(upstream_task_id, ''), COALESCE(upstream_request_id, '')
+		FROM video_pipeline.provider_jobs
+		WHERE id = $1
+		FOR SHARE`,
+		jobID,
+	).Scan(&upstreamTaskID, &upstreamRequestID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", "", controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the Provider job has no durable upstream identity projection",
+			)
+		}
+		return "", "", fmt.Errorf("read Provider upstream identity: %w", err)
+	}
+	return upstreamTaskID, upstreamRequestID, nil
 }
 
 func (p *Postgres) ProviderJobPrepared(ctx context.Context, runIDRaw string) (bool, error) {
@@ -6224,6 +6303,18 @@ func releaseRunBudgetReservation(
 		return controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"the Provider reservation has an invalid release state",
+		)
+	}
+	upstreamTaskID, upstreamRequestID, err := readProviderUpstreamIdentity(
+		ctx, tx, expected.JobID,
+	)
+	if err != nil {
+		return err
+	}
+	if upstreamTaskID != "" || upstreamRequestID != "" {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"a Provider allocation with a durable upstream identity requires terminal cost reconciliation",
 		)
 	}
 	switch jobState {

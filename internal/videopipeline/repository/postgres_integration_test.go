@@ -2275,6 +2275,55 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			Dispatch: cancelDispatch, ReasonCode: "INTEGRATION_CANCEL_WITH_COST",
 			TraceID: cancelStep.TraceID,
 		}
+		if err := store.RecordProviderJobObservation(
+			ctx, cancelStep, cancelDispatch,
+			orchestration.ProviderJobObservation{
+				State: "RUNNING", UpstreamTaskID: cancelResult.UpstreamTaskID,
+				RequestID: cancelResult.RequestID,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		identityDrift := cancelResult
+		identityDrift.UpstreamTaskID = "different-cancel-cost-task"
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, identityDrift,
+		); err == nil {
+			t.Fatal("costed cancellation accepted a different upstream task")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("costed cancellation identity drift = %#v", err)
+			}
+		}
+		var preRunState, preAttemptState, preJobState, preReservationState string
+		var preTerminalLedger int
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status`,
+			cancelRun.RunID,
+		).Scan(
+			&preRunState, &preAttemptState, &preJobState, &preReservationState,
+			&preTerminalLedger,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if preRunState != "RUNNING" || preAttemptState != "RUNNING" ||
+			preJobState != "RUNNING" || preReservationState != "RESERVED" ||
+			preTerminalLedger != 0 {
+			t.Fatalf(
+				"cancellation identity drift side effects = run:%s attempt:%s job:%s reservation:%s terminalLedger:%d",
+				preRunState, preAttemptState, preJobState, preReservationState,
+				preTerminalLedger,
+			)
+		}
 		if err := store.RecordProviderCancellation(
 			ctx, cancelStep, cancelInput, cancelResult,
 		); err != nil {
@@ -2319,6 +2368,18 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		); err != nil {
 			t.Fatalf("exact costed cancellation replay: %v", err)
 		}
+		missingIdentity := cancelResult
+		missingIdentity.UpstreamTaskID = ""
+		if err := store.RecordProviderCancellation(
+			ctx, cancelStep, cancelInput, missingIdentity,
+		); err == nil {
+			t.Fatal("costed cancellation replay accepted a missing upstream task")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("missing cancellation identity replay = %#v", err)
+			}
+		}
 		drifted := cancelResult
 		driftedActual := int64(19)
 		drifted.Cost.ActualMicros = &driftedActual
@@ -2354,6 +2415,55 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		failureInput := orchestration.CancelProviderJobInput{
 			Dispatch: failureDispatch, ReasonCode: "RECONCILE_HISTORY",
 			TraceID: failureStep.TraceID,
+		}
+		if err := store.RecordProviderJobObservation(
+			ctx, failureStep, failureDispatch,
+			orchestration.ProviderJobObservation{
+				State: "RUNNING", UpstreamTaskID: failureResult.UpstreamTaskID,
+				RequestID: failureResult.RequestID,
+			},
+		); err != nil {
+			t.Fatal(err)
+		}
+		identityDrift := failureResult
+		identityDrift.RequestID = "different-failed-cost-request"
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, identityDrift,
+		); err == nil {
+			t.Fatal("Provider failure accepted a different upstream request")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("Provider failure identity drift = %#v", err)
+			}
+		}
+		var preRunState, preAttemptState, preJobState, preReservationState string
+		var preTerminalLedger int
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status`,
+			failureRun.RunID,
+		).Scan(
+			&preRunState, &preAttemptState, &preJobState, &preReservationState,
+			&preTerminalLedger,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if preRunState != "RUNNING" || preAttemptState != "RUNNING" ||
+			preJobState != "RUNNING" || preReservationState != "RESERVED" ||
+			preTerminalLedger != 0 {
+			t.Fatalf(
+				"failure identity drift side effects = run:%s attempt:%s job:%s reservation:%s terminalLedger:%d",
+				preRunState, preAttemptState, preJobState, preReservationState,
+				preTerminalLedger,
+			)
 		}
 		if err := store.RecordProviderCancellation(
 			ctx, failureStep, failureInput, failureResult,
@@ -2394,6 +2504,18 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ctx, failureStep, failureInput, failureResult,
 		); err != nil {
 			t.Fatalf("exact Provider failure replay: %v", err)
+		}
+		missingIdentity := failureResult
+		missingIdentity.RequestID = ""
+		if err := store.RecordProviderCancellation(
+			ctx, failureStep, failureInput, missingIdentity,
+		); err == nil {
+			t.Fatal("Provider failure replay accepted a missing upstream request")
+		} else {
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("missing Provider failure identity replay = %#v", err)
+			}
 		}
 	})
 
@@ -2481,12 +2603,56 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			ctx, observationStep,
 			orchestration.CancelProviderJobInput{
 				Dispatch:   observationDispatch,
-				ReasonCode: "INTEGRATION_OBSERVATION_CLEANUP",
+				ReasonCode: "RECONCILE_HISTORY",
 				TraceID:    observationStep.TraceID,
 			},
 			orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true},
+		); err == nil {
+			t.Fatal("adapter absence released a durable upstream task")
+		}
+		var protectedRunState, protectedAttemptState, protectedJobState string
+		var protectedReservationState, protectedTaskID, protectedRequestID string
+		var protectedTerminalLedger int
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, ga.state, pj.state, br.status,
+			       pj.upstream_task_id, pj.upstream_request_id,
+			       COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE gr.id = $1
+			GROUP BY gr.state, ga.state, pj.state, br.status,
+			         pj.upstream_task_id, pj.upstream_request_id`,
+			observationRun.RunID,
+		).Scan(
+			&protectedRunState, &protectedAttemptState, &protectedJobState,
+			&protectedReservationState, &protectedTaskID, &protectedRequestID,
+			&protectedTerminalLedger,
 		); err != nil {
 			t.Fatal(err)
+		}
+		if protectedRunState != "RECONCILING" || protectedAttemptState != "UNKNOWN" ||
+			protectedJobState != "UNKNOWN" || protectedReservationState != "RESERVED" ||
+			protectedTaskID != "stable-observation-task" ||
+			protectedRequestID != "stable-observation-request" ||
+			protectedTerminalLedger != 0 {
+			t.Fatalf(
+				"known upstream after adapter absence = run:%s attempt:%s job:%s reservation:%s task:%s request:%s terminalLedger:%d",
+				protectedRunState, protectedAttemptState, protectedJobState,
+				protectedReservationState, protectedTaskID, protectedRequestID,
+				protectedTerminalLedger,
+			)
+		}
+		reconcileReplay, err := store.PrepareProviderJob(
+			ctx, observationStep, observationDispatch,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reconcileReplay.ReconcileOnly {
+			t.Fatal("adapter absence reopened paid Provider submission")
 		}
 	})
 
@@ -5824,22 +5990,28 @@ func testComposeProviderPollingCancellation(
 		t.Fatalf("decode Compose create operation: %v", err)
 	}
 	providerJobDeadline := time.Now().Add(15 * time.Second)
+	durableTaskID, durableRequestID := "", ""
 	for {
 		var providerJobs int
 		if err := pool.QueryRow(ctx, `
-			SELECT COUNT(*)
+			SELECT COUNT(*),
+			       COALESCE(MAX(pj.upstream_task_id), ''),
+			       COALESCE(MAX(pj.upstream_request_id), '')
 			FROM video_pipeline.provider_jobs pj
 			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
 			WHERE ga.generation_run_id = $1`,
 			createOperation.AggregateID,
-		).Scan(&providerJobs); err != nil {
+		).Scan(&providerJobs, &durableTaskID, &durableRequestID); err != nil {
 			t.Fatal(err)
 		}
-		if providerJobs == 1 {
+		if providerJobs == 1 && durableTaskID != "" && durableRequestID != "" {
 			break
 		}
 		if time.Now().After(providerJobDeadline) {
-			t.Fatal("Compose worker did not prepare the provider job")
+			t.Fatalf(
+				"Compose worker did not durably observe the provider identity: jobs=%d task=%q request=%q",
+				providerJobs, durableTaskID, durableRequestID,
+			)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}
@@ -5937,49 +6109,111 @@ func testComposeProviderPollingCancellation(
 			t.Fatalf("decode Compose reconcile operation: %v", err)
 		}
 	}
-	recoveryDeadline := time.Now().Add(30 * time.Second)
+	// The restarted mock adapter intentionally lost its in-memory registry and
+	// returns 404 for the stable JobID. PostgreSQL still proves that a paid
+	// upstream task/request existed, so reconciliation must remain retryable and
+	// retain the full reservation; adapter absence is not terminal evidence.
+	recoveryDeadline := time.Now().Add(15 * time.Second)
+	retryingCancellationObserved := false
 	for {
 		run, getErr := store.GetGenerationRun(ctx, createOperation.AggregateID)
 		if getErr != nil {
 			t.Fatal(getErr)
 		}
-		createState, cancelState, recoveryState, providerState := "", "", "", ""
+		createState, cancelState, recoveryState := "", "", ""
+		attemptState, providerState, reservationState := "", "", ""
+		storedTaskID, storedRequestID := "", ""
+		terminalLedger := 0
 		if err := pool.QueryRow(ctx, `
 			SELECT
 			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $1),
 			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $2),
 			  (SELECT state FROM video_pipeline.operation_requests WHERE id = $3),
-			  (SELECT pj.state FROM video_pipeline.provider_jobs pj
-			   JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
-			   WHERE ga.generation_run_id = $4)`,
+			  ga.state, pj.state, br.status,
+			  COALESCE(pj.upstream_task_id, ''),
+			  COALESCE(pj.upstream_request_id, ''),
+			  COUNT(*) FILTER (WHERE cl.entry_type IN ('ACTUAL', 'RELEASE'))
+			FROM video_pipeline.generation_attempts ga
+			JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id = ga.id
+			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
+			LEFT JOIN video_pipeline.cost_ledger cl ON cl.provider_job_id = pj.id
+			WHERE ga.generation_run_id = $4
+			GROUP BY ga.state, pj.state, br.status,
+			         pj.upstream_task_id, pj.upstream_request_id`,
 			createOperation.OperationID,
 			cancelOperation.OperationID,
 			reconcileOperation.OperationID,
 			createOperation.AggregateID,
-		).Scan(&createState, &cancelState, &recoveryState, &providerState); err != nil {
+		).Scan(
+			&createState, &cancelState, &recoveryState,
+			&attemptState, &providerState, &reservationState,
+			&storedTaskID, &storedRequestID, &terminalLedger,
+		); err != nil {
 			t.Fatal(err)
 		}
-		if run.State == "CANCELLED" &&
-			createState == "CANCELLED" &&
-			cancelState == "SUCCEEDED" &&
-			recoveryState == "SUCCEEDED" &&
-			providerState == "CANCELLED" {
-			if run.FailureClass != "" || run.FailureCode != "" {
-				t.Fatalf("Compose reconciled run retained failure = %#v", run)
+		description, describeErr := temporalClient.DescribeWorkflowExecution(
+			ctx, reconcileOperation.TemporalWorkflowID, "",
+		)
+		if describeErr != nil {
+			t.Fatalf("describe Compose reconciliation: %v", describeErr)
+		}
+		for _, pending := range description.GetPendingActivities() {
+			if pending.GetActivityType().GetName() == orchestration.ActivityCancelProviderJob &&
+				pending.GetLastFailure() != nil {
+				retryingCancellationObserved = true
+				break
 			}
+		}
+		if run.State == "RECONCILING" && attemptState == "UNKNOWN" &&
+			providerState == "UNKNOWN" && reservationState == "RESERVED" &&
+			storedTaskID == durableTaskID && storedRequestID == durableRequestID &&
+			terminalLedger == 0 && retryingCancellationObserved {
 			break
 		}
 		if time.Now().After(recoveryDeadline) {
 			t.Fatalf(
-				"Compose recovery did not converge: run=%#v create=%s cancel=%s recovery=%s provider=%s",
+				"Compose 404 safety did not hold: run=%#v create=%s cancel=%s recovery=%s attempt=%s provider=%s reservation=%s task=%q request=%q terminalLedger=%d retryingCancellation=%t",
 				run,
 				createState,
 				cancelState,
 				recoveryState,
+				attemptState,
 				providerState,
+				reservationState,
+				storedTaskID,
+				storedRequestID,
+				terminalLedger,
+				retryingCancellationObserved,
 			)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+	if err := temporalClient.CancelWorkflow(
+		ctx, reconcileOperation.TemporalWorkflowID, "",
+	); err != nil {
+		t.Fatalf("cancel Compose reconciliation fixture: %v", err)
+	}
+	if err := temporalClient.GetWorkflow(
+		ctx, reconcileOperation.TemporalWorkflowID, "",
+	).Get(ctx, nil); err == nil || !temporal.IsCanceledError(err) {
+		t.Fatalf("Compose reconciliation cleanup = %v, want Canceled", err)
+	}
+	recoveryHistory := temporalClient.GetWorkflowHistory(
+		ctx,
+		reconcileOperation.TemporalWorkflowID,
+		"",
+		false,
+		enumspb.HISTORY_EVENT_FILTER_TYPE_ALL_EVENT,
+	)
+	for recoveryHistory.HasNext() {
+		event, historyErr := recoveryHistory.Next()
+		if historyErr != nil {
+			t.Fatalf("read Compose reconciliation history: %v", historyErr)
+		}
+		scheduled := event.GetActivityTaskScheduledEventAttributes()
+		if scheduled != nil && scheduled.ActivityType.GetName() == orchestration.ActivityExecuteProviderJob {
+			t.Fatal("Compose reconciliation scheduled a second paid provider POST")
+		}
 	}
 	var providerJobs, cancelOperations, recoveryOperations int
 	if err := pool.QueryRow(ctx, `
@@ -5997,7 +6231,7 @@ func testComposeProviderPollingCancellation(
 	}
 	if providerJobs != 1 || cancelOperations != 1 || recoveryOperations != 1 {
 		t.Fatalf(
-			"Compose recovery duplicated durable facts: providerJobs=%d cancelOperations=%d recoveryOperations=%d",
+			"Compose 404 safety duplicated durable facts: providerJobs=%d cancelOperations=%d recoveryOperations=%d",
 			providerJobs,
 			cancelOperations,
 			recoveryOperations,

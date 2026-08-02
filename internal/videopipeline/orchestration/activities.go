@@ -879,7 +879,7 @@ func (a *Activities) CancelProviderJob(
 			if !prepared {
 				result := CancelProviderResult{State: "CANCELLED", NoRemoteTask: true}
 				if err := a.Production.RecordProviderCancellation(ctx, step, input, result); err != nil {
-					return CancelProviderResult{}, err
+					return CancelProviderResult{}, classifyPostProductionError(err)
 				}
 				return result, nil
 			}
@@ -965,7 +965,7 @@ func (a *Activities) CancelProviderJob(
 				}
 			}
 			if err := a.Production.RecordProviderCancellation(ctx, step, input, result); err != nil {
-				return CancelProviderResult{}, err
+				return CancelProviderResult{}, classifyPostProductionError(err)
 			}
 		}
 		if result.State == "UNKNOWN" {
