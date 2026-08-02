@@ -2460,6 +2460,378 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			}
 		})
 	}
+	type terminalProjection struct {
+		RunState, RunFinishedAt, ShotState        string
+		JobState, TaskID, RequestID, JobUpdatedAt string
+		JobTerminalAt, ArtifactStatus             string
+		OutputCount, QCCount, LedgerCount         int
+	}
+	providerRunID := uuid.MustParse(run.RunID)
+	providerJobID := uuid.NewSHA1(providerRunID, []byte("provider-job"))
+	providerArtifactID := uuid.NewSHA1(
+		uuid.NameSpaceOID, []byte("artifact:"+providerResult.ArtifactDigest),
+	)
+	actualLedgerID := uuid.NewSHA1(providerJobID, []byte("actual-cost"))
+	releaseLedgerID := uuid.NewSHA1(providerJobID, []byte("unused-reservation-release"))
+	readTerminalProjection := func(
+		t *testing.T,
+		runID string,
+		jobID uuid.UUID,
+		artifactDigest string,
+	) terminalProjection {
+		t.Helper()
+		var projection terminalProjection
+		if err := pool.QueryRow(ctx, `
+			SELECT gr.state, COALESCE(gr.finished_at::text, ''), ssr.lifecycle_state,
+			       pj.state, COALESCE(pj.upstream_task_id, ''),
+			       COALESCE(pj.upstream_request_id, ''), pj.updated_at::text,
+			       COALESCE(pj.terminal_at::text, ''),
+			       COALESCE((SELECT status FROM video_pipeline.artifacts
+			                 WHERE content_hash = $3), 'MISSING'),
+			       (SELECT COUNT(*) FROM video_pipeline.run_artifacts
+			        WHERE generation_run_id = gr.id AND role = 'OUTPUT'),
+			       (SELECT COUNT(*) FROM video_pipeline.qc_reports
+			        WHERE generation_run_id = gr.id),
+			       (SELECT COUNT(*) FROM video_pipeline.cost_ledger
+			        WHERE provider_job_id = pj.id)
+			FROM video_pipeline.generation_runs gr
+			JOIN video_pipeline.shot_spec_revisions ssr
+			  ON ssr.id = gr.shot_spec_revision_id
+			JOIN video_pipeline.generation_attempts ga
+			  ON ga.generation_run_id = gr.id
+			JOIN video_pipeline.provider_jobs pj
+			  ON pj.generation_attempt_id = ga.id AND pj.id = $2
+			WHERE gr.id = $1`,
+			runID, jobID, artifactDigest,
+		).Scan(
+			&projection.RunState, &projection.RunFinishedAt, &projection.ShotState,
+			&projection.JobState, &projection.TaskID, &projection.RequestID,
+			&projection.JobUpdatedAt, &projection.JobTerminalAt,
+			&projection.ArtifactStatus, &projection.OutputCount,
+			&projection.QCCount, &projection.LedgerCount,
+		); err != nil {
+			t.Fatal(err)
+		}
+		return projection
+	}
+	prepareTerminalRepairWindow := func(t *testing.T, runID string) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.generation_runs SET state = 'RUNNING' WHERE id = $1`,
+			runID,
+		)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.shot_spec_revisions ssr
+			SET lifecycle_state = 'RUNNING'
+			FROM video_pipeline.generation_runs gr
+			WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
+			runID,
+		)
+	}
+	restoreTerminalProjection := func(t *testing.T, runID string) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.generation_runs SET state = 'SUCCEEDED' WHERE id = $1`,
+			runID,
+		)
+		mustExec(t, ctx, pool, `
+			UPDATE video_pipeline.shot_spec_revisions ssr
+			SET lifecycle_state = 'REVIEW'
+			FROM video_pipeline.generation_runs gr
+			WHERE gr.id = $1 AND ssr.id = gr.shot_spec_revision_id`,
+			runID,
+		)
+	}
+	assertTerminalReplayConflictWithoutWrites := func(
+		t *testing.T,
+		runID string,
+		jobID uuid.UUID,
+		artifactDigest string,
+		result orchestration.ProviderResult,
+	) {
+		t.Helper()
+		before := readTerminalProjection(t, runID, jobID, artifactDigest)
+		err := store.CompletePreparedProviderJob(ctx, step, runID, result)
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+			t.Fatalf("terminal projection replay error = %#v, want %s", err, controlplane.CodeRevisionConflict)
+		}
+		after := readTerminalProjection(t, runID, jobID, artifactDigest)
+		if !reflect.DeepEqual(after, before) {
+			t.Fatalf("terminal projection changed on rejected replay:\nbefore=%#v\nafter=%#v", before, after)
+		}
+	}
+
+	for _, artifactStatus := range []string{"ARCHIVED", "DISABLED", "ORPHAN_CANDIDATE"} {
+		artifactStatus := artifactStatus
+		t.Run("terminal Provider replay rejects "+artifactStatus+" shot output", func(t *testing.T) {
+			t.Cleanup(func() {
+				mustExec(t, ctx, pool, `
+					UPDATE video_pipeline.artifacts
+					SET status = 'ACTIVE', orphaned_at = NULL, retention_until = NULL
+					WHERE id = $1`,
+					providerArtifactID,
+				)
+				restoreTerminalProjection(t, run.RunID)
+			})
+			mustExec(t, ctx, pool, `
+				UPDATE video_pipeline.artifacts
+				SET status = $2,
+				    orphaned_at = CASE WHEN $2 = 'ORPHAN_CANDIDATE' THEN now() ELSE NULL END,
+				    retention_until = CASE
+				      WHEN $2 = 'ORPHAN_CANDIDATE' THEN now() + interval '1 hour'
+				      ELSE NULL
+				    END
+				WHERE id = $1`,
+				providerArtifactID, artifactStatus,
+			)
+			prepareTerminalRepairWindow(t, run.RunID)
+			assertTerminalReplayConflictWithoutWrites(
+				t, run.RunID, providerJobID, providerResult.ArtifactDigest, providerResult,
+			)
+		})
+	}
+	t.Run("terminal Provider replay rejects missing shot output", func(t *testing.T) {
+		t.Cleanup(func() {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.run_artifacts
+					(generation_run_id, artifact_id, role)
+				VALUES ($1, $2, 'OUTPUT') ON CONFLICT DO NOTHING`,
+				run.RunID, providerArtifactID,
+			)
+			restoreTerminalProjection(t, run.RunID)
+		})
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.run_artifacts
+			WHERE generation_run_id = $1 AND artifact_id = $2 AND role = 'OUTPUT'`,
+			run.RunID, providerArtifactID,
+		)
+		prepareTerminalRepairWindow(t, run.RunID)
+		assertTerminalReplayConflictWithoutWrites(
+			t, run.RunID, providerJobID, providerResult.ArtifactDigest, providerResult,
+		)
+	})
+
+	var providerReservationID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT budget_reservation_id FROM video_pipeline.provider_jobs WHERE id = $1`,
+		providerJobID,
+	).Scan(&providerReservationID); err != nil {
+		t.Fatal(err)
+	}
+	var otherJobID, otherReservationID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT id, budget_reservation_id
+		FROM video_pipeline.provider_jobs
+		WHERE id <> $1
+		ORDER BY created_at
+		LIMIT 1`,
+		providerJobID,
+	).Scan(&otherJobID, &otherReservationID); err != nil {
+		t.Fatal(err)
+	}
+	restoreSuccessfulCostProjection := func(t *testing.T) {
+		t.Helper()
+		mustExec(t, ctx, pool, `
+			DELETE FROM video_pipeline.cost_ledger
+			WHERE id IN ($1, $2)
+			   OR (provider_job_id = $3 AND entry_type IN ('ACTUAL', 'RELEASE'))`,
+			actualLedgerID, releaseLedgerID, providerJobID,
+		)
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, units, unit_name,
+				 pricing_rule_version, verified)
+			VALUES
+				($1, $3, $4, 'ACTUAL', 40, 'CNY', 30, 'mock-units', 'pricing-v1', true),
+				($2, $3, $4, 'RELEASE', 10, 'CNY', NULL, NULL, 'pricing-v1', true)`,
+			actualLedgerID, releaseLedgerID, providerJobID, providerReservationID,
+		)
+	}
+	costProjectionDrifts := []struct {
+		name   string
+		mutate func(*testing.T)
+	}{
+		{name: "missing ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL provider job", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, actualLedgerID, otherJobID)
+		}},
+		{name: "ACTUAL reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, actualLedgerID, otherReservationID)
+		}},
+		{name: "ACTUAL entry type", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'ADJUSTMENT' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 41 WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL null amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = NULL WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'USD' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL null currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = NULL WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL units", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = 31 WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL unit name", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = 'drift-units' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'drift-v1' WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "ACTUAL verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, actualLedgerID)
+		}},
+		{name: "extra ACTUAL", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, units, unit_name,
+					 pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'ACTUAL', 40, 'CNY', 30, 'mock-units', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+		{name: "missing RELEASE", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE provider job", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET provider_job_id = $2 WHERE id = $1`, releaseLedgerID, otherJobID)
+		}},
+		{name: "RELEASE reservation", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET budget_reservation_id = $2 WHERE id = $1`, releaseLedgerID, otherReservationID)
+		}},
+		{name: "RELEASE entry type", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET entry_type = 'ADJUSTMENT' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = 11 WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE null amount", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET amount_micros = NULL WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = 'USD' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE null currency", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET currency = NULL WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE units", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET units = 1 WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE unit name", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET unit_name = 'drift-units' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE pricing", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET pricing_rule_version = 'drift-v1' WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "RELEASE verified", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `UPDATE video_pipeline.cost_ledger SET verified = false WHERE id = $1`, releaseLedgerID)
+		}},
+		{name: "extra RELEASE", mutate: func(t *testing.T) {
+			mustExec(t, ctx, pool, `
+				INSERT INTO video_pipeline.cost_ledger
+					(id, provider_job_id, budget_reservation_id, entry_type,
+					 amount_micros, currency, pricing_rule_version, verified)
+				VALUES ($1, $2, $3, 'RELEASE', 10, 'CNY', 'pricing-v1', true)`,
+				uuid.New(), providerJobID, providerReservationID,
+			)
+		}},
+	}
+	for _, test := range costProjectionDrifts {
+		test := test
+		t.Run("terminal Provider replay rejects "+test.name+" drift", func(t *testing.T) {
+			t.Cleanup(func() {
+				restoreSuccessfulCostProjection(t)
+				restoreTerminalProjection(t, run.RunID)
+			})
+			test.mutate(t)
+			prepareTerminalRepairWindow(t, run.RunID)
+			assertTerminalReplayConflictWithoutWrites(
+				t, run.RunID, providerJobID, providerResult.ArtifactDigest, providerResult,
+			)
+		})
+	}
+	t.Run("terminal Provider replay rejects unexpected RELEASE at full reservation", func(t *testing.T) {
+		_, fullReservationCommand := cloneIntegrationShotCommand(
+			t, ctx, pool, store, shotID.String(), publicCommand,
+		)
+		fullStep, fullRun, fullDispatch := createIntegrationWorkflowRun(
+			t, ctx, store, "full-reservation-terminal-replay", fullReservationCommand,
+		)
+		if _, err := store.PrepareProviderJob(ctx, fullStep, fullDispatch); err != nil {
+			t.Fatal(err)
+		}
+		fullArtifact, err := cas.Put(
+			ctx, bytes.NewReader([]byte("full reservation terminal replay artifact")),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fullActual := int64(50)
+		fullResult := providerResult
+		fullResult.UpstreamTaskID = "full-reservation-task"
+		fullResult.RequestID = "full-reservation-request"
+		fullResult.ArtifactDigest = fullArtifact.Digest
+		fullResult.ArtifactURI = fullArtifact.URI
+		fullResult.ArtifactSize = fullArtifact.Size
+		fullResult.Model = fullDispatch.Route
+		fullResult.Cost.ActualMicros = &fullActual
+		if err := store.CompletePreparedProviderJob(
+			ctx, fullStep, fullRun.RunID, fullResult,
+		); err != nil {
+			t.Fatal(err)
+		}
+		fullRunUUID := uuid.MustParse(fullRun.RunID)
+		fullJobID := uuid.NewSHA1(fullRunUUID, []byte("provider-job"))
+		var fullReservationID uuid.UUID
+		var fullReleaseCount int
+		if err := pool.QueryRow(ctx, `
+			SELECT pj.budget_reservation_id,
+			       (SELECT COUNT(*) FROM video_pipeline.cost_ledger
+			        WHERE provider_job_id = pj.id AND entry_type = 'RELEASE')
+			FROM video_pipeline.provider_jobs pj
+			WHERE pj.id = $1`,
+			fullJobID,
+		).Scan(&fullReservationID, &fullReleaseCount); err != nil {
+			t.Fatal(err)
+		}
+		if fullReleaseCount != 0 {
+			t.Fatalf("full-reservation completion RELEASE rows = %d, want 0", fullReleaseCount)
+		}
+		unexpectedReleaseID := uuid.NewSHA1(
+			fullJobID, []byte("unused-reservation-release"),
+		)
+		t.Cleanup(func() {
+			mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, unexpectedReleaseID)
+			restoreTerminalProjection(t, fullRun.RunID)
+		})
+		mustExec(t, ctx, pool, `
+			INSERT INTO video_pipeline.cost_ledger
+				(id, provider_job_id, budget_reservation_id, entry_type,
+				 amount_micros, currency, pricing_rule_version, verified)
+			VALUES ($1, $2, $3, 'RELEASE', 1, 'CNY', 'pricing-v1', true)`,
+			unexpectedReleaseID, fullJobID, fullReservationID,
+		)
+		prepareTerminalRepairWindow(t, fullRun.RunID)
+		assertTerminalReplayConflictWithoutWrites(
+			t, fullRun.RunID, fullJobID, fullResult.ArtifactDigest, fullResult,
+		)
+		mustExec(t, ctx, pool, `DELETE FROM video_pipeline.cost_ledger WHERE id = $1`, unexpectedReleaseID)
+		restoreTerminalProjection(t, fullRun.RunID)
+		if err := store.CompletePreparedProviderJob(
+			ctx, fullStep, fullRun.RunID, fullResult,
+		); err != nil {
+			t.Fatalf("full-reservation exact terminal replay: %v", err)
+		}
+	})
 	if err := store.RecordProviderCancellation(
 		ctx, step,
 		orchestration.CancelProviderJobInput{
@@ -2917,18 +3289,27 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 		t.Fatalf("exact Provider completion replay after post-production: %v", err)
 	}
 	var passedQCAfterPostProduction int
+	var shotStateAfterPostProductionReplay string
 	if err := pool.QueryRow(ctx, `
-		SELECT COUNT(*)
-		FROM video_pipeline.qc_reports
-		WHERE generation_run_id = $1 AND state = 'PASSED'`,
+		SELECT
+		  (SELECT COUNT(*)
+		   FROM video_pipeline.qc_reports
+		   WHERE generation_run_id = $1 AND state = 'PASSED'),
+		  (SELECT ssr.lifecycle_state
+		   FROM video_pipeline.shot_spec_revisions ssr
+		   JOIN video_pipeline.generation_runs gr
+		     ON gr.shot_spec_revision_id = ssr.id
+		   WHERE gr.id = $1)`,
 		run.RunID,
-	).Scan(&passedQCAfterPostProduction); err != nil {
+	).Scan(
+		&passedQCAfterPostProduction, &shotStateAfterPostProductionReplay,
+	); err != nil {
 		t.Fatal(err)
 	}
-	if passedQCAfterPostProduction != 1 {
+	if passedQCAfterPostProduction != 1 || shotStateAfterPostProductionReplay != "APPROVED" {
 		t.Fatalf(
-			"Provider completion replay after post-production QC reports = %d, want 1",
-			passedQCAfterPostProduction,
+			"Provider completion replay after post-production = QC:%d shot:%s, want 1/APPROVED",
+			passedQCAfterPostProduction, shotStateAfterPostProductionReplay,
 		)
 	}
 	// A corrected post-production revision commonly reuses the exact UTF-8 SRT

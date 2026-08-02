@@ -1905,6 +1905,10 @@ func (p *Postgres) CompleteProviderJob(
 		return errors.New("provider artifact URI does not match its content hash")
 	}
 	result = normalizedProviderResult(result)
+	usageUnits, err := providerUsageUnits(result.Usage)
+	if err != nil {
+		return err
+	}
 	expectedJobID := uuid.NewSHA1(runID, []byte("provider-job"))
 	type completionOutcome struct {
 		budgetExceeded bool
@@ -1986,7 +1990,9 @@ func (p *Postgres) CompleteProviderJob(
 				)
 			}
 			if err := verifySucceededProviderCompletion(
-				ctx, tx, runID, jobID, result,
+				ctx, tx, runID, jobID, reservationID,
+				reservedMicros, reservedCurrency, reservedPricing,
+				usageUnits, result,
 			); err != nil {
 				return completionOutcome{}, err
 			}
@@ -2073,7 +2079,7 @@ func (p *Postgres) CompleteProviderJob(
 				VALUES ($1, $2, $3, 'ACTUAL', $4, $5, $6, $7, $8, $9)
 				ON CONFLICT (id) DO NOTHING`,
 				ledgerID, jobID, reservationID, actualMicros, result.Cost.Currency,
-				result.Usage.InputUnits+result.Usage.OutputUnits, result.Usage.Unit,
+				usageUnits, result.Usage.Unit,
 				result.Cost.PricingVersion, actualTrustedForAllocation,
 			); err != nil {
 				return completionOutcome{}, fmt.Errorf("insert actual provider cost: %w", err)
@@ -2092,7 +2098,7 @@ func (p *Postgres) CompleteProviderJob(
 				FROM video_pipeline.cost_ledger
 				WHERE id = $1
 				FOR SHARE`,
-				ledgerID, result.Usage.InputUnits+result.Usage.OutputUnits,
+				ledgerID, usageUnits,
 				result.Usage.Unit,
 			).Scan(
 				&storedJobID, &storedReservationID, &storedEntryType,
@@ -2137,6 +2143,15 @@ func (p *Postgres) CompleteProviderJob(
 				return completionOutcome{}, fmt.Errorf(
 					"release unused Provider reservation: %w", err,
 				)
+			}
+		}
+		if !budgetExceeded {
+			if err := verifySucceededProviderCostProjection(
+				ctx, tx, jobID, reservationID,
+				reservedMicros, reservedCurrency, reservedPricing,
+				usageUnits, result,
+			); err != nil {
+				return completionOutcome{}, err
 			}
 		}
 		if budgetExceeded {
@@ -2353,6 +2368,16 @@ func normalizedProviderResult(result orchestration.ProviderResult) orchestration
 	return result
 }
 
+func providerUsageUnits(usage providercontract.Usage) (int64, error) {
+	if usage.InputUnits < 0 || usage.OutputUnits < 0 {
+		return 0, errors.New("provider usage units must be non-negative")
+	}
+	if usage.InputUnits > math.MaxInt64-usage.OutputUnits {
+		return 0, errors.New("provider usage units exceed int64")
+	}
+	return usage.InputUnits + usage.OutputUnits, nil
+}
+
 // verifySucceededProviderCompletion makes terminal success an immutable
 // replay boundary. The Provider job row is already locked by the caller. Every
 // identity, artifact, usage, and cost field must match the first committed
@@ -2362,16 +2387,19 @@ func verifySucceededProviderCompletion(
 	tx pgx.Tx,
 	runID uuid.UUID,
 	jobID uuid.UUID,
+	reservationID uuid.UUID,
+	reservedMicros int64,
+	reservedCurrency string,
+	reservedPricing string,
+	usageUnits int64,
 	result orchestration.ProviderResult,
 ) error {
-	ledgerID := uuid.NewSHA1(jobID, []byte("actual-cost"))
 	var (
 		storedTaskID, storedRequestID            string
 		storedDigest, storedURI, storedMediaType string
 		storedSize                               int64
 		storedMediaSpec                          []byte
 		outputCount                              int64
-		ledgerMatches                            bool
 	)
 	if err := tx.QueryRow(ctx, `
 		SELECT COALESCE(pj.upstream_task_id, ''),
@@ -2384,21 +2412,7 @@ func verifySucceededProviderCompletion(
 		          ON output_artifact.id = outputs.artifact_id
 		        WHERE outputs.generation_run_id = gr.id
 		          AND outputs.role = 'OUTPUT'
-		          AND COALESCE(output_artifact.media_spec->>'kind', 'shot_video') = 'shot_video'),
-		       EXISTS (
-		         SELECT 1
-		         FROM video_pipeline.cost_ledger actual
-		         WHERE actual.id = $3
-		           AND actual.provider_job_id = pj.id
-		           AND actual.budget_reservation_id = pj.budget_reservation_id
-		           AND actual.entry_type = 'ACTUAL'
-		           AND actual.amount_micros IS NOT DISTINCT FROM $4
-		           AND actual.currency IS NOT DISTINCT FROM $5
-		           AND actual.units IS NOT DISTINCT FROM $6
-		           AND actual.unit_name IS NOT DISTINCT FROM $7
-		           AND actual.pricing_rule_version = $8
-		           AND actual.verified = $9
-		       )
+		          AND COALESCE(output_artifact.media_spec->>'kind', 'shot_video') = 'shot_video')
 		FROM video_pipeline.provider_jobs pj
 		JOIN video_pipeline.generation_attempts ga
 		  ON ga.id = pj.generation_attempt_id
@@ -2409,22 +2423,21 @@ func verifySucceededProviderCompletion(
 		JOIN video_pipeline.artifacts a
 		  ON a.id = ra.artifact_id
 		 AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video'
+		 AND a.status = 'ACTIVE'
 		WHERE gr.id = $1 AND pj.id = $2
 		ORDER BY a.id
 		LIMIT 1
 		FOR SHARE OF a`,
-		runID, jobID, ledgerID, result.Cost.ActualMicros,
-		result.Cost.Currency, result.Usage.InputUnits+result.Usage.OutputUnits,
-		result.Usage.Unit, result.Cost.PricingVersion, result.Cost.Verified,
+		runID, jobID,
 	).Scan(
 		&storedTaskID, &storedRequestID,
 		&storedDigest, &storedURI, &storedMediaType, &storedSize,
-		&storedMediaSpec, &outputCount, &ledgerMatches,
+		&storedMediaSpec, &outputCount,
 	); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return controlplane.NewConflictError(
-				controlplane.CodeConflict,
-				"the succeeded Provider job has no exact immutable output and cost projection",
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job has no unique ACTIVE immutable shot output",
 			)
 		}
 		return fmt.Errorf("read succeeded Provider completion: %w", err)
@@ -2447,10 +2460,159 @@ func verifySucceededProviderCompletion(
 		Usage:          mediaSpec.Usage,
 		Cost:           mediaSpec.Cost,
 	}
-	if outputCount != 1 || !ledgerMatches || !reflect.DeepEqual(stored, result) {
+	if outputCount != 1 || !reflect.DeepEqual(stored, result) {
 		return controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"Provider completion result differs from the immutable succeeded job",
+		)
+	}
+	if err := verifySucceededProviderCostProjection(
+		ctx, tx, jobID, reservationID,
+		reservedMicros, reservedCurrency, reservedPricing,
+		usageUnits, result,
+	); err != nil {
+		return err
+	}
+	return nil
+}
+
+// verifySucceededProviderCostProjection freezes the complete successful cost
+// projection. A successful completion has exactly one deterministic ACTUAL row
+// and either exactly one deterministic unused-reservation RELEASE row or no
+// RELEASE at all when the actual consumed the full reservation. The caller
+// already holds FOR UPDATE locks on the Provider job and reservation.
+func verifySucceededProviderCostProjection(
+	ctx context.Context,
+	tx pgx.Tx,
+	jobID uuid.UUID,
+	reservationID uuid.UUID,
+	reservedMicros int64,
+	reservedCurrency string,
+	reservedPricing string,
+	usageUnits int64,
+	result orchestration.ProviderResult,
+) error {
+	if result.Cost.ActualMicros == nil || !result.Cost.Verified ||
+		*result.Cost.ActualMicros < 0 || *result.Cost.ActualMicros > reservedMicros ||
+		result.Cost.Currency != reservedCurrency ||
+		result.Cost.PricingVersion != reservedPricing {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the succeeded Provider job has an invalid immutable cost result",
+		)
+	}
+
+	actualID := uuid.NewSHA1(jobID, []byte("actual-cost"))
+	var (
+		storedJobID, storedReservationID uuid.UUID
+		storedEntryType                  string
+		storedAmountMatch                bool
+		storedCurrencyMatch              bool
+		storedUnitsMatch                 bool
+		storedUnitNameMatch              bool
+		storedPricingMatch               bool
+		storedVerifiedMatch              bool
+		actualCount                      int64
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id, budget_reservation_id, entry_type,
+		       amount_micros IS NOT DISTINCT FROM $5,
+		       currency IS NOT DISTINCT FROM $6,
+		       units IS NOT DISTINCT FROM $3,
+		       unit_name IS NOT DISTINCT FROM $4,
+		       pricing_rule_version = $7,
+		       verified = $8,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.cost_ledger actual_count
+		        WHERE (actual_count.provider_job_id = $2
+		               AND actual_count.entry_type = 'ACTUAL')
+		           OR actual_count.id = $1)
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		actualID, jobID,
+		usageUnits, result.Usage.Unit,
+		*result.Cost.ActualMicros, result.Cost.Currency,
+		result.Cost.PricingVersion, result.Cost.Verified,
+	).Scan(
+		&storedJobID, &storedReservationID, &storedEntryType,
+		&storedAmountMatch, &storedCurrencyMatch,
+		&storedUnitsMatch, &storedUnitNameMatch,
+		&storedPricingMatch, &storedVerifiedMatch, &actualCount,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job is missing its immutable ACTUAL cost",
+			)
+		}
+		return fmt.Errorf("read succeeded Provider ACTUAL cost: %w", err)
+	}
+	if actualCount != 1 || storedJobID != jobID ||
+		storedReservationID != reservationID || storedEntryType != "ACTUAL" ||
+		!storedAmountMatch || !storedCurrencyMatch ||
+		!storedUnitsMatch || !storedUnitNameMatch ||
+		!storedPricingMatch || !storedVerifiedMatch {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the succeeded Provider ACTUAL cost projection has drifted",
+		)
+	}
+
+	var releaseCount int64
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.cost_ledger
+		WHERE (provider_job_id = $1 AND entry_type = 'RELEASE') OR id = $2`,
+		jobID, uuid.NewSHA1(jobID, []byte("unused-reservation-release")),
+	).Scan(&releaseCount); err != nil {
+		return fmt.Errorf("count succeeded Provider RELEASE costs: %w", err)
+	}
+	releaseExpected := *result.Cost.ActualMicros < reservedMicros
+	if !releaseExpected {
+		if releaseCount != 0 {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job has an unexpected RELEASE cost",
+			)
+		}
+		return nil
+	}
+
+	releaseID := uuid.NewSHA1(jobID, []byte("unused-reservation-release"))
+	var releaseUnitsNull, releaseUnitNameNull bool
+	if err := tx.QueryRow(ctx, `
+		SELECT provider_job_id, budget_reservation_id, entry_type,
+		       amount_micros IS NOT DISTINCT FROM $2,
+		       currency IS NOT DISTINCT FROM $3,
+		       pricing_rule_version = $4, verified = true,
+		       units IS NULL, unit_name IS NULL
+		FROM video_pipeline.cost_ledger
+		WHERE id = $1
+		FOR SHARE`,
+		releaseID, reservedMicros-*result.Cost.ActualMicros,
+		reservedCurrency, reservedPricing,
+	).Scan(
+		&storedJobID, &storedReservationID, &storedEntryType,
+		&storedAmountMatch, &storedCurrencyMatch,
+		&storedPricingMatch, &storedVerifiedMatch,
+		&releaseUnitsNull, &releaseUnitNameNull,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewConflictError(
+				controlplane.CodeRevisionConflict,
+				"the succeeded Provider job is missing its immutable RELEASE cost",
+			)
+		}
+		return fmt.Errorf("read succeeded Provider RELEASE cost: %w", err)
+	}
+	if releaseCount != 1 || storedJobID != jobID ||
+		storedReservationID != reservationID || storedEntryType != "RELEASE" ||
+		!storedAmountMatch || !storedCurrencyMatch || !storedPricingMatch ||
+		!storedVerifiedMatch || !releaseUnitsNull || !releaseUnitNameNull {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"the succeeded Provider RELEASE cost projection has drifted",
 		)
 	}
 	return nil
@@ -2527,18 +2689,26 @@ func (p *Postgres) RecordAutomaticQC(
 		if err != nil {
 			return struct{}{}, fmt.Errorf("insert QC report: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE video_pipeline.shot_spec_revisions ssr
-			SET lifecycle_state = $2
-			FROM video_pipeline.generation_runs gr
-			WHERE gr.id = $1
-			  AND gr.state = 'SUCCEEDED'
-			  AND ssr.id = gr.shot_spec_revision_id`,
-			runID, shotState,
-		); err != nil {
-			return struct{}{}, fmt.Errorf("advance shot QC state: %w", err)
-		}
 		if tag.RowsAffected() == 1 {
+			shotTag, err := tx.Exec(ctx, `
+				UPDATE video_pipeline.shot_spec_revisions ssr
+				SET lifecycle_state = $2
+				FROM video_pipeline.generation_runs gr
+				WHERE gr.id = $1
+				  AND gr.state = 'SUCCEEDED'
+				  AND ssr.id = gr.shot_spec_revision_id
+				  AND ssr.lifecycle_state = 'QC_PENDING'`,
+				runID, shotState,
+			)
+			if err != nil {
+				return struct{}{}, fmt.Errorf("advance shot QC state: %w", err)
+			}
+			if shotTag.RowsAffected() != 1 {
+				return struct{}{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"new QC evidence requires the shot to be QC_PENDING",
+				)
+			}
 			if err := insertAuditAndOutbox(
 				ctx, tx,
 				uuid.NewSHA1(reportID, []byte("audit")),

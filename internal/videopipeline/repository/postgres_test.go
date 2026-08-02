@@ -2,6 +2,7 @@ package repository
 
 import (
 	"errors"
+	"math"
 	"testing"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
@@ -9,6 +10,36 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"github.com/google/uuid"
 )
+
+func TestProviderUsageUnits(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		usage   providercontract.Usage
+		want    int64
+		wantErr bool
+	}{
+		{name: "zero"},
+		{name: "sum", usage: providercontract.Usage{InputUnits: 10, OutputUnits: 20}, want: 30},
+		{name: "negative input", usage: providercontract.Usage{InputUnits: -1}, wantErr: true},
+		{name: "negative output", usage: providercontract.Usage{OutputUnits: -1}, wantErr: true},
+		{name: "overflow", usage: providercontract.Usage{InputUnits: math.MaxInt64, OutputUnits: 1}, wantErr: true},
+		{name: "maximum", usage: providercontract.Usage{InputUnits: math.MaxInt64}, want: math.MaxInt64},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := providerUsageUnits(test.usage)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("providerUsageUnits() error = %v, wantErr %t", err, test.wantErr)
+			}
+			if got != test.want {
+				t.Fatalf("providerUsageUnits() = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
 
 func TestEventTypeForAction(t *testing.T) {
 	t.Parallel()
