@@ -39,11 +39,12 @@ const (
 var errProviderJobIntentExists = errors.New("provider job intent already exists")
 
 type jobRecord struct {
-	RequestHash     string                       `json:"request_hash"`
-	Expected        providercontract.OutputSpec  `json:"expected_output"`
-	Response        providercontract.JobResponse `json:"response"`
-	SpeechDuration  *speechDurationQC            `json:"speech_duration_qc,omitempty"`
-	Reconciliations []speechReconciliation       `json:"speech_reconciliations,omitempty"`
+	RequestHash      string                       `json:"request_hash"`
+	Expected         providercontract.OutputSpec  `json:"expected_output"`
+	Response         providercontract.JobResponse `json:"response"`
+	SpeechInspection *speechInspectionCheckpoint  `json:"speech_inspection,omitempty"`
+	SpeechDuration   *speechDurationQC            `json:"speech_duration_qc,omitempty"`
+	Reconciliations  []speechReconciliation       `json:"speech_reconciliations,omitempty"`
 }
 
 type speechDurationQC struct {
@@ -310,6 +311,20 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, safeError(providercontract.CodeConflict, "jobId was already used for different input", false))
 			return
 		}
+		if request.Capability == providercontract.CapabilitySpeech {
+			recovered, handled, recoverErr := s.reconcileSpeechInspection(
+				r.Context(), request.JobID, requestHash, existing,
+			)
+			if recoverErr != nil {
+				writeProviderError(w, recoverErr)
+				return
+			}
+			if handled {
+				w.Header().Set("Idempotent-Replayed", "true")
+				writeJSON(w, http.StatusOK, recovered)
+				return
+			}
+		}
 		if !s.authorizedSpeechRetry(request, existing) {
 			w.Header().Set("Idempotent-Replayed", "true")
 			writeJSON(w, http.StatusOK, existing.Response)
@@ -364,6 +379,20 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 					))
 					return
 				}
+				if request.Capability == providercontract.CapabilitySpeech {
+					recovered, handled, recoverErr := s.reconcileSpeechInspection(
+						r.Context(), request.JobID, requestHash, replayed,
+					)
+					if recoverErr != nil {
+						writeProviderError(w, recoverErr)
+						return
+					}
+					if handled {
+						w.Header().Set("Idempotent-Replayed", "true")
+						writeJSON(w, http.StatusOK, recovered)
+						return
+					}
+				}
 				w.Header().Set("Idempotent-Replayed", "true")
 				writeJSON(w, http.StatusOK, replayed.Response)
 				return
@@ -373,7 +402,27 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if request.Capability == providercontract.CapabilitySpeech {
-		response, err := s.synthesizeSpeech(r.Context(), request)
+		// A receipt can outlive a missing mutable registry file. Reconcile it
+		// after publishing the replacement intent and before any Provider call.
+		if recovered, handled, recoverErr := s.reconcileSpeechInspection(
+			r.Context(), request.JobID, requestHash, intent,
+		); recoverErr != nil {
+			writeProviderError(w, recoverErr)
+			return
+		} else if handled {
+			w.Header().Set("Idempotent-Replayed", "true")
+			writeJSON(w, http.StatusOK, recovered)
+			return
+		}
+		response, inspection, err := s.synthesizeSpeech(r.Context(), request, requestHash)
+		if inspection != nil {
+			intent.Response = response
+			intent.SpeechInspection = inspection
+			if persistErr := s.updateRecord(request.JobID, intent); persistErr != nil {
+				writeProviderError(w, persistErr)
+				return
+			}
+		}
 		if err != nil {
 			response.Error = providerErrorOrGeneric(err)
 			if response.Error.Retryable {
@@ -381,24 +430,36 @@ func (s *Server) createJob(w http.ResponseWriter, r *http.Request) {
 			} else {
 				response.State = providercontract.StatusRequiresAction
 			}
-			intent.Response = response
-			if persistErr := s.updateRecord(request.JobID, intent); persistErr != nil {
-				writeProviderError(w, persistErr)
-				return
+			if inspection == nil {
+				intent.Response = response
+				if persistErr := s.updateRecord(request.JobID, intent); persistErr != nil {
+					writeProviderError(w, persistErr)
+					return
+				}
 			}
 			writeProviderError(w, err)
 			return
 		}
-		intent.Response = response
-		intent.SpeechDuration = newSpeechDurationQC(
-			int64(request.Request.Output.DurationMillis),
-			response.Artifacts[0].DurationMillis,
+		recovered, handled, recoverErr := s.reconcileSpeechInspection(
+			r.Context(), request.JobID, requestHash, intent,
 		)
-		if err := s.updateRecord(request.JobID, intent); err != nil {
-			writeProviderError(w, err)
+		if recoverErr != nil {
+			writeProviderError(w, recoverErr)
 			return
 		}
-		writeJSON(w, http.StatusCreated, response)
+		if !handled {
+			writeProviderError(w, safeError(
+				providercontract.CodeUnavailable,
+				"speech inspection receipt is not durable",
+				false,
+			))
+			return
+		}
+		if recovered.State != providercontract.StatusSucceeded {
+			writeProviderError(w, recovered.Error)
+			return
+		}
+		writeJSON(w, http.StatusCreated, recovered)
 		return
 	}
 	upstream, err := s.provider.Submit(r.Context(), upstreamRequest)
@@ -701,6 +762,15 @@ func (s *Server) getJob(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, safeError(providercontract.CodeNotFound, "job not found", false))
 		return
 	}
+	if recovered, handled, recoverErr := s.reconcileSpeechInspection(
+		r.Context(), jobID, record.RequestHash, record,
+	); recoverErr != nil {
+		writeProviderError(w, recoverErr)
+		return
+	} else if handled {
+		writeJSON(w, http.StatusOK, recovered)
+		return
+	}
 	if providercontract.Terminal(record.Response.State) &&
 		(record.Response.State != providercontract.StatusSucceeded || len(record.Response.Artifacts) > 0) {
 		writeJSON(w, http.StatusOK, record.Response)
@@ -789,7 +859,31 @@ func (s *Server) cancelJob(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) loadRecord(jobID string) (*jobRecord, bool, error) {
-	return s.loadRecordFromDisk(jobID)
+	record, ok, err := s.loadRecordFromDisk(jobID)
+	if err != nil || !ok {
+		return record, ok, err
+	}
+	result, resultOK, err := s.loadSpeechInspectionResult(jobID)
+	if err != nil {
+		return nil, false, err
+	}
+	if resultOK {
+		receipt, receiptOK, receiptErr := s.loadSpeechInspectionReceipt(jobID)
+		if receiptErr != nil {
+			return nil, false, receiptErr
+		}
+		if result.RequestHash != record.RequestHash ||
+			result.Duration.RequestedMillis != int64(record.Expected.DurationMillis) ||
+			!receiptOK || validateSpeechInspectionResultBinding(result, receipt) != nil {
+			return nil, false, safeError(
+				providercontract.CodeUnavailable,
+				"speech inspection result does not match the durable job intent",
+				false,
+			)
+		}
+		applySpeechInspectionResult(record, result)
+	}
+	return record, true, nil
 }
 
 func (s *Server) loadRecordFromDisk(jobID string) (*jobRecord, bool, error) {
@@ -1137,7 +1231,8 @@ func acceptedProviderIdentity(provider string) bool {
 func (s *Server) synthesizeSpeech(
 	ctx context.Context,
 	request providercontract.JobRequest,
-) (providercontract.JobResponse, error) {
+	requestHash string,
+) (providercontract.JobResponse, *speechInspectionCheckpoint, error) {
 	response := providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		State: providercontract.StatusUnknown, Model: request.Model,
@@ -1153,39 +1248,47 @@ func (s *Server) synthesizeSpeech(
 		response.Usage, _ = TTSUsageAttributes(result.UsageTokens)
 	}
 	if err != nil {
-		return response, err
+		return response, nil, err
 	}
 	usage, err := TTSUsageAttributes(result.UsageTokens)
 	if err != nil {
-		return response, safeError(providercontract.CodeUnavailable, "Agent Plan TTS usage evidence is invalid", false)
+		return response, nil, safeError(providercontract.CodeUnavailable, "Agent Plan TTS usage evidence is invalid", false)
 	}
-	committed, err := s.store.Put(ctx, bytes.NewReader(result.Audio))
-	if err != nil {
-		return response, safeError(providercontract.CodeUnavailable, "Agent Plan TTS audio could not be committed to CAS", true)
+	if len(result.Audio) == 0 {
+		return response, nil, safeError(providercontract.CodeUnavailable, "Agent Plan TTS returned no audio bytes", false)
 	}
-	measured, err := s.inspector.Inspect(ctx, committed.Path)
-	if err != nil || validateMeasuredSpeech(measured, request.Request.Output) != nil {
-		return response, safeError(
-			providercontract.CodeUnavailable,
-			"Agent Plan TTS audio failed media inspection and requires operator reconciliation",
-			false,
-		)
-	}
+	artifact := provisionalSpeechArtifact(request, result.Audio, result.MediaType)
 	response = providercontract.JobResponse{
 		JobID: request.JobID, RunID: request.RunID,
 		UpstreamTaskID: result.ConnectID, RequestID: result.RequestID,
 		ConnectID: result.ConnectID, LogID: result.LogID,
-		State: providercontract.StatusSucceeded, Progress: 100, Model: request.Model,
-		Artifacts: []providercontract.AssetRef{{
-			ID: request.JobID + "-audio", Revision: committed.Digest,
-			Kind: providercontract.ModalityAudio, Role: providercontract.AssetRoleOutput,
-			URI: committed.URI, SHA256: committed.Digest,
-			LicenseReference: "request-license-manifest", MediaType: result.MediaType,
-			SizeBytes: committed.Size, DurationMillis: measured.DurationMillis,
-		}},
+		State: providercontract.StatusRequiresAction, Model: request.Model,
 		Usage: usage, Cost: s.subscriptionCost(request),
+		Error: speechInspectionError(),
 	}
-	return response, nil
+	inspection := &speechInspectionCheckpoint{
+		State: speechInspectionPending, Artifact: artifact,
+	}
+	receipt := speechInspectionReceipt{
+		SchemaVersion: speechInspectionReceiptSchema,
+		RequestHash:   requestHash,
+		Response:      response,
+		Artifact:      artifact,
+	}
+	// Publish the job-to-digest receipt before committing bytes. A crash can
+	// therefore leave a visible missing-object condition, but never an
+	// untraceable paid CAS orphan.
+	if err := s.createSpeechInspectionReceipt(request.JobID, receipt); err != nil {
+		return response, nil, err
+	}
+	committed, err := s.store.Put(ctx, bytes.NewReader(result.Audio))
+	if err != nil {
+		return response, inspection, speechInspectionError()
+	}
+	if committed.Digest != artifact.SHA256 || committed.URI != artifact.URI || committed.Size != artifact.SizeBytes {
+		return response, inspection, speechInspectionError()
+	}
+	return response, inspection, nil
 }
 
 func newSpeechDurationQC(requested, measured int64) *speechDurationQC {

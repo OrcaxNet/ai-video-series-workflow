@@ -181,7 +181,14 @@ Speech 成功路径同样以 CAS 中的真实音频为准：Adapter 在写入成
 ffprobe 校验音频格式并实测时长，返回 artifact、后续字幕/Manifest 和恢复均使用
 实测值。请求中的 cue 时长只保留在 `expected_output`；registry 另外记录
 `speech_duration_qc` 的请求值、实测值、绝对偏差、250ms 门限和 QC 状态。探测失败
-会进入不可自动重试的 `requires_action`，避免已经获得音频后再次付费提交。
+会进入不可自动重试的 `requires_action`，避免已经获得音频后再次付费提交。为避免
+CAS 孤儿，Adapter 在 CAS 写入前先原子发布不可变的 job→digest inspection receipt；
+receipt 只保存 CAS URI/digest/size/media type 与脱敏 Provider evidence，不公开尚未验证的
+artifact。相同 `POST /v1/jobs` 重放或 `GET /v1/jobs/{jobId}` 会重新校验 receipt、逐字节
+复算 CAS digest，再对同一对象运行 ffprobe，绝不再次合成。成功后先以 create-if-absent
+发布不可变 inspection result，再单调更新 registry；两个 Adapter 竞争时首个合法 result
+成为唯一完成真相。CAS 缺失、损坏、媒体类型或实测格式不合规时保留 receipt 与
+`requires_action`，不得产生第二次 Provider submit。
 
 历史错误证据不得原地修改。`go run ./cmd/video-speech-evidence-correction`
 是纯离线追加工具：它逐一核验旧 provider registry、Stage 1 ledger、音频 CAS 和
