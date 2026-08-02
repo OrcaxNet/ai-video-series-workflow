@@ -600,7 +600,7 @@ func (g *Gate) validateNewAttempt(ledger Ledger, attempt Attempt) error {
 			return providerError(providercontract.CodeForbidden, "previous stage 1 provider evidence is incomplete")
 		}
 		if record.ActualAFPMilli > 0 && exceedsDrift(
-			record.ActualAFPMilli, g.plan.ReferenceJobAFPMilli, g.plan.MaximumAFPDriftBPS,
+			record.ActualAFPMilli, record.PredictedAFPMilli, g.plan.MaximumAFPDriftBPS,
 		) {
 			return providerError(providercontract.CodeBudgetExceeded, "a completed stage 1 job exceeded the 10 percent AFP drift limit")
 		}

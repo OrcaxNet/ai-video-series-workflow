@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"reflect"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
 )
@@ -22,6 +23,29 @@ func main() {
 func run(args []string, output io.Writer) error {
 	if len(args) < 3 {
 		return packageUsageError()
+	}
+	if args[0] == "verify-flo167" {
+		if len(args) != 3 {
+			return packageUsageError()
+		}
+		var package_ stage1.FLO167SupersessionPackage
+		if err := decodeFile(args[1], &package_); err != nil {
+			return fmt.Errorf("read FLO-167 supersession package: %w", err)
+		}
+		var projection stage1.FLO167CanonicalProjection
+		if err := decodeFile(args[2], &projection); err != nil {
+			return fmt.Errorf("read FLO-167 canonical projection: %w", err)
+		}
+		if err := package_.Validate(); err != nil {
+			return err
+		}
+		if err := projection.Validate(); err != nil {
+			return err
+		}
+		if projection.SupersessionPackageHash != package_.ContentHash || !reflect.DeepEqual(projection.Shots, package_.Shots) {
+			return errors.New("FLO-167 package and projection bindings differ")
+		}
+		return encodePackage(output, projection)
 	}
 	var plan stage1.Plan
 	if err := decodeFile(args[1], &plan); err != nil {
@@ -85,7 +109,7 @@ func encodePackage(output io.Writer, value any) error {
 }
 
 func packageUsageError() error {
-	return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json> OR verify-revision <plan.json> <parent-package.json> <child-package.json> OR <seal-retry|verify-retry> <plan.json> <package.json> <retry-package.json>")
+	return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json> OR verify-flo167 <supersession-package.json> <projection.json> OR verify-revision <plan.json> <parent-package.json> <child-package.json> OR <seal-retry|verify-retry> <plan.json> <package.json> <retry-package.json>")
 }
 
 func decodeFile(path string, destination any) error {

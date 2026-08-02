@@ -79,6 +79,7 @@ type Runner struct {
 	truth            ProductTruthPreparer
 	executionPackage ExecutionPackage
 	controlledRetry  *ControlledRetryPackage
+	supersession     *FLO167SupersessionPackage
 }
 
 func NewRunner(
@@ -88,7 +89,7 @@ func NewRunner(
 	truth ProductTruthPreparer,
 	executionPackage ExecutionPackage,
 ) (*Runner, error) {
-	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil, nil)
+	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil, nil, nil)
 }
 
 // NewRunnerWithExecutionPackageRevision requires both immutable artifacts so
@@ -102,7 +103,7 @@ func NewRunnerWithExecutionPackageRevision(
 	executionPackage ExecutionPackage,
 ) (*Runner, error) {
 	return newRunner(
-		gate, adapter, artifacts, truth, executionPackage, &parentExecutionPackage, nil,
+		gate, adapter, artifacts, truth, executionPackage, &parentExecutionPackage, nil, nil,
 	)
 }
 
@@ -116,7 +117,21 @@ func NewRunnerWithControlledRetry(
 	executionPackage ExecutionPackage,
 	controlledRetry ControlledRetryPackage,
 ) (*Runner, error) {
-	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil, &controlledRetry)
+	return newRunner(gate, adapter, artifacts, truth, executionPackage, nil, &controlledRetry, nil)
+}
+
+// NewRunnerWithFLO167Supersession is the only continuation constructor. It
+// keeps the v2 package as immutable parent evidence and requires PostgreSQL to
+// independently authorize the exact v3 hash before any paid-boundary insert.
+func NewRunnerWithFLO167Supersession(
+	gate *Gate,
+	adapter *AdapterSubmitter,
+	artifacts ArtifactVerifier,
+	truth ProductTruthPreparer,
+	legacyExecutionPackage ExecutionPackage,
+	supersession FLO167SupersessionPackage,
+) (*Runner, error) {
+	return newRunner(gate, adapter, artifacts, truth, legacyExecutionPackage, nil, nil, &supersession)
 }
 
 func newRunner(
@@ -127,6 +142,7 @@ func newRunner(
 	executionPackage ExecutionPackage,
 	parentExecutionPackage *ExecutionPackage,
 	controlledRetry *ControlledRetryPackage,
+	supersession *FLO167SupersessionPackage,
 ) (*Runner, error) {
 	if gate == nil || adapter == nil || artifacts == nil || truth == nil {
 		return nil, errors.New("stage 1 gate, authenticated adapter, CAS verifier, and product truth are required")
@@ -139,6 +155,18 @@ func newRunner(
 	}
 	if executionPackage.ParentExecutionPackageHash != "" && controlledRetry != nil {
 		return nil, errors.New("speech-v2 package revision cannot be combined with a controlled retry package")
+	}
+	if supersession != nil {
+		if controlledRetry != nil || executionPackage.ParentExecutionPackageHash != "" || executionPackage.LiveActivation == nil {
+			return nil, errors.New("FLO-167 supersession requires the original v2 live package without another revision")
+		}
+		if err := supersession.Validate(); err != nil {
+			return nil, fmt.Errorf("validate FLO-167 supersession: %w", err)
+		}
+		if supersession.LegacyExecutionPackageHash != executionPackage.ContentHash ||
+			supersession.LegacyAuthorizationHash != executionPackage.LiveActivation.SourceAuthorizationHash {
+			return nil, errors.New("FLO-167 supersession is bound to another legacy package or authorization")
+		}
 	}
 	if executionPackage.ParentExecutionPackageHash == "" {
 		if parentExecutionPackage != nil {
@@ -170,6 +198,7 @@ func newRunner(
 	return &Runner{
 		gate: gate, adapter: adapter, executor: executor, artifacts: artifacts,
 		truth: truth, executionPackage: executionPackage, controlledRetry: controlledRetry,
+		supersession: supersession,
 	}, nil
 }
 
@@ -177,6 +206,16 @@ func (r *Runner) Submit(ctx context.Context, input SubmitInput) (SubmitResult, e
 	frozen, ok := r.executionPackage.Job(input.ShotID)
 	if !ok {
 		return SubmitResult{}, providerError(providercontract.CodeForbidden, "shot is outside the frozen stage 1 execution package")
+	}
+	if r.supersession != nil {
+		binding, ok := r.supersession.Shot(input.ShotID)
+		if !ok {
+			return SubmitResult{}, providerError(providercontract.CodeForbidden, "shot has no FLO-167 supersession binding")
+		}
+		if err := r.supersession.AuthorizeSubmit(input.ShotID, binding.Pricing.ExpectedAFPMilli); err != nil {
+			return SubmitResult{}, providerError(providercontract.CodeForbidden, err.Error())
+		}
+		frozen.PredictedAFPMilli = binding.Pricing.ExpectedAFPMilli
 	}
 	return r.submitFrozen(ctx, frozen, nil, input.QuotaSnapshot)
 }
@@ -290,6 +329,28 @@ func (r *Runner) prepareProductTruth(
 			expectedTruth.ControlledRetryPackageHash = r.controlledRetry.ContentHash
 		}
 	}
+	if r.supersession != nil {
+		binding, ok := r.supersession.Shot(frozen.ShotID)
+		if !ok {
+			return providercontract.JobRequest{}, providerError(providercontract.CodeForbidden, "shot has no FLO-167 pricing binding")
+		}
+		wire := orchestration.DurationPricingBinding{
+			DurationMS: binding.Pricing.DurationMS, PricingSnapshotID: binding.Pricing.PricingSnapshotID,
+			PricingSnapshotDigest: binding.Pricing.PricingSnapshotDigest,
+			ReferenceAFPMilli:     binding.Pricing.ReferenceAFPMilli, ReferenceDurationMS: binding.Pricing.ReferenceDurationMS,
+			ExpectedAFPMilli: binding.Pricing.ExpectedAFPMilli, NormalizationVersion: binding.Pricing.NormalizationVersion,
+			RoundingVersion: binding.Pricing.RoundingVersion, PricingRuleVersion: binding.Pricing.PricingRuleVersion,
+			MaximumDriftBPS: binding.Pricing.MaximumDriftBPS,
+		}
+		expectedTruth.SupersessionPackageHash = r.supersession.ContentHash
+		expectedTruth.DurationPricing = &wire
+		expectedTruth.RouteBindingHash = binding.RouteHash
+		expectedTruth.G1BindingHash = binding.G1Hash
+		expectedTruth.G2BindingHash = binding.G2Hash
+		expectedTruth.SafetyBindingHash = binding.SafetyHash
+		expectedTruth.CanonicalInputHash = binding.CanonicalInputHash
+		expectedTruth.SemanticInputHash = binding.SemanticInputHash
+	}
 	preparation := orchestration.ExecuteProviderJobInput{
 		Run: frozen.Run, Prompt: prompt, Route: frozen.Route,
 		BudgetApprovalID:    frozen.BudgetApprovalID,
@@ -310,6 +371,16 @@ func (r *Runner) prepareProductTruth(
 		if r.controlledRetry != nil && r.controlledRetry.Job.Run.RunID == frozen.Run.RunID {
 			preparation.ExpectedControlledRetryPackageHash = r.controlledRetry.ContentHash
 		}
+	}
+	if r.supersession != nil {
+		preparation.ExpectedSupersessionPackageHash = r.supersession.ContentHash
+		preparation.DurationPricing = expectedTruth.DurationPricing
+		preparation.RouteBindingHash = expectedTruth.RouteBindingHash
+		preparation.G1BindingHash = expectedTruth.G1BindingHash
+		preparation.G2BindingHash = expectedTruth.G2BindingHash
+		preparation.SafetyBindingHash = expectedTruth.SafetyBindingHash
+		preparation.CanonicalInputHash = expectedTruth.CanonicalInputHash
+		preparation.SemanticInputHash = expectedTruth.SemanticInputHash
 	}
 	prepared, err := r.truth.PrepareProviderJob(ctx, orchestration.WorkflowStep{
 		WorkflowID: frozen.WorkflowID, ActivityID: frozen.ActivityID,
@@ -379,6 +450,7 @@ func (r *Runner) Complete(ctx context.Context, input CompleteInput) (CompletionR
 				MediaType: artifact.MediaType, ArtifactSize: artifact.SizeBytes,
 				Width: artifact.Width, Height: artifact.Height,
 				DurationMillis: artifact.DurationMillis,
+				ActualAFPMilli: input.ActualAFPMilli,
 				Model:          response.Model, Usage: response.Usage, Cost: response.Cost,
 			},
 		); err != nil {

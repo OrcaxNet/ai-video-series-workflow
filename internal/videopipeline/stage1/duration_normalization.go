@@ -36,12 +36,15 @@ type DurationPricingBinding struct {
 	ReferenceAFPMilli     int64  `json:"referenceAfpMilli"`
 	ReferenceDurationMS   int64  `json:"referenceDurationMs"`
 	ExpectedAFPMilli      int64  `json:"expectedAfpMilli"`
+	PricingRuleVersion    string `json:"pricingRuleVersion"`
+	MaximumDriftBPS       int64  `json:"maximumDriftBasisPoints"`
 	NormalizationVersion  string `json:"normalizationVersion"`
 	RoundingVersion       string `json:"roundingVersion"`
 }
 
 func (b DurationPricingBinding) Validate() error {
-	if b.DurationMS <= 0 || b.ReferenceAFPMilli < 0 || b.ReferenceDurationMS <= 0 {
+	if b.DurationMS <= 0 || b.ReferenceAFPMilli != FLO167ReferenceAFPMilli ||
+		b.ReferenceDurationMS != FLO167ReferenceDurationMS {
 		return errors.New("duration pricing values are outside the nonnegative integer domain")
 	}
 	if strings.TrimSpace(b.PricingSnapshotID) == "" || !validLowerDigest(b.PricingSnapshotDigest) {
@@ -49,6 +52,9 @@ func (b DurationPricingBinding) Validate() error {
 	}
 	if b.NormalizationVersion != DurationNormalizationVersion || b.RoundingVersion != NonnegativeHalfUpVersion {
 		return errors.New("unknown duration normalization or rounding version")
+	}
+	if b.PricingRuleVersion != "agent-plan-subscription-v1" || b.MaximumDriftBPS != MaximumAFPDriftBPS {
+		return errors.New("pricing rule or maximum drift basis points drifted")
 	}
 	expected, err := NormalizeAFPMilli(b.ReferenceAFPMilli, b.ReferenceDurationMS, b.DurationMS)
 	if err != nil {
@@ -137,6 +143,89 @@ type FLO167SupersessionPackage struct {
 	ContentHash                string                     `json:"contentHash"`
 }
 
+type FLO167LegacyTerminal struct {
+	ShotID            string `json:"shotId"`
+	ProviderTaskID    string `json:"providerTaskId"`
+	ProviderRequestID string `json:"providerRequestId"`
+	ArtifactSHA256    string `json:"artifactSha256"`
+	ActualAFPMilli    int64  `json:"actualAfpMilli"`
+	ExpectedAFPMilli  int64  `json:"expectedAfpMilli"`
+	ActualVideoTokens int64  `json:"actualVideoTokens"`
+	ActualCashMicros  int64  `json:"actualCashMicros"`
+	LedgerSHA256      string `json:"ledgerSha256"`
+}
+
+type FLO167CanonicalProjection struct {
+	SchemaVersion           string               `json:"schemaVersion"`
+	SupersessionPackageHash string               `json:"supersessionPackageHash"`
+	CompletedSet            []string             `json:"completedSet"`
+	AllowedSubmitSet        []string             `json:"allowedSubmitSet"`
+	A01Terminal             FLO167LegacyTerminal `json:"a01Terminal"`
+	Shots                   []FLO167ShotBinding  `json:"shots"`
+	StateMachine            []string             `json:"stateMachine"`
+	ContentHash             string               `json:"contentHash"`
+}
+
+func SealFLO167CanonicalProjection(p FLO167CanonicalProjection) (FLO167CanonicalProjection, error) {
+	p.ContentHash = ""
+	hash, err := canonicalDigest(p)
+	if err != nil {
+		return FLO167CanonicalProjection{}, err
+	}
+	p.ContentHash = hash
+	return p, p.Validate()
+}
+
+func (p FLO167CanonicalProjection) Validate() error {
+	if p.SchemaVersion != "flo100.batch-a-duration-projection.v3" || !validLowerDigest(p.SupersessionPackageHash) {
+		return errors.New("FLO-167 projection identity is invalid")
+	}
+	if !equalOrderedStrings(p.CompletedSet, []string{"GOLD-A01"}) ||
+		!equalOrderedStrings(p.AllowedSubmitSet, []string{"GOLD-A02", "GOLD-A03", "GOLD-A04", "GOLD-A05", "GOLD-A06", "GOLD-A07", "GOLD-A08", "GOLD-A09", "GOLD-A10"}) {
+		return errors.New("FLO-167 projection sets drifted")
+	}
+	t := p.A01Terminal
+	if t.ShotID != "GOLD-A01" || t.ProviderTaskID != "cgt-20260803044117-2zwsb" ||
+		t.ProviderRequestID != "02178570327780286f296e4c58ddf650991f54d763d292afe21e6" ||
+		t.ArtifactSHA256 != "f791f6914f2fa31c4fecbc8728846b4bbb0a22d45716b83b3845bf05256b125a" ||
+		t.ActualAFPMilli != 2_007_900 || t.ExpectedAFPMilli != 2_003_760 ||
+		t.ActualVideoTokens != 87_300 || t.ActualCashMicros != 0 || !validLowerDigest(t.LedgerSHA256) {
+		return errors.New("FLO-167 A01 terminal evidence drifted")
+	}
+	wantStates := []string{"v2_stopped_after_A01", "supersession_package_pending_v3", "v3_authorized_A02_A10", "quota_reserved", "A02_submitted"}
+	if !equalOrderedStrings(p.StateMachine, wantStates) || len(p.Shots) != 10 {
+		return errors.New("FLO-167 projection state machine or shot set drifted")
+	}
+	for i, shot := range p.Shots {
+		if shot.ShotID != SortedFLO167ShotIDs()[i] || shot.Pricing.Validate() != nil {
+			return errors.New("FLO-167 projection shot binding drifted")
+		}
+		for _, value := range []string{shot.RouteHash, shot.G1Hash, shot.G2Hash, shot.SafetyHash, shot.CanonicalInputHash, shot.SemanticInputHash} {
+			if !validLowerDigest(value) {
+				return errors.New("FLO-167 projection contains an invalid shot hash")
+			}
+		}
+	}
+	want, err := canonicalDigest(FLO167CanonicalProjection{p.SchemaVersion, p.SupersessionPackageHash,
+		p.CompletedSet, p.AllowedSubmitSet, p.A01Terminal, p.Shots, p.StateMachine, ""})
+	if err != nil {
+		return err
+	}
+	if p.ContentHash != want {
+		return errors.New("FLO-167 projection contentHash does not match canonical content")
+	}
+	return nil
+}
+
+func (p FLO167SupersessionPackage) Shot(shotID string) (FLO167ShotBinding, bool) {
+	for _, shot := range p.Shots {
+		if shot.ShotID == shotID {
+			return shot, true
+		}
+	}
+	return FLO167ShotBinding{}, false
+}
+
 func SealFLO167SupersessionPackage(p FLO167SupersessionPackage) (FLO167SupersessionPackage, error) {
 	p.ContentHash = ""
 	hash, err := canonicalDigest(p)
@@ -176,7 +265,11 @@ func (p FLO167SupersessionPackage) Validate() error {
 		return errors.New("supersession requires ten shot bindings")
 	}
 	seen := make(map[string]struct{}, 10)
-	for _, shot := range p.Shots {
+	orderedIDs := SortedFLO167ShotIDs()
+	for index, shot := range p.Shots {
+		if shot.ShotID != orderedIDs[index] {
+			return fmt.Errorf("shot ordinal %d drifted: got %s, want %s", index+1, shot.ShotID, orderedIDs[index])
+		}
 		if _, ok := FLO167ShotDurationsMS[shot.ShotID]; !ok {
 			return fmt.Errorf("unknown shot %q", shot.ShotID)
 		}
@@ -237,7 +330,7 @@ func (p FLO167SupersessionPackage) AuthorizeSubmit(shotID string, actualAFPMilli
 	if binding == nil {
 		return errors.New("shot pricing binding is missing")
 	}
-	ok, err := AFPWithinDrift(actualAFPMilli, binding.Pricing.ExpectedAFPMilli, MaximumAFPDriftBPS)
+	ok, err := AFPWithinDrift(actualAFPMilli, binding.Pricing.ExpectedAFPMilli, binding.Pricing.MaximumDriftBPS)
 	if err != nil {
 		return err
 	}

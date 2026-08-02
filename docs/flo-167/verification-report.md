@@ -1,10 +1,13 @@
 # FLO-167 provider-free verification
 
-- Baseline: `35f87d664e26b74bc1afb176f40c77405a9997ae`
-- No Provider client, credential, reservation, cost row, job, or external request is constructed by the normalization/package tests.
-- Canonical package content hash: `75d039d98dba6762e1d5f34d427762377ecdf9f3c19f22a55a577b0b8adf272b`.
-- A01 is preserved as the sole legacy terminal: actual `2007900`, expected `2003760`, delta `4140` milli-AFP (`+0.2066%` for display only), `87300` video tokens, zero cash. A01 submission is permanently rejected.
-- A02 is exactly allowed at `2254230` milli-AFP. Inclusive `+/-10%` boundaries pass; one milli-AFP beyond either boundary is rejected.
-- Checked multiplication/addition rejects overflow. Unknown versions and duration, price snapshot, route, G1, G2, SAFETY, canonical hash, semantic hash, or completed-set drift fail validation.
-- Migration `000010` adds immutable supersession, per-shot binding, authorization, and idempotent submission projections. Its down migration works on a fresh/empty projection and refuses to erase existing supersession lineage.
-- Tests: `go test ./...`, `go test -race ./...`, and `video-pipeline/scripts/check-secrets.sh`.
+- Baseline: `35f87d664e26b74bc1afb176f40c77405a9997ae`.
+- The v3 materializer and authorization importer have no Provider client. `PrepareProviderJob` locks and validates the complete supersession projection before any reservation, cost, or Provider-job insert; retries verify the same durable identities.
+- Canonical package content hash: `2d7c87212bf95426794fcdc0c3ee2747dea6d0921c3262c7da58f27e99ba4b70`; canonical projection content hash: `6a787cbcce0b96f94ed80a47e77083c9cf8ed1e1debca0f1f06616ce187e6d64`.
+- Delivered package/projection file SHA-256: `5a373aa440f8f418f966bf99a40ccb0d7149320b93635ec3366598c94b009ceb` / `ab781a2e179493822c20d129d75a7d51794b8b84d119c5e5cbb3663c459cddb6`.
+- Independent verification command: `go run ./cmd/video-stage1-package verify-flo167 docs/flo-167/provider-free-execution-package.json docs/flo-167/canonical-projection.json`.
+- Real frozen lineage: old authorization `7bf55cad2a4f81f54eb6617bbab81fd21f789785ce1176213014f5833ce4ac25`, old execution package `6a7c03ed869c427d23cc6b669e7938ba271c8343b3e4627e85cd93ea50fffd2e`, old projection `c0d2d316867c79d1ebc419dec3a68fe29c947cd184d21a2b11e45c6224013202`, A01 ledger `7ea9cfb63b3c54fa46583cf5abdb0bc67d323eead9ab4f45e9187e9700dcf0e0`, and stop archive `dd1954608254791425d7574fe7333d1c1d7cd77cb843572f79d84a3dbeadea76`.
+- A01 remains the sole legacy terminal: actual `2007900`, normalized expected `2003760`, delta `4140` milli-AFP (`+0.2066%` display only), `87300` video tokens, zero cash. Once A01 crossed the paid boundary, legacy continuation is disabled; A01 cannot be submitted through v3.
+- The exact duration vector is `4000/4500/5000/5500/4000/5000/4500/5500/4000/4500` ms and the normalized AFP vector is `2003760/2254230/2504700/2755170/2003760/2504700/2254230/2755170/2003760/2254230`.
+- Reference AFP/duration, pricing rule/snapshot, rounding, route, G1, G2, SAFETY, canonical/semantic input, completed set, authorization scope, quota freshness/capacity, and zero-cash fields are checked before paid-boundary writes. Terminal rows repeat the full binding and independently measured AFP/tokens/cash evidence.
+- Migration `000010` adds immutable package, canonical projection, shot, authorization, inherited AFP reservation, submission, and terminal projections. A trigger allows only `pending -> authorized -> quota_reserved -> A02_submitted`; integration tests reject skipped and backward transitions. Up/down SHA-256: `22148e2e82e61a7385394a7e6b4dedbef3d4ad97524c48f10b530602c8a2b4ff` / `73d6e0c63843fecf3bec61c62bf1b028b031691b4ee8f5b1c63935300da7a68b`.
+- Verified provider-free with `go test ./...`, `go test -race ./...`, `go vet ./...`, `video-pipeline/scripts/check-secrets.sh`, and `make video-smoke`. Smoke ran fresh PostgreSQL repository integration plus migration `10 -> 9 -> 10` and restored migration 10 cleanly. `TestFLO167MaterializesIdenticallyAcrossFreshPostgresAndReplay` restored the frozen A01 database into two fresh PostgreSQL databases, materialized and authorized v3 twice in each, and asserted identical canonical bytes.

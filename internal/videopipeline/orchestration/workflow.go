@@ -150,6 +150,7 @@ type ProviderResult struct {
 	Width          int                            `json:"width,omitempty"`
 	Height         int                            `json:"height,omitempty"`
 	DurationMillis int64                          `json:"durationMillis,omitempty"`
+	ActualAFPMilli int64                          `json:"actualAfpMilli,omitempty"`
 	Model          providercontract.ModelSnapshot `json:"modelSnapshot"`
 	Usage          providercontract.Usage         `json:"usage"`
 	Cost           providercontract.Cost          `json:"cost"`
@@ -695,6 +696,30 @@ type ExecuteProviderJobInput struct {
 	EstimatedVideoTokens               int64                      `json:"estimatedVideoTokens,omitempty"`
 	PredictedAFPMilli                  int64                      `json:"predictedAfpMilli,omitempty"`
 	BillingMode                        string                     `json:"billingMode,omitempty"`
+	ExpectedSupersessionPackageHash    string                     `json:"expectedSupersessionPackageHash,omitempty"`
+	DurationPricing                    *DurationPricingBinding    `json:"durationPricing,omitempty"`
+	RouteBindingHash                   string                     `json:"routeBindingHash,omitempty"`
+	G1BindingHash                      string                     `json:"g1BindingHash,omitempty"`
+	G2BindingHash                      string                     `json:"g2BindingHash,omitempty"`
+	SafetyBindingHash                  string                     `json:"safetyBindingHash,omitempty"`
+	CanonicalInputHash                 string                     `json:"canonicalInputHash,omitempty"`
+	SemanticInputHash                  string                     `json:"semanticInputHash,omitempty"`
+}
+
+// DurationPricingBinding is the provider-neutral wire form of the immutable
+// FLO-167 per-shot pricing contract. The repository compares every field with
+// PostgreSQL before creating a reservation, cost row, or Provider job.
+type DurationPricingBinding struct {
+	DurationMS            int64  `json:"durationMs"`
+	PricingSnapshotID     string `json:"pricingSnapshotId"`
+	PricingSnapshotDigest string `json:"pricingSnapshotDigest"`
+	ReferenceAFPMilli     int64  `json:"referenceAfpMilli"`
+	ReferenceDurationMS   int64  `json:"referenceDurationMs"`
+	ExpectedAFPMilli      int64  `json:"expectedAfpMilli"`
+	PricingRuleVersion    string `json:"pricingRuleVersion"`
+	MaximumDriftBPS       int64  `json:"maximumDriftBasisPoints"`
+	NormalizationVersion  string `json:"normalizationVersion"`
+	RoundingVersion       string `json:"roundingVersion"`
 }
 
 // SubscriptionQuotaSnapshot records an authenticated Agent Plan read in AFP
@@ -763,6 +788,14 @@ type PreparedProductTruth struct {
 	EstimatedVideoTokens       int64                          `json:"estimatedVideoTokens,omitempty"`
 	PredictedAFPMilli          int64                          `json:"predictedAfpMilli,omitempty"`
 	BillingMode                string                         `json:"billingMode,omitempty"`
+	SupersessionPackageHash    string                         `json:"supersessionPackageHash,omitempty"`
+	DurationPricing            *DurationPricingBinding        `json:"durationPricing,omitempty"`
+	RouteBindingHash           string                         `json:"routeBindingHash,omitempty"`
+	G1BindingHash              string                         `json:"g1BindingHash,omitempty"`
+	G2BindingHash              string                         `json:"g2BindingHash,omitempty"`
+	SafetyBindingHash          string                         `json:"safetyBindingHash,omitempty"`
+	CanonicalInputHash         string                         `json:"canonicalInputHash,omitempty"`
+	SemanticInputHash          string                         `json:"semanticInputHash,omitempty"`
 }
 
 type RunQCInput struct {

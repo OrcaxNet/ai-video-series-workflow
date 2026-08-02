@@ -99,6 +99,21 @@ func TestRunVerifyRevisionUsesCanonicalRevisionContract(t *testing.T) {
 	}
 }
 
+func TestRunVerifyFLO167DeliveredArtifacts(t *testing.T) {
+	t.Parallel()
+	var output bytes.Buffer
+	err := run([]string{"verify-flo167",
+		filepath.Join("..", "..", "docs", "flo-167", "provider-free-execution-package.json"),
+		filepath.Join("..", "..", "docs", "flo-167", "canonical-projection.json")}, &output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var projection stage1.FLO167CanonicalProjection
+	if json.Unmarshal(output.Bytes(), &projection) != nil || projection.ContentHash != "6a787cbcce0b96f94ed80a47e77083c9cf8ed1e1debca0f1f06616ce187e6d64" {
+		t.Fatal("verify-flo167 did not emit the exact canonical projection")
+	}
+}
+
 func cliTestExecutionPackage(t *testing.T, plan stage1.Plan) stage1.ExecutionPackage {
 	t.Helper()
 	jobs := make([]stage1.FrozenJob, len(plan.PrimaryShotIDs))
