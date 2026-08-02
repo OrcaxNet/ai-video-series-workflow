@@ -188,6 +188,16 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 				SuggestedAction: "configure the frozen analyzer before opening G3",
 			}
 		}
+		if request.AnalyzerSealSHA256 != "" {
+			sealed, ok := s.Analyzer.(sealedAudioAnalyzer)
+			if !ok || sealed.AnalyzerSealSHA256() != request.AnalyzerSealSHA256 {
+				return Result{}, &providercontract.Error{
+					Code: providercontract.CodeUnavailable, Retryable: false, RequiresAction: true,
+					SafeMessage:     "native audio analyzer differs from the frozen execution package",
+					SuggestedAction: "configure the exact sealed analyzer before opening G3",
+				}
+			}
+		}
 		analysisRequest := AudioAnalysisRequest{
 			Request: request, NativeMixes: rendered.NativeMixes,
 			FinalMix: rendered.FinalMix, FinalVideo: rendered.FinalVideo,

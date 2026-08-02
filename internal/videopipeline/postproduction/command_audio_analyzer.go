@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/analyzerseal"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/cerevaluation"
 )
@@ -23,9 +24,48 @@ const audioAnalyzerCommandSchemaVersion = "flo154.audio-analyzer-command.v1"
 // writes one strict AudioAnalysis JSON object, which this adapter binds to the
 // exact CAS inputs and hashes before the release gate evaluates it.
 type CommandAudioAnalyzer struct {
-	Program string
-	Store   *artifactstore.Store
-	Runner  CommandRunner
+	Program                     string
+	Store                       *artifactstore.Store
+	Runner                      CommandRunner
+	sealSHA256, analyzerVersion string
+}
+
+// NewSealedCommandAudioAnalyzer accepts only the executable named by the
+// verified local seal. The worker therefore cannot silently select another
+// command after a native execution package has been approved.
+func NewSealedCommandAudioAnalyzer(
+	program, root, seal string,
+	store *artifactstore.Store,
+) (*CommandAudioAnalyzer, error) {
+	manifest, evidence, err := analyzerseal.Verify(root, seal)
+	if err != nil {
+		return nil, fmt.Errorf("verify audio analyzer seal: %w", err)
+	}
+	wantProgram, err := filepath.Abs(filepath.Join(root, manifest.Analyzer.Path))
+	if err != nil {
+		return nil, err
+	}
+	gotProgram, err := filepath.Abs(program)
+	if err != nil {
+		return nil, err
+	}
+	if gotProgram != wantProgram {
+		return nil, errors.New("audio analyzer command differs from the sealed executable")
+	}
+	analyzer, err := NewCommandAudioAnalyzer(wantProgram, store)
+	if err != nil {
+		return nil, err
+	}
+	analyzer.sealSHA256 = evidence.SealSHA256
+	analyzer.analyzerVersion = manifest.Analyzer.Version
+	return analyzer, nil
+}
+
+func (a *CommandAudioAnalyzer) AnalyzerSealSHA256() string {
+	if a == nil {
+		return ""
+	}
+	return a.sealSHA256
 }
 
 type analyzerMediaInput struct {
@@ -177,6 +217,9 @@ func (a *CommandAudioAnalyzer) Analyze(
 	var extra any
 	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
 		return AudioAnalysis{}, errors.New("audio analyzer output must contain exactly one JSON value")
+	}
+	if a.analyzerVersion != "" && analysis.AnalyzerVersion != a.analyzerVersion {
+		return AudioAnalysis{}, errors.New("audio analyzer output version differs from its seal")
 	}
 	// The adapter, not the external process, owns the immutable evidence hash.
 	analysis.ContentHash = ""

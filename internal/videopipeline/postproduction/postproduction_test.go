@@ -263,6 +263,43 @@ func TestNativeAudioFinalizationMakesZeroSpeechCallsAndNoFakeDialogueStem(t *tes
 	}
 }
 
+func TestNativeAudioFinalizationRequiresFrozenAnalyzerSeal(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wanted := strings.Repeat("a", 64)
+	request := nativeAudioRequest(t)
+	request.AnalyzerSealSHA256 = wanted
+	for _, test := range []struct {
+		name    string
+		seal    string
+		wantErr bool
+	}{
+		{name: "exact seal", seal: wanted},
+		{name: "drifted seal", seal: strings.Repeat("b", 64), wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			analyzer := &fakeAudioAnalyzer{sealSHA256: test.seal}
+			service, serviceErr := NewService(nil, &fakeMedia{store: store}, store, analyzer)
+			if serviceErr != nil {
+				t.Fatal(serviceErr)
+			}
+			_, finalizeErr := service.Finalize(t.Context(), request)
+			if test.wantErr {
+				if providercontract.ErrorCodeOf(finalizeErr) != providercontract.CodeUnavailable || analyzer.calls != 0 {
+					t.Fatalf("Finalize() error=%v analyzer calls=%d", finalizeErr, analyzer.calls)
+				}
+				return
+			}
+			if finalizeErr != nil || analyzer.calls != 1 {
+				t.Fatalf("Finalize() error=%v analyzer calls=%d", finalizeErr, analyzer.calls)
+			}
+		})
+	}
+}
+
 func TestHybridAudioSynthesizesOnlyFrozenFallbackAndReusesCompletedAttempt(t *testing.T) {
 	t.Parallel()
 	store, err := artifactstore.New(t.TempDir())
@@ -587,7 +624,10 @@ type fakeAudioAnalyzer struct {
 	calls                     int
 	lipOffsetMillis           int64
 	ambienceHardSilenceMillis int64
+	sealSHA256                string
 }
+
+func (f *fakeAudioAnalyzer) AnalyzerSealSHA256() string { return f.sealSHA256 }
 
 func (f *fakeAudioAnalyzer) Analyze(_ context.Context, input AudioAnalysisRequest) (AudioAnalysis, error) {
 	f.calls++

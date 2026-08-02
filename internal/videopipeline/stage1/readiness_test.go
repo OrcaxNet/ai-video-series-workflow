@@ -378,6 +378,40 @@ func TestPlanValidatePinsApprovedStage1Boundary(t *testing.T) {
 	}
 }
 
+func TestPlanValidatePinsFLO154NativeZeroTTSBoundary(t *testing.T) {
+	t.Parallel()
+	valid := nativeTestPlan()
+	if err := valid.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		mutate func(*Plan)
+	}{
+		{name: "FLO-104 batch reuse", mutate: func(plan *Plan) { plan.BatchID = "flo104-sample-1" }},
+		{name: "TTS AFP reservation", mutate: func(plan *Plan) { plan.MaximumTTSAFPMilli = 1 }},
+		{name: "TTS preflight", mutate: func(plan *Plan) { plan.TTSPreflight.CompletedNoCost = true }},
+		{name: "speech submit", mutate: func(plan *Plan) { plan.NativeAudio.MaximumSpeechSubmits = 1 }},
+		{name: "TTS strategy", mutate: func(plan *Plan) { plan.NativeAudio.AudioStrategy = providercontract.AudioStrategyTTSRequired }},
+		{name: "audio disabled", mutate: func(plan *Plan) { plan.NativeAudio.GenerateAudio = false }},
+		{name: "fake stems", mutate: func(plan *Plan) { plan.NativeAudio.AudioDelivery = providercontract.NativeAudioStems }},
+		{name: "analyzer hash drift", mutate: func(plan *Plan) { plan.NativeAudio.AnalyzerSealSHA256 = "missing" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			plan := valid
+			plan.PrimaryShotIDs = append([]string(nil), valid.PrimaryShotIDs...)
+			plan.RequiredEvidence = append([]string(nil), valid.RequiredEvidence...)
+			native := *valid.NativeAudio
+			plan.NativeAudio = &native
+			test.mutate(&plan)
+			if err := plan.Validate(); err == nil {
+				t.Fatal("mutated FLO-154 native plan unexpectedly passed")
+			}
+		})
+	}
+}
+
 func TestValidateDialoguePins600CharactersAnd81AFP(t *testing.T) {
 	t.Parallel()
 	characters, afpMilli, err := ValidateDialogue([]string{strings.Repeat("字", 300), strings.Repeat("文", 300)})
@@ -1111,6 +1145,26 @@ func testPlan() Plan {
 			UsageAttribution: "provider_usage_tokens_per_request",
 		},
 	}
+}
+
+func nativeTestPlan() Plan {
+	plan := testPlan()
+	plan.SchemaVersion = NativeSchemaVersion
+	plan.BatchID = "flo154-native-sample-1"
+	for index := range plan.PrimaryShotIDs {
+		plan.PrimaryShotIDs[index] = fmt.Sprintf("flo154-shot-%02d", index+1)
+	}
+	plan.MonthlyBaselineAFPMilli = 0
+	plan.MaximumTTSAFPMilli = 0
+	plan.RequiredEvidence = append([]string(nil), nativeRequiredEvidence...)
+	plan.TTSPreflight = TTSPreflight{}
+	plan.NativeAudio = &NativeAudioPreflight{
+		ProductSchema: NativeProductSchemaVersion,
+		AudioStrategy: providercontract.AudioStrategyNativePreferred,
+		GenerateAudio: true, AudioDelivery: providercontract.NativeAudioMix,
+		MaximumSpeechSubmits: 0, AnalyzerSealSHA256: strings.Repeat("a", 64),
+	}
+	return plan
 }
 
 func testAttempt(shotID, attemptID string) Attempt {

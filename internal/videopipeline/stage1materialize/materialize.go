@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/analyzerseal"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
@@ -28,16 +29,33 @@ import (
 )
 
 const (
-	productSchema = "flo104.sample1.product-input.v1"
-	batchID       = "flo104-sample-1"
-	actorRole     = "ADMIN"
+	productSchema       = "flo104.sample1.product-input.v1"
+	batchID             = "flo104-sample-1"
+	nativeProductSchema = stage1.NativeProductSchemaVersion
+	actorRole           = "ADMIN"
 )
 
 type Files struct {
-	Product string
-	Source  string
-	Safety  string
-	Visual  string
+	Product      string
+	Source       string
+	Safety       string
+	Visual       string
+	AnalyzerRoot string
+	AnalyzerSeal string
+	CodeCommit   string
+	BuildSHA256  string
+}
+
+type materializationPolicy struct {
+	NativeOnly        bool
+	BatchID           string
+	ProductSchema     string
+	ResolverVersion   string
+	PromptTemplateRef string
+	WorkflowPrefix    string
+	ReasonCode        string
+	ReportSchema      string
+	DisplayName       string
 }
 
 type Approval struct {
@@ -57,6 +75,7 @@ type Report struct {
 	ProviderJobs         int64             `json:"providerJobs"`
 	BudgetReservations   int64             `json:"budgetReservations"`
 	CostLedgerEntries    int64             `json:"costLedgerEntries"`
+	VideoBudgetState     string            `json:"videoBudgetState,omitempty"`
 	ApprovalCommentID    string            `json:"approvalCommentId"`
 	ApprovalValidUntil   time.Time         `json:"approvalValidUntil"`
 }
@@ -213,13 +232,15 @@ type sharedPrompt struct {
 }
 
 type outputInput struct {
-	Width          int    `json:"width"`
-	Height         int    `json:"height"`
-	AspectRatio    string `json:"aspectRatio"`
-	FPS            int    `json:"fps"`
-	DurationMillis int    `json:"durationMillis"`
-	Format         string `json:"format"`
-	GenerateAudio  bool   `json:"generateAudio"`
+	Width          int                                  `json:"width"`
+	Height         int                                  `json:"height"`
+	AspectRatio    string                               `json:"aspectRatio"`
+	FPS            int                                  `json:"fps"`
+	DurationMillis int                                  `json:"durationMillis"`
+	Format         string                               `json:"format"`
+	GenerateAudio  bool                                 `json:"generateAudio"`
+	AudioStrategy  providercontract.AudioStrategy       `json:"audioStrategy,omitempty"`
+	AudioDelivery  providercontract.NativeAudioDelivery `json:"audioDelivery,omitempty"`
 }
 
 func (o outputInput) providerSpec() providercontract.OutputSpec {
@@ -227,7 +248,14 @@ func (o outputInput) providerSpec() providercontract.OutputSpec {
 		Width: o.Width, Height: o.Height, Resolution: fmt.Sprintf("%dp", o.Height),
 		AspectRatio: o.AspectRatio, FPS: o.FPS, DurationMillis: o.DurationMillis,
 		Format: o.Format, GenerateAudio: o.GenerateAudio,
+		AudioStrategy: o.AudioStrategy, AudioDelivery: o.AudioDelivery,
 	}
+}
+
+type ambienceInput struct {
+	Identity           string `json:"identity"`
+	Version            string `json:"version"`
+	ContinuityIntoNext bool   `json:"continuityIntoNext"`
 }
 
 type shotInput struct {
@@ -247,6 +275,7 @@ type shotInput struct {
 	Narrative                  json.RawMessage `json:"narrative"`
 	Cinematography             json.RawMessage `json:"cinematography"`
 	Continuity                 json.RawMessage `json:"continuity"`
+	Ambience                   ambienceInput   `json:"ambience"`
 	PositivePrompt             string          `json:"positivePrompt"`
 	EstimatedVideoTokens       int64           `json:"estimatedVideoTokens"`
 	PredictedAFPMilli          int64           `json:"predictedAfpMilli"`
@@ -318,13 +347,16 @@ type postInput struct {
 }
 
 type prepared struct {
-	product                                                         productInput
-	productBytes, sourceBytes, safetyBytes, visualBytes, voiceBytes []byte
-	productHash, voiceHash, profileHash                             string
-	visualAsset, voiceAsset                                         reusableAsset
-	visualLicense, voiceLicense                                     licenseInput
-	videoRoute, speechRoute                                         providercontract.ModelSnapshot
-	videoCapabilityID, speechCapabilityID                           uuid.UUID
+	product                                                                        productInput
+	productBytes, sourceBytes, safetyBytes, visualBytes, voiceBytes, analyzerBytes []byte
+	productHash, voiceHash, profileHash                                            string
+	visualAsset, voiceAsset                                                        reusableAsset
+	visualLicense, voiceLicense                                                    licenseInput
+	videoRoute, speechRoute                                                        providercontract.ModelSnapshot
+	videoCapabilityID, speechCapabilityID                                          uuid.UUID
+	policy                                                                         materializationPolicy
+	analyzerEvidence                                                               analyzerseal.Evidence
+	codeCommit, buildSHA256                                                        string
 }
 
 func Materialize(ctx context.Context, pool *pgxpool.Pool, cas *artifactstore.Store, plan stage1.Plan, files Files, approval Approval) (stage1.ExecutionPackage, Report, error) {
@@ -338,8 +370,17 @@ func Materialize(ctx context.Context, pool *pgxpool.Pool, cas *artifactstore.Sto
 	if err != nil {
 		return stage1.ExecutionPackage{}, Report{}, err
 	}
+	inputs := map[string][]byte{
+		"product_input": p.productBytes, "source": p.sourceBytes,
+		"safety": p.safetyBytes, "visual": p.visualBytes,
+	}
+	if p.policy.NativeOnly {
+		inputs["analyzer_seal"] = p.analyzerBytes
+	} else {
+		inputs["voice_descriptor"] = p.voiceBytes
+	}
 	casObjects := map[string]artifactstore.Artifact{}
-	for name, data := range map[string][]byte{"product_input": p.productBytes, "source": p.sourceBytes, "safety": p.safetyBytes, "visual": p.visualBytes, "voice_descriptor": p.voiceBytes} {
+	for name, data := range inputs {
 		object, putErr := cas.Put(ctx, bytes.NewReader(data))
 		if putErr != nil {
 			return stage1.ExecutionPackage{}, Report{}, fmt.Errorf("ingest %s: %w", name, putErr)
@@ -379,6 +420,10 @@ func prepare(files Files, plan stage1.Plan, approval Approval) (prepared, error)
 	if err := json.Unmarshal(productBytes, &product); err != nil {
 		return prepared{}, fmt.Errorf("decode product input: %w", err)
 	}
+	policy, err := policyFor(product, plan)
+	if err != nil {
+		return prepared{}, err
+	}
 	sourceBytes, err := read(files.Source, 2<<20)
 	if err != nil {
 		return prepared{}, fmt.Errorf("read source: %w", err)
@@ -392,8 +437,8 @@ func prepare(files Files, plan stage1.Plan, approval Approval) (prepared, error)
 		return prepared{}, fmt.Errorf("read visual evidence: %w", err)
 	}
 	productHash := sum(productBytes)
-	if product.SchemaVersion != productSchema || product.BatchID != batchID || product.BatchID != plan.BatchID || len(product.Shots) != stage1.RequiredPrimaryJobs {
-		return prepared{}, errors.New("product input is not the approved FLO-104 sample 1 schema")
+	if len(product.Shots) != stage1.RequiredPrimaryJobs {
+		return prepared{}, errors.New("product input must freeze exactly ten primary shots")
 	}
 	if sum(sourceBytes) != product.Source.SHA256 || int64(len(sourceBytes)) != product.Source.Bytes || sum(safetyBytes) != product.ContentSafetyEvidence.SHA256 || int64(len(safetyBytes)) != product.ContentSafetyEvidence.Bytes {
 		return prepared{}, errors.New("source or safety evidence differs from the fixed product input")
@@ -420,11 +465,31 @@ func prepare(files Files, plan stage1.Plan, approval Approval) (prepared, error)
 			voiceLicense = license
 		}
 	}
-	if visual.AssetID == "" || voice.AssetID == "" || visualLicense.ID == "" || voiceLicense.ID == "" {
-		return prepared{}, errors.New("fixed visual/voice assets and licenses are required")
+	if visual.AssetID == "" || visualLicense.ID == "" {
+		return prepared{}, errors.New("fixed visual asset and license are required")
 	}
-	if product.GenerationProfile.VideoRoute.ModelID != stage1.FormalVideoModel || product.GenerationProfile.VideoRoute.Verification != providercontract.PendingKey || product.GenerationProfile.SpeechRoute.ModelID != "doubao-seed-tts-2.0" || product.GenerationProfile.SpeechRoute.Verification != providercontract.PendingKey {
+	if product.GenerationProfile.VideoRoute.ModelID != stage1.FormalVideoModel || product.GenerationProfile.VideoRoute.Verification != providercontract.PendingKey {
 		return prepared{}, errors.New("product input routes are outside the approved pending_key boundary")
+	}
+	if policy.NativeOnly {
+		if voice.AssetID != "" || voiceLicense.ID != "" || product.GenerationProfile.SpeechRoute != (routeInput{}) ||
+			product.DialogueSummary.TTSAFPMilliEstimate != 0 || !nativePostEmpty(product.PostProduction) {
+			return prepared{}, errors.New("FLO-154 native product must omit VOICE, Speech route/budget, and TTS estimates")
+		}
+		output := product.SharedPrompt.Output.providerSpec()
+		if output.ResolvedAudioStrategy() != providercontract.AudioStrategyNativePreferred ||
+			!output.GenerateAudio || output.AudioDelivery != providercontract.NativeAudioMix {
+			return prepared{}, errors.New("FLO-154 native product must freeze native_preferred generateAudio=true native_mix")
+		}
+		if err := validateNativeShots(product.Shots); err != nil {
+			return prepared{}, err
+		}
+	} else {
+		if voice.AssetID == "" || voiceLicense.ID == "" ||
+			product.GenerationProfile.SpeechRoute.ModelID != "doubao-seed-tts-2.0" ||
+			product.GenerationProfile.SpeechRoute.Verification != providercontract.PendingKey {
+			return prepared{}, errors.New("fixed FLO-104 voice asset, license, and Speech route are required")
+		}
 	}
 	if product.GenerationPlan.MaximumCalls != stage1.MaximumNewProviderJobs || product.GenerationPlan.MaximumVideoTokens != plan.MaximumVideoTokens || product.GenerationPlan.MaximumAFPMilli != plan.MonthlyMaximumAFPMilli || product.GenerationPlan.MaximumCashMicros != plan.MaximumCashMicros || int64(product.DialogueSummary.UnicodeCharacterCount) > plan.MaximumDialogueCharacters {
 		return prepared{}, errors.New("product input exceeds an approved Stage 1 limit")
@@ -432,28 +497,129 @@ func prepare(files Files, plan stage1.Plan, approval Approval) (prepared, error)
 	if !product.ContentSafetyEvidence.ValidUntil.Equal(approval.ValidUntil) {
 		return prepared{}, errors.New("ADMIN approval validity does not match the frozen safety package")
 	}
-	if err := validateIDs(product); err != nil {
+	if err := validateIDs(product, policy.NativeOnly); err != nil {
 		return prepared{}, err
 	}
-	voiceDescriptor := map[string]any{"schemaVersion": "v1", "provider": voice.Provider, "model": voice.Model, "resourceId": voice.ResourceID, "speaker": voice.Speaker, "voiceClone": voice.VoiceClone, "inputPackageHash": productHash}
-	voiceBytes, err := controlplane.CanonicalJSON(voiceDescriptor)
-	if err != nil {
-		return prepared{}, err
+	var voiceBytes []byte
+	var analyzerBytes []byte
+	var analyzerEvidence analyzerseal.Evidence
+	if policy.NativeOnly {
+		if len(files.CodeCommit) != 40 || !validLowerHex(files.CodeCommit) || !validLowerDigest(files.BuildSHA256) {
+			return prepared{}, errors.New("FLO-154 native materialization requires fixed code commit and build SHA-256")
+		}
+		_, analyzerEvidence, err = analyzerseal.Verify(files.AnalyzerRoot, files.AnalyzerSeal)
+		if err != nil {
+			return prepared{}, fmt.Errorf("verify FLO-154 analyzer seal: %w", err)
+		}
+		if analyzerEvidence.SealSHA256 != plan.NativeAudio.AnalyzerSealSHA256 {
+			return prepared{}, errors.New("FLO-154 analyzer seal differs from the approved plan")
+		}
+		analyzerBytes, err = read(files.AnalyzerSeal, 1<<20)
+		if err != nil {
+			return prepared{}, fmt.Errorf("read FLO-154 analyzer seal: %w", err)
+		}
+	} else {
+		voiceDescriptor := map[string]any{"schemaVersion": "v1", "provider": voice.Provider, "model": voice.Model, "resourceId": voice.ResourceID, "speaker": voice.Speaker, "voiceClone": voice.VoiceClone, "inputPackageHash": productHash}
+		voiceBytes, err = controlplane.CanonicalJSON(voiceDescriptor)
+		if err != nil {
+			return prepared{}, err
+		}
 	}
 	profileHash, _ := digest(product.GenerationProfile)
 	videoHash, _ := digest(map[string]any{"route": product.GenerationProfile.VideoRoute, "providerProfileId": product.Reserved.VideoProviderProfileID, "inputPackageHash": productHash})
-	speechHash, _ := digest(map[string]any{"route": product.GenerationProfile.SpeechRoute, "providerProfileId": product.Reserved.SpeechProviderProfileID, "inputPackageHash": productHash})
 	videoRoute := modelRoute(product.GenerationProfile.VideoRoute, videoHash)
-	speechRoute := modelRoute(product.GenerationProfile.SpeechRoute, speechHash)
-	return prepared{product: product, productBytes: productBytes, sourceBytes: sourceBytes, safetyBytes: safetyBytes, visualBytes: visualBytes, voiceBytes: voiceBytes, productHash: productHash, voiceHash: sum(voiceBytes), profileHash: profileHash, visualAsset: visual, voiceAsset: voice, visualLicense: visualLicense, voiceLicense: voiceLicense, videoRoute: videoRoute, speechRoute: speechRoute, videoCapabilityID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("capability:"+videoHash)), speechCapabilityID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("capability:"+speechHash))}, nil
+	result := prepared{
+		product: product, productBytes: productBytes, sourceBytes: sourceBytes,
+		safetyBytes: safetyBytes, visualBytes: visualBytes, voiceBytes: voiceBytes,
+		analyzerBytes: analyzerBytes, productHash: productHash, voiceHash: sum(voiceBytes),
+		profileHash: profileHash, visualAsset: visual, voiceAsset: voice,
+		visualLicense: visualLicense, voiceLicense: voiceLicense, videoRoute: videoRoute,
+		videoCapabilityID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("capability:"+videoHash)),
+		policy:            policy, analyzerEvidence: analyzerEvidence,
+		codeCommit: files.CodeCommit, buildSHA256: files.BuildSHA256,
+	}
+	if !policy.NativeOnly {
+		speechHash, _ := digest(map[string]any{"route": product.GenerationProfile.SpeechRoute, "providerProfileId": product.Reserved.SpeechProviderProfileID, "inputPackageHash": productHash})
+		result.speechRoute = modelRoute(product.GenerationProfile.SpeechRoute, speechHash)
+		result.speechCapabilityID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("capability:"+speechHash))
+	}
+	return result, nil
+}
+
+func policyFor(product productInput, plan stage1.Plan) (materializationPolicy, error) {
+	switch {
+	case product.SchemaVersion == productSchema && product.BatchID == batchID &&
+		product.BatchID == plan.BatchID && !plan.IsNativeOnly():
+		return materializationPolicy{
+			BatchID: batchID, ProductSchema: productSchema,
+			ResolverVersion: "stage1-product-input-v1", PromptTemplateRef: productSchema,
+			WorkflowPrefix: "flo104-stage1-", ReasonCode: "FLO104_FIXED_SAMPLE1",
+			ReportSchema: "flo104.sample1.materialization-report.v1",
+			DisplayName:  "FLO-104 Agent Plan video",
+		}, nil
+	case product.SchemaVersion == nativeProductSchema && product.BatchID == plan.BatchID &&
+		plan.IsNativeOnly():
+		return materializationPolicy{
+			NativeOnly: true, BatchID: product.BatchID, ProductSchema: nativeProductSchema,
+			ResolverVersion: "flo154-native-materializer-v1", PromptTemplateRef: nativeProductSchema,
+			WorkflowPrefix: "flo154-native-", ReasonCode: "FLO154_NATIVE_SAMPLE1",
+			ReportSchema: "flo154.native-materialization-report.v1",
+			DisplayName:  "FLO-154 Agent Plan native video",
+		}, nil
+	default:
+		return materializationPolicy{}, errors.New("product input schema/batch differs from the approved readiness plan")
+	}
+}
+
+func nativePostEmpty(post postInput) bool {
+	return post.SpeechProviderProfileID == "" && post.SpeechBudgetApprovalID == "" &&
+		post.SpeechBudgetMaximumMicros == 0 && post.SpeechBudgetCurrency == "" &&
+		post.Speaker == "" && post.VoiceAssetVersionID == ""
+}
+
+func validateNativeShots(shots []shotInput) error {
+	identities := map[string]struct{}{}
+	continuities := 0
+	lipSyncDialogue := 0
+	for _, shot := range shots {
+		if strings.TrimSpace(shot.Ambience.Identity) == "" || strings.TrimSpace(shot.Ambience.Version) == "" {
+			return errors.New("every FLO-154 shot must freeze ambience identity and version")
+		}
+		identities[shot.Ambience.Identity+"\x00"+shot.Ambience.Version] = struct{}{}
+		if shot.Ambience.ContinuityIntoNext {
+			continuities++
+		}
+		var cinematography map[string]any
+		var narrative struct {
+			Dialogue []json.RawMessage `json:"dialogue"`
+		}
+		if json.Unmarshal(shot.Cinematography, &cinematography) != nil ||
+			json.Unmarshal(shot.Narrative, &narrative) != nil {
+			return errors.New("FLO-154 shot cinematography or narrative is invalid")
+		}
+		if required, _ := nestedBool(cinematography, "lipSyncRequired", "requiresLipSync"); required && len(narrative.Dialogue) > 0 {
+			lipSyncDialogue++
+		}
+	}
+	if len(identities) < 2 || continuities < 2 || lipSyncDialogue < 4 {
+		return errors.New("FLO-154 sample requires two ambience groups, two continuities, and four lip-sync dialogue shots")
+	}
+	return nil
 }
 
 func modelRoute(input routeInput, hash string) providercontract.ModelSnapshot {
 	return providercontract.ModelSnapshot{CapabilityAlias: input.CapabilityAlias, Provider: "VOLCENGINE", ModelID: input.ModelID, RouteVersion: input.RouteVersion, CapabilityHash: hash, Verification: providercontract.PendingKey}
 }
 
-func validateIDs(product productInput) error {
-	values := []string{product.Reserved.SeriesID, product.Reserved.SourceRevisionID, product.Reserved.EpisodeID, product.Reserved.EpisodeRevisionID, product.Reserved.SceneID, product.Reserved.SceneRevisionID, product.Reserved.ScriptRevisionID, product.Reserved.StoryboardRevisionID, product.Reserved.GenerationProfileID, product.Reserved.GenerationProfileRevisionID, product.Reserved.GenerationPlanID, product.Reserved.VisualAssetID, product.Reserved.VisualAssetVersionID, product.Reserved.VisualLicenseSnapshotID, product.Reserved.VoiceAssetID, product.Reserved.VoiceAssetVersionID, product.Reserved.VoiceLicenseSnapshotID, product.Reserved.SafetyEvidenceArtifactID, product.Reserved.G1DecisionID, product.Reserved.G2DecisionID, product.Reserved.SafetyDecisionID, product.Reserved.VideoBudgetApprovalID, product.Reserved.SpeechBudgetApprovalID, product.Reserved.VideoProviderProfileID, product.Reserved.SpeechProviderProfileID, product.Reserved.SeriesContextRevisionID, product.Reserved.EpisodeContextRevisionID, product.Reserved.SceneContextRevisionID}
+func validateIDs(product productInput, nativeOnly bool) error {
+	values := []string{product.Reserved.SeriesID, product.Reserved.SourceRevisionID, product.Reserved.EpisodeID, product.Reserved.EpisodeRevisionID, product.Reserved.SceneID, product.Reserved.SceneRevisionID, product.Reserved.ScriptRevisionID, product.Reserved.StoryboardRevisionID, product.Reserved.GenerationProfileID, product.Reserved.GenerationProfileRevisionID, product.Reserved.GenerationPlanID, product.Reserved.VisualAssetID, product.Reserved.VisualAssetVersionID, product.Reserved.VisualLicenseSnapshotID, product.Reserved.SafetyEvidenceArtifactID, product.Reserved.G1DecisionID, product.Reserved.G2DecisionID, product.Reserved.SafetyDecisionID, product.Reserved.VideoBudgetApprovalID, product.Reserved.VideoProviderProfileID, product.Reserved.SeriesContextRevisionID, product.Reserved.EpisodeContextRevisionID, product.Reserved.SceneContextRevisionID}
+	if !nativeOnly {
+		values = append(values,
+			product.Reserved.VoiceAssetID, product.Reserved.VoiceAssetVersionID,
+			product.Reserved.VoiceLicenseSnapshotID, product.Reserved.SpeechBudgetApprovalID,
+			product.Reserved.SpeechProviderProfileID,
+		)
+	}
 	seen := map[string]struct{}{}
 	for _, shot := range product.Shots {
 		values = append(values, shot.DBShotID, shot.ShotSpecRevisionID, shot.PromptSnapshotID, shot.EffectiveContextSnapshotID, shot.RunID)
@@ -485,7 +651,17 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	); err != nil {
 		return stage1.ExecutionPackage{}, fmt.Errorf("persist visual artifact evidence: %w", err)
 	}
-	if err := ensureActiveInputArtifact(
+	if p.policy.NativeOnly {
+		if err := ensureActiveInputArtifact(
+			ctx, tx, objects["analyzer_seal"], "application/vnd.video-series.analyzer-seal+json",
+			map[string]any{
+				"kind": "analyzer_seal", "inputPackageHash": p.productHash,
+				"codeCommitSha": p.codeCommit, "buildSha256": p.buildSHA256,
+			},
+		); err != nil {
+			return stage1.ExecutionPackage{}, fmt.Errorf("persist analyzer seal evidence: %w", err)
+		}
+	} else if err := ensureActiveInputArtifact(
 		ctx, tx, objects["voice_descriptor"], "audio/x-voice-profile+json",
 		map[string]any{
 			"kind": "voice_profile", "speaker": p.product.PostProduction.Speaker,
@@ -531,7 +707,9 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	// UUID aliases are valid transport spellings but may not become distinct
 	// TEXT budget buckets in persisted product truth.
 	ids.VideoBudgetApprovalID = mustUUID(ids.VideoBudgetApprovalID).String()
-	ids.SpeechBudgetApprovalID = mustUUID(ids.SpeechBudgetApprovalID).String()
+	if !p.policy.NativeOnly {
+		ids.SpeechBudgetApprovalID = mustUUID(ids.SpeechBudgetApprovalID).String()
+	}
 	providerOutput := p.product.SharedPrompt.Output.providerSpec()
 	exec := func(label, query string, args ...any) error {
 		if _, err := tx.Exec(ctx, query, args...); err != nil {
@@ -541,24 +719,41 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	}
 
 	// Provider snapshots are product truth only. The command never constructs an Adapter client.
-	if err := exec("video provider profile", `INSERT INTO video_pipeline.provider_profiles (id,provider,display_name,base_url_ref,credential_ref,enabled,mode,health,config_hash) VALUES ($1,'VOLCENGINE','FLO-104 Agent Plan video','internal://volcengine-provider','env:ARK_API_KEY',true,'LIVE','READY',$2)`, mustUUID(ids.VideoProviderProfileID), p.videoRoute.CapabilityHash); err != nil {
+	if err := exec("video provider profile", `INSERT INTO video_pipeline.provider_profiles (id,provider,display_name,base_url_ref,credential_ref,enabled,mode,health,config_hash) VALUES ($1,'VOLCENGINE',$2,'internal://volcengine-provider','env:ARK_API_KEY',true,'LIVE','READY',$3)`, mustUUID(ids.VideoProviderProfileID), p.policy.DisplayName, p.videoRoute.CapabilityHash); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
-	if err := exec("speech provider profile", `INSERT INTO video_pipeline.provider_profiles (id,provider,display_name,base_url_ref,credential_ref,enabled,mode,health,config_hash) VALUES ($1,'VOLCENGINE','FLO-104 Agent Plan speech','internal://volcengine-tts-provider','env:ARK_API_KEY',true,'LIVE','READY',$2)`, mustUUID(ids.SpeechProviderProfileID), p.speechRoute.CapabilityHash); err != nil {
-		return stage1.ExecutionPackage{}, err
+	if !p.policy.NativeOnly {
+		if err := exec("speech provider profile", `INSERT INTO video_pipeline.provider_profiles (id,provider,display_name,base_url_ref,credential_ref,enabled,mode,health,config_hash) VALUES ($1,'VOLCENGINE','FLO-104 Agent Plan speech','internal://volcengine-tts-provider','env:ARK_API_KEY',true,'LIVE','READY',$2)`, mustUUID(ids.SpeechProviderProfileID), p.speechRoute.CapabilityHash); err != nil {
+			return stage1.ExecutionPackage{}, err
+		}
 	}
 	limits := map[string]any{"allowedTerritories": p.product.GenerationPlan.Territories, "productForms": p.product.GenerationPlan.ProductForms, "contentSafetyPolicyVersions": []string{p.product.ContentSafetyEvidence.PolicyVersion}, "remainingCalls": p.product.GenerationPlan.MaximumCalls, "unitPriceMicros": 1, "accountingNote": "Agent Plan subscription; one-micro-per-second reservation floor, actual cost comes from Provider usage evidence"}
-	for _, cap := range []struct {
+	if p.policy.NativeOnly {
+		limits["supportsNativeAudio"] = true
+		limits["nativeAudioDelivery"] = string(providercontract.NativeAudioMix)
+		limits["maximumSpeechSubmits"] = 0
+	}
+	type capability struct {
 		id                                   uuid.UUID
 		profile, alias, model, version, hash string
 		inputs                               []string
-	}{{p.videoCapabilityID, ids.VideoProviderProfileID, "video.primary", p.videoRoute.ModelID, p.videoRoute.RouteVersion, p.videoRoute.CapabilityHash, []string{"prompt", "reference_image", "reference_audio"}}, {p.speechCapabilityID, ids.SpeechProviderProfileID, "speech.primary", p.speechRoute.ModelID, p.speechRoute.RouteVersion, p.speechRoute.CapabilityHash, []string{"text", "voice_profile"}}} {
+	}
+	capabilities := []capability{{p.videoCapabilityID, ids.VideoProviderProfileID, "video.primary", p.videoRoute.ModelID, p.videoRoute.RouteVersion, p.videoRoute.CapabilityHash, []string{"prompt", "reference_image"}}}
+	if !p.policy.NativeOnly {
+		capabilities[0].inputs = append(capabilities[0].inputs, "reference_audio")
+		capabilities = append(capabilities, capability{p.speechCapabilityID, ids.SpeechProviderProfileID, "speech.primary", p.speechRoute.ModelID, p.speechRoute.RouteVersion, p.speechRoute.CapabilityHash, []string{"text", "voice_profile"}})
+	}
+	for _, cap := range capabilities {
 		if err := exec("provider capability", `INSERT INTO video_pipeline.provider_capability_snapshots (id,provider_profile_id,capability_alias,model_id,route_version,supported_inputs,limits,pricing_rule_version,capability_hash,status,effective_at,expires_at) VALUES ($1,$2,$3,$4,$5,$6,$7,'agent-plan-subscription-v1',$8,'ACTIVE',$9,$10)`, cap.id, mustUUID(cap.profile), cap.alias, cap.model, cap.version, cap.inputs, limits, cap.hash, now, approval.ValidUntil); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
 	}
 
-	if err := exec("generation profile", `INSERT INTO video_pipeline.generation_profiles (id,profile_id,revision,schema_version,status,stage,aspect_profile,episode_target_ms,shot_min_ms,shot_max_ms,capability_routes,media_processing,render_defaults,qc_thresholds,retry_policy,budget_policy,license_policy,content_hash,created_by) VALUES ($1,$2,1,'v1','ACTIVE',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, mustUUID(ids.GenerationProfileRevisionID), mustUUID(ids.GenerationProfileID), p.product.GenerationProfile.Stage, p.product.GenerationProfile.AspectProfile, p.product.GenerationProfile.EpisodeTargetMS, p.product.GenerationProfile.ShotMinMS, p.product.GenerationProfile.ShotMaxMS, map[string]any{"video": p.videoRoute, "speech": p.speechRoute}, map[string]any{"postProduction": p.product.PostProduction}, providerOutput, p.product.PostProduction.QualityThresholds, p.product.GenerationProfile.RetryPolicy, p.product.AuthorizationBoundary, map[string]any{"territories": p.product.GenerationPlan.Territories, "productForms": p.product.GenerationPlan.ProductForms}, p.profileHash, p.product.CreatedBy); err != nil {
+	routes := map[string]any{"video": p.videoRoute}
+	if !p.policy.NativeOnly {
+		routes["speech"] = p.speechRoute
+	}
+	if err := exec("generation profile", `INSERT INTO video_pipeline.generation_profiles (id,profile_id,revision,schema_version,status,stage,aspect_profile,episode_target_ms,shot_min_ms,shot_max_ms,capability_routes,media_processing,render_defaults,qc_thresholds,retry_policy,budget_policy,license_policy,content_hash,created_by) VALUES ($1,$2,1,'v1','ACTIVE',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, mustUUID(ids.GenerationProfileRevisionID), mustUUID(ids.GenerationProfileID), p.product.GenerationProfile.Stage, p.product.GenerationProfile.AspectProfile, p.product.GenerationProfile.EpisodeTargetMS, p.product.GenerationProfile.ShotMinMS, p.product.GenerationProfile.ShotMaxMS, routes, map[string]any{"postProduction": p.product.PostProduction}, providerOutput, p.product.PostProduction.QualityThresholds, p.product.GenerationProfile.RetryPolicy, p.product.AuthorizationBoundary, map[string]any{"territories": p.product.GenerationPlan.Territories, "productForms": p.product.GenerationPlan.ProductForms}, p.profileHash, p.product.CreatedBy); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
 	if err := exec("series", `INSERT INTO video_pipeline.series (id,title,status,default_profile_id,rights_declaration,created_by) VALUES ($1,$2,'ACTIVE',$3,$4,$5)`, mustUUID(ids.SeriesID), p.product.Source.Title, mustUUID(ids.GenerationProfileRevisionID), p.product.Source.Rights, p.product.CreatedBy); err != nil {
@@ -593,24 +788,28 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	visualLicense := p.visualLicense
 	voiceLicense := p.voiceLicense
 	visualLicenseHash, _ := digest(map[string]any{"license": visualLicense, "inputPackageHash": p.productHash})
-	voiceLicenseHash, _ := digest(map[string]any{"license": voiceLicense, "effectivePolicyStatus": "ALLOWED", "adminApproval": approval.CommentID, "validUntil": approval.ValidUntil, "inputPackageHash": p.productHash})
 	if err := exec("visual license", `INSERT INTO video_pipeline.license_snapshots (id,subject_type,subject_ref,license_id,license_hash,policy_status,territories,commercial_use,expires_at,source_uri,reviewed_by,reviewed_at) VALUES ($1,$2,$3,$4,$5,'ALLOWED',$6,$7,$8,$9,$10,$11)`, mustUUID(ids.VisualLicenseSnapshotID), visualLicense.SubjectType, visualLicense.SubjectRef, visualLicense.LicenseID, visualLicenseHash, visualLicense.Territories, visualLicense.CommercialUse, visualLicense.ExpiresAt, visualLicense.SourceURI, approval.ActorID, now); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
-	if err := exec("voice license", `INSERT INTO video_pipeline.license_snapshots (id,subject_type,subject_ref,license_id,license_hash,policy_status,territories,commercial_use,expires_at,source_uri,reviewed_by,reviewed_at) VALUES ($1,'VOICE',$2,$3,$4,'ALLOWED',$5,true,$6,$7,$8,$9)`, mustUUID(ids.VoiceLicenseSnapshotID), voiceLicense.SubjectRef, voiceLicense.LicenseID, voiceLicenseHash, voiceLicense.Territories, approval.ValidUntil, voiceLicense.SourceURI, approval.ActorID, now); err != nil {
-		return stage1.ExecutionPackage{}, err
+	if !p.policy.NativeOnly {
+		voiceLicenseHash, _ := digest(map[string]any{"license": voiceLicense, "effectivePolicyStatus": "ALLOWED", "adminApproval": approval.CommentID, "validUntil": approval.ValidUntil, "inputPackageHash": p.productHash})
+		if err := exec("voice license", `INSERT INTO video_pipeline.license_snapshots (id,subject_type,subject_ref,license_id,license_hash,policy_status,territories,commercial_use,expires_at,source_uri,reviewed_by,reviewed_at) VALUES ($1,'VOICE',$2,$3,$4,'ALLOWED',$5,true,$6,$7,$8,$9)`, mustUUID(ids.VoiceLicenseSnapshotID), voiceLicense.SubjectRef, voiceLicense.LicenseID, voiceLicenseHash, voiceLicense.Territories, approval.ValidUntil, voiceLicense.SourceURI, approval.ActorID, now); err != nil {
+			return stage1.ExecutionPackage{}, err
+		}
 	}
 	if err := exec("visual asset", `INSERT INTO video_pipeline.assets (id,series_id,asset_type,scope_type,scope_id) VALUES ($1,$2,'IMAGE','SERIES',$2)`, mustUUID(ids.VisualAssetID), mustUUID(ids.SeriesID)); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
-	if err := exec("visual version", `INSERT INTO video_pipeline.asset_versions (id,asset_id,revision,status,content_hash,artifact_uri,media_type,dimensions,source_ref,license_snapshot_id,created_by) VALUES ($1,$2,1,'APPROVED',$3,$4,'image/png',$5,$6,$7,$8)`, mustUUID(ids.VisualAssetVersionID), mustUUID(ids.VisualAssetID), objects["visual"].Digest, objects["visual"].URI, map[string]any{"width": p.visualAsset.Width, "height": p.visualAsset.Height}, "flo104-product-input:"+p.productHash, mustUUID(ids.VisualLicenseSnapshotID), p.product.CreatedBy); err != nil {
+	if err := exec("visual version", `INSERT INTO video_pipeline.asset_versions (id,asset_id,revision,status,content_hash,artifact_uri,media_type,dimensions,source_ref,license_snapshot_id,created_by) VALUES ($1,$2,1,'APPROVED',$3,$4,'image/png',$5,$6,$7,$8)`, mustUUID(ids.VisualAssetVersionID), mustUUID(ids.VisualAssetID), objects["visual"].Digest, objects["visual"].URI, map[string]any{"width": p.visualAsset.Width, "height": p.visualAsset.Height}, p.policy.ProductSchema+":"+p.productHash, mustUUID(ids.VisualLicenseSnapshotID), p.product.CreatedBy); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
-	if err := exec("voice asset", `INSERT INTO video_pipeline.assets (id,series_id,asset_type,scope_type,scope_id) VALUES ($1,$2,'VOICE','SERIES',$2)`, mustUUID(ids.VoiceAssetID), mustUUID(ids.SeriesID)); err != nil {
-		return stage1.ExecutionPackage{}, err
-	}
-	if err := exec("voice version", `INSERT INTO video_pipeline.asset_versions (id,asset_id,revision,status,content_hash,artifact_uri,media_type,dimensions,source_ref,license_snapshot_id,created_by) VALUES ($1,$2,1,'APPROVED',$3,$4,'audio/x-voice-profile+json',$5,$6,$7,$8)`, mustUUID(ids.VoiceAssetVersionID), mustUUID(ids.VoiceAssetID), objects["voice_descriptor"].Digest, objects["voice_descriptor"].URI, map[string]any{"speaker": p.product.PostProduction.Speaker}, "flo104-product-input:"+p.productHash, mustUUID(ids.VoiceLicenseSnapshotID), p.product.CreatedBy); err != nil {
-		return stage1.ExecutionPackage{}, err
+	if !p.policy.NativeOnly {
+		if err := exec("voice asset", `INSERT INTO video_pipeline.assets (id,series_id,asset_type,scope_type,scope_id) VALUES ($1,$2,'VOICE','SERIES',$2)`, mustUUID(ids.VoiceAssetID), mustUUID(ids.SeriesID)); err != nil {
+			return stage1.ExecutionPackage{}, err
+		}
+		if err := exec("voice version", `INSERT INTO video_pipeline.asset_versions (id,asset_id,revision,status,content_hash,artifact_uri,media_type,dimensions,source_ref,license_snapshot_id,created_by) VALUES ($1,$2,1,'APPROVED',$3,$4,'audio/x-voice-profile+json',$5,$6,$7,$8)`, mustUUID(ids.VoiceAssetVersionID), mustUUID(ids.VoiceAssetID), objects["voice_descriptor"].Digest, objects["voice_descriptor"].URI, map[string]any{"speaker": p.product.PostProduction.Speaker}, p.policy.ProductSchema+":"+p.productHash, mustUUID(ids.VoiceLicenseSnapshotID), p.product.CreatedBy); err != nil {
+			return stage1.ExecutionPackage{}, err
+		}
 	}
 	if err := exec("safety artifact", `INSERT INTO video_pipeline.artifacts (id,content_hash,artifact_uri,media_type,size_bytes,media_spec,status) VALUES ($1,$2,$3,'application/json',$4,$5,'ACTIVE')`, mustUUID(ids.SafetyEvidenceArtifactID), objects["safety"].Digest, objects["safety"].URI, objects["safety"].Size, map[string]any{"kind": "content_safety_evidence", "policyVersion": p.product.ContentSafetyEvidence.PolicyVersion, "inputPackageHash": p.productHash}); err != nil {
 		return stage1.ExecutionPackage{}, err
@@ -621,19 +820,30 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 	seriesContextHash, _ := digest(map[string]any{"scope": "SERIES", "creativeBrief": p.product.CreativeBrief, "inputPackageHash": p.productHash})
 	episodeContextHash, _ := digest(map[string]any{"scope": "EPISODE", "dialogue": p.product.DialogueSummary, "inputPackageHash": p.productHash})
 	sceneContextHash, _ := digest(map[string]any{"scope": "SCENE", "sceneRevisionHash": sceneHash, "inputPackageHash": p.productHash})
-	for _, c := range []struct {
+	baseContexts := []struct {
 		id, scope, scopeID, hash string
 		payload                  any
-	}{{ids.SeriesContextRevisionID, "SERIES", ids.SeriesID, seriesContextHash, map[string]any{"creativeBrief": p.product.CreativeBrief}}, {ids.EpisodeContextRevisionID, "EPISODE", ids.EpisodeID, episodeContextHash, map[string]any{"dialogue": p.product.DialogueSummary}}, {ids.SceneContextRevisionID, "SCENE", ids.SceneID, sceneContextHash, map[string]any{"sceneRevisionHash": sceneHash}}} {
-		if err := exec("context", `INSERT INTO video_pipeline.context_revisions (id,series_id,scope_type,scope_id,revision,status,schema_version,resolver_version,payload,content_hash,created_by) VALUES ($1,$2,$3,$4,1,'APPROVED','v1','stage1-product-input-v1',$5,$6,$7)`, mustUUID(c.id), mustUUID(ids.SeriesID), c.scope, mustUUID(c.scopeID), c.payload, c.hash, p.product.CreatedBy); err != nil {
+	}{{ids.SeriesContextRevisionID, "SERIES", ids.SeriesID, seriesContextHash, map[string]any{"creativeBrief": p.product.CreativeBrief}}, {ids.EpisodeContextRevisionID, "EPISODE", ids.EpisodeID, episodeContextHash, map[string]any{"dialogue": p.product.DialogueSummary}}}
+	if !p.policy.NativeOnly {
+		baseContexts = append(baseContexts, struct {
+			id, scope, scopeID, hash string
+			payload                  any
+		}{ids.SceneContextRevisionID, "SCENE", ids.SceneID, sceneContextHash, map[string]any{"sceneRevisionHash": sceneHash}})
+	}
+	for _, c := range baseContexts {
+		if err := exec("context", `INSERT INTO video_pipeline.context_revisions (id,series_id,scope_type,scope_id,revision,status,schema_version,resolver_version,payload,content_hash,created_by) VALUES ($1,$2,$3,$4,1,'APPROVED','v1',$5,$6,$7,$8)`, mustUUID(c.id), mustUUID(ids.SeriesID), c.scope, mustUUID(c.scopeID), p.policy.ResolverVersion, c.payload, c.hash, p.product.CreatedBy); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
 	}
 
 	// Exact gate decisions and budget reviews are inserted before the dependent
 	// shot/run rows. Every binding uses the database-derived immutable hash.
-	for _, d := range []struct{ id, gate, role, explanation string }{{ids.G1DecisionID, "G1", "PRODUCER", "Approved fixed FLO-104 sample 1 script"}, {ids.G2DecisionID, "G2", "PRODUCER", "Approved fixed FLO-104 sample 1 storyboard and shots"}, {ids.SafetyDecisionID, "SAFETY", actorRole, string(mustJSON(map[string]any{"policyVersion": p.product.ContentSafetyEvidence.PolicyVersion, "evidenceHash": objects["safety"].Digest, "validUntil": approval.ValidUntil, "explanation": "ADMIN-approved offline safety evidence; " + approval.CommentID}))}} {
-		if err := exec("approval decision", `INSERT INTO video_pipeline.approval_decisions (id,series_id,episode_id,gate,decision,reason_code,explanation,actor_id,actor_role,decided_at,trace_id) VALUES ($1,$2,$3,$4,'APPROVED','FLO104_FIXED_SAMPLE1',$5,$6,$7,$8,$9)`, mustUUID(d.id), mustUUID(ids.SeriesID), mustUUID(ids.EpisodeID), d.gate, d.explanation, approval.ActorID, d.role, now, p.product.PostProduction.TraceID); err != nil {
+	approvalSubject := "fixed FLO-104 sample 1"
+	if p.policy.NativeOnly {
+		approvalSubject = "fixed FLO-154 native sample 1"
+	}
+	for _, d := range []struct{ id, gate, role, explanation string }{{ids.G1DecisionID, "G1", "PRODUCER", "Approved " + approvalSubject + " script"}, {ids.G2DecisionID, "G2", "PRODUCER", "Approved " + approvalSubject + " storyboard and shots"}, {ids.SafetyDecisionID, "SAFETY", actorRole, string(mustJSON(map[string]any{"policyVersion": p.product.ContentSafetyEvidence.PolicyVersion, "evidenceHash": objects["safety"].Digest, "validUntil": approval.ValidUntil, "explanation": "ADMIN-approved offline safety evidence; " + approval.CommentID}))}} {
+		if err := exec("approval decision", `INSERT INTO video_pipeline.approval_decisions (id,series_id,episode_id,gate,decision,reason_code,explanation,actor_id,actor_role,decided_at,trace_id) VALUES ($1,$2,$3,$4,'APPROVED',$5,$6,$7,$8,$9,$10)`, mustUUID(d.id), mustUUID(ids.SeriesID), mustUUID(ids.EpisodeID), d.gate, p.policy.ReasonCode, d.explanation, approval.ActorID, d.role, now, p.product.PostProduction.TraceID); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
 	}
@@ -659,24 +869,46 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 		return stage1.ExecutionPackage{}, err
 	}
 
-	assetIDs := []uuid.UUID{mustUUID(ids.VisualAssetVersionID), mustUUID(ids.VoiceAssetVersionID)}
-	contextBase := []uuid.UUID{mustUUID(ids.SeriesContextRevisionID), mustUUID(ids.EpisodeContextRevisionID), mustUUID(ids.SceneContextRevisionID)}
+	assetIDs := []uuid.UUID{mustUUID(ids.VisualAssetVersionID)}
+	if !p.policy.NativeOnly {
+		assetIDs = append(assetIDs, mustUUID(ids.VoiceAssetVersionID))
+	}
+	contextBase := []uuid.UUID{mustUUID(ids.SeriesContextRevisionID), mustUUID(ids.EpisodeContextRevisionID)}
+	if !p.policy.NativeOnly {
+		contextBase = append(contextBase, mustUUID(ids.SceneContextRevisionID))
+	}
 	jobs := make([]stage1.FrozenJob, 0, len(p.product.Shots))
 	runIDs := make([]string, 0, len(p.product.Shots))
 	shotHashes := map[string]string{}
 	for _, shot := range p.product.Shots {
 		shotHash, _ := digest(map[string]any{"shot": shot, "profileHash": p.profileHash, "inputPackageHash": p.productHash})
 		shotHashes[shot.ShotSpecRevisionID] = shotHash
-		shotContextID := uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo104-shot-context:"+shot.ShotSpecRevisionID+":"+p.productHash))
+		shotContextID := uuid.NewSHA1(uuid.NameSpaceOID, []byte(p.policy.WorkflowPrefix+"shot-context:"+shot.ShotSpecRevisionID+":"+p.productHash))
 		shotContextHash, _ := digest(map[string]any{"scope": "SHOT", "shot": shot, "inputPackageHash": p.productHash})
+		currentSceneContextID := mustUUID(ids.SceneContextRevisionID)
+		currentSceneContextHash := sceneContextHash
+		if p.policy.NativeOnly {
+			if shot.Ordinal > 1 {
+				currentSceneContextID = uuid.NewSHA1(uuid.NameSpaceOID, []byte(p.policy.WorkflowPrefix+"scene-context:"+shot.ShotSpecRevisionID+":"+p.productHash))
+			}
+			scenePayload := map[string]any{"sceneRevisionHash": sceneHash, "audio": map[string]any{"ambience": map[string]any{"identity": shot.Ambience.Identity, "version": shot.Ambience.Version}}, "audio.ambience.continuity": shot.Ambience.ContinuityIntoNext}
+			currentSceneContextHash, _ = digest(map[string]any{"scope": "SCENE", "payload": scenePayload, "inputPackageHash": p.productHash})
+			if err := exec("native scene context", `INSERT INTO video_pipeline.context_revisions (id,series_id,scope_type,scope_id,revision,status,schema_version,resolver_version,payload,content_hash,created_by) VALUES ($1,$2,'SCENE',$3,$4,'APPROVED','v1',$5,$6,$7,$8)`, currentSceneContextID, mustUUID(ids.SeriesID), mustUUID(ids.SceneID), shot.Ordinal, p.policy.ResolverVersion, scenePayload, currentSceneContextHash, p.product.CreatedBy); err != nil {
+				return stage1.ExecutionPackage{}, err
+			}
+		}
 		if err := exec("shot", `INSERT INTO video_pipeline.shots (id,scene_id,ordinal) VALUES ($1,$2,$3)`, mustUUID(shot.DBShotID), mustUUID(ids.SceneID), shot.Ordinal); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
-		if err := exec("shot context", `INSERT INTO video_pipeline.context_revisions (id,series_id,scope_type,scope_id,revision,status,schema_version,resolver_version,payload,content_hash,created_by) VALUES ($1,$2,'SHOT',$3,1,'APPROVED','v1','stage1-product-input-v1',$4,$5,$6)`, shotContextID, mustUUID(ids.SeriesID), mustUUID(shot.DBShotID), map[string]any{"timeline": shot.Timeline, "narrative": shot.Narrative, "cinematography": shot.Cinematography, "continuity": shot.Continuity}, shotContextHash, p.product.CreatedBy); err != nil {
+		if err := exec("shot context", `INSERT INTO video_pipeline.context_revisions (id,series_id,scope_type,scope_id,revision,status,schema_version,resolver_version,payload,content_hash,created_by) VALUES ($1,$2,'SHOT',$3,1,'APPROVED','v1',$4,$5,$6,$7)`, shotContextID, mustUUID(ids.SeriesID), mustUUID(shot.DBShotID), p.policy.ResolverVersion, map[string]any{"timeline": shot.Timeline, "narrative": shot.Narrative, "cinematography": shot.Cinematography, "continuity": shot.Continuity}, shotContextHash, p.product.CreatedBy); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
-		contexts := append(append([]uuid.UUID{}, contextBase...), shotContextID)
-		contextHashes := map[string]string{"context:series": seriesContextHash, "context:episode": episodeContextHash, "context:scene": sceneContextHash, "context:shot": shotContextHash}
+		contexts := append([]uuid.UUID{}, contextBase...)
+		if p.policy.NativeOnly {
+			contexts = append(contexts, currentSceneContextID)
+		}
+		contexts = append(contexts, shotContextID)
+		contextHashes := map[string]string{"context:series": seriesContextHash, "context:episode": episodeContextHash, "context:scene": currentSceneContextHash, "context:shot": shotContextHash}
 		effectiveHash, _ := digest(map[string]any{"contextRevisionIds": contexts, "contextHashes": contextHashes, "inputPackageHash": p.productHash})
 		if err := exec("shot spec", `INSERT INTO video_pipeline.shot_spec_revisions (id,shot_id,storyboard_revision_id,revision,lifecycle_state,freshness,duration_ms,aspect_profile,fps,width,height,cast_count,primary_action_count,narrative,asset_version_refs,context_revision_ids,effective_context_hash,continuity,cinematography,generation_profile_id,gate2_decision_id,content_hash,created_by) VALUES ($1,$2,$3,1,'READY','FRESH',5000,$4,24,1280,720,1,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, mustUUID(shot.ShotSpecRevisionID), mustUUID(shot.DBShotID), mustUUID(ids.StoryboardRevisionID), p.product.GenerationProfile.AspectProfile, shot.Narrative, assetIDs, contexts, effectiveHash, shot.Continuity, shot.Cinematography, mustUUID(ids.GenerationProfileRevisionID), mustUUID(ids.G2DecisionID), shotHash, p.product.CreatedBy); err != nil {
 			return stage1.ExecutionPackage{}, err
@@ -687,69 +919,126 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 		if err := bind(ids.SafetyDecisionID, "SHOT_SPEC_REVISION", shot.ShotSpecRevisionID, shotHash); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
-		if err := exec("effective context", `INSERT INTO video_pipeline.effective_context_snapshots (id,shot_spec_revision_id,schema_version,resolver_version,context_revision_ids,normalized_payload,content_hash) VALUES ($1,$2,'v1','stage1-product-input-v1',$3,$4,$5)`, mustUUID(shot.EffectiveContextSnapshotID), mustUUID(shot.ShotSpecRevisionID), contexts, map[string]any{"contextHashes": contextHashes, "inputPackageHash": p.productHash}, effectiveHash); err != nil {
+		if err := exec("effective context", `INSERT INTO video_pipeline.effective_context_snapshots (id,shot_spec_revision_id,schema_version,resolver_version,context_revision_ids,normalized_payload,content_hash) VALUES ($1,$2,'v1',$3,$4,$5,$6)`, mustUUID(shot.EffectiveContextSnapshotID), mustUUID(shot.ShotSpecRevisionID), p.policy.ResolverVersion, contexts, map[string]any{"contextHashes": contextHashes, "inputPackageHash": p.productHash}, effectiveHash); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
-		inputHashes := map[string]string{"shot_spec": shotHash, "generation_profile": p.profileHash, "context:series": seriesContextHash, "context:episode": episodeContextHash, "context:scene": sceneContextHash, "context:shot": shotContextHash, "asset:" + ids.VisualAssetVersionID: objects["visual"].Digest, "asset:" + ids.VoiceAssetVersionID: objects["voice_descriptor"].Digest}
-		promptHash, err := repository.ImportedPromptHash(shot.ShotSpecRevisionID, ids.GenerationProfileRevisionID, effectiveHash, assetIDs, shot.PositivePrompt, p.product.SharedPrompt.NegativePrompt, providerOutput, inputHashes, p.productHash)
+		inputHashes := map[string]string{"shot_spec": shotHash, "generation_profile": p.profileHash, "context:series": seriesContextHash, "context:episode": episodeContextHash, "context:scene": currentSceneContextHash, "context:shot": shotContextHash, "asset:" + ids.VisualAssetVersionID: objects["visual"].Digest}
+		if !p.policy.NativeOnly {
+			inputHashes["asset:"+ids.VoiceAssetVersionID] = objects["voice_descriptor"].Digest
+		}
+		promptHash, err := repository.ImportedPromptHashForCompiler(p.policy.ResolverVersion, shot.ShotSpecRevisionID, ids.GenerationProfileRevisionID, effectiveHash, assetIDs, shot.PositivePrompt, p.product.SharedPrompt.NegativePrompt, providerOutput, inputHashes, p.productHash)
 		if err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
-		if err := exec("prompt snapshot", `INSERT INTO video_pipeline.prompt_snapshots (id,shot_spec_revision_id,schema_version,compiler_version,prompt_template_ref,effective_context_snapshot_id,asset_version_refs,positive_prompt,negative_prompt,model_payload,normalized_input_hash,content_hash,output_spec,input_revision_hashes) VALUES ($1,$2,'v1','stage1-product-input-v1','flo104.sample1.product-input.v1',$3,$4,$5,$6,$7,$8,$8,$9,$10)`, mustUUID(shot.PromptSnapshotID), mustUUID(shot.ShotSpecRevisionID), mustUUID(shot.EffectiveContextSnapshotID), assetIDs, shot.PositivePrompt, p.product.SharedPrompt.NegativePrompt, map[string]any{"generationProfileRevisionId": ids.GenerationProfileRevisionID, "inputPackageHash": p.productHash}, promptHash, providerOutput, inputHashes); err != nil {
+		if err := exec("prompt snapshot", `INSERT INTO video_pipeline.prompt_snapshots (id,shot_spec_revision_id,schema_version,compiler_version,prompt_template_ref,effective_context_snapshot_id,asset_version_refs,positive_prompt,negative_prompt,model_payload,normalized_input_hash,content_hash,output_spec,input_revision_hashes) VALUES ($1,$2,'v1',$3,$4,$5,$6,$7,$8,$9,$10,$10,$11,$12)`, mustUUID(shot.PromptSnapshotID), mustUUID(shot.ShotSpecRevisionID), p.policy.ResolverVersion, p.policy.PromptTemplateRef, mustUUID(shot.EffectiveContextSnapshotID), assetIDs, shot.PositivePrompt, p.product.SharedPrompt.NegativePrompt, map[string]any{"generationProfileRevisionId": ids.GenerationProfileRevisionID, "inputPackageHash": p.productHash}, promptHash, providerOutput, inputHashes); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
 		for _, in := range []struct {
 			typ        string
 			id         uuid.UUID
 			hash, role string
-		}{{"SHOT_SPEC", mustUUID(shot.ShotSpecRevisionID), shotHash, "primary-shot"}, {"GENERATION_PROFILE", mustUUID(ids.GenerationProfileRevisionID), p.profileHash, "generation-profile"}, {"CONTEXT", contexts[0], seriesContextHash, "context:series"}, {"CONTEXT", contexts[1], episodeContextHash, "context:episode"}, {"CONTEXT", contexts[2], sceneContextHash, "context:scene"}, {"CONTEXT", contexts[3], shotContextHash, "context:shot"}} {
+		}{{"SHOT_SPEC", mustUUID(shot.ShotSpecRevisionID), shotHash, "primary-shot"}, {"GENERATION_PROFILE", mustUUID(ids.GenerationProfileRevisionID), p.profileHash, "generation-profile"}, {"CONTEXT", contexts[0], seriesContextHash, "context:series"}, {"CONTEXT", contexts[1], episodeContextHash, "context:episode"}, {"CONTEXT", contexts[2], currentSceneContextHash, "context:scene"}, {"CONTEXT", contexts[3], shotContextHash, "context:shot"}} {
 			if err := exec("prompt input", `INSERT INTO video_pipeline.prompt_snapshot_inputs (prompt_snapshot_id,input_type,input_revision_id,input_hash,dependency_role) VALUES ($1,$2,$3,$4,$5)`, mustUUID(shot.PromptSnapshotID), in.typ, in.id, in.hash, in.role); err != nil {
 				return stage1.ExecutionPackage{}, err
 			}
 		}
-		for index, a := range []struct{ id, hash, role string }{{ids.VisualAssetVersionID, objects["visual"].Digest, "reference_image"}, {ids.VoiceAssetVersionID, objects["voice_descriptor"].Digest, "reference_audio"}} {
+		promptAssets := []struct{ id, hash, role string }{{ids.VisualAssetVersionID, objects["visual"].Digest, "reference_image"}}
+		if !p.policy.NativeOnly {
+			promptAssets = append(promptAssets, struct{ id, hash, role string }{ids.VoiceAssetVersionID, objects["voice_descriptor"].Digest, "reference_audio"})
+		}
+		for index, a := range promptAssets {
 			if err := exec("prompt asset", `INSERT INTO video_pipeline.prompt_snapshot_assets (prompt_snapshot_id,alias,asset_version_id,asset_hash,provider_role) VALUES ($1,$2,$3,$4,$5)`, mustUUID(shot.PromptSnapshotID), fmt.Sprintf("asset-%03d", index+1), mustUUID(a.id), a.hash, a.role); err != nil {
 				return stage1.ExecutionPackage{}, err
 			}
 		}
-		if err := exec("prompt import audit", `INSERT INTO video_pipeline.audit_events (id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload) VALUES ($1,$2,$3,'ADMIN','prompt_snapshot.imported','PROMPT_SNAPSHOT',$4,'FLO104_FIXED_SAMPLE1',$5,$6)`, uuid.NewSHA1(mustUUID(shot.PromptSnapshotID), []byte("import-audit")), now, approval.ActorID, mustUUID(shot.PromptSnapshotID), p.product.PostProduction.TraceID, map[string]any{"inputPackageHash": p.productHash, "originalPromptHash": shot.PromptSnapshotContentHash, "derivedPromptHash": promptHash, "approvalCommentId": approval.CommentID}); err != nil {
+		if err := exec("prompt import audit", `INSERT INTO video_pipeline.audit_events (id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload) VALUES ($1,$2,$3,'ADMIN','prompt_snapshot.imported','PROMPT_SNAPSHOT',$4,$5,$6,$7)`, uuid.NewSHA1(mustUUID(shot.PromptSnapshotID), []byte("import-audit")), now, approval.ActorID, mustUUID(shot.PromptSnapshotID), p.policy.ReasonCode, p.product.PostProduction.TraceID, map[string]any{"inputPackageHash": p.productHash, "originalPromptHash": shot.PromptSnapshotContentHash, "derivedPromptHash": promptHash, "approvalCommentId": approval.CommentID}); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
 		runDigest, err := repository.GenerationRunSpecDigest(shot.ShotSpecRevisionID, shot.PromptSnapshotID, promptHash, ids.GenerationProfileRevisionID, ids.GenerationPlanID, p.videoRoute, 1)
 		if err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
-		if err := exec("generation run", `INSERT INTO video_pipeline.generation_runs (id,shot_spec_revision_id,prompt_snapshot_id,generation_profile_id,temporal_workflow_id,run_spec_digest,creative_attempt,state,dry_run,budget_approval_id,trace_id,created_by) VALUES ($1,$2,$3,$4,$5,$6,1,'VALIDATED',false,$7,$8,$9)`, mustUUID(shot.RunID), mustUUID(shot.ShotSpecRevisionID), mustUUID(shot.PromptSnapshotID), mustUUID(ids.GenerationProfileRevisionID), "flo104-stage1-"+shot.RunID, runDigest, ids.VideoBudgetApprovalID, p.product.PostProduction.TraceID, p.product.CreatedBy); err != nil {
+		if err := exec("generation run", `INSERT INTO video_pipeline.generation_runs (id,shot_spec_revision_id,prompt_snapshot_id,generation_profile_id,temporal_workflow_id,run_spec_digest,creative_attempt,state,dry_run,budget_approval_id,trace_id,created_by) VALUES ($1,$2,$3,$4,$5,$6,1,'VALIDATED',false,$7,$8,$9)`, mustUUID(shot.RunID), mustUUID(shot.ShotSpecRevisionID), mustUUID(shot.PromptSnapshotID), mustUUID(ids.GenerationProfileRevisionID), p.policy.WorkflowPrefix+shot.RunID, runDigest, ids.VideoBudgetApprovalID, p.product.PostProduction.TraceID, p.product.CreatedBy); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
 		attemptUUID := uuid.NewSHA1(mustUUID(shot.RunID), []byte("attempt:1"))
 		if err := exec("generation attempt", `INSERT INTO video_pipeline.generation_attempts (id,generation_run_id,sequence,attempt_kind,state,input_hash,model_snapshot,parameter_diff) VALUES ($1,$2,1,'PROVIDER_REQUEST','VALIDATED',$3,$4,$5)`, attemptUUID, mustUUID(shot.RunID), runDigest, p.videoRoute, map[string]any{"originalRunSpecDigest": shot.RunSpecDigest, "inputPackageHash": p.productHash}); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
-		jobs = append(jobs, stage1.FrozenJob{ShotID: shot.ShotID, ShotSpecRevisionID: shot.ShotSpecRevisionID, AttemptID: shot.AttemptID, IdempotencyKey: shot.IdempotencyKey, Run: orchestration.GenerationRunRef{RunID: shot.RunID, RunSpecDigest: runDigest, Attempt: 1}, PromptSnapshotID: shot.PromptSnapshotID, PromptSnapshotHash: promptHash, GenerationPlanID: ids.GenerationPlanID, BudgetApprovalID: ids.VideoBudgetApprovalID, BudgetMaximumMicros: p.product.GenerationPlan.MaximumCashMicros, BudgetCurrency: p.product.GenerationPlan.Currency, ProviderProfileID: ids.VideoProviderProfileID, Route: p.videoRoute, EstimatedVideoTokens: shot.EstimatedVideoTokens, PredictedAFPMilli: shot.PredictedAFPMilli, EstimatedNonSubscriptionCashMicros: shot.EstimatedCashMicros, WorkflowID: "flo104-stage1-" + shot.RunID, ActivityID: "submit-" + shot.ShotID, TraceID: p.product.PostProduction.TraceID})
+		jobs = append(jobs, stage1.FrozenJob{ShotID: shot.ShotID, ShotSpecRevisionID: shot.ShotSpecRevisionID, AttemptID: shot.AttemptID, IdempotencyKey: shot.IdempotencyKey, Run: orchestration.GenerationRunRef{RunID: shot.RunID, RunSpecDigest: runDigest, Attempt: 1}, PromptSnapshotID: shot.PromptSnapshotID, PromptSnapshotHash: promptHash, GenerationPlanID: ids.GenerationPlanID, BudgetApprovalID: ids.VideoBudgetApprovalID, BudgetMaximumMicros: p.product.GenerationPlan.MaximumCashMicros, BudgetCurrency: p.product.GenerationPlan.Currency, ProviderProfileID: ids.VideoProviderProfileID, Route: p.videoRoute, EstimatedVideoTokens: shot.EstimatedVideoTokens, PredictedAFPMilli: shot.PredictedAFPMilli, EstimatedNonSubscriptionCashMicros: shot.EstimatedCashMicros, WorkflowID: p.policy.WorkflowPrefix + shot.RunID, ActivityID: "submit-" + shot.ShotID, TraceID: p.product.PostProduction.TraceID})
 		runIDs = append(runIDs, shot.RunID)
 	}
 
 	execPolicy := controlplane.ExecutionPolicy{TargetTerritory: p.product.GenerationPlan.Territories[0], ProductForm: p.product.GenerationPlan.ProductForms[0], ContentSafetyPolicyVersion: p.product.ContentSafetyEvidence.PolicyVersion, ContentSafetyDecisionID: ids.SafetyDecisionID}
 	planHash, _ := digest(map[string]any{"inputPackageHash": p.productHash, "shotSpecRevisionIds": p.product.GenerationPlan.ShotSpecRevisionIDs, "route": p.videoRoute, "budget": p.product.GenerationPlan.MaximumCashMicros, "executionPolicy": execPolicy})
-	planRecord := controlplane.GenerationPlan{GenerationPlanID: ids.GenerationPlanID, State: "READY", DryRun: false, ShotCount: len(p.product.Shots), ProviderCallCount: len(p.product.Shots), RouteSnapshot: controlplane.ModelRouteSnapshot{CapabilityAlias: p.videoRoute.CapabilityAlias, ProviderProfileID: ids.VideoProviderProfileID, Provider: p.videoRoute.Provider, ModelID: p.videoRoute.ModelID, RouteVersion: p.videoRoute.RouteVersion, CapabilityHash: p.videoRoute.CapabilityHash}, ExecutionPolicy: execPolicy, Estimate: controlplane.CostEstimate{UnitsMinimum: 50, UnitsMaximum: 50, Unit: "video_seconds", AmountMinimum: nil, AmountMaximum: nil, Currency: "CNY", PricingRuleVersion: "agent-plan-subscription-v1", ValidUntil: approval.ValidUntil}, SpeechBudgetLimit: &controlplane.BudgetLimit{AmountMicros: p.product.GenerationPlan.MaximumCashMicros, Currency: p.product.GenerationPlan.Currency}, BudgetDecision: "APPROVED", PlanHash: planHash}
+	budgetDecision := "APPROVED"
+	if p.policy.NativeOnly {
+		// The current Deep Research decision authorizes no-cost materialization
+		// only. Keep the exact VIDEO review open so PrepareProviderJob fails
+		// closed until QA fixes the hashes and a later authorization approves it.
+		budgetDecision = "PENDING"
+	}
+	planRecord := controlplane.GenerationPlan{GenerationPlanID: ids.GenerationPlanID, State: "READY", DryRun: false, ShotCount: len(p.product.Shots), ProviderCallCount: len(p.product.Shots), RouteSnapshot: controlplane.ModelRouteSnapshot{CapabilityAlias: p.videoRoute.CapabilityAlias, ProviderProfileID: ids.VideoProviderProfileID, Provider: p.videoRoute.Provider, ModelID: p.videoRoute.ModelID, RouteVersion: p.videoRoute.RouteVersion, CapabilityHash: p.videoRoute.CapabilityHash}, ExecutionPolicy: execPolicy, Estimate: controlplane.CostEstimate{UnitsMinimum: 50, UnitsMaximum: 50, Unit: "video_seconds", AmountMinimum: nil, AmountMaximum: nil, Currency: "CNY", PricingRuleVersion: "agent-plan-subscription-v1", ValidUntil: approval.ValidUntil}, BudgetDecision: budgetDecision, PlanHash: planHash}
+	if !p.policy.NativeOnly {
+		planRecord.SpeechBudgetLimit = &controlplane.BudgetLimit{AmountMicros: p.product.GenerationPlan.MaximumCashMicros, Currency: p.product.GenerationPlan.Currency}
+	}
 	if err := exec("plan operation", `INSERT INTO video_pipeline.operation_requests (id,operation_type,aggregate_type,aggregate_id,state,trace_id,requested_by) VALUES ($1,'CREATE_GENERATION_PLAN','SERIES',$2,'SUCCEEDED',$3,$4)`, mustUUID(ids.GenerationPlanID), mustUUID(ids.SeriesID), p.product.PostProduction.TraceID, p.product.CreatedBy); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
 	if err := exec("plan idempotency", `INSERT INTO video_pipeline.idempotency_records (scope,idempotency_key,request_hash,operation_id,response_status,response_body,expires_at) VALUES ('stage1-materialize',$1,$2,$3,201,$4,$5)`, p.productHash, planHash, mustUUID(ids.GenerationPlanID), planRecord, approval.ValidUntil); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
-	if err := exec("plan audit", `INSERT INTO video_pipeline.audit_events (id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload) VALUES ($1,$2,$3,'ADMIN','generation_plan.created','GENERATION_PLAN',$4,'FLO104_FIXED_SAMPLE1',$5,$6)`, uuid.NewSHA1(mustUUID(ids.GenerationPlanID), []byte("plan-audit")), now, approval.ActorID, mustUUID(ids.GenerationPlanID), p.product.PostProduction.TraceID, map[string]any{"seriesId": ids.SeriesID, "episodeRevisionId": ids.EpisodeRevisionID, "shotSpecRevisionIds": p.product.GenerationPlan.ShotSpecRevisionIDs, "candidatesPerShot": 1, "pricingRuleVersion": "agent-plan-subscription-v1", "planHash": planHash, "state": "READY", "budgetDecision": "APPROVED", "budgetLimit": controlplane.BudgetLimit{AmountMicros: p.product.GenerationPlan.MaximumCashMicros, Currency: p.product.GenerationPlan.Currency}, "speechBudgetLimit": controlplane.BudgetLimit{AmountMicros: p.product.GenerationPlan.MaximumCashMicros, Currency: p.product.GenerationPlan.Currency}, "executionPolicy": execPolicy, "inputPackageHash": p.productHash, "approvalCommentId": approval.CommentID}); err != nil {
+	planAudit := map[string]any{"seriesId": ids.SeriesID, "episodeRevisionId": ids.EpisodeRevisionID, "shotSpecRevisionIds": p.product.GenerationPlan.ShotSpecRevisionIDs, "candidatesPerShot": 1, "pricingRuleVersion": "agent-plan-subscription-v1", "planHash": planHash, "state": "READY", "budgetDecision": budgetDecision, "budgetLimit": controlplane.BudgetLimit{AmountMicros: p.product.GenerationPlan.MaximumCashMicros, Currency: p.product.GenerationPlan.Currency}, "executionPolicy": execPolicy, "inputPackageHash": p.productHash, "approvalCommentId": approval.CommentID}
+	if !p.policy.NativeOnly {
+		planAudit["speechBudgetLimit"] = controlplane.BudgetLimit{AmountMicros: p.product.GenerationPlan.MaximumCashMicros, Currency: p.product.GenerationPlan.Currency}
+	} else {
+		planAudit["maximumSpeechSubmits"] = 0
+		planAudit["analyzerSealSha256"] = p.analyzerEvidence.SealSHA256
+	}
+	if err := exec("plan audit", `INSERT INTO video_pipeline.audit_events (id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload) VALUES ($1,$2,$3,'ADMIN','generation_plan.created','GENERATION_PLAN',$4,$5,$6,$7)`, uuid.NewSHA1(mustUUID(ids.GenerationPlanID), []byte("plan-audit")), now, approval.ActorID, mustUUID(ids.GenerationPlanID), p.policy.ReasonCode, p.product.PostProduction.TraceID, planAudit); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
-	for _, review := range []struct{ id, scope string }{{ids.VideoBudgetApprovalID, "VIDEO"}, {ids.SpeechBudgetApprovalID, "SPEECH"}} {
-		if err := exec("budget review", `INSERT INTO video_pipeline.review_tasks (id,series_id,episode_id,review_type,state,reason_codes,assigned_role,decided_at,generation_plan_id,budget_scope,budget_limit_micros,budget_currency) VALUES ($1,$2,$3,'BUDGET','APPROVED',ARRAY['FLO104_FIXED_SAMPLE1'],'ADMIN',$4,$5,$6,$7,$8)`, mustUUID(review.id), mustUUID(ids.SeriesID), mustUUID(ids.EpisodeID), now, mustUUID(ids.GenerationPlanID), review.scope, p.product.GenerationPlan.MaximumCashMicros, p.product.GenerationPlan.Currency); err != nil {
+	reviews := []struct{ id, scope string }{{ids.VideoBudgetApprovalID, "VIDEO"}}
+	if !p.policy.NativeOnly {
+		reviews = append(reviews, struct{ id, scope string }{ids.SpeechBudgetApprovalID, "SPEECH"})
+	}
+	for _, review := range reviews {
+		reviewState := "APPROVED"
+		var decidedAt any = now
+		if p.policy.NativeOnly && review.scope == "VIDEO" {
+			reviewState = "OPEN"
+			decidedAt = nil
+		}
+		if err := exec("budget review", `INSERT INTO video_pipeline.review_tasks (id,series_id,episode_id,review_type,state,reason_codes,assigned_role,decided_at,generation_plan_id,budget_scope,budget_limit_micros,budget_currency) VALUES ($1,$2,$3,'BUDGET',$4,ARRAY[$5],'ADMIN',$6,$7,$8,$9,$10)`, mustUUID(review.id), mustUUID(ids.SeriesID), mustUUID(ids.EpisodeID), reviewState, p.policy.ReasonCode, decidedAt, mustUUID(ids.GenerationPlanID), review.scope, p.product.GenerationPlan.MaximumCashMicros, p.product.GenerationPlan.Currency); err != nil {
 			return stage1.ExecutionPackage{}, err
 		}
 	}
 
-	post := orchestration.FinalizeEpisodeInput{EpisodeRevisionID: ids.EpisodeRevisionID, RunIDs: runIDs, GenerationPlanID: ids.GenerationPlanID, TraceID: p.product.PostProduction.TraceID, PersistProductTruth: true, Config: orchestration.PostProductionConfig{Enabled: true, Evidence: postproduction.EvidenceLive, SpeechRoute: p.speechRoute, SpeechProviderProfileID: ids.SpeechProviderProfileID, SpeechBudgetApprovalID: ids.SpeechBudgetApprovalID, SpeechBudgetMaximumMicros: p.product.PostProduction.SpeechBudgetMaximumMicros, SpeechBudgetCurrency: p.product.PostProduction.SpeechBudgetCurrency, SubtitleLanguage: p.product.PostProduction.SubtitleLanguage, BurnSubtitles: p.product.PostProduction.BurnSubtitles, EnforcePoCDuration: true}}
-	package_, err := stage1.SealExecutionPackage(stage1.ExecutionPackage{SchemaVersion: stage1.ExecutionPackageSchemaVersion, BatchID: batchID, PrimaryJobs: jobs, PostProduction: post})
+	postConfig := orchestration.PostProductionConfig{Enabled: true, Evidence: postproduction.EvidenceLive, SubtitleLanguage: p.product.PostProduction.SubtitleLanguage, BurnSubtitles: p.product.PostProduction.BurnSubtitles, EnforcePoCDuration: true}
+	if p.policy.NativeOnly {
+		postConfig.AudioStrategy = providercontract.AudioStrategyNativePreferred
+		postConfig.AnalyzerSealSHA256 = p.analyzerEvidence.SealSHA256
+	} else {
+		postConfig.SpeechRoute = p.speechRoute
+		postConfig.SpeechProviderProfileID = ids.SpeechProviderProfileID
+		postConfig.SpeechBudgetApprovalID = ids.SpeechBudgetApprovalID
+		postConfig.SpeechBudgetMaximumMicros = p.product.PostProduction.SpeechBudgetMaximumMicros
+		postConfig.SpeechBudgetCurrency = p.product.PostProduction.SpeechBudgetCurrency
+	}
+	post := orchestration.FinalizeEpisodeInput{EpisodeRevisionID: ids.EpisodeRevisionID, RunIDs: runIDs, GenerationPlanID: ids.GenerationPlanID, TraceID: p.product.PostProduction.TraceID, PersistProductTruth: true, Config: postConfig}
+	packageInput := stage1.ExecutionPackage{SchemaVersion: stage1.ExecutionPackageSchemaVersion, BatchID: p.policy.BatchID, PrimaryJobs: jobs, PostProduction: post}
+	if p.policy.NativeOnly {
+		packageInput.NativeEvidence = &stage1.NativeExecutionEvidence{
+			CodeCommitSHA: p.codeCommit, BuildSHA256: p.buildSHA256,
+			ProductInputSHA256:       p.productHash,
+			AnalyzerSealSHA256:       p.analyzerEvidence.SealSHA256,
+			AnalyzerExecutableSHA256: p.analyzerEvidence.ExecutableSHA256,
+			AnalyzerConfigSHA256:     p.analyzerEvidence.ConfigSHA256,
+			AnalyzerComponentSHA256:  p.analyzerEvidence.Components,
+			AssetSHA256:              map[string]string{"source": objects["source"].Digest, "safety": objects["safety"].Digest, "visual": objects["visual"].Digest, "analyzer_seal": objects["analyzer_seal"].Digest},
+		}
+	}
+	package_, err := stage1.SealExecutionPackage(packageInput)
 	if err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
@@ -764,7 +1053,16 @@ func materializeDB(ctx context.Context, pool *pgxpool.Pool, plan stage1.Plan, p 
 			"persist immutable generation plan bindings: %w", err,
 		)
 	}
-	if err := exec("materialization audit", `INSERT INTO video_pipeline.audit_events (id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload) VALUES ($1,$2,$3,'ADMIN','stage1.execution_package.materialized','GENERATION_PLAN',$4,'FLO104_FIXED_SAMPLE1',$5,$6)`, uuid.NewSHA1(mustUUID(ids.GenerationPlanID), []byte("stage1-materialization")), now, approval.ActorID, mustUUID(ids.GenerationPlanID), p.product.PostProduction.TraceID, map[string]any{"inputPackageHash": p.productHash, "sourceHash": objects["source"].Digest, "safetyHash": objects["safety"].Digest, "visualHash": objects["visual"].Digest, "voiceDescriptorHash": objects["voice_descriptor"].Digest, "executionPackageHash": package_.ContentHash, "executionPackage": package_, "approvalCommentId": approval.CommentID, "approvalValidUntil": approval.ValidUntil, "originalShotHashes": originalHashes(p.product.Shots), "derivedShotHashes": shotHashes, "providerCalls": 0}); err != nil {
+	materializationAudit := map[string]any{"inputPackageHash": p.productHash, "sourceHash": objects["source"].Digest, "safetyHash": objects["safety"].Digest, "visualHash": objects["visual"].Digest, "executionPackageHash": package_.ContentHash, "executionPackage": package_, "approvalCommentId": approval.CommentID, "approvalValidUntil": approval.ValidUntil, "originalShotHashes": originalHashes(p.product.Shots), "derivedShotHashes": shotHashes, "providerCalls": 0}
+	if p.policy.NativeOnly {
+		materializationAudit["ttsCalls"] = 0
+		materializationAudit["analyzerSealHash"] = objects["analyzer_seal"].Digest
+		materializationAudit["codeCommitSha"] = p.codeCommit
+		materializationAudit["buildSha256"] = p.buildSHA256
+	} else {
+		materializationAudit["voiceDescriptorHash"] = objects["voice_descriptor"].Digest
+	}
+	if err := exec("materialization audit", `INSERT INTO video_pipeline.audit_events (id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload) VALUES ($1,$2,$3,'ADMIN','stage1.execution_package.materialized','GENERATION_PLAN',$4,$5,$6,$7)`, uuid.NewSHA1(mustUUID(ids.GenerationPlanID), []byte("stage1-materialization")), now, approval.ActorID, mustUUID(ids.GenerationPlanID), p.policy.ReasonCode, p.product.PostProduction.TraceID, materializationAudit); err != nil {
 		return stage1.ExecutionPackage{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -787,6 +1085,10 @@ func ensureGenerationRunPlanBindings(
 	inputPackageHash string,
 	occurredAt time.Time,
 ) error {
+	reasonCode := "FLO104_FIXED_SAMPLE1"
+	if package_.NativeEvidence != nil {
+		reasonCode = "FLO154_NATIVE_SAMPLE1"
+	}
 	for _, job := range package_.PrimaryJobs {
 		var shotID, promptID, profileID uuid.UUID
 		var runDigest, state, budgetApprovalID string
@@ -889,9 +1191,9 @@ func ensureGenerationRunPlanBindings(
 				(id, occurred_at, actor_id, actor_role, action,
 				 aggregate_type, aggregate_id, reason_code, trace_id, payload)
 			VALUES ($1, $2, $3, 'ADMIN', 'generation_run.created',
-			        'GENERATION_RUN', $4, 'FLO104_FIXED_SAMPLE1', $5, $6)`,
+			        'GENERATION_RUN', $4, $5, $6, $7)`,
 			uuid.NewSHA1(mustUUID(job.Run.RunID), []byte("audit")), occurredAt,
-			approval.ActorID, mustUUID(job.Run.RunID), job.TraceID, payload,
+			approval.ActorID, mustUUID(job.Run.RunID), reasonCode, job.TraceID, payload,
 		); err != nil {
 			return fmt.Errorf("persist imported generation plan binding %s: %w", job.Run.RunID, err)
 		}
@@ -945,9 +1247,18 @@ func ensureActiveInputArtifact(
 
 func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPackage, p prepared, approval Approval, objects map[string]artifactstore.Artifact) (Report, error) {
 	counts := map[string]int64{}
-	for name, query := range map[string]string{"shots": "SELECT count(*) FROM video_pipeline.shot_spec_revisions WHERE storyboard_revision_id='10400000-0000-4000-8000-000000000008'", "prompts": "SELECT count(*) FROM video_pipeline.prompt_snapshots WHERE compiler_version='stage1-product-input-v1'", "runs": "SELECT count(*) FROM video_pipeline.generation_runs WHERE trace_id='flo104-sample1-formal-v1'", "contexts": "SELECT count(*) FROM video_pipeline.context_revisions WHERE resolver_version='stage1-product-input-v1'"} {
+	queries := map[string]struct {
+		query string
+		args  []any
+	}{
+		"shots":    {"SELECT count(*) FROM video_pipeline.shot_spec_revisions WHERE storyboard_revision_id=$1", []any{mustUUID(p.product.Reserved.StoryboardRevisionID)}},
+		"prompts":  {`SELECT count(*) FROM video_pipeline.prompt_snapshots ps JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id=ps.shot_spec_revision_id WHERE ssr.storyboard_revision_id=$1 AND ps.compiler_version=$2`, []any{mustUUID(p.product.Reserved.StoryboardRevisionID), p.policy.ResolverVersion}},
+		"runs":     {"SELECT count(*) FROM video_pipeline.generation_runs WHERE trace_id=$1", []any{p.product.PostProduction.TraceID}},
+		"contexts": {"SELECT count(*) FROM video_pipeline.context_revisions WHERE series_id=$1 AND resolver_version=$2", []any{mustUUID(p.product.Reserved.SeriesID), p.policy.ResolverVersion}},
+	}
+	for name, statement := range queries {
 		var count int64
-		if err := pool.QueryRow(ctx, query).Scan(&count); err != nil {
+		if err := pool.QueryRow(ctx, statement.query, statement.args...).Scan(&count); err != nil {
 			return Report{}, err
 		}
 		counts[name] = count
@@ -963,12 +1274,17 @@ func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPa
 			uri:       objects["visual"].URI,
 			mediaType: "image/png", size: objects["visual"].Size,
 		},
-		p.product.Reserved.VoiceAssetVersionID: {
+	}
+	if !p.policy.NativeOnly {
+		expectedAssets[p.product.Reserved.VoiceAssetVersionID] = struct {
+			assetID, digest, uri, mediaType string
+			size                            int64
+		}{
 			assetID:   p.product.Reserved.VoiceAssetID,
 			digest:    objects["voice_descriptor"].Digest,
 			uri:       objects["voice_descriptor"].URI,
 			mediaType: "audio/x-voice-profile+json", size: objects["voice_descriptor"].Size,
-		},
+		}
 	}
 	for _, job := range package_.PrimaryJobs {
 		var generationPlanID string
@@ -1044,6 +1360,32 @@ func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPa
 		if len(request.Request.Assets) != len(expectedAssets) {
 			return Report{}, errors.New("offline Provider envelope omitted fixed asset evidence")
 		}
+		if p.policy.NativeOnly {
+			output := request.Request.Output
+			if output.ResolvedAudioStrategy() != providercontract.AudioStrategyNativePreferred ||
+				!output.GenerateAudio || output.AudioDelivery != providercontract.NativeAudioMix {
+				return Report{}, errors.New("offline Provider envelope changed the frozen native audio request")
+			}
+		}
+	}
+	if p.policy.NativeOnly {
+		var nativeCapabilities, speechProfiles, speechReviews, openVideoReviews, approvedVideoReviews int64
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.provider_capability_snapshots WHERE provider_profile_id=$1 AND limits->>'supportsNativeAudio'='true' AND limits->>'nativeAudioDelivery'='native_mix' AND limits->>'maximumSpeechSubmits'='0'`, mustUUID(p.product.Reserved.VideoProviderProfileID)).Scan(&nativeCapabilities); err != nil {
+			return Report{}, err
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.provider_profiles WHERE base_url_ref='internal://volcengine-tts-provider' AND display_name LIKE 'FLO-154%'`).Scan(&speechProfiles); err != nil {
+			return Report{}, err
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.review_tasks WHERE generation_plan_id=$1 AND budget_scope='SPEECH'`, mustUUID(p.product.Reserved.GenerationPlanID)).Scan(&speechReviews); err != nil {
+			return Report{}, err
+		}
+		if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE state='OPEN'), count(*) FILTER (WHERE state='APPROVED') FROM video_pipeline.review_tasks WHERE generation_plan_id=$1 AND budget_scope='VIDEO'`, mustUUID(p.product.Reserved.GenerationPlanID)).Scan(&openVideoReviews, &approvedVideoReviews); err != nil {
+			return Report{}, err
+		}
+		if nativeCapabilities != 1 || speechProfiles != 0 || speechReviews != 0 ||
+			openVideoReviews != 1 || approvedVideoReviews != 0 {
+			return Report{}, errors.New("FLO-154 native materialization capability or zero-Speech boundary drifted")
+		}
 	}
 	var providerJobs, reservations, cost int64
 	if err := pool.QueryRow(ctx, `
@@ -1073,7 +1415,11 @@ func verify(ctx context.Context, pool *pgxpool.Pool, package_ stage1.ExecutionPa
 	for name, object := range objects {
 		casMap[name] = object.Digest
 	}
-	return Report{SchemaVersion: "flo104.sample1.materialization-report.v1", BatchID: batchID, InputPackageHash: p.productHash, ExecutionPackageHash: package_.ContentHash, Counts: counts, CAS: casMap, ProviderCalls: 0, ProviderJobs: providerJobs, BudgetReservations: reservations, CostLedgerEntries: cost, ApprovalCommentID: approval.CommentID, ApprovalValidUntil: approval.ValidUntil}, nil
+	report := Report{SchemaVersion: p.policy.ReportSchema, BatchID: p.policy.BatchID, InputPackageHash: p.productHash, ExecutionPackageHash: package_.ContentHash, Counts: counts, CAS: casMap, ProviderCalls: 0, ProviderJobs: providerJobs, BudgetReservations: reservations, CostLedgerEntries: cost, ApprovalCommentID: approval.CommentID, ApprovalValidUntil: approval.ValidUntil}
+	if p.policy.NativeOnly {
+		report.VideoBudgetState = "OPEN"
+	}
+	return report, nil
 }
 
 func digest(value any) (string, error) {
@@ -1085,6 +1431,46 @@ func digest(value any) (string, error) {
 }
 func sum(data []byte) string          { value := sha256.Sum256(data); return hex.EncodeToString(value[:]) }
 func mustUUID(value string) uuid.UUID { return uuid.MustParse(value) }
+
+func validLowerDigest(value string) bool { return len(value) == 64 && validLowerHex(value) }
+
+func validLowerHex(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
+}
+
+func nestedBool(value any, keys ...string) (bool, bool) {
+	switch typed := value.(type) {
+	case map[string]any:
+		for _, key := range keys {
+			if raw, ok := typed[key]; ok {
+				if result, valid := raw.(bool); valid {
+					return result, true
+				}
+			}
+		}
+		for _, child := range typed {
+			if result, ok := nestedBool(child, keys...); ok {
+				return result, true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if result, ok := nestedBool(child, keys...); ok {
+				return result, true
+			}
+		}
+	}
+	return false, false
+}
+
 func mustJSON(value any) []byte {
 	data, err := json.Marshal(value)
 	if err != nil {

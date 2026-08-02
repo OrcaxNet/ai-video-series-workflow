@@ -26,8 +26,23 @@ type ExecutionPackage struct {
 	BatchID                    string                             `json:"batchId"`
 	ParentExecutionPackageHash string                             `json:"parentExecutionPackageHash,omitempty"`
 	ContentHash                string                             `json:"contentHash"`
+	NativeEvidence             *NativeExecutionEvidence           `json:"nativeEvidence,omitempty"`
 	PrimaryJobs                []FrozenJob                        `json:"primaryJobs"`
 	PostProduction             orchestration.FinalizeEpisodeInput `json:"postProduction"`
+}
+
+// NativeExecutionEvidence binds a FLO-154 package to the exact no-network
+// analyzer installation and input assets verified before any paid boundary.
+// FLO-104 packages omit this field and therefore retain their original bytes.
+type NativeExecutionEvidence struct {
+	CodeCommitSHA            string            `json:"codeCommitSha"`
+	BuildSHA256              string            `json:"buildSha256"`
+	ProductInputSHA256       string            `json:"productInputSha256"`
+	AnalyzerSealSHA256       string            `json:"analyzerSealSha256"`
+	AnalyzerExecutableSHA256 string            `json:"analyzerExecutableSha256"`
+	AnalyzerConfigSHA256     string            `json:"analyzerConfigSha256"`
+	AnalyzerComponentSHA256  map[string]string `json:"analyzerComponentSha256"`
+	AssetSHA256              map[string]string `json:"assetSha256"`
 }
 
 // FrozenJob contains identifiers and approved limits only. Prompt text, asset
@@ -93,6 +108,9 @@ func (p ExecutionPackage) Validate(plan Plan) error {
 		return fmt.Errorf("stage 1 execution package requires exactly %d primary jobs", RequiredPrimaryJobs)
 	case !validLowerDigest(p.ContentHash):
 		return errors.New("stage 1 execution package requires a lowercase SHA-256 contentHash")
+	}
+	if err := p.validateNativeEvidence(plan); err != nil {
+		return err
 	}
 	if p.PostProduction.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2 &&
 		p.ParentExecutionPackageHash == "" {
@@ -176,6 +194,59 @@ func (p ExecutionPackage) Validate(plan Plan) error {
 	}
 	if p.ContentHash != wantHash {
 		return errors.New("stage 1 execution package contentHash does not match its frozen content")
+	}
+	return nil
+}
+
+func (p ExecutionPackage) validateNativeEvidence(plan Plan) error {
+	if !plan.IsNativeOnly() {
+		if p.NativeEvidence != nil {
+			return errors.New("FLO-104 execution package cannot carry FLO-154 native evidence")
+		}
+		return nil
+	}
+	if p.NativeEvidence == nil {
+		return errors.New("FLO-154 native execution package requires immutable preflight evidence")
+	}
+	evidence := p.NativeEvidence
+	if len(evidence.CodeCommitSHA) != 40 || !validLowerHex(evidence.CodeCommitSHA) {
+		return errors.New("FLO-154 native evidence requires a lowercase 40-character code commit SHA")
+	}
+	for name, value := range map[string]string{
+		"build":               evidence.BuildSHA256,
+		"product input":       evidence.ProductInputSHA256,
+		"analyzer seal":       evidence.AnalyzerSealSHA256,
+		"analyzer executable": evidence.AnalyzerExecutableSHA256,
+		"analyzer config":     evidence.AnalyzerConfigSHA256,
+	} {
+		if !validLowerDigest(value) {
+			return fmt.Errorf("FLO-154 native evidence %s SHA-256 is invalid", name)
+		}
+	}
+	if evidence.AnalyzerSealSHA256 != plan.NativeAudio.AnalyzerSealSHA256 {
+		return errors.New("FLO-154 native analyzer seal differs from the approved plan")
+	}
+	requiredComponents := []string{
+		"asr_model", "tokenizer", "normalizer", "vad", "face_mouth",
+		"av_sync", "ffmpeg", "ffprobe", "license_snapshot",
+	}
+	for _, name := range requiredComponents {
+		if !validLowerDigest(evidence.AnalyzerComponentSHA256[name]) {
+			return fmt.Errorf("FLO-154 native analyzer component %q is not frozen", name)
+		}
+	}
+	if len(evidence.AssetSHA256) == 0 {
+		return errors.New("FLO-154 native input asset hashes are required")
+	}
+	for name, value := range evidence.AssetSHA256 {
+		if strings.TrimSpace(name) == "" || !validLowerDigest(value) {
+			return errors.New("FLO-154 native input asset hash is invalid")
+		}
+	}
+	if p.PostProduction.Config.ResolvedAudioStrategy() != providercontract.AudioStrategyNativePreferred ||
+		p.PostProduction.Config.RequiresSpeech() ||
+		p.PostProduction.Config.AnalyzerSealSHA256 != evidence.AnalyzerSealSHA256 {
+		return errors.New("FLO-154 native package must freeze native_preferred with zero Speech configuration")
 	}
 	return nil
 }
@@ -382,4 +453,13 @@ func validLowerDigest(value string) bool {
 		}
 	}
 	return true
+}
+
+func validLowerHex(value string) bool {
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return value != ""
 }

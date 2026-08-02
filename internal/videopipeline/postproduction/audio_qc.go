@@ -35,6 +35,11 @@ type AudioAnalyzer interface {
 	Analyze(context.Context, AudioAnalysisRequest) (AudioAnalysis, error)
 }
 
+type sealedAudioAnalyzer interface {
+	AudioAnalyzer
+	AnalyzerSealSHA256() string
+}
+
 // AudioQualityError keeps the failed metrics and their immutable CAS evidence
 // available to Temporal/error handling while preserving the provider-neutral
 // error code through Unwrap.

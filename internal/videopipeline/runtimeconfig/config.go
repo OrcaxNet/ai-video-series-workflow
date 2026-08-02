@@ -63,6 +63,8 @@ type OrchestratorWorker struct {
 	PostgresDSN               string
 	ArtifactRoot              string
 	AudioAnalyzerCommand      string
+	AudioAnalyzerRoot         string
+	AudioAnalyzerSeal         string
 }
 
 // MockProvider configures the deterministic, no-key provider fixture.
@@ -189,6 +191,8 @@ func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 		SpeechProviderAdapterURL:  value(os.LookupEnv, "VIDEO_SPEECH_PROVIDER_ADAPTER_URL", "http://mock-provider:8090"),
 		ArtifactRoot:              value(os.LookupEnv, "VIDEO_ARTIFACT_ROOT", "/var/lib/video-pipeline/artifacts"),
 		AudioAnalyzerCommand:      value(os.LookupEnv, "VIDEO_AUDIO_ANALYZER_COMMAND", ""),
+		AudioAnalyzerRoot:         value(os.LookupEnv, "VIDEO_AUDIO_ANALYZER_ROOT", ""),
+		AudioAnalyzerSeal:         value(os.LookupEnv, "VIDEO_AUDIO_ANALYZER_SEAL", ""),
 	}
 	if err := validateDialAddress(cfg.TemporalAddress); err != nil {
 		return OrchestratorWorker{}, fmt.Errorf("VIDEO_TEMPORAL_ADDRESS: %w", err)
@@ -212,6 +216,11 @@ func LoadOrchestratorWorker() (OrchestratorWorker, error) {
 	}
 	if strings.TrimSpace(cfg.ArtifactRoot) == "" {
 		return OrchestratorWorker{}, errors.New("VIDEO_ARTIFACT_ROOT is required")
+	}
+	if cfg.AudioAnalyzerCommand != "" || cfg.AudioAnalyzerRoot != "" || cfg.AudioAnalyzerSeal != "" {
+		if strings.TrimSpace(cfg.AudioAnalyzerCommand) == "" || strings.TrimSpace(cfg.AudioAnalyzerRoot) == "" || strings.TrimSpace(cfg.AudioAnalyzerSeal) == "" {
+			return OrchestratorWorker{}, errors.New("VIDEO_AUDIO_ANALYZER_COMMAND, VIDEO_AUDIO_ANALYZER_ROOT, and VIDEO_AUDIO_ANALYZER_SEAL must be configured together")
+		}
 	}
 	return cfg, nil
 }

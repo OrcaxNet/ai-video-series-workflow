@@ -35,9 +35,12 @@ Final Mix、Final Video、字幕、Audio QC report、命令计划 hash、工具�
 
 ## ASR、字幕、口型与环境声门禁
 
-Worker 可通过 `VIDEO_AUDIO_ANALYZER_COMMAND` 配置本地、已冻结的分析器。命令接收
+Worker 只接受同时配置的 `VIDEO_AUDIO_ANALYZER_COMMAND`、
+`VIDEO_AUDIO_ANALYZER_ROOT`、`VIDEO_AUDIO_ANALYZER_SEAL`。启动时先校验封印、可执行文件、
+模型/Tokenizer/Normalizer/VAD/人脸口部/音画同步/FFmpeg/FFprobe/许可证快照的 SHA-256，
+运行时再校验执行包里的 analyzer seal，任一漂移均失败关闭。命令接收
 `input.json analysis.json` 两个参数；输入只含 CAS 媒体路径/hash、cue 时间窗、run
-时间窗、Scene Context ambience identity/version/continuity、镜头口型要求和 FLO-104 frozen
+时间窗、Scene Context ambience identity/version/continuity、镜头口型要求和 frozen
 ASR 配置，不提供参考字幕正文，避免 ASR
 “照抄答案”。输出是严格 JSON，未知字段、多 JSON、来源 hash 漂移或超限大小均失败关闭；
 来源 hash 同时绑定 Final Video、Final Mix、逐镜 Native Mix 和可选 Dialogue，音画起点
@@ -67,8 +70,40 @@ Prompt、fallback 或质量证据。
 验证命令：
 
 ```bash
+tools/flo154-analyzer/build.sh "$PWD/artifacts/flo154-analyzer/build" \
+  <本地已冻结的 faster-whisper 模型目录>
+
+go run ./cmd/video-stage1-readiness \
+  video-pipeline/config/flo154-native-stage1-readiness.json
+
+# 先提交全部受跟踪源码，再以该 SHA 和 materializer 二进制哈希生成独立执行包。
+go run ./cmd/video-stage1-materialize \
+  -plan video-pipeline/config/flo154-native-stage1-readiness.json \
+  -product <flo154-product.json> -source <source.json> -safety <flo154-safety.json> \
+  -visual <visual.json> -analyzer-root <analyzer-build> -analyzer-seal <analyzer-build>/analyzer-seal.json \
+  -code-commit <40位固定SHA> -build-sha256 <materializer二进制SHA-256> \
+  -approval-comment <审批评论UUID> -approval-actor <审批者UUID> \
+  -approval-valid-until <RFC3339> \
+  -output <execution-package.json> -report <materialization-report.json>
+
+# 该命令没有 Provider client；它重算代码/二进制/输入/分析器哈希，执行无参考字幕的
+# 离线 fixture，并从 ledger/audit 断言 Provider/TTS/job/reservation/cost 全部为零。
+go run ./cmd/video-flo154-preflight \
+  -plan video-pipeline/config/flo154-native-stage1-readiness.json \
+  -package <execution-package.json> -product <flo154-product.json> \
+  -source <source.json> -safety <flo154-safety.json> -visual <visual.json> \
+  -analyzer-root <analyzer-build> -analyzer-seal <analyzer-build>/analyzer-seal.json \
+  -repo-root . -build <materializer-binary> -fixture-input <offline-fixture-input.json> \
+  -output <preflight-report.json>
+
 go test ./...
 make video-postproduction-integration-test
 ```
 
-第二条需要本机 FFmpeg/FFprobe；不会调用任何外部 Provider。
+两个物化/预检命令都通过 `VIDEO_POSTGRES_DSN` 指向同一隔离测试库，物化还通过
+`VIDEO_ARTIFACT_ROOT` 指向隔离 CAS。分析器构建只消费调用者明确提供的本地模型快照，
+不下载权重；分析器 fixture 与后期集成
+测试需要本机 FFmpeg/FFprobe。上述命令均不会调用任何外部 Provider。新的真实 Provider
+样片必须等待 QA 固定版本验证通过及 Deep Research 重新签发授权，旧授权不可复用。当前
+native materializer 只创建 `OPEN` 的 VIDEO budget review；`PrepareProviderJob` 在任何
+reservation/job/cost 写入前要求它已被单独批准，因此离线执行包本身不构成付费授权。

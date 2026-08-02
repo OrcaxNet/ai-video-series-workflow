@@ -305,7 +305,8 @@ func loadExactPromptSnapshot(
 	if schemaVersion != "v1" ||
 		compilerVersion != "control-plane-compiler-v1" &&
 			compilerVersion != "control-plane-compiler-v2-native-audio" &&
-			compilerVersion != "stage1-product-input-v1" {
+			compilerVersion != "stage1-product-input-v1" &&
+			compilerVersion != "flo154-native-materializer-v1" {
 		return orchestration.PromptSnapshotRef{}, controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"prompt snapshot compiler identity is not executable",
@@ -344,7 +345,7 @@ func loadExactPromptSnapshot(
 		)
 	}
 	var expectedHash string
-	if compilerVersion == "stage1-product-input-v1" {
+	if importedPromptCompiler(compilerVersion) {
 		var imported struct {
 			InputPackageHash   string `json:"inputPackageHash"`
 			OriginalPromptHash string `json:"originalPromptHash"`
@@ -373,7 +374,8 @@ func loadExactPromptSnapshot(
 				"imported prompt package evidence is incomplete",
 			)
 		}
-		expectedHash, err = ImportedPromptHash(
+		expectedHash, err = ImportedPromptHashForCompiler(
+			compilerVersion,
 			shotID.String(), profileID.String(), effectiveHash, assetIDs,
 			positivePrompt, negativePrompt, output, expectedInputRevisionHashes,
 			imported.InputPackageHash,
@@ -456,9 +458,34 @@ func ImportedPromptHash(
 	inputRevisionHashes map[string]string,
 	inputPackageHash string,
 ) (string, error) {
+	return ImportedPromptHashForCompiler(
+		"stage1-product-input-v1", shotSpecRevisionID,
+		generationProfileRevisionID, effectiveContextHash, assetVersionIDs,
+		positivePrompt, negativePrompt, output, inputRevisionHashes,
+		inputPackageHash,
+	)
+}
+
+// ImportedPromptHashForCompiler preserves the immutable FLO-104 importer while
+// giving FLO-154 its own executable compiler namespace and digest domain.
+func ImportedPromptHashForCompiler(
+	compilerVersion string,
+	shotSpecRevisionID string,
+	generationProfileRevisionID string,
+	effectiveContextHash string,
+	assetVersionIDs []uuid.UUID,
+	positivePrompt string,
+	negativePrompt string,
+	output providercontract.OutputSpec,
+	inputRevisionHashes map[string]string,
+	inputPackageHash string,
+) (string, error) {
+	if !importedPromptCompiler(compilerVersion) {
+		return "", errors.New("unsupported imported prompt compiler")
+	}
 	return digestValue(map[string]any{
 		"schemaVersion":             "v1",
-		"compilerVersion":           "stage1-product-input-v1",
+		"compilerVersion":           compilerVersion,
 		"shotSpecRevisionId":        shotSpecRevisionID,
 		"generationProfileRevision": generationProfileRevisionID,
 		"effectiveContextHash":      effectiveContextHash,
@@ -469,6 +496,10 @@ func ImportedPromptHash(
 		"inputRevisionHashes":       inputRevisionHashes,
 		"inputPackageHash":          inputPackageHash,
 	})
+}
+
+func importedPromptCompiler(version string) bool {
+	return version == "stage1-product-input-v1" || version == "flo154-native-materializer-v1"
 }
 
 // GenerationRunSpecDigest exposes the repository's canonical run identity to
@@ -4186,6 +4217,7 @@ func (p *Postgres) PrepareEpisodePostProduction(
 		Subtitle:            subtitle,
 		BackgroundAudio:     background,
 		AudioStrategy:       input.Config.ResolvedAudioStrategy(),
+		AnalyzerSealSHA256:  input.Config.AnalyzerSealSHA256,
 		CueFallbacks:        append([]postproduction.CueFallback(nil), input.Config.CueFallbacks...),
 		Speech:              input.Config.SpeechConfiguration(),
 		Output: postproduction.OutputPolicy{

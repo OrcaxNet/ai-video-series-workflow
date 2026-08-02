@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "flo154.asr-normalizer.v1",
+  "unicodeForm": "NFKC",
+  "simplifiedChineseEngine": "github.com/longbridgeapp/opencc",
+  "simplifiedChineseVersion": "v0.3.13",
+  "configuration": "t2s",
+  "punctuationRemoved": true,
+  "whitespaceRemoved": true
+}

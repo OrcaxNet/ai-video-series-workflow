@@ -167,6 +167,7 @@ type PostProductionConfig struct {
 	Enabled                       bool                               `json:"enabled"`
 	Evidence                      string                             `json:"evidence"`
 	AudioStrategy                 providercontract.AudioStrategy     `json:"audioStrategy,omitempty"`
+	AnalyzerSealSHA256            string                             `json:"analyzerSealSha256,omitempty"`
 	CueFallbacks                  []postproduction.CueFallback       `json:"cueFallbacks,omitempty"`
 	SpeechRoute                   providercontract.ModelSnapshot     `json:"speechRoute"`
 	SpeechProviderProfileID       string                             `json:"speechProviderProfileId"`
@@ -230,6 +231,9 @@ func (c PostProductionConfig) Validate() error {
 	if c.AudioStrategy != "" && !c.AudioStrategy.Valid() {
 		return errors.New("post-production audio strategy is invalid")
 	}
+	if c.AnalyzerSealSHA256 != "" && !validWorkflowDigest(c.AnalyzerSealSHA256) {
+		return errors.New("post-production analyzer seal SHA-256 is invalid")
+	}
 	if c.ResolvedAudioStrategy() == providercontract.AudioStrategyHybrid && len(c.CueFallbacks) == 0 {
 		return errors.New("hybrid post-production requires at least one cue fallback")
 	}
@@ -252,6 +256,18 @@ func (c PostProductionConfig) Validate() error {
 		}
 	}
 	return nil
+}
+
+func validWorkflowDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return false
+		}
+	}
+	return true
 }
 
 // Stage1FinalizationWorkflow completes the already-generated formal Stage 1

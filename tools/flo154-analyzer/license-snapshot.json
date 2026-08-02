@@ -1,0 +1,41 @@
+{
+  "schemaVersion": "flo154.analyzer-license-snapshot.v1",
+  "commercialUseRequired": true,
+  "components": [
+    {
+      "name": "OpenAI Whisper model weights and tokenizer",
+      "spdxLicense": "MIT",
+      "source": "https://github.com/openai/whisper/blob/main/LICENSE"
+    },
+    {
+      "name": "faster-whisper",
+      "spdxLicense": "MIT",
+      "source": "https://github.com/SYSTRAN/faster-whisper/blob/master/LICENSE"
+    },
+    {
+      "name": "Silero VAD",
+      "spdxLicense": "MIT",
+      "source": "https://github.com/snakers4/silero-vad/blob/master/LICENSE"
+    },
+    {
+      "name": "OpenCV face detector and runtime",
+      "spdxLicense": "Apache-2.0",
+      "source": "https://github.com/opencv/opencv/blob/4.x/LICENSE"
+    },
+    {
+      "name": "FFmpeg/FFprobe local build",
+      "spdxLicense": "GPL-3.0-or-later",
+      "source": "https://ffmpeg.org/legal.html"
+    },
+    {
+      "name": "FLO-154 analyzer wrapper, normalizer, and AV-sync estimator",
+      "spdxLicense": "LicenseRef-Project-Internal",
+      "source": "repo://tools/flo154-analyzer"
+    }
+  ],
+  "forbiddenLicenseClasses": [
+    "research-only",
+    "non-commercial",
+    "evaluation-only"
+  ]
+}

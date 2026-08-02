@@ -84,7 +84,9 @@ func main() {
 	}
 	var analyzers []postproduction.AudioAnalyzer
 	if cfg.AudioAnalyzerCommand != "" {
-		analyzer, analyzerErr := postproduction.NewCommandAudioAnalyzer(cfg.AudioAnalyzerCommand, artifacts)
+		analyzer, analyzerErr := postproduction.NewSealedCommandAudioAnalyzer(
+			cfg.AudioAnalyzerCommand, cfg.AudioAnalyzerRoot, cfg.AudioAnalyzerSeal, artifacts,
+		)
 		if analyzerErr != nil {
 			log.Fatalf("configure native audio analyzer: %v", analyzerErr)
 		}

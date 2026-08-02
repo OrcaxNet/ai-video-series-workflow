@@ -393,6 +393,7 @@ type Request struct {
 	Subtitle            SubtitleRevision               `json:"subtitleRevision"`
 	BackgroundAudio     *Artifact                      `json:"backgroundAudio,omitempty"`
 	AudioStrategy       providercontract.AudioStrategy `json:"audioStrategy,omitempty"`
+	AnalyzerSealSHA256  string                         `json:"analyzerSealSha256,omitempty"`
 	CueFallbacks        []CueFallback                  `json:"cueFallbacks,omitempty"`
 	Speech              SpeechConfig                   `json:"speech"`
 	Output              OutputPolicy                   `json:"output"`
@@ -473,6 +474,9 @@ func (r Request) Validate() error {
 		return errors.New("tts_required already replaces every cue and cannot carry local fallbacks")
 	}
 	if strategy.RequiresNativeAudio() {
+		if r.AnalyzerSealSHA256 != "" && !validDigest(r.AnalyzerSealSHA256) {
+			return errors.New("native audio analyzer seal SHA-256 is invalid")
+		}
 		for index, clip := range r.Clips {
 			if clip.ProviderVideo == nil || !clip.ProviderVideo.GenerateAudio {
 				return fmt.Errorf("clip %d lacks Provider-native audio provenance", index)
