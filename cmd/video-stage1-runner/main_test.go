@@ -56,6 +56,19 @@ func TestValidateImmutableExecutionPackageClassifiesMalformedRevisionParent(t *t
 	assertForbiddenNonRetryable(t, validateImmutableExecutionPackage(stage1.Plan{}, package_))
 }
 
+func TestRequireExactLiveBuildRejectsUnrelatedOrDirtyTestBinary(t *testing.T) {
+	t.Parallel()
+	if err := requireExactLiveBuild(stage1.ExecutionPackage{}); err != nil {
+		t.Fatalf("offline package unexpectedly required VCS identity: %v", err)
+	}
+	package_ := stage1.ExecutionPackage{LiveActivation: &stage1.LiveActivationBinding{
+		SourceCodeCommit: strings.Repeat("f", 40),
+	}}
+	if err := requireExactLiveBuild(package_); err == nil {
+		t.Fatal("unrelated test binary unexpectedly satisfied live source identity")
+	}
+}
+
 func TestLoadRevisionParentClassifiesArtifactFailures(t *testing.T) {
 	t.Parallel()
 	child := stage1.ExecutionPackage{ParentExecutionPackageHash: strings.Repeat("a", 64)}

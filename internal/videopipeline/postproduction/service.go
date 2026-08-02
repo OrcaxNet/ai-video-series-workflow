@@ -64,9 +64,10 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		if paidCueCount == 0 {
 			paidCueCount = 1
 		}
+		subscription := request.Speech.BillingMode == providercontract.BillingModeSubscriptionIncludedOnly
 		baseBudget := request.Speech.BudgetMaximumMicros / int64(paidCueCount)
 		remainder := request.Speech.BudgetMaximumMicros % int64(paidCueCount)
-		if baseBudget == 0 {
+		if baseBudget == 0 && !subscription {
 			return Result{}, errors.New("speech budget cannot allocate a positive amount to every cue")
 		}
 		paidIndex := 0
@@ -74,6 +75,9 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		for _, cue := range request.Subtitle.Cues {
 			if attempt, ok := completed[cue.ID]; ok {
 				attempts = append(attempts, attempt)
+				if subscription {
+					batchAFPMilli += attempt.Usage.OutputUnits
+				}
 				continue
 			}
 			if request.Speech.IdentityVersion == SpeechIdentityV2 &&
@@ -121,7 +125,15 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 				return Result{}, fmt.Errorf("validate cue %q speech evidence: %w", cue.ID, err)
 			}
 			attempts = append(attempts, attempt)
-			if request.Speech.BatchAuthorization != nil {
+			if subscription {
+				batchAFPMilli += attempt.Usage.OutputUnits
+				if batchAFPMilli > request.Speech.MaximumAFPMilli {
+					return Result{}, &providercontract.Error{
+						Code: providercontract.CodeBudgetExceeded, Retryable: false,
+						SafeMessage: "subscription speech exceeded its cumulative AFP ceiling",
+					}
+				}
+			} else if request.Speech.BatchAuthorization != nil {
 				batchAFPMilli += attempt.Usage.OutputUnits
 				if batchAFPMilli > request.Speech.BatchAuthorization.MaximumAFPMilli {
 					return Result{}, &providercontract.Error{
@@ -138,6 +150,12 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 					RequiresAction:  true,
 					SuggestedAction: "inspect canary evidence before authorizing additional speech jobs",
 				}
+			}
+		}
+		if subscription && batchAFPMilli > request.Speech.MaximumAFPMilli {
+			return Result{}, &providercontract.Error{
+				Code: providercontract.CodeBudgetExceeded, Retryable: false,
+				SafeMessage: "completed subscription speech exceeds its cumulative AFP ceiling",
 			}
 		}
 	}

@@ -12,6 +12,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime/debug"
 	"strings"
 	"time"
 
@@ -90,6 +91,9 @@ func run(
 		return fmt.Errorf("decode immutable stage 1 execution package: %w", err)
 	}
 	if err := validateImmutableExecutionPackage(plan, executionPackage); err != nil {
+		return err
+	}
+	if err := requireExactLiveBuild(executionPackage); err != nil {
 		return err
 	}
 	parentExecutionPackage, err := loadRevisionParent(plan, executionPackage, lookup)
@@ -277,6 +281,29 @@ func validateImmutableExecutionPackage(plan stage1.Plan, package_ stage1.Executi
 			return stage1.UnverifiableRevisionParentError(cause)
 		}
 		return cause
+	}
+	return nil
+}
+
+func requireExactLiveBuild(package_ stage1.ExecutionPackage) error {
+	if package_.LiveActivation == nil {
+		return nil
+	}
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return errors.New("live execution requires verifiable Go VCS build information")
+	}
+	var revision, modified string
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			revision = setting.Value
+		case "vcs.modified":
+			modified = setting.Value
+		}
+	}
+	if revision != package_.LiveActivation.SourceCodeCommit || modified != "false" {
+		return errors.New("live execution binary is not the exact clean source commit authorized by the execution package")
 	}
 	return nil
 }

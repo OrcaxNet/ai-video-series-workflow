@@ -33,6 +33,8 @@ type providerReservationEstimatePayload struct {
 	PromptSnapshotID  string                         `json:"promptSnapshotId"`
 	RunSpecDigest     string                         `json:"runSpecDigest"`
 	ModelSnapshot     providercontract.ModelSnapshot `json:"modelSnapshot"`
+	BillingMode       string                         `json:"billingMode,omitempty"`
+	ReservedAFPMilli  int64                          `json:"reservedAfpMilli,omitempty"`
 }
 
 type providerReservationExpectation struct {
@@ -314,7 +316,10 @@ func loadExactPromptSnapshot(
 	}
 	assets, assetHashes, err := loadPromptAssetEvidence(ctx, tx, assetIDs)
 	if err != nil {
-		return orchestration.PromptSnapshotRef{}, err
+		assets, assetHashes, err = loadFLO100LivePromptAssetEvidence(ctx, tx, promptID, assetIDs)
+		if err != nil {
+			return orchestration.PromptSnapshotRef{}, err
+		}
 	}
 	var shotHash, profileHash string
 	if err := tx.QueryRow(ctx, `
@@ -1373,7 +1378,15 @@ func (p *Postgres) PrepareProviderJob(
 		if err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
-		if plan.SeriesID != seriesID.String() || plan.Plan.State == "BLOCKED" ||
+		liveAuthority, err := readStage1LiveAuthority(ctx, tx, runID)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		planSeriesID := seriesID.String()
+		if liveAuthority != nil {
+			planSeriesID = liveAuthority.ControlSeriesID.String()
+		}
+		if plan.SeriesID != planSeriesID || plan.Plan.State == "BLOCKED" ||
 			plan.EpisodeRevisionID == "" ||
 			!containsString(plan.ShotSpecRevisionIDs, shotID.String()) {
 			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
@@ -1398,51 +1411,60 @@ func (p *Postgres) PrepareProviderJob(
 				"create a new plan for the exact approved shot set",
 			)
 		}
-		var episodeStatus string
-		if err := tx.QueryRow(ctx, `
-			SELECT status
-			FROM video_pipeline.episode_revisions
-			WHERE id = $1 AND episode_id = $2
-			FOR SHARE`,
-			episodeRevisionID, episodeID,
-		).Scan(&episodeStatus); err != nil {
-			return orchestration.PreparedProviderJob{}, fmt.Errorf("read provider episode gate: %w", err)
-		}
-		if episodeStatus != "G2_APPROVED" && episodeStatus != "G3_LOCKED" {
-			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
-				controlplane.CodeGateRequired,
-				"provider episode revision is no longer approved for generation",
-				"approve the exact episode revision before paid submission",
-			)
-		}
-		if err := requireFrozenPlanShots(
-			ctx, tx, planShotIDs, profileID, seriesID, episodeID,
-		); err != nil {
-			return orchestration.PreparedProviderJob{}, err
-		}
-		if err := requireApprovedDecision(
-			ctx, tx, gate2DecisionID.String(), "G2", seriesID, episodeID,
-			"SHOT_SPEC_REVISION", shotID,
-		); err != nil {
-			return orchestration.PreparedProviderJob{}, err
-		}
-		assetIDs, err := loadShotAssetIDs(ctx, tx, planShotIDs)
-		if err != nil {
-			return orchestration.PreparedProviderJob{}, err
-		}
-		if err := lockPostProductionRights(ctx, tx, assetIDs); err != nil {
-			return orchestration.PreparedProviderJob{}, err
-		}
-		if err := requireAssetLicenses(
-			ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy,
-		); err != nil {
-			return orchestration.PreparedProviderJob{}, err
-		}
-		if err := requireContentSafetyDecision(
-			ctx, tx, plan.ExecutionPolicy, seriesID, episodeRevisionID,
-			planShotIDs, p.now().UTC(),
-		); err != nil {
-			return orchestration.PreparedProviderJob{}, err
+		if liveAuthority != nil {
+			if err := requireStage1LiveAuthority(
+				ctx, tx, liveAuthority, input, plan, seriesID, episodeID,
+				episodeRevisionID, shotID, promptID, profileID, promptHash, p.now().UTC(),
+			); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+		} else {
+			var episodeStatus string
+			if err := tx.QueryRow(ctx, `
+				SELECT status
+				FROM video_pipeline.episode_revisions
+				WHERE id = $1 AND episode_id = $2
+				FOR SHARE`,
+				episodeRevisionID, episodeID,
+			).Scan(&episodeStatus); err != nil {
+				return orchestration.PreparedProviderJob{}, fmt.Errorf("read provider episode gate: %w", err)
+			}
+			if episodeStatus != "G2_APPROVED" && episodeStatus != "G3_LOCKED" {
+				return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+					controlplane.CodeGateRequired,
+					"provider episode revision is no longer approved for generation",
+					"approve the exact episode revision before paid submission",
+				)
+			}
+			if err := requireFrozenPlanShots(
+				ctx, tx, planShotIDs, profileID, seriesID, episodeID,
+			); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+			if err := requireApprovedDecision(
+				ctx, tx, gate2DecisionID.String(), "G2", seriesID, episodeID,
+				"SHOT_SPEC_REVISION", shotID,
+			); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+			assetIDs, err := loadShotAssetIDs(ctx, tx, planShotIDs)
+			if err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+			if err := lockPostProductionRights(ctx, tx, assetIDs); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+			if err := requireAssetLicenses(
+				ctx, tx, assetIDs, p.now().UTC(), plan.ExecutionPolicy,
+			); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
+			if err := requireContentSafetyDecision(
+				ctx, tx, plan.ExecutionPolicy, seriesID, episodeRevisionID,
+				planShotIDs, p.now().UTC(),
+			); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
 		}
 		if input.BudgetMaximumMicros != plan.BudgetLimit.AmountMicros ||
 			input.BudgetCurrency != plan.BudgetLimit.Currency {
@@ -1483,8 +1505,12 @@ func (p *Postgres) PrepareProviderJob(
 				"persisted generation run digest no longer matches its frozen inputs",
 			)
 		}
+		budgetSeriesID := seriesID
+		if liveAuthority != nil {
+			budgetSeriesID = liveAuthority.ControlSeriesID
+		}
 		if err := requireBudgetApprovalForUpdate(
-			ctx, tx, persistedBudgetApprovalID, seriesID, episodeID,
+			ctx, tx, persistedBudgetApprovalID, budgetSeriesID, episodeID,
 			generationPlanID, "VIDEO", plan.BudgetLimit,
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
@@ -1543,29 +1569,49 @@ func (p *Postgres) PrepareProviderJob(
 			return orchestration.PreparedProviderJob{}, err
 		}
 		unitPrice, priced := numericLimit(capabilityLimits, "unitPriceMicros")
-		if !priced || unitPrice <= 0 || pricingVersion == "" {
-			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
-				controlplane.CodeBudgetExceeded,
-				"the frozen Provider route has no executable unit-price snapshot",
-				"refresh pricing and approve a fully priced generation plan",
+		subscriptionLive := input.BillingMode == providercontract.BillingModeSubscriptionIncludedOnly
+		var estimatedMicros int64
+		if subscriptionLive {
+			billingLimit, _ := capabilityLimits["billingMode"].(string)
+			if liveAuthority == nil || pricingVersion == "" ||
+				billingLimit != providercontract.BillingModeSubscriptionIncludedOnly ||
+				priced && unitPrice != 0 || approvedMicros != 0 || approvedCurrency != "CNY" ||
+				input.PredictedAFPMilli <= 0 || input.EstimatedVideoTokens <= 0 {
+				return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+					controlplane.CodeBudgetExceeded,
+					"subscription dispatch is not an exact zero-cash AFP allocation",
+					"use the immutable FLO-100 A-only Agent Plan package",
+				)
+			}
+		} else {
+			if liveAuthority != nil || input.BillingMode != "" || !priced || unitPrice <= 0 || pricingVersion == "" {
+				return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+					controlplane.CodeBudgetExceeded,
+					"the frozen Provider route has no executable unit-price snapshot",
+					"refresh pricing and approve a fully priced generation plan",
+				)
+			}
+			estimatedMicros = saturatingMicros(
+				float64(exactPrompt.Output.DurationMillis)/1000,
+				unitPrice,
 			)
-		}
-		estimatedMicros := saturatingMicros(
-			float64(exactPrompt.Output.DurationMillis)/1000,
-			unitPrice,
-		)
-		if estimatedMicros <= 0 {
-			return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
-				controlplane.CodeBudgetExceeded,
-				"the per-run Provider estimate is not positive",
-				"refresh the Prompt output duration and pricing snapshot",
-			)
+			if estimatedMicros <= 0 {
+				return orchestration.PreparedProviderJob{}, controlplane.NewPolicyError(
+					controlplane.CodeBudgetExceeded,
+					"the per-run Provider estimate is not positive",
+					"refresh the Prompt output duration and pricing snapshot",
+				)
+			}
 		}
 		reservationID := uuid.NewSHA1(runID, []byte("budget-reservation"))
 		budget := providercontract.BudgetEnvelope{
 			EstimatedCostMicros: estimatedMicros,
 			MaxCostMicros:       estimatedMicros,
 			MaxAttempts:         1,
+			BillingMode:         input.BillingMode,
+		}
+		if subscriptionLive {
+			budget.ReservedAFPMilli = input.PredictedAFPMilli
 		}
 		bindReservation := func() (orchestration.PreparedProviderJob, error) {
 			reservation, err := providercontract.BindBudgetReservation(
@@ -1585,20 +1631,29 @@ func (p *Postgres) PrepareProviderJob(
 					"bind durable Provider budget reservation: %w", err,
 				)
 			}
+			productTruth := orchestration.PreparedProductTruth{
+				ShotSpecRevisionID: shotID.String(),
+				Run: orchestration.GenerationRunRef{
+					RunID: input.Run.RunID, RunSpecDigest: runDigest,
+					Attempt: creativeAttempt,
+				},
+				PromptSnapshotID: promptID.String(), PromptSnapshotHash: promptHash,
+				GenerationPlanID:    generationPlanID,
+				BudgetApprovalID:    persistedBudgetApprovalID,
+				BudgetMaximumMicros: approvedMicros, BudgetCurrency: approvedCurrency,
+				ProviderProfileID: providerProfileID.String(), Route: persistedRoute,
+			}
+			if liveAuthority != nil {
+				productTruth.LiveActivationID = liveAuthority.ActivationID.String()
+				productTruth.ExecutionPackageHash = liveAuthority.ExecutionPackageHash
+				productTruth.SourceCodeCommit = liveAuthority.SourceCodeCommit
+				productTruth.EstimatedVideoTokens = input.EstimatedVideoTokens
+				productTruth.PredictedAFPMilli = input.PredictedAFPMilli
+				productTruth.BillingMode = input.BillingMode
+			}
 			return orchestration.PreparedProviderJob{
 				Budget: budget, BudgetReservation: reservation,
-				ProductTruth: orchestration.PreparedProductTruth{
-					ShotSpecRevisionID: shotID.String(),
-					Run: orchestration.GenerationRunRef{
-						RunID: input.Run.RunID, RunSpecDigest: runDigest,
-						Attempt: creativeAttempt,
-					},
-					PromptSnapshotID: promptID.String(), PromptSnapshotHash: promptHash,
-					GenerationPlanID:    generationPlanID,
-					BudgetApprovalID:    persistedBudgetApprovalID,
-					BudgetMaximumMicros: approvedMicros, BudgetCurrency: approvedCurrency,
-					ProviderProfileID: providerProfileID.String(), Route: persistedRoute,
-				},
+				ProductTruth: productTruth,
 			}, nil
 		}
 		prepared, err := bindReservation()
@@ -1637,7 +1692,7 @@ func (p *Postgres) PrepareProviderJob(
 		jobID := uuid.NewSHA1(runID, []byte("provider-job"))
 		jobKey := "provider-job-" + input.Run.RunID
 		requestEnvelope := immutableProviderRequest{
-			Input: input, Prepared: prepared,
+			Input: canonicalProviderInput(input), Prepared: prepared,
 		}
 		requestHash, err := digestValue(requestEnvelope)
 		if err != nil {
@@ -1717,6 +1772,11 @@ func (p *Postgres) PrepareProviderJob(
 				return orchestration.PreparedProviderJob{}, err
 			}
 			prepared.ReconcileOnly = storedJobState != "QUEUED" || hasUpstreamTask
+			if liveAuthority != nil && !prepared.ReconcileOnly {
+				if err := reserveStage1LiveAFP(ctx, tx, liveAuthority, input, p.now().UTC()); err != nil {
+					return orchestration.PreparedProviderJob{}, err
+				}
+			}
 			return prepared, nil
 		}
 		if !errors.Is(existingErr, pgx.ErrNoRows) {
@@ -1741,6 +1801,11 @@ func (p *Postgres) PrepareProviderJob(
 				controlplane.CodeConflict,
 				"a non-validated generation attempt has no exact prepared Provider job to recover",
 			)
+		}
+		if liveAuthority != nil {
+			if err := reserveStage1LiveAFP(ctx, tx, liveAuthority, input, p.now().UTC()); err != nil {
+				return orchestration.PreparedProviderJob{}, err
+			}
 		}
 		allocatedMicros, err := readCumulativeProviderBudgetAllocation(
 			ctx, tx, persistedBudgetApprovalID,
@@ -1888,7 +1953,7 @@ func (p *Postgres) RecordProviderJobObservation(
 		}
 		var frozen immutableProviderRequest
 		if err := json.Unmarshal(requestSnapshot, &frozen); err != nil ||
-			!reflect.DeepEqual(frozen.Input, input) {
+			!reflect.DeepEqual(frozen.Input, canonicalProviderInput(input)) {
 			return struct{}{}, controlplane.NewConflictError(
 				controlplane.CodeRevisionConflict,
 				"the Provider observation differs from its immutable dispatch",
@@ -2121,7 +2186,7 @@ func (p *Postgres) CompleteProviderJob(
 		if err != nil {
 			return completionOutcome{}, err
 		}
-		if !reflect.DeepEqual(preparedSnapshot.Input, input) {
+		if !reflect.DeepEqual(preparedSnapshot.Input, canonicalProviderInput(input)) {
 			return completionOutcome{}, controlplane.NewConflictError(
 				controlplane.CodeRevisionConflict,
 				"provider completion input differs from the prepared immutable request",
@@ -2599,6 +2664,8 @@ func newProviderReservationExpectation(
 			PromptSnapshotID:  prepared.ProductTruth.PromptSnapshotID,
 			RunSpecDigest:     prepared.ProductTruth.Run.RunSpecDigest,
 			ModelSnapshot:     prepared.ProductTruth.Route,
+			BillingMode:       prepared.Budget.BillingMode,
+			ReservedAFPMilli:  prepared.Budget.ReservedAFPMilli,
 		},
 	}, nil
 }
@@ -3876,11 +3943,21 @@ func (p *Postgres) PrepareEpisodePostProduction(
 	if err != nil {
 		return postproduction.Request{}, errors.New("post-production run IDs must be UUIDs")
 	}
+	liveAuthority, err := readFLO100LiveFinalizationAuthority(
+		ctx, p.pool, episodeRevisionID, input.GenerationPlanID, runIDs, p.now().UTC(),
+	)
+	if err != nil {
+		return postproduction.Request{}, err
+	}
 	var episodeHash string
-	if err := p.pool.QueryRow(ctx, `
+	episodeQuery := `
 		SELECT content_hash
 		FROM video_pipeline.episode_revisions
-		WHERE id = $1 AND status = 'G2_APPROVED'`,
+		WHERE id = $1 AND status = 'G2_APPROVED'`
+	if liveAuthority != nil {
+		episodeQuery = `SELECT content_hash FROM video_pipeline.episode_revisions WHERE id=$1`
+	}
+	if err := p.pool.QueryRow(ctx, episodeQuery,
 		episodeRevisionID,
 	).Scan(&episodeHash); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -3923,7 +4000,7 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			         FROM unnest(ssr.asset_version_refs) requested(id)
 			         JOIN video_pipeline.asset_versions av ON av.id = requested.id
 			         JOIN video_pipeline.license_snapshots ls ON ls.id = av.license_snapshot_id
-			         WHERE ls.policy_status = 'ALLOWED'
+			         WHERE $3 OR (ls.policy_status = 'ALLOWED'
 			           AND (ls.expires_at IS NULL OR ls.expires_at > now())
 			           AND (av.consent_asset_id IS NULL OR EXISTS (
 			             SELECT 1
@@ -3931,7 +4008,7 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			             WHERE ca.id = av.consent_asset_id
 			               AND ca.status = 'ACTIVE'
 			               AND (ca.expires_at IS NULL OR ca.expires_at > now())
-			           ))
+			           )))
 			       ), 'provider-output:no-input-assets')
 			FROM video_pipeline.generation_runs gr
 			JOIN video_pipeline.shot_spec_revisions ssr ON ssr.id = gr.shot_spec_revision_id
@@ -3950,7 +4027,7 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			    SELECT 1 FROM video_pipeline.qc_reports qr
 			    WHERE qr.generation_run_id = gr.id AND qr.state = 'PASSED'
 			  )
-			  AND NOT EXISTS (
+			  AND ($3 OR NOT EXISTS (
 			    SELECT 1
 			    FROM unnest(ssr.asset_version_refs) requested(id)
 			    LEFT JOIN video_pipeline.asset_versions av ON av.id = requested.id
@@ -3967,12 +4044,12 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			           AND ca.status = 'ACTIVE'
 			           AND (ca.expires_at IS NULL OR ca.expires_at > now())
 			       ))
-			  )
+			  ))
 			  AND a.status = 'ACTIVE'
 			  AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video'
 			ORDER BY a.created_at
 			LIMIT 1`,
-			runID, episodeRevisionID,
+			runID, episodeRevisionID, liveAuthority != nil,
 		).Scan(
 			&clip.RunID, &clip.ShotSpecRevisionID, &clip.ShotSpecHash,
 			&clip.DurationMillis, &narrative, &assetVersionRefs,
@@ -4096,6 +4173,7 @@ func (p *Postgres) PrepareEpisodePostProduction(
 			BudgetApprovalID:                 input.Config.SpeechBudgetApprovalID,
 			BudgetMaximumMicros:              input.Config.SpeechBudgetMaximumMicros,
 			BudgetCurrency:                   input.Config.SpeechBudgetCurrency,
+			BillingMode:                      input.Config.SpeechBillingMode,
 			IdentityVersion:                  input.Config.SpeechIdentityVersion,
 			Voice:                            input.Config.SpeechVoice,
 			AuthorizedCueID:                  input.Config.SpeechAuthorizedCueID,
@@ -4217,13 +4295,17 @@ func (p *Postgres) CommitEpisodePostProduction(
 			JOIN video_pipeline.episodes ep ON ep.id = sc.episode_id
 			JOIN video_pipeline.episode_revisions er ON er.id = $2 AND er.episode_id = ep.id
 			WHERE gr.id = ANY($1::uuid[])
-			  AND er.status = 'G2_APPROVED'
+			  AND (er.status = 'G2_APPROVED' OR EXISTS (
+			    SELECT 1 FROM video_pipeline.stage1_live_activations live
+			    JOIN video_pipeline.stage1_live_activation_runs lar ON lar.activation_id=live.id
+			    WHERE live.live_generation_plan_id=$3 AND lar.run_id=gr.id
+			  ))
 			  AND gr.state = 'SUCCEEDED'
 			  AND EXISTS (
 			    SELECT 1 FROM video_pipeline.qc_reports qr
 			    WHERE qr.generation_run_id = gr.id AND qr.state = 'PASSED'
 			  )`,
-			runIDs, episodeRevisionID,
+			runIDs, episodeRevisionID, input.GenerationPlanID,
 		).Scan(&eligibleRuns); err != nil {
 			return struct{}{}, fmt.Errorf("validate post-production inputs: %w", err)
 		}
@@ -5343,6 +5425,22 @@ func (p *Postgres) requireCurrentEpisodeAssetRights(
 			"restart from the immutable generation plan for this episode revision",
 		)
 	}
+	liveAuthority, err := readFLO100LiveFinalizationAuthority(
+		ctx, tx, episodeRevisionID, generationPlanID, runIDs, p.now().UTC(),
+	)
+	if err != nil {
+		return err
+	}
+	if liveAuthority != nil {
+		if plan.SeriesID != liveAuthority.ControlSeriesID.String() || backgroundAudioAssetVersionID != "" {
+			return controlplane.NewPolicyError(
+				controlplane.CodeLicenseBlocked,
+				"FLO-100 live finalization drifted from its no-background exact G1 scope",
+				"use the exact Batch A plan without an added background asset",
+			)
+		}
+		return nil
+	}
 
 	rows, err := tx.Query(ctx, `
 		SELECT gr.id, ssr.id, ssr.asset_version_refs, ep.series_id
@@ -5496,6 +5594,37 @@ func (p *Postgres) requireCurrentPostProductionBudget(
 			controlplane.CodeBudgetExceeded,
 			"post-production speech budget is outside the immutable generation plan",
 			"create a current plan for the exact episode, TTS amount, and currency",
+		)
+	}
+	var liveControlSeriesID, liveSpeechBudgetID uuid.UUID
+	liveErr := tx.QueryRow(ctx, `SELECT a.control_series_id,a.speech_budget_approval_id
+		FROM video_pipeline.stage1_live_activations a
+		JOIN video_pipeline.stage1_live_submit_authorizations sa ON sa.activation_id=a.id
+		JOIN video_pipeline.stage1_live_projection_seals ps ON ps.activation_id=a.id
+		WHERE a.live_generation_plan_id=$1 AND a.source_episode_revision_id=$2
+		  AND sa.source_code_commit=a.source_code_commit
+		  AND sa.execution_package_hash=a.live_execution_package_hash
+		  AND sa.projection_hash=ps.projection_hash AND sa.valid_until>$3
+		FOR SHARE OF a,sa,ps`, generationPlanID, episodeRevisionID, p.now().UTC()).
+		Scan(&liveControlSeriesID, &liveSpeechBudgetID)
+	if liveErr != nil && !errors.Is(liveErr, pgx.ErrNoRows) {
+		return fmt.Errorf("read FLO-100 live speech budget: %w", liveErr)
+	}
+	if liveErr == nil {
+		if plan.SeriesID != liveControlSeriesID.String() ||
+			config.SpeechBudgetApprovalID != liveSpeechBudgetID.String() ||
+			config.SpeechBillingMode != providercontract.BillingModeSubscriptionIncludedOnly ||
+			config.SpeechBudgetMaximumMicros != 0 || config.SpeechMaximumCashMicros != 0 ||
+			config.SpeechMaximumAFPMilli != flo100SpeechAFPMilli || config.SpeechMaxAttempts != 1 {
+			return controlplane.NewPolicyError(
+				controlplane.CodeBudgetExceeded,
+				"FLO-100 speech budget differs from its zero-cash 1.039 AFP authority",
+				"use the exact live post-production package",
+			)
+		}
+		return requireBudgetApproval(
+			ctx, tx, config.SpeechBudgetApprovalID, liveControlSeriesID, uuid.Nil,
+			generationPlanID, "SPEECH", required,
 		)
 	}
 	var seriesID, episodeID uuid.UUID
@@ -6803,10 +6932,16 @@ func (p *Postgres) postProductionGateBindings(
 	rows, err := p.pool.Query(ctx, `
 		SELECT DISTINCT ON (ad.gate) ad.id, ad.gate, to_jsonb(ad)
 		FROM video_pipeline.approval_decisions ad
-		JOIN video_pipeline.episode_revisions er ON er.episode_id = ad.episode_id
-		WHERE er.id = $1
-		  AND ad.gate IN ('G1', 'G2')
+		WHERE ad.gate IN ('G1', 'G2')
 		  AND ad.decision = 'APPROVED'
+		  AND (ad.episode_id=(SELECT episode_id FROM video_pipeline.episode_revisions WHERE id=$1)
+		       OR ad.id IN (
+		         SELECT g1_decision_id FROM video_pipeline.stage1_live_activations
+		         WHERE source_episode_revision_id=$1
+		         UNION ALL
+		         SELECT g2_decision_id FROM video_pipeline.stage1_live_activations
+		         WHERE source_episode_revision_id=$1
+		       ))
 		ORDER BY ad.gate, ad.decided_at DESC`,
 		episodeRevisionID,
 	)

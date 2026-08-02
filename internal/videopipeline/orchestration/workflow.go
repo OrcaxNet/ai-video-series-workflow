@@ -171,6 +171,7 @@ type PostProductionConfig struct {
 	SpeechBudgetApprovalID        string                             `json:"speechBudgetApprovalId"`
 	SpeechBudgetMaximumMicros     int64                              `json:"speechBudgetMaximumMicros"`
 	SpeechBudgetCurrency          string                             `json:"speechBudgetCurrency"`
+	SpeechBillingMode             string                             `json:"speechBillingMode,omitempty"`
 	SpeechIdentityVersion         string                             `json:"speechIdentityVersion,omitempty"`
 	SpeechVoice                   *postproduction.SpeechVoiceBinding `json:"speechVoice,omitempty"`
 	SpeechAuthorizedCueID         string                             `json:"speechAuthorizedCueId,omitempty"`
@@ -197,9 +198,11 @@ func (c PostProductionConfig) Validate() error {
 		c.Evidence != postproduction.EvidencePendingKey {
 		return errors.New("post-production evidence is invalid")
 	}
+	subscription := c.SpeechBillingMode == providercontract.BillingModeSubscriptionIncludedOnly
 	if c.SpeechProviderProfileID == "" || c.SpeechBudgetApprovalID == "" ||
 		c.SpeechBudgetMaximumMicros < 0 ||
-		(c.SpeechBudgetMaximumMicros == 0 && c.SpeechRoute.Verification != providercontract.PendingKey) ||
+		(c.SpeechBudgetMaximumMicros == 0 && !subscription && c.SpeechRoute.Verification != providercontract.PendingKey) ||
+		(c.SpeechBillingMode != "" && !subscription) ||
 		len(c.SpeechBudgetCurrency) != 3 {
 		return errors.New("post-production speech profile and approved budget are required")
 	}
@@ -211,6 +214,7 @@ func (c PostProductionConfig) Validate() error {
 		BudgetApprovalID:    c.SpeechBudgetApprovalID,
 		BudgetMaximumMicros: c.SpeechBudgetMaximumMicros,
 		BudgetCurrency:      c.SpeechBudgetCurrency,
+		BillingMode:         c.SpeechBillingMode,
 		IdentityVersion:     c.SpeechIdentityVersion, Voice: c.SpeechVoice,
 		AuthorizedCueID:                  c.SpeechAuthorizedCueID,
 		MaximumAFPMilli:                  c.SpeechMaximumAFPMilli,
@@ -680,6 +684,37 @@ type ExecuteProviderJobInput struct {
 	// repository compares it with the facts locked in its SERIALIZABLE
 	// transaction before it inserts a reservation, Provider job, or cost row.
 	ExpectedProductTruth *PreparedProductTruth `json:"expectedProductTruth,omitempty"`
+	// SubscriptionQuotaSnapshot is fresh external usage evidence consumed only
+	// by the PostgreSQL prepare transaction. It is persisted in the dedicated
+	// AFP ledger and deliberately excluded from the immutable Provider request.
+	SubscriptionQuotaSnapshot    *SubscriptionQuotaSnapshot `json:"subscriptionQuotaSnapshot,omitempty"`
+	ExpectedExecutionPackageHash string                     `json:"expectedExecutionPackageHash,omitempty"`
+	ExpectedLiveActivationID     string                     `json:"expectedLiveActivationId,omitempty"`
+	ExpectedSourceCodeCommit     string                     `json:"expectedSourceCodeCommit,omitempty"`
+	EstimatedVideoTokens         int64                      `json:"estimatedVideoTokens,omitempty"`
+	PredictedAFPMilli            int64                      `json:"predictedAfpMilli,omitempty"`
+	BillingMode                  string                     `json:"billingMode,omitempty"`
+}
+
+// SubscriptionQuotaSnapshot records an authenticated Agent Plan read in AFP
+// milli-units. ExternalReservedAFPMilli covers conservative reservations not
+// already represented by this database; callers must not include this
+// activation's own durable reservation in that value.
+type SubscriptionQuotaSnapshot struct {
+	SchemaVersion            string    `json:"schemaVersion"`
+	Source                   string    `json:"source"`
+	CapturedAt               time.Time `json:"capturedAt"`
+	AccountID                string    `json:"accountId"`
+	Profile                  string    `json:"profile"`
+	Region                   string    `json:"region"`
+	BillingMode              string    `json:"billingMode"`
+	FiveHourUsedAFPMilli     int64     `json:"fiveHourUsedAfpMilli"`
+	FiveHourTotalAFPMilli    int64     `json:"fiveHourTotalAfpMilli"`
+	WeeklyUsedAFPMilli       int64     `json:"weeklyUsedAfpMilli"`
+	WeeklyTotalAFPMilli      int64     `json:"weeklyTotalAfpMilli"`
+	MonthlyUsedAFPMilli      int64     `json:"monthlyUsedAfpMilli"`
+	MonthlyTotalAFPMilli     int64     `json:"monthlyTotalAfpMilli"`
+	ExternalReservedAFPMilli int64     `json:"externalReservedAfpMilli"`
 }
 
 // PreparedProviderJob is the durable per-run budget allocation returned by the
@@ -710,16 +745,22 @@ type ProviderJobObservation struct {
 // reservation. A narrow runner can compare it with its signed-off package
 // without accepting any caller-reported authorization state.
 type PreparedProductTruth struct {
-	ShotSpecRevisionID  string                         `json:"shotSpecRevisionId"`
-	Run                 GenerationRunRef               `json:"run"`
-	PromptSnapshotID    string                         `json:"promptSnapshotId"`
-	PromptSnapshotHash  string                         `json:"promptSnapshotHash"`
-	GenerationPlanID    string                         `json:"generationPlanId"`
-	BudgetApprovalID    string                         `json:"budgetApprovalId"`
-	BudgetMaximumMicros int64                          `json:"budgetMaximumMicros"`
-	BudgetCurrency      string                         `json:"budgetCurrency"`
-	ProviderProfileID   string                         `json:"providerProfileId"`
-	Route               providercontract.ModelSnapshot `json:"route"`
+	ShotSpecRevisionID   string                         `json:"shotSpecRevisionId"`
+	Run                  GenerationRunRef               `json:"run"`
+	PromptSnapshotID     string                         `json:"promptSnapshotId"`
+	PromptSnapshotHash   string                         `json:"promptSnapshotHash"`
+	GenerationPlanID     string                         `json:"generationPlanId"`
+	BudgetApprovalID     string                         `json:"budgetApprovalId"`
+	BudgetMaximumMicros  int64                          `json:"budgetMaximumMicros"`
+	BudgetCurrency       string                         `json:"budgetCurrency"`
+	ProviderProfileID    string                         `json:"providerProfileId"`
+	Route                providercontract.ModelSnapshot `json:"route"`
+	LiveActivationID     string                         `json:"liveActivationId,omitempty"`
+	ExecutionPackageHash string                         `json:"executionPackageHash,omitempty"`
+	SourceCodeCommit     string                         `json:"sourceCodeCommit,omitempty"`
+	EstimatedVideoTokens int64                          `json:"estimatedVideoTokens,omitempty"`
+	PredictedAFPMilli    int64                          `json:"predictedAfpMilli,omitempty"`
+	BillingMode          string                         `json:"billingMode,omitempty"`
 }
 
 type RunQCInput struct {

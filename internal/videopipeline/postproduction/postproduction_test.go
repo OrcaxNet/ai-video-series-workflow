@@ -196,6 +196,39 @@ func TestServiceBlocksPendingKeyBeforePaidSubmission(t *testing.T) {
 	}
 }
 
+func TestServiceAcceptsSubscriptionSpeechWithZeroCashAndAFP(t *testing.T) {
+	t.Parallel()
+	store, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	zero := int64(0)
+	speech := &fakeSpeech{store: store, mutate: func(attempt *ProviderAttempt) {
+		attempt.Cost.EstimatedMicros = 0
+		attempt.Cost.ActualMicros = &zero
+		attempt.Cost.BillingMode = "subscription_included"
+		attempt.Usage.Unit = "milli_afp"
+		attempt.Usage.OutputUnits = attempt.Usage.GeneratedChars * 135
+	}}
+	service, err := NewService(speech, &fakeMedia{store: store}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request := mustRequest(t, EvidenceLive)
+	request.Speech.BudgetMaximumMicros = 0
+	request.Speech.BillingMode = providercontract.BillingModeSubscriptionIncludedOnly
+	request.Speech.MaximumAFPMilli = 1_039
+	request.Speech.MaximumNonSubscriptionCashMicros = 0
+	request.Speech.MaxAttempts = 1
+	result, err := service.Finalize(t.Context(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.SpeechAttempts) != len(request.Subtitle.Cues) || speech.calls != len(request.Subtitle.Cues) {
+		t.Fatalf("subscription speech attempts=%d calls=%d", len(result.SpeechAttempts), speech.calls)
+	}
+}
+
 func TestServiceReauthorizesBeforeEveryPaidSpeechSubmission(t *testing.T) {
 	t.Parallel()
 	store, err := artifactstore.New(t.TempDir())

@@ -130,14 +130,9 @@ func (r GenerationRequest) Validate() error {
 		return errors.New("prompt is required")
 	case strings.TrimSpace(r.PromptSnapshotID) == "":
 		return errors.New("prompt_snapshot_id is required")
-	case r.Budget.EstimatedCostMicros < 0:
-		return errors.New("estimated_cost_micros must be non-negative")
-	case r.Budget.MaxCostMicros <= 0:
-		return errors.New("max_cost_micros must be positive")
-	case r.Budget.EstimatedCostMicros > r.Budget.MaxCostMicros:
-		return errors.New("estimated_cost_micros must not exceed max_cost_micros")
-	case r.Budget.MaxAttempts < 1:
-		return errors.New("max_attempts must be positive")
+	}
+	if err := r.Budget.Validate(); err != nil {
+		return fmt.Errorf("budget: %w", err)
 	}
 	for _, asset := range r.Assets {
 		if asset.ID == "" || asset.Revision == "" || asset.SHA256 == "" ||

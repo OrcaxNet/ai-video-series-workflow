@@ -12,6 +12,47 @@ type BudgetEnvelope struct {
 	EstimatedCostMicros int64 `json:"estimated_cost_micros"`
 	MaxCostMicros       int64 `json:"max_cost_micros"`
 	MaxAttempts         int   `json:"max_attempts"`
+	// BillingMode is empty for the legacy metered-cash contract. The explicit
+	// subscription value is the only contract allowed to carry a zero CNY
+	// maximum; ReservedAFPMilli then becomes the paid-boundary resource limit.
+	BillingMode      string `json:"billing_mode,omitempty"`
+	ReservedAFPMilli int64  `json:"reserved_afp_milli,omitempty"`
+}
+
+const BillingModeSubscriptionIncludedOnly = "subscription_included_only"
+
+// Validate rejects ambiguous zero-price envelopes. A Provider request can be
+// cash-free only when it is explicitly covered by a subscription and carries
+// a positive AFP reservation; metered requests retain the positive cash cap.
+func (b BudgetEnvelope) Validate() error {
+	if b.EstimatedCostMicros < 0 {
+		return fmt.Errorf("estimated_cost_micros must be non-negative")
+	}
+	if b.MaxCostMicros < 0 {
+		return fmt.Errorf("max_cost_micros must be non-negative")
+	}
+	if b.EstimatedCostMicros > b.MaxCostMicros {
+		return fmt.Errorf("estimated_cost_micros must not exceed max_cost_micros")
+	}
+	if b.MaxAttempts < 1 {
+		return fmt.Errorf("max_attempts must be positive")
+	}
+	if b.ReservedAFPMilli < 0 {
+		return fmt.Errorf("reserved_afp_milli must be non-negative")
+	}
+	if b.BillingMode == BillingModeSubscriptionIncludedOnly {
+		if b.EstimatedCostMicros != 0 || b.MaxCostMicros != 0 || b.ReservedAFPMilli <= 0 {
+			return fmt.Errorf("subscription-included budget requires zero cash and a positive AFP reservation")
+		}
+		return nil
+	}
+	if b.BillingMode != "" {
+		return fmt.Errorf("unsupported budget billing mode %q", b.BillingMode)
+	}
+	if b.MaxCostMicros <= 0 || b.ReservedAFPMilli != 0 {
+		return fmt.Errorf("max_cost_micros must be positive for metered billing and reserved_afp_milli must be zero")
+	}
+	return nil
 }
 
 type BudgetPolicy struct {

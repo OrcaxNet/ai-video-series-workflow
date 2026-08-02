@@ -28,6 +28,20 @@ type ExecutionPackage struct {
 	ContentHash                string                             `json:"contentHash"`
 	PrimaryJobs                []FrozenJob                        `json:"primaryJobs"`
 	PostProduction             orchestration.FinalizeEpisodeInput `json:"postProduction"`
+	LiveActivation             *LiveActivationBinding             `json:"liveActivation,omitempty"`
+}
+
+// LiveActivationBinding proves that a live package is a new authority
+// projection over the immutable offline A package rather than an in-place
+// mutation of its seal. Submit authorization is checked again from PostgreSQL.
+type LiveActivationBinding struct {
+	ActivationID                string `json:"activationId"`
+	OfflineExecutionPackageHash string `json:"offlineExecutionPackageHash"`
+	SourceAuthorizationHash     string `json:"sourceAuthorizationHash"`
+	SourceCodeCommit            string `json:"sourceCodeCommit"`
+	G1DecisionID                string `json:"g1DecisionId"`
+	G2DecisionID                string `json:"g2DecisionId"`
+	SafetyDecisionID            string `json:"safetyDecisionId"`
 }
 
 // FrozenJob contains identifiers and approved limits only. Prompt text, asset
@@ -53,6 +67,7 @@ type FrozenJob struct {
 	WorkflowID                         string                         `json:"workflowId"`
 	ActivityID                         string                         `json:"activityId"`
 	TraceID                            string                         `json:"traceId"`
+	BillingMode                        string                         `json:"billingMode,omitempty"`
 }
 
 // RequiresRevisionParent reports whether the package claims the speech-v2
@@ -93,6 +108,9 @@ func (p ExecutionPackage) Validate(plan Plan) error {
 		return fmt.Errorf("stage 1 execution package requires exactly %d primary jobs", RequiredPrimaryJobs)
 	case !validLowerDigest(p.ContentHash):
 		return errors.New("stage 1 execution package requires a lowercase SHA-256 contentHash")
+	}
+	if err := p.validateLiveActivation(plan); err != nil {
+		return err
 	}
 	if p.PostProduction.Config.SpeechIdentityVersion == postproduction.SpeechIdentityV2 &&
 		p.ParentExecutionPackageHash == "" {
@@ -313,9 +331,17 @@ func (j FrozenJob) validate(plan Plan) error {
 		j.Route.ModelID != plan.VideoModel || j.Route.Verification != providercontract.PendingKey {
 		return errors.New("route must freeze the approved formal video capability")
 	}
-	if (!plan.OfflineOnly && j.BudgetMaximumMicros <= 0) ||
-		(plan.OfflineOnly && j.BudgetMaximumMicros != 0) || j.BudgetCurrency != "CNY" {
+	if plan.SubscriptionIncludedOnly {
+		if j.BudgetMaximumMicros != 0 || j.EstimatedNonSubscriptionCashMicros != 0 ||
+			j.BillingMode != providercontract.BillingModeSubscriptionIncludedOnly {
+			return errors.New("FLO-100 live VIDEO budget must be subscription-included with zero CNY cash")
+		}
+	} else if (!plan.OfflineOnly && j.BudgetMaximumMicros <= 0) ||
+		(plan.OfflineOnly && j.BudgetMaximumMicros != 0) || j.BillingMode != "" {
 		return errors.New("frozen VIDEO budget must match the approved CNY cash boundary")
+	}
+	if j.BudgetCurrency != "CNY" {
+		return errors.New("frozen VIDEO budget currency must be CNY")
 	}
 	if j.EstimatedVideoTokens <= 0 || j.PredictedAFPMilli <= 0 ||
 		j.EstimatedNonSubscriptionCashMicros < 0 {
@@ -323,6 +349,42 @@ func (j FrozenJob) validate(plan Plan) error {
 	}
 	if exceedsDrift(j.PredictedAFPMilli, plan.ReferenceJobAFPMilli, plan.MaximumAFPDriftBPS) {
 		return errors.New("frozen AFP estimate exceeds the approved drift")
+	}
+	return nil
+}
+
+func (p ExecutionPackage) validateLiveActivation(plan Plan) error {
+	if !plan.SubscriptionIncludedOnly {
+		if p.LiveActivation != nil {
+			return errors.New("only a subscription-live plan may carry a live activation binding")
+		}
+		return nil
+	}
+	if p.LiveActivation == nil {
+		return errors.New("FLO-100 live package requires an immutable activation binding")
+	}
+	binding := p.LiveActivation
+	for name, value := range map[string]string{
+		"activationId":     binding.ActivationID,
+		"g1DecisionId":     binding.G1DecisionID,
+		"g2DecisionId":     binding.G2DecisionID,
+		"safetyDecisionId": binding.SafetyDecisionID,
+	} {
+		if _, err := uuid.Parse(value); err != nil {
+			return fmt.Errorf("live activation %s must be a UUID", name)
+		}
+	}
+	if !validLowerDigest(binding.OfflineExecutionPackageHash) ||
+		!validLowerDigest(binding.SourceAuthorizationHash) {
+		return errors.New("live activation package/authorization hashes must be lowercase SHA-256")
+	}
+	if len(binding.SourceCodeCommit) != 40 {
+		return errors.New("live activation sourceCodeCommit must be a full Git SHA")
+	}
+	for _, character := range binding.SourceCodeCommit {
+		if character < '0' || character > '9' && character < 'a' || character > 'f' {
+			return errors.New("live activation sourceCodeCommit must be lowercase hexadecimal")
+		}
 	}
 	return nil
 }

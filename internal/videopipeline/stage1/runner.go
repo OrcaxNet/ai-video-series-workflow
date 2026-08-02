@@ -19,7 +19,8 @@ type ArtifactVerifier interface {
 // SubmitInput selects one job from the immutable execution package. The caller
 // cannot provide prompts, routes, budgets, assets, or authorization booleans.
 type SubmitInput struct {
-	ShotID string `json:"shotId"`
+	ShotID        string                                   `json:"shotId"`
+	QuotaSnapshot *orchestration.SubscriptionQuotaSnapshot `json:"quotaSnapshot,omitempty"`
 }
 
 // PollInput selects an already-prepared immutable attempt. It cannot create a
@@ -177,7 +178,7 @@ func (r *Runner) Submit(ctx context.Context, input SubmitInput) (SubmitResult, e
 	if !ok {
 		return SubmitResult{}, providerError(providercontract.CodeForbidden, "shot is outside the frozen stage 1 execution package")
 	}
-	return r.submitFrozen(ctx, frozen, nil)
+	return r.submitFrozen(ctx, frozen, nil, input.QuotaSnapshot)
 }
 
 // Poll advances and returns the authenticated Adapter view for an attempt that
@@ -226,18 +227,19 @@ func (r *Runner) SubmitControlledRetry(ctx context.Context, input SubmitInput) (
 		return SubmitResult{}, providerError(providercontract.CodeForbidden, "shot is outside the frozen stage 1 controlled retry package")
 	}
 	approval := r.controlledRetry.Approval
-	return r.submitFrozen(ctx, r.controlledRetry.Job, &approval)
+	return r.submitFrozen(ctx, r.controlledRetry.Job, &approval, input.QuotaSnapshot)
 }
 
 func (r *Runner) submitFrozen(
 	ctx context.Context,
 	frozen FrozenJob,
 	retry *RetryApproval,
+	quota *orchestration.SubscriptionQuotaSnapshot,
 ) (SubmitResult, error) {
 	attempt := attemptFromFrozen(frozen, retry)
 
 	return r.executor.ExecutePrepared(ctx, attempt, func(ctx context.Context) (providercontract.JobRequest, error) {
-		return r.prepareProductTruth(ctx, frozen)
+		return r.prepareProductTruth(ctx, frozen, quota)
 	})
 }
 
@@ -255,6 +257,7 @@ func attemptFromFrozen(frozen FrozenJob, retry *RetryApproval) Attempt {
 func (r *Runner) prepareProductTruth(
 	ctx context.Context,
 	frozen FrozenJob,
+	quota *orchestration.SubscriptionQuotaSnapshot,
 ) (providercontract.JobRequest, error) {
 	prompt, err := r.truth.ResolvePromptSnapshot(ctx, frozen.PromptSnapshotID)
 	if err != nil {
@@ -276,6 +279,14 @@ func (r *Runner) prepareProductTruth(
 		BudgetCurrency:      frozen.BudgetCurrency,
 		ProviderProfileID:   frozen.ProviderProfileID, Route: frozen.Route,
 	}
+	if activation := r.executionPackage.LiveActivation; activation != nil {
+		expectedTruth.LiveActivationID = activation.ActivationID
+		expectedTruth.ExecutionPackageHash = r.executionPackage.ContentHash
+		expectedTruth.SourceCodeCommit = activation.SourceCodeCommit
+		expectedTruth.EstimatedVideoTokens = frozen.EstimatedVideoTokens
+		expectedTruth.PredictedAFPMilli = frozen.PredictedAFPMilli
+		expectedTruth.BillingMode = frozen.BillingMode
+	}
 	preparation := orchestration.ExecuteProviderJobInput{
 		Run: frozen.Run, Prompt: prompt, Route: frozen.Route,
 		BudgetApprovalID:    frozen.BudgetApprovalID,
@@ -283,7 +294,16 @@ func (r *Runner) prepareProductTruth(
 		BudgetCurrency:      frozen.BudgetCurrency,
 		ProviderProfileID:   frozen.ProviderProfileID,
 		TraceID:             frozen.TraceID, PersistProductTruth: true,
-		ExpectedProductTruth: &expectedTruth,
+		ExpectedProductTruth:      &expectedTruth,
+		SubscriptionQuotaSnapshot: quota,
+		EstimatedVideoTokens:      frozen.EstimatedVideoTokens,
+		PredictedAFPMilli:         frozen.PredictedAFPMilli,
+		BillingMode:               frozen.BillingMode,
+	}
+	if activation := r.executionPackage.LiveActivation; activation != nil {
+		preparation.ExpectedExecutionPackageHash = r.executionPackage.ContentHash
+		preparation.ExpectedLiveActivationID = activation.ActivationID
+		preparation.ExpectedSourceCodeCommit = activation.SourceCodeCommit
 	}
 	prepared, err := r.truth.PrepareProviderJob(ctx, orchestration.WorkflowStep{
 		WorkflowID: frozen.WorkflowID, ActivityID: frozen.ActivityID,
@@ -459,6 +479,11 @@ func (r *Runner) completionFromProvider(
 	}
 	if response.Cost.ActualMicros == nil || response.Cost.Currency != "CNY" {
 		evidenceProblems = append(evidenceProblems, "actual cost attribution")
+	}
+	if r.gate.Plan().SubscriptionIncludedOnly &&
+		(response.Cost.ActualMicros == nil || *response.Cost.ActualMicros != 0 ||
+			response.Cost.BillingMode != "subscription_included") {
+		evidenceProblems = append(evidenceProblems, "subscription-included zero-cash attribution")
 	}
 	if response.State == providercontract.StatusSucceeded {
 		if response.Usage.VideoTokens <= 0 || input.ActualAFPMilli <= 0 {
