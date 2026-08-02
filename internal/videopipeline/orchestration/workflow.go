@@ -198,7 +198,9 @@ func (c PostProductionConfig) Validate() error {
 		return errors.New("post-production evidence is invalid")
 	}
 	if c.SpeechProviderProfileID == "" || c.SpeechBudgetApprovalID == "" ||
-		c.SpeechBudgetMaximumMicros <= 0 || len(c.SpeechBudgetCurrency) != 3 {
+		c.SpeechBudgetMaximumMicros < 0 ||
+		(c.SpeechBudgetMaximumMicros == 0 && c.SpeechRoute.Verification != providercontract.PendingKey) ||
+		len(c.SpeechBudgetCurrency) != 3 {
 		return errors.New("post-production speech profile and approved budget are required")
 	}
 	if c.SubtitleLanguage == "" {
