@@ -209,8 +209,9 @@ func RevoiceStage1(
 	}
 
 	var providerJobsBefore int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.provider_jobs`).Scan(&providerJobsBefore); err != nil {
-		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("count Provider jobs before revoice: %w", err)
+	providerJobsBefore, err = countExecutionPackageProviderJobs(ctx, pool, parent)
+	if err != nil {
+		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("count package Provider jobs before revoice: %w", err)
 	}
 	tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
 	if err != nil {
@@ -515,8 +516,9 @@ func RevoiceStage1(
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, errors.New("authorized cue AFP estimate exceeds the frozen canary")
 	}
 	var providerJobsAfter int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.provider_jobs`).Scan(&providerJobsAfter); err != nil {
-		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("count Provider jobs after revoice: %w", err)
+	providerJobsAfter, err = countExecutionPackageProviderJobs(ctx, pool, parent)
+	if err != nil {
+		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, fmt.Errorf("count package Provider jobs after revoice: %w", err)
 	}
 	if providerJobsAfter != providerJobsBefore {
 		return stage1.ExecutionPackage{}, SpeechVoiceRevisionReport{}, errors.New("revoice unexpectedly changed Provider job truth")

@@ -135,8 +135,9 @@ func AuthorizeSpeechBatch(
 		return stage1.ExecutionPackage{}, SpeechBatchRevisionReport{}, err
 	}
 	var providerJobsBefore int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.provider_jobs`).Scan(&providerJobsBefore); err != nil {
-		return stage1.ExecutionPackage{}, SpeechBatchRevisionReport{}, fmt.Errorf("count Provider jobs before speech batch revision: %w", err)
+	providerJobsBefore, err = countExecutionPackageProviderJobs(ctx, pool, parent)
+	if err != nil {
+		return stage1.ExecutionPackage{}, SpeechBatchRevisionReport{}, fmt.Errorf("count package Provider jobs before speech batch revision: %w", err)
 	}
 	ledger := repository.NewForPool(pool)
 	preparedParent, err := ledger.PrepareEpisodePostProduction(ctx, orchestration.WorkflowStep{
@@ -225,8 +226,9 @@ func AuthorizeSpeechBatch(
 		return stage1.ExecutionPackage{}, SpeechBatchRevisionReport{}, fmt.Errorf("verify speech batch request: %w", err)
 	}
 	var providerJobsAfter int64
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.provider_jobs`).Scan(&providerJobsAfter); err != nil {
-		return stage1.ExecutionPackage{}, SpeechBatchRevisionReport{}, fmt.Errorf("count Provider jobs after speech batch revision: %w", err)
+	providerJobsAfter, err = countExecutionPackageProviderJobs(ctx, pool, parent)
+	if err != nil {
+		return stage1.ExecutionPackage{}, SpeechBatchRevisionReport{}, fmt.Errorf("count package Provider jobs after speech batch revision: %w", err)
 	}
 	if providerJobsAfter != providerJobsBefore {
 		return stage1.ExecutionPackage{}, SpeechBatchRevisionReport{}, errors.New("speech batch revision unexpectedly changed Provider job truth")

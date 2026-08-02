@@ -1844,15 +1844,16 @@ func (p *Postgres) CompletePreparedProviderJob(
 	if err != nil {
 		return errors.New("runId must be a UUID")
 	}
+	expectedJobID := uuid.NewSHA1(runID, []byte("provider-job"))
 	var requestSnapshot []byte
 	if err := p.pool.QueryRow(ctx, `
 		SELECT pj.request_snapshot
 		FROM video_pipeline.provider_jobs pj
 		JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
-		WHERE ga.generation_run_id = $1
+		WHERE ga.generation_run_id = $1 AND pj.id = $2
 		ORDER BY ga.sequence, pj.created_at
 		LIMIT 1`,
-		runID,
+		runID, expectedJobID,
 	).Scan(&requestSnapshot); err != nil {
 		return fmt.Errorf("read prepared Provider completion input: %w", err)
 	}
@@ -1903,6 +1904,8 @@ func (p *Postgres) CompleteProviderJob(
 	if result.ArtifactURI != "cas://sha256/"+result.ArtifactDigest {
 		return errors.New("provider artifact URI does not match its content hash")
 	}
+	result = normalizedProviderResult(result)
+	expectedJobID := uuid.NewSHA1(runID, []byte("provider-job"))
 	type completionOutcome struct {
 		budgetExceeded bool
 	}
@@ -1924,9 +1927,9 @@ func (p *Postgres) CompleteProviderJob(
 			JOIN video_pipeline.generation_attempts ga ON ga.id = pj.generation_attempt_id
 			JOIN video_pipeline.generation_runs gr ON gr.id = ga.generation_run_id
 			JOIN video_pipeline.budget_reservations br ON br.id = pj.budget_reservation_id
-			WHERE gr.id = $1
+			WHERE gr.id = $1 AND pj.id = $2
 			FOR UPDATE OF pj, ga, gr, br`,
-			runID,
+			runID, expectedJobID,
 		).Scan(
 			&jobID, &attemptID, &reservationID,
 			&runState, &attemptState, &jobState,
@@ -1973,6 +1976,59 @@ func (p *Postgres) CompleteProviderJob(
 			return completionOutcome{}, controlplane.NewConflictError(
 				controlplane.CodeRevisionConflict,
 				"provider completion model differs from the prepared immutable route",
+			)
+		}
+		if jobState == "SUCCEEDED" {
+			if attemptState != "SUCCEEDED" || reservationStatus != "SETTLED" {
+				return completionOutcome{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"the succeeded Provider completion has inconsistent terminal projections",
+				)
+			}
+			if err := verifySucceededProviderCompletion(
+				ctx, tx, runID, jobID, result,
+			); err != nil {
+				return completionOutcome{}, err
+			}
+			switch runState {
+			case "SUCCEEDED", "PAUSED":
+				return completionOutcome{}, nil
+			case "RUNNING":
+				// A Provider may finish while the run is PAUSED. RESUME_PAUSED
+				// intentionally restores RUNNING; the exact completion replay then
+				// repairs only the run/shot projection without touching the frozen
+				// job identity, artifact, ledger, or terminal timestamps.
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.generation_runs
+					SET state = 'SUCCEEDED', failure_class = NULL, failure_code = NULL,
+					    started_at = COALESCE(started_at, now()), finished_at = now()
+					WHERE id = $1 AND state = 'RUNNING'`,
+					runID,
+				); err != nil {
+					return completionOutcome{}, fmt.Errorf("repair succeeded generation run: %w", err)
+				}
+				if _, err := tx.Exec(ctx, `
+					UPDATE video_pipeline.shot_spec_revisions ssr
+					SET lifecycle_state = 'QC_PENDING'
+					FROM video_pipeline.generation_runs gr
+					WHERE gr.id = $1 AND gr.state = 'SUCCEEDED'
+					  AND ssr.id = gr.shot_spec_revision_id`,
+					runID,
+				); err != nil {
+					return completionOutcome{}, fmt.Errorf("repair shot after succeeded Provider job: %w", err)
+				}
+				return completionOutcome{}, nil
+			default:
+				return completionOutcome{}, controlplane.NewConflictError(
+					controlplane.CodeConflict,
+					"the succeeded Provider completion has an unrecoverable run projection",
+				)
+			}
+		}
+		if runState == "SUCCEEDED" || attemptState == "SUCCEEDED" {
+			return completionOutcome{}, controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"a succeeded generation projection has no immutable succeeded Provider job",
 			)
 		}
 		if runState == "CANCELLED" || runState == "FAILED" ||
@@ -2022,26 +2078,37 @@ func (p *Postgres) CompleteProviderJob(
 			); err != nil {
 				return completionOutcome{}, fmt.Errorf("insert actual provider cost: %w", err)
 			}
+			var storedJobID, storedReservationID uuid.UUID
+			var storedEntryType string
 			var storedActual int64
 			var storedCurrency, storedPricing string
 			var storedVerified bool
+			var storedUnitsMatch, storedUnitNameMatch bool
 			if err := tx.QueryRow(ctx, `
-				SELECT amount_micros, currency, pricing_rule_version, verified
+				SELECT provider_job_id, budget_reservation_id, entry_type,
+				       amount_micros, currency, pricing_rule_version, verified,
+				       units IS NOT DISTINCT FROM $2,
+				       unit_name IS NOT DISTINCT FROM $3
 				FROM video_pipeline.cost_ledger
 				WHERE id = $1
 				FOR SHARE`,
-				ledgerID,
+				ledgerID, result.Usage.InputUnits+result.Usage.OutputUnits,
+				result.Usage.Unit,
 			).Scan(
+				&storedJobID, &storedReservationID, &storedEntryType,
 				&storedActual, &storedCurrency, &storedPricing, &storedVerified,
+				&storedUnitsMatch, &storedUnitNameMatch,
 			); err != nil {
 				return completionOutcome{}, fmt.Errorf(
 					"read actual provider cost: %w", err,
 				)
 			}
-			if storedActual != actualMicros ||
+			if storedJobID != jobID || storedReservationID != reservationID ||
+				storedEntryType != "ACTUAL" || storedActual != actualMicros ||
 				storedCurrency != result.Cost.Currency ||
 				storedPricing != result.Cost.PricingVersion ||
-				storedVerified != actualTrustedForAllocation {
+				storedVerified != actualTrustedForAllocation ||
+				!storedUnitsMatch || !storedUnitNameMatch {
 				return completionOutcome{}, controlplane.NewConflictError(
 					controlplane.CodeRevisionConflict,
 					"Provider completion cost differs from its immutable ledger entry",
@@ -2265,6 +2332,125 @@ func (p *Postgres) CompleteProviderJob(
 			controlplane.CodeBudgetExceeded,
 			"Provider cost exceeded or drifted from the immutable reservation",
 			"create a new priced plan and budget approval before retrying",
+		)
+	}
+	return nil
+}
+
+type providerCompletionMediaSpec struct {
+	Width          int                            `json:"width"`
+	Height         int                            `json:"height"`
+	DurationMillis int64                          `json:"durationMillis"`
+	Model          providercontract.ModelSnapshot `json:"modelSnapshot"`
+	Usage          providercontract.Usage         `json:"usage"`
+	Cost           providercontract.Cost          `json:"cost"`
+}
+
+func normalizedProviderResult(result orchestration.ProviderResult) orchestration.ProviderResult {
+	if result.MediaType == "" {
+		result.MediaType = "video/mp4"
+	}
+	return result
+}
+
+// verifySucceededProviderCompletion makes terminal success an immutable
+// replay boundary. The Provider job row is already locked by the caller. Every
+// identity, artifact, usage, and cost field must match the first committed
+// result before an exact replay may continue to repair a missing QC projection.
+func verifySucceededProviderCompletion(
+	ctx context.Context,
+	tx pgx.Tx,
+	runID uuid.UUID,
+	jobID uuid.UUID,
+	result orchestration.ProviderResult,
+) error {
+	ledgerID := uuid.NewSHA1(jobID, []byte("actual-cost"))
+	var (
+		storedTaskID, storedRequestID            string
+		storedDigest, storedURI, storedMediaType string
+		storedSize                               int64
+		storedMediaSpec                          []byte
+		outputCount                              int64
+		ledgerMatches                            bool
+	)
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE(pj.upstream_task_id, ''),
+		       COALESCE(pj.upstream_request_id, ''),
+		       a.content_hash, a.artifact_uri, a.media_type, a.size_bytes,
+		       a.media_spec,
+		       (SELECT COUNT(*)
+		        FROM video_pipeline.run_artifacts outputs
+		        JOIN video_pipeline.artifacts output_artifact
+		          ON output_artifact.id = outputs.artifact_id
+		        WHERE outputs.generation_run_id = gr.id
+		          AND outputs.role = 'OUTPUT'
+		          AND COALESCE(output_artifact.media_spec->>'kind', 'shot_video') = 'shot_video'),
+		       EXISTS (
+		         SELECT 1
+		         FROM video_pipeline.cost_ledger actual
+		         WHERE actual.id = $3
+		           AND actual.provider_job_id = pj.id
+		           AND actual.budget_reservation_id = pj.budget_reservation_id
+		           AND actual.entry_type = 'ACTUAL'
+		           AND actual.amount_micros IS NOT DISTINCT FROM $4
+		           AND actual.currency IS NOT DISTINCT FROM $5
+		           AND actual.units IS NOT DISTINCT FROM $6
+		           AND actual.unit_name IS NOT DISTINCT FROM $7
+		           AND actual.pricing_rule_version = $8
+		           AND actual.verified = $9
+		       )
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga
+		  ON ga.id = pj.generation_attempt_id
+		JOIN video_pipeline.generation_runs gr
+		  ON gr.id = ga.generation_run_id
+		JOIN video_pipeline.run_artifacts ra
+		  ON ra.generation_run_id = gr.id AND ra.role = 'OUTPUT'
+		JOIN video_pipeline.artifacts a
+		  ON a.id = ra.artifact_id
+		 AND COALESCE(a.media_spec->>'kind', 'shot_video') = 'shot_video'
+		WHERE gr.id = $1 AND pj.id = $2
+		ORDER BY a.id
+		LIMIT 1
+		FOR SHARE OF a`,
+		runID, jobID, ledgerID, result.Cost.ActualMicros,
+		result.Cost.Currency, result.Usage.InputUnits+result.Usage.OutputUnits,
+		result.Usage.Unit, result.Cost.PricingVersion, result.Cost.Verified,
+	).Scan(
+		&storedTaskID, &storedRequestID,
+		&storedDigest, &storedURI, &storedMediaType, &storedSize,
+		&storedMediaSpec, &outputCount, &ledgerMatches,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return controlplane.NewConflictError(
+				controlplane.CodeConflict,
+				"the succeeded Provider job has no exact immutable output and cost projection",
+			)
+		}
+		return fmt.Errorf("read succeeded Provider completion: %w", err)
+	}
+	var mediaSpec providerCompletionMediaSpec
+	if err := json.Unmarshal(storedMediaSpec, &mediaSpec); err != nil {
+		return fmt.Errorf("decode succeeded Provider artifact media spec: %w", err)
+	}
+	stored := orchestration.ProviderResult{
+		UpstreamTaskID: storedTaskID,
+		RequestID:      storedRequestID,
+		ArtifactDigest: storedDigest,
+		ArtifactURI:    storedURI,
+		MediaType:      storedMediaType,
+		ArtifactSize:   storedSize,
+		Width:          mediaSpec.Width,
+		Height:         mediaSpec.Height,
+		DurationMillis: mediaSpec.DurationMillis,
+		Model:          mediaSpec.Model,
+		Usage:          mediaSpec.Usage,
+		Cost:           mediaSpec.Cost,
+	}
+	if outputCount != 1 || !ledgerMatches || !reflect.DeepEqual(stored, result) {
+		return controlplane.NewConflictError(
+			controlplane.CodeRevisionConflict,
+			"Provider completion result differs from the immutable succeeded job",
 		)
 	}
 	return nil

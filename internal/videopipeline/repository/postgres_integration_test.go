@@ -2268,6 +2268,61 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			PricingVersion: "pricing-v1", Verified: true,
 		},
 	}
+	pauseDuringCompletionDigest, _ := digestValue(map[string]any{
+		"runId": run.RunID, "reason": "PAUSE_DURING_PROVIDER_COMPLETION",
+	})
+	if _, err := store.RequestRunPause(
+		ctx, run.RunID, 1, qaPauseActor, "PAUSE_DURING_PROVIDER_COMPLETION",
+		controlplane.Idempotency{
+			Scope: "workflow-projection-pause-during-completion:" + run.RunID,
+			Key:   uuid.NewString(), RequestHash: pauseDuringCompletionDigest,
+		},
+		step.TraceID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	// The core completion may commit immediately before the Stage 1 caller
+	// records automatic QC, including while the run is PAUSED. The exact replay
+	// must preserve the pause; after RESUME_PAUSED it repairs only the run/shot
+	// and missing QC projections without changing the succeeded Provider result.
+	if err := store.CompleteProviderJob(
+		ctx, step, dispatch, providerResult,
+	); err != nil {
+		t.Fatalf("initial Provider completion: %v", err)
+	}
+	var qcBeforeRepair int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM video_pipeline.qc_reports
+		WHERE generation_run_id = $1`, run.RunID,
+	).Scan(&qcBeforeRepair); err != nil {
+		t.Fatal(err)
+	}
+	if qcBeforeRepair != 0 {
+		t.Fatalf("QC reports before prepared replay = %d, want 0", qcBeforeRepair)
+	}
+	if err := store.CompletePreparedProviderJob(
+		ctx, step, run.RunID, providerResult,
+	); err == nil {
+		t.Fatal("prepared completion created QC while the succeeded run remained paused")
+	} else {
+		var domain *controlplane.DomainError
+		if !errors.As(err, &domain) || domain.Code != controlplane.CodeConflict {
+			t.Fatalf("paused prepared completion error = %#v", err)
+		}
+	}
+	resumeAfterCompletionDigest, _ := digestValue(map[string]any{
+		"runId": run.RunID, "mode": "RESUME_PAUSED_AFTER_PROVIDER_COMPLETION",
+	})
+	if _, err := store.RequestRunResume(
+		ctx, run.RunID, 1, qaPauseActor, "RESUME_PAUSED",
+		controlplane.Idempotency{
+			Scope: "workflow-projection-resume-after-completion:" + run.RunID,
+			Key:   uuid.NewString(), RequestHash: resumeAfterCompletionDigest,
+		},
+		step.TraceID,
+	); err != nil {
+		t.Fatal(err)
+	}
 	for replay := 1; replay <= 2; replay++ {
 		if err := store.CompletePreparedProviderJob(
 			ctx, step, run.RunID, providerResult,
@@ -2296,6 +2351,114 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 			"Stage 1 completion QC projection = reports:%d shot:%s, want 1/REVIEW",
 			stage1PassedQC, stage1ShotState,
 		)
+	}
+	completionDriftCases := []struct {
+		name   string
+		mutate func(*orchestration.ProviderResult)
+	}{
+		{
+			name: "upstream task",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.UpstreamTaskID += "-drift"
+			},
+		},
+		{
+			name: "upstream request",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.RequestID += "-drift"
+			},
+		},
+		{
+			name: "artifact",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.ArtifactDigest = strings.Repeat("a", 64)
+				if candidate.ArtifactDigest == providerResult.ArtifactDigest {
+					candidate.ArtifactDigest = strings.Repeat("b", 64)
+				}
+				candidate.ArtifactURI = "cas://sha256/" + candidate.ArtifactDigest
+			},
+		},
+		{
+			name: "usage distribution",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.Usage.InputUnits++
+				candidate.Usage.OutputUnits--
+			},
+		},
+		{
+			name: "estimated cost",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.Cost.EstimatedMicros--
+			},
+		},
+		{
+			name: "actual cost",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				actual := *candidate.Cost.ActualMicros + 1
+				candidate.Cost.ActualMicros = &actual
+			},
+		},
+		{
+			name: "model",
+			mutate: func(candidate *orchestration.ProviderResult) {
+				candidate.Model.RouteVersion += "-drift"
+			},
+		},
+	}
+	for _, test := range completionDriftCases {
+		t.Run("terminal Provider completion rejects "+test.name+" drift", func(t *testing.T) {
+			candidate := providerResult
+			test.mutate(&candidate)
+			err := store.CompletePreparedProviderJob(ctx, step, run.RunID, candidate)
+			var domain *controlplane.DomainError
+			if !errors.As(err, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+				t.Fatalf("completion drift error = %#v, want %s", err, controlplane.CodeRevisionConflict)
+			}
+
+			var (
+				storedTaskID, storedRequestID      string
+				outputCount, passedQC, actualCount int
+				driftArtifactCount                 int
+			)
+			if err := pool.QueryRow(ctx, `
+				SELECT COALESCE(pj.upstream_task_id, ''),
+				       COALESCE(pj.upstream_request_id, ''),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.run_artifacts
+				        WHERE generation_run_id = gr.id AND role = 'OUTPUT'),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.qc_reports
+				        WHERE generation_run_id = gr.id AND state = 'PASSED'),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.cost_ledger
+				        WHERE provider_job_id = pj.id AND entry_type = 'ACTUAL'),
+				       (SELECT COUNT(*)
+				        FROM video_pipeline.artifacts
+				        WHERE content_hash = $2 AND $2 <> $3)
+				FROM video_pipeline.provider_jobs pj
+				JOIN video_pipeline.generation_attempts ga
+				  ON ga.id = pj.generation_attempt_id
+				JOIN video_pipeline.generation_runs gr
+				  ON gr.id = ga.generation_run_id
+				WHERE gr.id = $1`,
+				run.RunID, candidate.ArtifactDigest, providerResult.ArtifactDigest,
+			).Scan(
+				&storedTaskID, &storedRequestID, &outputCount,
+				&passedQC, &actualCount, &driftArtifactCount,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if storedTaskID != providerResult.UpstreamTaskID ||
+				storedRequestID != providerResult.RequestID ||
+				outputCount != 1 || passedQC != 1 || actualCount != 1 ||
+				driftArtifactCount != 0 {
+				t.Fatalf(
+					"completion drift side effects = task:%q request:%q output:%d qc:%d actual:%d artifact:%d",
+					storedTaskID, storedRequestID, outputCount,
+					passedQC, actualCount, driftArtifactCount,
+				)
+			}
+		})
 	}
 	if err := store.RecordProviderCancellation(
 		ctx, step,
@@ -2744,6 +2907,29 @@ func TestPostgres_WorkflowProjectionClosesQ1AndManifestLineage(t *testing.T) {
 	}
 	if linkedPostArtifacts != 5 {
 		t.Fatalf("linked post-production artifacts = %d, want 5", linkedPostArtifacts)
+	}
+	// final_video is intentionally another OUTPUT binding for every source run.
+	// Terminal Provider replay must compare only the immutable shot_video output,
+	// so a legitimate post-production projection cannot make an exact replay fail.
+	if err := store.CompletePreparedProviderJob(
+		ctx, step, run.RunID, providerResult,
+	); err != nil {
+		t.Fatalf("exact Provider completion replay after post-production: %v", err)
+	}
+	var passedQCAfterPostProduction int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM video_pipeline.qc_reports
+		WHERE generation_run_id = $1 AND state = 'PASSED'`,
+		run.RunID,
+	).Scan(&passedQCAfterPostProduction); err != nil {
+		t.Fatal(err)
+	}
+	if passedQCAfterPostProduction != 1 {
+		t.Fatalf(
+			"Provider completion replay after post-production QC reports = %d, want 1",
+			passedQCAfterPostProduction,
+		)
 	}
 	// A corrected post-production revision commonly reuses the exact UTF-8 SRT
 	// bytes while producing new dialogue/video/manifest bytes. The CAS artifact

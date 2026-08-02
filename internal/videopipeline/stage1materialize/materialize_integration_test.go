@@ -146,6 +146,96 @@ func TestMaterializePersistsAndRepairsImmutableGenerationPlanBindings(t *testing
 	if repairedPlan != legacy.GenerationPlanID {
 		t.Fatalf("repaired generation plan = %q, want %q", repairedPlan, legacy.GenerationPlanID)
 	}
+
+	// Revoice and speech-batch materialization observe only the immutable runs
+	// in their execution package. Model an unrelated run allocating a Provider
+	// job between the before/after observations: the scoped postcondition must
+	// remain stable even though the global table legitimately changes.
+	packageJobsBefore, err := countExecutionPackageProviderJobs(ctx, pool, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var globalJobsBefore int64
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM video_pipeline.provider_jobs`,
+	).Scan(&globalJobsBefore); err != nil {
+		t.Fatal(err)
+	}
+	var legacyAttemptID, capabilitySnapshotID uuid.UUID
+	if err := pool.QueryRow(ctx, `
+		SELECT ga.id,
+		       (SELECT pcs.id
+		        FROM video_pipeline.provider_capability_snapshots pcs
+		        WHERE pcs.provider_profile_id = $2
+		          AND pcs.model_id = $3
+		          AND pcs.route_version = $4
+		          AND pcs.capability_hash = $5
+		        ORDER BY pcs.effective_at DESC
+		        LIMIT 1)
+		FROM video_pipeline.generation_attempts ga
+		WHERE ga.generation_run_id = $1 AND ga.sequence = 1`,
+		uuid.MustParse(legacy.Run.RunID),
+		uuid.MustParse(legacy.ProviderProfileID),
+		legacy.Route.ModelID, legacy.Route.RouteVersion, legacy.Route.CapabilityHash,
+	).Scan(&legacyAttemptID, &capabilitySnapshotID); err != nil {
+		t.Fatal(err)
+	}
+	unrelatedReservationID := uuid.New()
+	unrelatedJobID := uuid.New()
+	insertResult := make(chan error, 1)
+	go func() {
+		_, insertErr := pool.Exec(ctx, `
+			WITH reservation AS (
+			  INSERT INTO video_pipeline.budget_reservations
+			    (id, generation_run_id, amount_micros, currency,
+			     pricing_rule_version, estimate_payload, status,
+			     confirmed_by, confirmed_at)
+			  VALUES ($1, $2, 0, 'CNY', 'integration-unrelated-v1',
+			          '{}'::jsonb, 'RESERVED', 'integration-test', now())
+			)
+			INSERT INTO video_pipeline.provider_jobs
+			  (id, generation_attempt_id, provider_profile_id,
+			   capability_snapshot_id, budget_reservation_id,
+			   idempotency_key, request_hash, request_snapshot, state)
+			VALUES ($3, $4, $5, $6, $1, $7, $8, '{}'::jsonb, 'QUEUED')`,
+			unrelatedReservationID, uuid.MustParse(legacy.Run.RunID),
+			unrelatedJobID, legacyAttemptID, uuid.MustParse(legacy.ProviderProfileID),
+			capabilitySnapshotID, "integration-unrelated-"+unrelatedJobID.String(),
+			strings.Repeat("0", 64),
+		)
+		insertResult <- insertErr
+	}()
+	if err := <-insertResult; err != nil {
+		t.Fatal(err)
+	}
+	packageJobsAfter, err := countExecutionPackageProviderJobs(ctx, pool, initial)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var globalJobsAfter int64
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM video_pipeline.provider_jobs`,
+	).Scan(&globalJobsAfter); err != nil {
+		t.Fatal(err)
+	}
+	if packageJobsAfter != packageJobsBefore || globalJobsAfter != globalJobsBefore+1 {
+		t.Fatalf(
+			"unrelated Provider allocation changed package scope: package %d→%d, global %d→%d",
+			packageJobsBefore, packageJobsAfter, globalJobsBefore, globalJobsAfter,
+		)
+	}
+	if _, err := pool.Exec(ctx, `
+		DELETE FROM video_pipeline.provider_jobs WHERE id = $1`,
+		unrelatedJobID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		DELETE FROM video_pipeline.budget_reservations WHERE id = $1`,
+		unrelatedReservationID,
+	); err != nil {
+		t.Fatal(err)
+	}
 	driftCases := []struct {
 		name       string
 		state      string
