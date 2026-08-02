@@ -52,7 +52,7 @@ func run(args []string, output io.Writer) error {
 		if err := decodeFile(args[3], &child); err != nil {
 			return fmt.Errorf("read stage 1 child execution package: %w", err)
 		}
-		if err := child.ValidateSpeechV2Revision(plan, package_); err != nil {
+		if err := child.ValidateRevision(plan, package_); err != nil {
 			return err
 		}
 		return encodePackage(output, child)
