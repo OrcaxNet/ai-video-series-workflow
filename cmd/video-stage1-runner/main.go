@@ -17,6 +17,7 @@ import (
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/artifactstore"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/postproduction"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
@@ -214,7 +215,7 @@ func run(
 			return fmt.Errorf("connect to Stage 1 finalization Temporal: %w", dialErr)
 		}
 		defer temporalClient.Close()
-		workflowID := "stage1-finalization-" + executionPackage.BatchID + "-" + executionPackage.ContentHash[:16]
+		workflowID := stage1FinalizationWorkflowID(executionPackage)
 		workflowRun, startErr := temporalClient.ExecuteWorkflow(
 			ctx,
 			stage1FinalizationStartOptions(workflowID, temporalTaskQueue),
@@ -236,6 +237,11 @@ func run(
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(result)
+}
+
+func stage1FinalizationWorkflowID(executionPackage stage1.ExecutionPackage) string {
+	return "stage1-finalization-" + executionPackage.BatchID + "-" +
+		executionPackage.ContentHash[:16] + "-" + postproduction.AlgorithmRevision
 }
 
 func stage1FinalizationStartOptions(

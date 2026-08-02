@@ -123,6 +123,17 @@ func TestFFmpegProcessor_RendersDeterministicDelivery(t *testing.T) {
 		first.FinalVideo.FPS != 24 || first.FinalVideo.DurationMillis != 2_000 {
 		t.Fatalf("unexpected final media spec: %#v", first.FinalVideo)
 	}
+	if len(first.AudioTimingCorrections) != 2 ||
+		first.QC.AudioVideoStartP95Millis == nil ||
+		first.QC.SubtitleBoundaryP95Millis == nil ||
+		first.QC.ManualTimingRequired || first.QC.State != "TIMING_PASSED_CER_PENDING" {
+		t.Fatalf("live timing evidence was not measured: %#v %#v", first.QC, first.AudioTimingCorrections)
+	}
+	for _, correction := range first.AudioTimingCorrections {
+		if correction.EndTrimApplied || correction.HardCutDetected {
+			t.Fatalf("live dialogue was hard-cut: %#v", correction)
+		}
+	}
 
 	// The contract mock deliberately stores JSON fixture bytes while labeling
 	// their intended media type. mock_only finalization must turn those lineage

@@ -27,12 +27,13 @@ type CommandPlan struct {
 }
 
 type RenderResult struct {
-	Dialogue        Artifact
-	FinalVideo      Artifact
-	CommandPlanHash string
-	QC              QCReport
-	FFmpegVersion   string
-	FFprobeVersion  string
+	Dialogue               Artifact
+	FinalVideo             Artifact
+	CommandPlanHash        string
+	QC                     QCReport
+	AudioTimingCorrections []AudioTimingCorrection
+	FFmpegVersion          string
+	FFprobeVersion         string
 }
 
 type MediaProcessor interface {
@@ -128,7 +129,11 @@ func (p *FFmpegProcessor) Render(
 		}
 	}
 
-	plan, err := BuildCommandPlan(request, attempts, p.FFmpeg)
+	corrections, err := p.measureSourceTiming(ctx, workdir, request, attempts)
+	if err != nil {
+		return RenderResult{}, err
+	}
+	plan, err := buildCommandPlan(request, attempts, p.FFmpeg, corrections)
 	if err != nil {
 		return RenderResult{}, err
 	}
@@ -141,6 +146,12 @@ func (p *FFmpegProcessor) Render(
 	}
 	for _, command := range plan.Commands {
 		if _, err := p.Runner.Run(ctx, workdir, command.Program, command.Args...); err != nil {
+			return RenderResult{}, err
+		}
+	}
+	if request.Evidence == EvidenceLive {
+		corrections, err = p.measureRenderedTiming(ctx, workdir, request, corrections)
+		if err != nil {
 			return RenderResult{}, err
 		}
 	}
@@ -211,21 +222,25 @@ func (p *FFmpegProcessor) Render(
 	if err != nil {
 		return RenderResult{}, err
 	}
+	qc := QCReport{
+		State:                "STRUCTURAL_PASSED",
+		ActualDurationMillis: probe.DurationMillis,
+		// Mock fixtures cannot establish CER or timing p95. Live media is
+		// measured below from the rendered independent dialogue track.
+		ManualTimingRequired: true,
+		MeasurementEvidence:  request.Evidence,
+	}
+	if request.Evidence == EvidenceLive {
+		qc = measuredTimingQC(probe.DurationMillis, request.Evidence, corrections)
+	}
 	return RenderResult{
-		Dialogue:        dialogue,
-		FinalVideo:      finalVideo,
-		CommandPlanHash: planHash,
-		QC: QCReport{
-			State:                "STRUCTURAL_PASSED",
-			ActualDurationMillis: probe.DurationMillis,
-			// Structural probing cannot establish CER or timing p95. Keep the
-			// manual timing gate closed until a measured live evidence report
-			// supplies those metrics.
-			ManualTimingRequired: true,
-			MeasurementEvidence:  request.Evidence,
-		},
-		FFmpegVersion:  ffmpegVersion,
-		FFprobeVersion: ffprobeVersion,
+		Dialogue:               dialogue,
+		FinalVideo:             finalVideo,
+		CommandPlanHash:        planHash,
+		QC:                     qc,
+		AudioTimingCorrections: corrections,
+		FFmpegVersion:          ffmpegVersion,
+		FFprobeVersion:         ffprobeVersion,
 	}, nil
 }
 
@@ -234,11 +249,27 @@ func BuildCommandPlan(
 	attempts []ProviderAttempt,
 	ffmpeg string,
 ) (CommandPlan, error) {
+	corrections, err := defaultAudioCorrections(request, attempts)
+	if err != nil {
+		return CommandPlan{}, err
+	}
+	return buildCommandPlan(request, attempts, ffmpeg, corrections)
+}
+
+func buildCommandPlan(
+	request Request,
+	attempts []ProviderAttempt,
+	ffmpeg string,
+	corrections []AudioTimingCorrection,
+) (CommandPlan, error) {
 	if err := request.Validate(); err != nil {
 		return CommandPlan{}, err
 	}
 	if len(attempts) != len(request.Subtitle.Cues) {
 		return CommandPlan{}, errors.New("speech attempt count must match subtitle cue count")
+	}
+	if request.Evidence == EvidenceLive && len(corrections) != len(attempts) {
+		return CommandPlan{}, errors.New("live speech correction count must match subtitle cue count")
 	}
 	if ffmpeg == "" {
 		ffmpeg = "ffmpeg"
@@ -288,12 +319,17 @@ func BuildCommandPlan(
 			"-map_metadata", "-1", "-c", "copy", "shots.mkv",
 		},
 	})
-	commands = append(commands, dialogueCommand(request, attempts, ffmpeg))
+	commands = append(commands, dialogueCommand(request, attempts, corrections, ffmpeg))
 	commands = append(commands, finalCommand(request, ffmpeg))
 	return CommandPlan{SchemaVersion: SchemaVersion, Commands: commands}, nil
 }
 
-func dialogueCommand(request Request, attempts []ProviderAttempt, ffmpeg string) Command {
+func dialogueCommand(
+	request Request,
+	attempts []ProviderAttempt,
+	corrections []AudioTimingCorrection,
+	ffmpeg string,
+) Command {
 	duration := seconds(request.DurationMillis())
 	policy := request.Output.withDefaults()
 	args := []string{"-nostdin", "-hide_banner", "-loglevel", "error", "-y"}
@@ -325,12 +361,22 @@ func dialogueCommand(request Request, attempts []ProviderAttempt, ffmpeg string)
 			)
 		}
 		label := fmt.Sprintf("cue%d", index)
-		filterParts = append(filterParts, fmt.Sprintf(
-			"[%d:a]aresample=%d,atrim=duration=%s,asetpts=PTS-STARTPTS,"+
-				"adelay=%d|%d[%s]",
-			index, policy.AudioSampleRate, seconds(cue.EndMillis-cue.StartMillis),
-			cue.StartMillis, cue.StartMillis, label,
-		))
+		if request.Evidence == EvidenceLive {
+			correction := corrections[index]
+			filterParts = append(filterParts, fmt.Sprintf(
+				"[%d:a]aresample=%d,atrim=start=%s,asetpts=PTS-STARTPTS,"+
+					"atempo=%s,adelay=%d|%d[%s]",
+				index, policy.AudioSampleRate, seconds(correction.TrimStartMillis),
+				formatTempo(correction.TempoRatio), cue.StartMillis, cue.StartMillis, label,
+			))
+		} else {
+			filterParts = append(filterParts, fmt.Sprintf(
+				"[%d:a]aresample=%d,atrim=duration=%s,asetpts=PTS-STARTPTS,"+
+					"adelay=%d|%d[%s]",
+				index, policy.AudioSampleRate, seconds(cue.EndMillis-cue.StartMillis),
+				cue.StartMillis, cue.StartMillis, label,
+			))
+		}
 		mixInputs = append(mixInputs, "["+label+"]")
 	}
 	filterParts = append(filterParts, fmt.Sprintf(
@@ -345,6 +391,113 @@ func dialogueCommand(request Request, attempts []ProviderAttempt, ffmpeg string)
 		"dialogue.wav",
 	)
 	return Command{Program: ffmpeg, Args: args}
+}
+
+func defaultAudioCorrections(
+	request Request,
+	attempts []ProviderAttempt,
+) ([]AudioTimingCorrection, error) {
+	if request.Evidence != EvidenceLive {
+		return nil, nil
+	}
+	if len(attempts) != len(request.Subtitle.Cues) {
+		return nil, errors.New("speech attempt count must match subtitle cue count")
+	}
+	corrections := make([]AudioTimingCorrection, 0, len(attempts))
+	for index, attempt := range attempts {
+		correction, err := buildAudioCorrection(
+			request.Subtitle.Cues[index],
+			attempt.Artifact.DurationMillis,
+			silenceWindow{AudibleEndMillis: attempt.Artifact.DurationMillis},
+		)
+		if err != nil {
+			return nil, err
+		}
+		correction.SourceDigest = attempt.Artifact.Digest
+		corrections = append(corrections, correction)
+	}
+	return corrections, nil
+}
+
+func (p *FFmpegProcessor) measureSourceTiming(
+	ctx context.Context,
+	workdir string,
+	request Request,
+	attempts []ProviderAttempt,
+) ([]AudioTimingCorrection, error) {
+	if request.Evidence != EvidenceLive {
+		return nil, nil
+	}
+	corrections := make([]AudioTimingCorrection, 0, len(attempts))
+	for index, attempt := range attempts {
+		inputName := fmt.Sprintf("cue-%03d%s", index, extensionFor(attempt.Artifact.MediaType))
+		output, err := p.Runner.Run(
+			ctx,
+			workdir,
+			p.FFmpeg,
+			"-nostdin", "-hide_banner", "-loglevel", "info",
+			"-i", inputName,
+			"-af", silenceDetectFilter(),
+			"-f", "null", "-",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("measure source timing for cue %q: %w", attempt.CueID, err)
+		}
+		measurement, err := parseSilenceWindow(output, attempt.Artifact.DurationMillis)
+		if err != nil {
+			return nil, fmt.Errorf("parse source timing for cue %q: %w", attempt.CueID, err)
+		}
+		correction, err := buildAudioCorrection(
+			request.Subtitle.Cues[index], attempt.Artifact.DurationMillis, measurement,
+		)
+		if err != nil {
+			return nil, err
+		}
+		correction.SourceDigest = attempt.Artifact.Digest
+		corrections = append(corrections, correction)
+	}
+	return corrections, nil
+}
+
+func (p *FFmpegProcessor) measureRenderedTiming(
+	ctx context.Context,
+	workdir string,
+	request Request,
+	corrections []AudioTimingCorrection,
+) ([]AudioTimingCorrection, error) {
+	if len(corrections) != len(request.Subtitle.Cues) {
+		return nil, errors.New("rendered timing correction count must match subtitle cue count")
+	}
+	measured := append([]AudioTimingCorrection(nil), corrections...)
+	for index, cue := range request.Subtitle.Cues {
+		windowMillis := cue.EndMillis - cue.StartMillis
+		output, err := p.Runner.Run(
+			ctx,
+			workdir,
+			p.FFmpeg,
+			"-nostdin", "-hide_banner", "-loglevel", "info",
+			"-ss", seconds(cue.StartMillis), "-t", seconds(windowMillis),
+			"-i", "dialogue.wav",
+			"-af", silenceDetectFilter(),
+			"-f", "null", "-",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("measure rendered timing for cue %q: %w", cue.ID, err)
+		}
+		window, err := parseSilenceWindow(output, windowMillis)
+		if err != nil {
+			return nil, fmt.Errorf("parse rendered timing for cue %q: %w", cue.ID, err)
+		}
+		measured[index].MeasuredOnsetMillis = window.OnsetMillis
+		measured[index].MeasuredAudibleEndMillis = window.AudibleEndMillis
+		measured[index].MeasuredBoundaryDeviationMillis = absolute(windowMillis - window.AudibleEndMillis)
+		measured[index].HardCutDetected = !window.HasTrailingSilence
+	}
+	return measured, nil
+}
+
+func formatTempo(value float64) string {
+	return strconv.FormatFloat(value, 'f', 9, 64)
 }
 
 func finalCommand(request Request, ffmpeg string) Command {

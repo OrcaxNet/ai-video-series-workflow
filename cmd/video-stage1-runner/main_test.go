@@ -32,6 +32,18 @@ func TestStage1FinalizationStartOptionsRecoverOnlyFailedWorkflow(t *testing.T) {
 	}
 }
 
+func TestStage1FinalizationWorkflowIDIncludesPostProductionAlgorithmRevision(t *testing.T) {
+	t.Parallel()
+	package_ := stage1.ExecutionPackage{
+		BatchID:     "flo104-sample-1",
+		ContentHash: strings.Repeat("a", 64),
+	}
+	want := "stage1-finalization-flo104-sample-1-aaaaaaaaaaaaaaaa-" + postproduction.AlgorithmRevision
+	if got := stage1FinalizationWorkflowID(package_); got != want {
+		t.Fatalf("workflow ID = %q, want %q", got, want)
+	}
+}
+
 func TestValidateImmutableExecutionPackageClassifiesMalformedRevisionParent(t *testing.T) {
 	t.Parallel()
 	package_ := stage1.ExecutionPackage{

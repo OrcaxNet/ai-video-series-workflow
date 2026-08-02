@@ -181,11 +181,13 @@ func (s *Service) Finalize(ctx context.Context, request Request) (Result, error)
 		"outputs": []Artifact{
 			subtitleArtifact, rendered.Dialogue, rendered.FinalVideo, serviceBOM,
 		},
-		"gates":           request.Gates,
-		"qc":              rendered.QC,
-		"commandPlanHash": rendered.CommandPlanHash,
-		"aiContentMarker": true,
-		"traceId":         request.TraceID,
+		"gates":                           request.Gates,
+		"qc":                              rendered.QC,
+		"audioTimingCorrections":          rendered.AudioTimingCorrections,
+		"postProductionAlgorithmRevision": AlgorithmRevision,
+		"commandPlanHash":                 rendered.CommandPlanHash,
+		"aiContentMarker":                 true,
+		"traceId":                         request.TraceID,
 	}
 	manifestBytes, err := canonicalJSON(manifestPayload)
 	if err != nil {
