@@ -129,14 +129,8 @@ func run(
 	}
 	var runner *stage1.Runner
 	retryPath, hasRetryPath := lookup("VIDEO_STAGE1_RETRY_PACKAGE_PATH")
-	if supersession != nil {
-		if parentExecutionPackage != nil || strings.TrimSpace(retryPath) != "" {
-			return errors.New("FLO-167 supersession cannot be combined with a revision parent or controlled retry package")
-		}
-		runner, err = stage1.NewRunnerWithFLO167Supersession(
-			gate, adapter, artifacts, store, executionPackage, *supersession,
-		)
-	} else if strings.TrimSpace(retryPath) != "" {
+	var retryPackage *stage1.ControlledRetryPackage
+	if strings.TrimSpace(retryPath) != "" {
 		retryFile, openErr := os.Open(retryPath)
 		if openErr != nil {
 			if args[0] == "retry" || args[0] == "finalize-input" {
@@ -144,14 +138,30 @@ func run(
 			}
 		} else {
 			defer retryFile.Close()
-			var retryPackage stage1.ControlledRetryPackage
-			if decodeErr := decodeOne(retryFile, &retryPackage); decodeErr != nil {
+			var decoded stage1.ControlledRetryPackage
+			if decodeErr := decodeOne(retryFile, &decoded); decodeErr != nil {
 				return fmt.Errorf("decode immutable stage 1 controlled retry package: %w", decodeErr)
 			}
-			runner, err = stage1.NewRunnerWithControlledRetry(
-				gate, adapter, artifacts, store, executionPackage, retryPackage,
+			retryPackage = &decoded
+		}
+	}
+	if supersession != nil {
+		if parentExecutionPackage != nil {
+			return errors.New("FLO-167 supersession cannot be combined with a revision parent")
+		}
+		if retryPackage != nil {
+			runner, err = stage1.NewRunnerWithFLO167SupersessionControlledRetry(
+				gate, adapter, artifacts, store, executionPackage, *supersession, *retryPackage,
+			)
+		} else {
+			runner, err = stage1.NewRunnerWithFLO167Supersession(
+				gate, adapter, artifacts, store, executionPackage, *supersession,
 			)
 		}
+	} else if retryPackage != nil {
+		runner, err = stage1.NewRunnerWithControlledRetry(
+			gate, adapter, artifacts, store, executionPackage, *retryPackage,
+		)
 	}
 	if runner == nil && err == nil {
 		if args[0] == "retry" {

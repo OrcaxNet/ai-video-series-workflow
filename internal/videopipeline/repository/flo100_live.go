@@ -73,6 +73,50 @@ type stage1LiveRun struct {
 	PredictedAFPMilli    int64
 }
 
+// FailPreparedProviderJob freezes an authenticated terminal failure against
+// the exact prepared request. Stage 1 controlled retry materialization depends
+// on this PostgreSQL evidence; a local ledger entry alone is never sufficient.
+func (p *Postgres) FailPreparedProviderJob(
+	ctx context.Context,
+	step orchestration.WorkflowStep,
+	runIDRaw string,
+	response providercontract.JobResponse,
+) error {
+	runID, err := uuid.Parse(runIDRaw)
+	if err != nil {
+		return errors.New("runId must be a UUID")
+	}
+	if response.State != providercontract.StatusFailed || response.Error == nil ||
+		strings.TrimSpace(string(response.Error.Code)) == "" ||
+		strings.TrimSpace(response.UpstreamTaskID) == "" || strings.TrimSpace(response.RequestID) == "" {
+		return controlplane.NewConflictError(controlplane.CodeRevisionConflict, "stage 1 failure evidence is incomplete")
+	}
+	expectedJobID := uuid.NewSHA1(runID, []byte("provider-job"))
+	var requestSnapshot []byte
+	if err := p.pool.QueryRow(ctx, `SELECT pj.request_snapshot
+		FROM video_pipeline.provider_jobs pj
+		JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id
+		WHERE ga.generation_run_id=$1 AND pj.id=$2`, runID, expectedJobID).Scan(&requestSnapshot); err != nil {
+		return fmt.Errorf("read prepared Provider failure input: %w", err)
+	}
+	var prepared immutableProviderRequest
+	if json.Unmarshal(requestSnapshot, &prepared) != nil || prepared.Input.Run.RunID != runIDRaw ||
+		!prepared.Input.PersistProductTruth {
+		return controlplane.NewConflictError(controlplane.CodeRevisionConflict, "prepared Provider failure input drifted")
+	}
+	return p.RecordProviderCancellation(
+		ctx, step,
+		orchestration.CancelProviderJobInput{
+			OperationID: uuid.NewSHA1(runID, []byte("stage1-terminal-failure")).String(),
+			Dispatch:    prepared.Input, ReasonCode: "STAGE1_TERMINAL_FAILURE", TraceID: step.TraceID,
+		},
+		orchestration.CancelProviderResult{
+			State: "FAILED", UpstreamTaskID: response.UpstreamTaskID, RequestID: response.RequestID,
+			Usage: response.Usage, Cost: response.Cost, ErrorCode: string(response.Error.Code),
+		},
+	)
+}
+
 type flo100LiveFinalizationAuthority struct {
 	ActivationID           uuid.UUID
 	ControlSeriesID        uuid.UUID
@@ -110,7 +154,7 @@ func readFLO100LiveFinalizationAuthority(
 		            AND NOT (cr.primary_run_id=ANY($3::uuid[]))
 		            AND (SELECT COUNT(*) FROM video_pipeline.stage1_live_activation_runs ar
 		                 WHERE ar.activation_id=a.id AND ar.run_id=ANY($3::uuid[]))=9))),
-		  EXISTS (SELECT 1 FROM video_pipeline.stage1_live_submit_authorizations sa
+		  (EXISTS (SELECT 1 FROM video_pipeline.stage1_live_submit_authorizations sa
 		          JOIN video_pipeline.stage1_live_projection_seals ps ON ps.activation_id=a.id
 		          WHERE sa.activation_id=a.id AND sa.source_code_commit=a.source_code_commit
 		            AND sa.execution_package_hash=a.live_execution_package_hash
@@ -119,7 +163,19 @@ func readFLO100LiveFinalizationAuthority(
 			            AND (sa.authorization_payload->'decision'->>'batchAProviderPostAuthorizedConditionally')::boolean=true
 			            AND (sa.authorization_payload->'decision'->>'batchBProviderPostAuthorized')::boolean=false
 			            AND (sa.authorization_payload->'decision'->>'batchCProviderPostAuthorized')::boolean=false
-			            AND (sa.authorization_payload->'decision'->>'stage4Authorized')::boolean=false),
+			            AND (sa.authorization_payload->'decision'->>'stage4Authorized')::boolean=false)
+		   OR EXISTS (SELECT 1 FROM video_pipeline.stage1_live_supersessions s
+		       JOIN video_pipeline.stage1_live_supersession_authorizations sa
+		         ON sa.supersession_id=s.id AND sa.authorization_hash=s.authorization_hash
+		       WHERE s.legacy_activation_id=a.id AND s.state='A02_submitted'
+		         AND sa.execution_package_hash=s.execution_package_hash
+		         AND sa.projection_hash=s.canonical_projection_hash AND sa.valid_until>$4
+		         AND (sa.payload->'decision'->>'a02A10ProviderPostAuthorizedConditionally')::boolean=true
+		         AND (sa.payload->'decision'->>'batchBProviderPostAuthorized')::boolean=false
+		         AND (sa.payload->'decision'->>'batchCProviderPostAuthorized')::boolean=false
+		         AND (sa.payload->'decision'->>'stage4Authorized')::boolean=false
+		         AND (SELECT COUNT(*) FROM video_pipeline.stage1_live_supersession_terminal_ledger tl
+		              WHERE tl.supersession_id=s.id)=9)),
 			  ((SELECT COUNT(*) FROM video_pipeline.approval_decisions d
 			    WHERE d.id=ANY(ARRAY[a.g1_decision_id,a.g2_decision_id,a.safety_decision_id])
 			      AND d.series_id=a.control_series_id AND d.episode_id IS NULL
@@ -295,7 +351,8 @@ func readStage1ControlledRetryAuthority(
 		       sa.valid_until,COALESCE(ps.projection_hash,''),
 		       ar.ordinal,cr.retry_run_id,ar.offline_run_id,gr.shot_spec_revision_id,
 		       gr.prompt_snapshot_id,p.content_hash,ar.authorized_prompt_hash,ar.intent_input_hash,
-		       ar.estimated_video_tokens,ar.predicted_afp_milli,
+		       (cr.controlled_retry_package->'job'->>'estimatedVideoTokens')::bigint,
+		       (cr.controlled_retry_package->'job'->>'predictedAfpMilli')::bigint,
 		       cr.controlled_retry_package_hash,cr.retry_approval_id,cr.duplicate_task_evidence_id,
 		       cr.primary_failure_class,cr.primary_failure_evidence_hash,cr.primary_run_id
 		FROM video_pipeline.stage1_live_controlled_retries cr

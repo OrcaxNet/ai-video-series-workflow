@@ -131,6 +131,7 @@ func (s *runnerTruthFixture) PrepareProviderJob(
 		truth.EstimatedVideoTokens = expected.EstimatedVideoTokens
 		truth.PredictedAFPMilli = expected.PredictedAFPMilli
 		truth.BillingMode = expected.BillingMode
+		truth.ControlledRetryPackageHash = expected.ControlledRetryPackageHash
 		truth.SupersessionPackageHash = expected.SupersessionPackageHash
 		truth.DurationPricing = expected.DurationPricing
 		truth.RouteBindingHash = expected.RouteBindingHash
@@ -169,6 +170,18 @@ func (s *runnerTruthFixture) CompletePreparedProviderJob(
 	_ orchestration.WorkflowStep,
 	_ string,
 	_ orchestration.ProviderResult,
+) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.completes++
+	return s.completeErr
+}
+
+func (s *runnerTruthFixture) FailPreparedProviderJob(
+	_ context.Context,
+	_ orchestration.WorkflowStep,
+	_ string,
+	_ providercontract.JobResponse,
 ) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -939,6 +952,99 @@ func TestNewRunnerWithFLO167SupersessionSubmitsA02AfterLegacyA01(t *testing.T) {
 	_, posts := fixture.counts()
 	if posts != 1 {
 		t.Fatalf("provider posts=%d, want 1", posts)
+	}
+}
+
+func TestNewRunnerWithFLO167SupersessionAllowsOneDurationNormalizedA02Retry(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ledger.json")
+	plan := testFLO167Plan()
+	legacy := testFLO167LegacyExecutionPackage(t, plan)
+	supersession := validFLO167Package(t)
+	supersession.LegacyExecutionPackageHash = legacy.ContentHash
+	supersession.LegacyAuthorizationHash = legacy.LiveActivation.SourceAuthorizationHash
+	var err error
+	supersession, err = SealFLO167SupersessionPackage(supersession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate, err := Open(plan, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindExecutionPackage(legacy.ContentHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindFLO167Supersession(supersession); err != nil {
+		t.Fatal(err)
+	}
+	primary := legacy.PrimaryJobs[1]
+	binding, _ := supersession.Shot(primary.ShotID)
+	primaryAttempt := attemptFromFrozen(primary, nil)
+	primaryAttempt.PredictedAFPMilli = binding.Pricing.ExpectedAFPMilli
+	if _, err := gate.Authorize(primaryAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Complete(primary.IdempotencyKey, Completion{
+		State: "TERMINAL_FAILED", ProviderTaskID: "failed-a02", ActualVideoTokens: 87_300,
+		ActualAFPMilli: binding.Pricing.ExpectedAFPMilli, EvidenceComplete: true,
+		FailureClass: string(providercontract.CodeUnavailable),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	retryJob := primary
+	retryJob.AttemptID = "flo167-controlled-retry-a02"
+	retryJob.Run = orchestration.GenerationRunRef{
+		RunID:         uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo167-retry-a02")).String(),
+		RunSpecDigest: strings.Repeat("e", 64), Attempt: primary.Run.Attempt + 1,
+	}
+	retryJob.IdempotencyKey = "provider-job-" + retryJob.Run.RunID
+	retryJob.PredictedAFPMilli = binding.Pricing.ExpectedAFPMilli
+	retryJob.ActivityID = "retry-GOLD-A02"
+	retryJob.TraceID = "flo167-controlled-retry-GOLD-A02"
+	postProduction := legacy.PostProduction
+	postProduction.RunIDs = append([]string(nil), postProduction.RunIDs...)
+	postProduction.RunIDs[1] = retryJob.Run.RunID
+	retry, err := SealControlledRetryPackage(ControlledRetryPackage{
+		SchemaVersion: ControlledRetryPackageSchemaVersion, BatchID: legacy.BatchID,
+		ParentExecutionPackageHash: legacy.ContentHash, Job: retryJob,
+		Approval: RetryApproval{
+			ApprovalID:        uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo167-retry-approval")).String(),
+			OriginalAttemptID: primary.AttemptID, FailureClass: string(providercontract.CodeUnavailable),
+			DuplicateTaskEvidenceID: uuid.NewSHA1(uuid.NameSpaceOID, []byte("flo167-retry-evidence")).String(),
+		},
+		PostProduction: postProduction,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := strings.Repeat("a", 64)
+	fixture := &runnerAdapterFixture{job: successfulRunnerJob(digest)}
+	server := httptest.NewServer(http.HandlerFunc(fixture.handler))
+	defer server.Close()
+	adapter, err := NewAdapterSubmitter(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner, err := NewRunnerWithFLO167SupersessionControlledRetry(
+		gate, adapter, runnerArtifactFixture{digests: map[string]bool{digest: true}},
+		&runnerTruthFixture{executionPackage: legacy, controlledRetry: &retry},
+		legacy, supersession, retry,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runner.SubmitControlledRetry(t.Context(), SubmitInput{ShotID: "GOLD-A02"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, posts := fixture.counts(); posts != 1 {
+		t.Fatalf("controlled retry Provider POSTs=%d, want 1", posts)
+	}
+	if _, err := runner.SubmitControlledRetry(t.Context(), SubmitInput{ShotID: "GOLD-A02"}); err != nil {
+		t.Fatalf("controlled retry replay error=%v", err)
+	}
+	if _, posts := fixture.counts(); posts != 1 {
+		t.Fatalf("controlled retry replay Provider POSTs=%d, want 1", posts)
 	}
 }
 

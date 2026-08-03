@@ -1816,7 +1816,10 @@ func (p *Postgres) PrepareProviderJob(
 				if err != nil {
 					return orchestration.PreparedProviderJob{}, err
 				}
-				if err := recordFLO167Submission(ctx, tx, flo167Boundary, attemptID, input, p.now().UTC()); err != nil {
+				if err := recordFLO167Submission(
+					ctx, tx, flo167Boundary, attemptID, input,
+					liveAuthority != nil && liveAuthority.IsControlledRetry, p.now().UTC(),
+				); err != nil {
 					return orchestration.PreparedProviderJob{}, err
 				}
 			}
@@ -1914,7 +1917,10 @@ func (p *Postgres) PrepareProviderJob(
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
-		if err := recordFLO167Submission(ctx, tx, flo167Boundary, attemptID, input, p.now().UTC()); err != nil {
+		if err := recordFLO167Submission(
+			ctx, tx, flo167Boundary, attemptID, input,
+			liveAuthority != nil && liveAuthority.IsControlledRetry, p.now().UTC(),
+		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
 		if _, err := tx.Exec(ctx, `

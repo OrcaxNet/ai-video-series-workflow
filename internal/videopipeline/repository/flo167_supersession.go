@@ -177,6 +177,32 @@ func requireFLO167Supersession(
 		!envelope.Decision.A02A10 || envelope.Decision.B || envelope.Decision.C || envelope.Decision.Stage4 {
 		return nil, controlplane.NewPolicyError(controlplane.CodeForbidden, "FLO-167 v3 authorization scope drifted", "obtain an A02-A10-only authorization")
 	}
+	if authority.IsControlledRetry {
+		var exactRetryBinding bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+			SELECT 1
+			FROM video_pipeline.stage1_live_supersession_controlled_retries sr
+			JOIN video_pipeline.stage1_live_supersession_submissions sub
+			  ON sub.supersession_id=sr.supersession_id AND sub.shot_id=sr.shot_id
+			JOIN video_pipeline.generation_attempts ga
+			  ON ga.id=sr.retry_attempt_id AND ga.generation_run_id=$2 AND ga.sequence=1
+			WHERE sr.supersession_id=$1 AND sr.activation_id=$3 AND sr.shot_id=$4
+			  AND sr.primary_attempt_id=sub.attempt_id
+			  AND sr.controlled_retry_package_hash=$5
+			  AND sr.retry_approval_id=$6 AND sr.duplicate_task_evidence_id=$7
+			  AND sr.supersession_package_hash=$8
+			  AND sr.canonical_projection_hash=$9 AND sr.authorization_hash=$10
+			  AND sr.pricing_snapshot_digest=$11
+		)`, result.SupersessionID, authority.Run.RunID, authority.ActivationID, shot.ShotID,
+			authority.ControlledRetryPackageHash, authority.RetryApprovalID,
+			authority.DuplicateTaskEvidenceID, packageHash, projectionHash, *authHash,
+			pricing.PricingSnapshotDigest).Scan(&exactRetryBinding); err != nil {
+			return nil, fmt.Errorf("verify FLO-167 controlled retry binding: %w", err)
+		}
+		if !exactRetryBinding {
+			return nil, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "FLO-167 controlled retry binding is absent or drifted")
+		}
+	}
 	if state == "v3_authorized_A02_A10" && shot.ShotID != "GOLD-A02" {
 		return nil, controlplane.NewPolicyError(controlplane.CodeForbidden, "FLO-167 continuation must begin with GOLD-A02", "submit the exact next shot")
 	}
@@ -321,12 +347,41 @@ func reserveFLO167AFP(
 	return nil
 }
 
-func recordFLO167Submission(ctx context.Context, tx pgx.Tx, boundary *flo167PaidBoundary, attemptID uuid.UUID, input orchestration.ExecuteProviderJobInput, now time.Time) error {
+func recordFLO167Submission(
+	ctx context.Context,
+	tx pgx.Tx,
+	boundary *flo167PaidBoundary,
+	attemptID uuid.UUID,
+	input orchestration.ExecuteProviderJobInput,
+	controlledRetry bool,
+	now time.Time,
+) error {
 	if boundary == nil {
 		return nil
 	}
 	if boundary.QuotaSnapshotID == uuid.Nil {
 		return errors.New("FLO-167 submission has no same-transaction quota snapshot")
+	}
+	if controlledRetry {
+		idempotencyKey := "provider-job-" + input.Run.RunID
+		if _, err := tx.Exec(ctx, `INSERT INTO video_pipeline.stage1_live_supersession_controlled_retry_submissions
+			(supersession_id,retry_attempt_id,quota_snapshot_id,idempotency_key,created_at)
+			VALUES ($1,$2,$3,$4,$5) ON CONFLICT (supersession_id) DO NOTHING`,
+			boundary.SupersessionID, attemptID, boundary.QuotaSnapshotID, idempotencyKey, now); err != nil {
+			return fmt.Errorf("record FLO-167 controlled retry submission: %w", err)
+		}
+		var storedAttempt, storedQuota uuid.UUID
+		var storedKey string
+		if err := tx.QueryRow(ctx, `SELECT retry_attempt_id,quota_snapshot_id,idempotency_key
+			FROM video_pipeline.stage1_live_supersession_controlled_retry_submissions
+			WHERE supersession_id=$1 FOR SHARE`, boundary.SupersessionID).Scan(
+			&storedAttempt, &storedQuota, &storedKey); err != nil {
+			return fmt.Errorf("verify FLO-167 controlled retry submission: %w", err)
+		}
+		if storedAttempt != attemptID || storedQuota != boundary.QuotaSnapshotID || storedKey != idempotencyKey {
+			return controlplane.NewConflictError(controlplane.CodeRevisionConflict, "existing FLO-167 controlled retry submission drifted")
+		}
+		return nil
 	}
 	b := boundary.Shot
 	idempotencyKey := "provider-job-" + input.Run.RunID
@@ -382,11 +437,28 @@ func recordFLO167Terminal(
 	var duration, referenceAFP, referenceDuration, expectedAFP, maximumDrift int64
 	var pricingID, pricingDigest, pricingRule, normalization, rounding string
 	var routeHash, g1Hash, g2Hash, safetyHash, completedHash, canonicalHash, semanticHash string
-	err := tx.QueryRow(ctx, `SELECT supersession_id,shot_id,duration_ms,pricing_snapshot_id,
-		pricing_snapshot_digest,reference_afp_milli,reference_duration_ms,expected_afp_milli,
-		pricing_rule_version,maximum_drift_basis_points,normalization_version,rounding_version,
-		route_hash,g1_hash,g2_hash,safety_hash,completed_set_hash,canonical_input_hash,semantic_input_hash
-		FROM video_pipeline.stage1_live_supersession_submissions WHERE attempt_id=$1 FOR SHARE`, attemptID).Scan(
+	err := tx.QueryRow(ctx, `WITH binding AS (
+		SELECT s.supersession_id,s.shot_id,s.duration_ms,s.pricing_snapshot_id,
+		       s.pricing_snapshot_digest,s.reference_afp_milli,s.reference_duration_ms,s.expected_afp_milli,
+		       s.pricing_rule_version,s.maximum_drift_basis_points,s.normalization_version,s.rounding_version,
+		       s.route_hash,s.g1_hash,s.g2_hash,s.safety_hash,s.completed_set_hash,s.canonical_input_hash,s.semantic_input_hash
+		FROM video_pipeline.stage1_live_supersession_submissions s WHERE s.attempt_id=$1
+		UNION ALL
+		SELECT s.supersession_id,s.shot_id,s.duration_ms,s.pricing_snapshot_id,
+		       s.pricing_snapshot_digest,s.reference_afp_milli,s.reference_duration_ms,s.expected_afp_milli,
+		       s.pricing_rule_version,s.maximum_drift_basis_points,s.normalization_version,s.rounding_version,
+		       s.route_hash,s.g1_hash,s.g2_hash,s.safety_hash,s.completed_set_hash,s.canonical_input_hash,s.semantic_input_hash
+		FROM video_pipeline.stage1_live_supersession_controlled_retry_submissions rs
+		JOIN video_pipeline.stage1_live_supersession_controlled_retries r ON r.supersession_id=rs.supersession_id
+		JOIN video_pipeline.stage1_live_supersession_submissions s
+		  ON s.supersession_id=r.supersession_id AND s.shot_id=r.shot_id
+		WHERE rs.retry_attempt_id=$1
+	)
+	SELECT supersession_id,shot_id,duration_ms,pricing_snapshot_id,
+	       pricing_snapshot_digest,reference_afp_milli,reference_duration_ms,expected_afp_milli,
+	       pricing_rule_version,maximum_drift_basis_points,normalization_version,rounding_version,
+	       route_hash,g1_hash,g2_hash,safety_hash,completed_set_hash,canonical_input_hash,semantic_input_hash
+	FROM binding`, attemptID).Scan(
 		&supersessionID, &shotID, &duration, &pricingID, &pricingDigest, &referenceAFP,
 		&referenceDuration, &expectedAFP, &pricingRule, &maximumDrift, &normalization, &rounding,
 		&routeHash, &g1Hash, &g2Hash, &safetyHash, &completedHash, &canonicalHash, &semanticHash)

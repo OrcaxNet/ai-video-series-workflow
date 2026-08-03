@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -449,6 +450,310 @@ func TestFLO167RunnerPaidBoundary(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestFLO167ControlledRetryIsBoundOnceAndConcurrentSubmitPostsOnce(t *testing.T) {
+	primaryDSN := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
+	if primaryDSN == "" {
+		t.Skip("VIDEO_TEST_POSTGRES_DSN is required")
+	}
+	ctx := t.Context()
+	package_, projection, legacy, plan := loadFLO167RunnerFixtures(t)
+	dsn := newFLO167FixtureDatabase(t, ctx, primaryDSN, 90)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	activationID := legacy.LiveActivation.ActivationID
+	if err := MaterializeFLO167Supersession(ctx, pool, FLO167Materialization{
+		LegacyActivationID: activationID, Package: package_, Projection: projection, CreatedAt: now,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"schemaVersion":           "flo100.batch-a-continuation-authorization.v3",
+		"supersessionPackageHash": package_.ContentHash, "canonicalProjectionHash": projection.ContentHash,
+		"pricingSnapshotDigest": package_.Shots[0].Pricing.PricingSnapshotDigest,
+		"decision": map[string]bool{"a02A10ProviderPostAuthorizedConditionally": true,
+			"batchBProviderPostAuthorized": false, "batchCProviderPostAuthorized": false, "stage4Authorized": false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AuthorizeFLO167Supersession(ctx, pool, FLO167Authorization{
+		LegacyActivationID: activationID, Payload: payload, IssuedAt: now, ValidUntil: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	gate, err := stage1.Open(plan, filepath.Join(t.TempDir(), "ledger.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.BindExecutionPackage(legacy.ContentHash); err != nil {
+		t.Fatal(err)
+	}
+	a01, a02 := legacy.PrimaryJobs[0], legacy.PrimaryJobs[1]
+	if _, err := gate.Authorize(stage1.Attempt{
+		AttemptID: a01.AttemptID, ShotID: a01.ShotID, IdempotencyKey: a01.IdempotencyKey,
+		EstimatedVideoTokens: a01.EstimatedVideoTokens, PredictedAFPMilli: a01.PredictedAFPMilli,
+		EstimatedNonSubscriptionCashMicros: a01.EstimatedNonSubscriptionCashMicros,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gate.Complete(a01.IdempotencyKey, stage1.Completion{
+		State: "TERMINAL_SUCCEEDED", ProviderTaskID: "legacy-a01", ActualVideoTokens: 87_300,
+		ActualAFPMilli: 2_007_900, EvidenceComplete: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	created := make(map[string]providercontract.JobRequest)
+	primaryFailed := false
+	retrySucceeded := false
+	retryJobID := ""
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch request.Method {
+		case http.MethodGet:
+			key := strings.TrimPrefix(request.URL.Path, "/v1/jobs/")
+			job, ok := created[key]
+			if !ok {
+				w.WriteHeader(http.StatusNotFound)
+				_ = json.NewEncoder(w).Encode(map[string]any{"error": &providercontract.Error{
+					Code: providercontract.CodeNotFound, SafeMessage: "job not found",
+				}})
+				return
+			}
+			response := providercontract.JobResponse{JobID: job.JobID, RunID: job.RunID,
+				UpstreamTaskID: "task-" + job.JobID, RequestID: "request-" + job.JobID,
+				State: providercontract.StatusQueued, Model: job.Model}
+			if job.JobID == a02.IdempotencyKey && primaryFailed {
+				zero := int64(0)
+				response.State = providercontract.StatusFailed
+				response.Error = &providercontract.Error{Code: providercontract.ErrorCode("TRANSIENT"), SafeMessage: "classified transient failure"}
+				response.Usage = providercontract.Usage{VideoTokens: 87_300}
+				response.Cost = providercontract.Cost{ActualMicros: &zero, Currency: "CNY",
+					PricingVersion: "agent-plan-subscription-v1", BillingMode: "subscription_included", Verified: true}
+			} else if job.JobID == retryJobID && retrySucceeded {
+				zero := int64(0)
+				digest := strings.Repeat("d", 64)
+				response.State = providercontract.StatusSucceeded
+				response.Artifacts = []providercontract.AssetRef{{
+					ID: "retry-video", Revision: digest, Kind: providercontract.ModalityVideo,
+					Role: providercontract.AssetRoleOutput, URI: "cas://sha256/" + digest,
+					SHA256: digest, LicenseReference: "license-retry", MediaType: "video/mp4", SizeBytes: 10,
+				}}
+				response.Usage = providercontract.Usage{VideoTokens: 87_300}
+				response.Cost = providercontract.Cost{ActualMicros: &zero, Currency: "CNY",
+					PricingVersion: "agent-plan-subscription-v1", BillingMode: "subscription_included", Verified: true}
+			}
+			_ = json.NewEncoder(w).Encode(response)
+		case http.MethodPost:
+			var job providercontract.JobRequest
+			if err := json.NewDecoder(request.Body).Decode(&job); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			posts++
+			created[job.JobID] = job
+			_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+				JobID: job.JobID, RunID: job.RunID, UpstreamTaskID: "task-" + job.JobID,
+				State: providercontract.StatusQueued, Model: job.Model,
+			})
+		default:
+			http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+	adapter, err := stage1.NewAdapterSubmitter(server.URL, server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := repository.NewForPool(pool)
+	runner, err := stage1.NewRunnerWithFLO167Supersession(
+		gate, adapter, flo167ArtifactVerifier{}, store, legacy, package_)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quota := orchestration.SubscriptionQuotaSnapshot{
+		SchemaVersion: "ark.agent-plan-quota.v1", Source: "integration-test", CapturedAt: now,
+		AccountID: "flo167-retry-account", Profile: "agent-plan_cn-beijing_personal", Region: "cn-beijing",
+		BillingMode: "subscription_included_only", FiveHourTotalAFPMilli: 135_000_000,
+		WeeklyTotalAFPMilli: 135_000_000, MonthlyTotalAFPMilli: 135_000_000,
+	}
+	if _, err := runner.Submit(ctx, stage1.SubmitInput{ShotID: a02.ShotID, QuotaSnapshot: &quota}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	primaryFailed = true
+	mu.Unlock()
+	if _, err := runner.Complete(ctx, stage1.CompleteInput{
+		IdempotencyKey: a02.IdempotencyKey, ActualAFPMilli: package_.Shots[1].Pricing.ExpectedAFPMilli,
+		EvidenceComplete: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	primaryRunID := mustUUID(a02.Run.RunID)
+	primaryProviderJobID := uuid.NewSHA1(primaryRunID, []byte("provider-job"))
+	var evidence controlledRetryTerminalEvidence
+	if err := pool.QueryRow(ctx, `SELECT gr.state,COALESCE(gr.failure_class,''),ga.state,pj.id,pj.state,
+		COALESCE(pj.upstream_task_id,''),COALESCE(pj.upstream_request_id,''),COALESCE(pj.error_code,''),
+		COALESCE(pj.error_snapshot,'{}'::jsonb),pj.terminal_at,br.status,
+		(SELECT COUNT(*) FROM video_pipeline.cost_ledger cl WHERE cl.provider_job_id=pj.id AND cl.budget_reservation_id=br.id)
+		FROM video_pipeline.generation_runs gr
+		JOIN video_pipeline.generation_attempts ga ON ga.generation_run_id=gr.id AND ga.sequence=1
+		JOIN video_pipeline.provider_jobs pj ON pj.generation_attempt_id=ga.id
+		JOIN video_pipeline.budget_reservations br ON br.id=pj.budget_reservation_id
+		WHERE gr.id=$1`, primaryRunID).Scan(
+		&evidence.GenerationRunState, &evidence.RunFailureClass, &evidence.AttemptState,
+		&evidence.ProviderJobID, &evidence.ProviderJobState, &evidence.UpstreamTaskID,
+		&evidence.UpstreamRequestID, &evidence.ErrorCode, &evidence.ErrorSnapshot,
+		&evidence.TerminalAt, &evidence.ReservationStatus, &evidence.CostEvidenceCount,
+	); err != nil {
+		t.Fatal(err)
+	}
+	evidenceHash, err := digest(evidence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateEvidenceID := uuid.NewSHA1(primaryProviderJobID, []byte("duplicate-task-evidence:"+evidenceHash))
+	retry := testFLO100LiveControlledRetry(t, pool, plan, legacy, a02, duplicateEvidenceID)
+	retry.Job.PredictedAFPMilli = package_.Shots[1].Pricing.ExpectedAFPMilli
+	retry.Approval.FailureClass = "TRANSIENT"
+	retry, err = stage1.SealControlledRetryPackage(retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	retryJobID = retry.Job.IdempotencyKey
+	mu.Unlock()
+	if err := BindFLO167ControlledRetry(ctx, pool, plan, legacy, package_, retry); err != nil {
+		t.Fatal(err)
+	}
+	if err := BindFLO167ControlledRetry(ctx, pool, plan, legacy, package_, retry); err != nil {
+		t.Fatalf("exact retry authority replay: %v", err)
+	}
+	competing := retry
+	competing.Approval.ApprovalID = uuid.NewString()
+	competing, err = stage1.SealControlledRetryPackage(competing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := BindFLO167ControlledRetry(ctx, pool, plan, legacy, package_, competing); err == nil {
+		t.Fatal("second Batch A controlled retry authority was accepted")
+	}
+
+	retryRunner, err := stage1.NewRunnerWithFLO167SupersessionControlledRetry(
+		gate, adapter, flo167ArtifactVerifier{}, store, legacy, package_, retry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	staleQuota := quota
+	staleQuota.CapturedAt = now.Add(-10 * time.Minute)
+	if _, err := retryRunner.SubmitControlledRetry(ctx, stage1.SubmitInput{
+		ShotID: a02.ShotID, QuotaSnapshot: &staleQuota,
+	}); err == nil {
+		t.Fatal("controlled retry accepted stale quota")
+	}
+	mu.Lock()
+	postsBeforeRetry := posts
+	mu.Unlock()
+	var rejectedSubmissions, rejectedJobs int
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM video_pipeline.stage1_live_supersession_controlled_retry_submissions),
+		(SELECT count(*) FROM video_pipeline.provider_jobs pj
+		 JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id
+		 WHERE ga.generation_run_id=$1)`, mustUUID(retry.Job.Run.RunID)).Scan(
+		&rejectedSubmissions, &rejectedJobs); err != nil {
+		t.Fatal(err)
+	}
+	if postsBeforeRetry != 1 || rejectedSubmissions != 0 || rejectedJobs != 0 {
+		t.Fatalf("stale retry crossed boundary: posts/submissions/jobs=%d/%d/%d", postsBeforeRetry, rejectedSubmissions, rejectedJobs)
+	}
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := retryRunner.SubmitControlledRetry(ctx, stage1.SubmitInput{ShotID: a02.ShotID, QuotaSnapshot: &quota})
+			errs <- err
+		}()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent controlled retry submit: %v", err)
+		}
+	}
+	mu.Lock()
+	gotPosts := posts
+	mu.Unlock()
+	if gotPosts != 2 {
+		t.Fatalf("primary + controlled retry Provider POSTs=%d, want 2", gotPosts)
+	}
+	var authorities, submissions, retryJobs int
+	if err := pool.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM video_pipeline.stage1_live_supersession_controlled_retries),
+		(SELECT count(*) FROM video_pipeline.stage1_live_supersession_controlled_retry_submissions),
+		(SELECT count(*) FROM video_pipeline.provider_jobs pj
+		 JOIN video_pipeline.generation_attempts ga ON ga.id=pj.generation_attempt_id
+		 WHERE ga.generation_run_id=$1)`, mustUUID(retry.Job.Run.RunID)).Scan(
+		&authorities, &submissions, &retryJobs); err != nil {
+		t.Fatal(err)
+	}
+	if authorities != 1 || submissions != 1 || retryJobs != 1 {
+		t.Fatalf("retry authority/submission/job rows=%d/%d/%d, want 1/1/1", authorities, submissions, retryJobs)
+	}
+	mu.Lock()
+	retrySucceeded = true
+	mu.Unlock()
+	if result, err := retryRunner.Complete(ctx, stage1.CompleteInput{
+		IdempotencyKey:   retry.Job.IdempotencyKey,
+		ActualAFPMilli:   package_.Shots[1].Pricing.ExpectedAFPMilli,
+		EvidenceComplete: true,
+	}); err != nil || result.State != "TERMINAL_SUCCEEDED" {
+		t.Fatalf("complete controlled retry result=%#v err=%v", result, err)
+	}
+	var terminalAttempt uuid.UUID
+	var terminalCash int64
+	if err := pool.QueryRow(ctx, `SELECT attempt_id,actual_cash_micros
+		FROM video_pipeline.stage1_live_supersession_terminal_ledger
+		WHERE shot_id=$1`, a02.ShotID).Scan(&terminalAttempt, &terminalCash); err != nil {
+		t.Fatal(err)
+	}
+	wantRetryAttempt := uuid.NewSHA1(mustUUID(retry.Job.Run.RunID), []byte("attempt:1"))
+	if terminalAttempt != wantRetryAttempt || terminalCash != 0 {
+		t.Fatalf("retry terminal attempt/cash=%s/%d, want %s/0", terminalAttempt, terminalCash, wantRetryAttempt)
+	}
+	if _, err := retryRunner.SubmitControlledRetry(ctx, stage1.SubmitInput{
+		ShotID: a02.ShotID, QuotaSnapshot: &quota,
+	}); err == nil {
+		t.Fatal("terminal controlled retry was submitted again")
+	}
+	mu.Lock()
+	postsAfterTerminalReplay := posts
+	mu.Unlock()
+	if postsAfterTerminalReplay != 2 {
+		t.Fatalf("terminal retry replay Provider POSTs=%d, want 2 total", postsAfterTerminalReplay)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE video_pipeline.stage1_live_supersession_controlled_retries
+		SET authorization_hash=$1`, strings.Repeat("f", 64)); err == nil {
+		t.Fatal("immutable FLO-167 retry authority accepted an update")
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM video_pipeline.stage1_live_supersession_controlled_retry_submissions`); err == nil {
+		t.Fatal("immutable FLO-167 retry submission accepted a delete")
+	}
+	downMigration, err := os.ReadFile("../../../video-pipeline/db/migrations/000011_flo167_controlled_retry.down.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(downMigration)); err == nil {
+		t.Fatal("migration 11 rollback guard accepted immutable retry evidence")
 	}
 }
 

@@ -47,6 +47,15 @@ type ProductTruthPreparer interface {
 	) error
 }
 
+type productTruthFailureCompleter interface {
+	FailPreparedProviderJob(
+		context.Context,
+		orchestration.WorkflowStep,
+		string,
+		providercontract.JobResponse,
+	) error
+}
+
 // CompleteInput supplies the independently measured Agent Plan AFP delta.
 // Provider tokens, cost, task state, content-safety outcome, and artifacts are
 // always read back from the authenticated adapter and cannot be overridden.
@@ -134,6 +143,25 @@ func NewRunnerWithFLO167Supersession(
 	return newRunner(gate, adapter, artifacts, truth, legacyExecutionPackage, nil, nil, &supersession)
 }
 
+// NewRunnerWithFLO167SupersessionControlledRetry enables the single explicit
+// Batch A retry while retaining the exact v3 continuation authority. The retry
+// still extends the immutable legacy execution package, but its AFP estimate
+// must match the duration-normalized v3 shot binding.
+func NewRunnerWithFLO167SupersessionControlledRetry(
+	gate *Gate,
+	adapter *AdapterSubmitter,
+	artifacts ArtifactVerifier,
+	truth ProductTruthPreparer,
+	legacyExecutionPackage ExecutionPackage,
+	supersession FLO167SupersessionPackage,
+	controlledRetry ControlledRetryPackage,
+) (*Runner, error) {
+	return newRunner(
+		gate, adapter, artifacts, truth, legacyExecutionPackage, nil,
+		&controlledRetry, &supersession,
+	)
+}
+
 func newRunner(
 	gate *Gate,
 	adapter *AdapterSubmitter,
@@ -157,7 +185,7 @@ func newRunner(
 		return nil, errors.New("speech-v2 package revision cannot be combined with a controlled retry package")
 	}
 	if supersession != nil {
-		if controlledRetry != nil || executionPackage.ParentExecutionPackageHash != "" || executionPackage.LiveActivation == nil {
+		if executionPackage.ParentExecutionPackageHash != "" || executionPackage.LiveActivation == nil {
 			return nil, errors.New("FLO-167 supersession requires the original v2 live package without another revision")
 		}
 		if err := supersession.Validate(); err != nil {
@@ -166,6 +194,15 @@ func newRunner(
 		if supersession.LegacyExecutionPackageHash != executionPackage.ContentHash ||
 			supersession.LegacyAuthorizationHash != executionPackage.LiveActivation.SourceAuthorizationHash {
 			return nil, errors.New("FLO-167 supersession is bound to another legacy package or authorization")
+		}
+		if controlledRetry != nil {
+			binding, ok := supersession.Shot(controlledRetry.Job.ShotID)
+			if !ok || controlledRetry.Job.ShotID == "GOLD-A01" {
+				return nil, errors.New("FLO-167 controlled retry must replace one A02-A10 primary")
+			}
+			if controlledRetry.Job.PredictedAFPMilli != binding.Pricing.ExpectedAFPMilli {
+				return nil, errors.New("FLO-167 controlled retry AFP differs from the duration-normalized shot binding")
+			}
 		}
 	}
 	if executionPackage.ParentExecutionPackageHash == "" {
@@ -433,7 +470,7 @@ func (r *Runner) Complete(ctx context.Context, input CompleteInput) (CompletionR
 		}
 	}
 	completion, evidenceErr := r.completionFromProvider(response, input)
-	if evidenceErr == nil && completion.State == "TERMINAL_SUCCEEDED" {
+	if evidenceErr == nil {
 		frozen, ok := r.jobByIdempotencyKey(input.IdempotencyKey)
 		if !ok {
 			return CompletionResult{}, providerError(
@@ -441,25 +478,34 @@ func (r *Runner) Complete(ctx context.Context, input CompleteInput) (CompletionR
 				"completion is outside the frozen stage 1 execution package",
 			)
 		}
-		artifact := response.Artifacts[0]
-		if err := r.truth.CompletePreparedProviderJob(
-			ctx,
-			orchestration.WorkflowStep{
-				WorkflowID: frozen.WorkflowID, ActivityID: frozen.ActivityID,
-				ActivityType: orchestration.ActivityExecuteProviderJob, TraceID: frozen.TraceID,
-			},
-			frozen.Run.RunID,
-			orchestration.ProviderResult{
-				UpstreamTaskID: response.UpstreamTaskID, RequestID: response.RequestID,
-				ArtifactDigest: artifact.SHA256, ArtifactURI: artifact.URI,
-				MediaType: artifact.MediaType, ArtifactSize: artifact.SizeBytes,
-				Width: artifact.Width, Height: artifact.Height,
-				DurationMillis: artifact.DurationMillis,
-				ActualAFPMilli: input.ActualAFPMilli,
-				Model:          response.Model, Usage: response.Usage, Cost: response.Cost,
-			},
-		); err != nil {
-			return CompletionResult{}, err
+		step := orchestration.WorkflowStep{
+			WorkflowID: frozen.WorkflowID, ActivityID: frozen.ActivityID,
+			ActivityType: orchestration.ActivityExecuteProviderJob, TraceID: frozen.TraceID,
+		}
+		if completion.State == "TERMINAL_SUCCEEDED" {
+			artifact := response.Artifacts[0]
+			if err := r.truth.CompletePreparedProviderJob(
+				ctx, step, frozen.Run.RunID,
+				orchestration.ProviderResult{
+					UpstreamTaskID: response.UpstreamTaskID, RequestID: response.RequestID,
+					ArtifactDigest: artifact.SHA256, ArtifactURI: artifact.URI,
+					MediaType: artifact.MediaType, ArtifactSize: artifact.SizeBytes,
+					Width: artifact.Width, Height: artifact.Height,
+					DurationMillis: artifact.DurationMillis,
+					ActualAFPMilli: input.ActualAFPMilli,
+					Model:          response.Model, Usage: response.Usage, Cost: response.Cost,
+				},
+			); err != nil {
+				return CompletionResult{}, err
+			}
+		} else {
+			failureCompleter, ok := r.truth.(productTruthFailureCompleter)
+			if !ok {
+				return CompletionResult{}, providerError(providercontract.CodeUnavailable, "PostgreSQL failure completion boundary is unavailable")
+			}
+			if err := failureCompleter.FailPreparedProviderJob(ctx, step, frozen.Run.RunID, response); err != nil {
+				return CompletionResult{}, err
+			}
 		}
 	}
 	if err := r.gate.Complete(input.IdempotencyKey, completion); err != nil {
