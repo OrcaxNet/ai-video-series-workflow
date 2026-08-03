@@ -44,6 +44,10 @@ OrbStack 入口使用独立的 `ai-video-series-*-orbstack` 数据卷，避免�
 | `http://127.0.0.1:18080/health/ready` | 控制面联合就绪 |
 | `http://127.0.0.1:8233` | Temporal UI |
 
+Studio Nginx 通过 Docker 内置 DNS 动态解析 `control-plane`，因此 Control Plane
+容器重建并更换地址后无需重启 Studio 即可自动恢复同源 API。`/health/studio`
+同时代理 Control Plane 的 `/health/ready`，不会在代理链路失效时误报 Studio 健康。
+
 操作台的项目创建、Gate、异常注入和成片锁版仍使用 Mock projection；Provider 状态
 来自控制面并能显示 Agent Plan 已配置。真实 mutation 在加载 series/episode、权利、
 revision、route、budget 和 policy 等不可变绑定前保持 fail closed。
