@@ -100,6 +100,10 @@ func run(
 	if err != nil {
 		return err
 	}
+	supersession, err := loadFLO167Supersession(lookup)
+	if err != nil {
+		return err
+	}
 	gate, err := stage1.Open(plan, ledgerPath)
 	if err != nil {
 		return err
@@ -125,7 +129,14 @@ func run(
 	}
 	var runner *stage1.Runner
 	retryPath, hasRetryPath := lookup("VIDEO_STAGE1_RETRY_PACKAGE_PATH")
-	if strings.TrimSpace(retryPath) != "" {
+	if supersession != nil {
+		if parentExecutionPackage != nil || strings.TrimSpace(retryPath) != "" {
+			return errors.New("FLO-167 supersession cannot be combined with a revision parent or controlled retry package")
+		}
+		runner, err = stage1.NewRunnerWithFLO167Supersession(
+			gate, adapter, artifacts, store, executionPackage, *supersession,
+		)
+	} else if strings.TrimSpace(retryPath) != "" {
 		retryFile, openErr := os.Open(retryPath)
 		if openErr != nil {
 			if args[0] == "retry" || args[0] == "finalize-input" {
@@ -241,6 +252,43 @@ func run(
 	encoder := json.NewEncoder(output)
 	encoder.SetEscapeHTML(false)
 	return encoder.Encode(result)
+}
+
+func loadFLO167Supersession(
+	lookup func(string) (string, bool),
+) (*stage1.FLO167SupersessionPackage, error) {
+	packagePath, packagePresent := lookup("VIDEO_STAGE1_FLO167_SUPERSESSION_PACKAGE_PATH")
+	projectionPath, projectionPresent := lookup("VIDEO_STAGE1_FLO167_PROJECTION_PATH")
+	packagePath = strings.TrimSpace(packagePath)
+	projectionPath = strings.TrimSpace(projectionPath)
+	if !packagePresent && !projectionPresent || packagePath == "" && projectionPath == "" {
+		return nil, nil
+	}
+	if packagePath == "" || projectionPath == "" {
+		return nil, errors.New("VIDEO_STAGE1_FLO167_SUPERSESSION_PACKAGE_PATH and VIDEO_STAGE1_FLO167_PROJECTION_PATH must be supplied together")
+	}
+	var package_ stage1.FLO167SupersessionPackage
+	packageFile, err := os.Open(packagePath)
+	if err != nil {
+		return nil, fmt.Errorf("open immutable FLO-167 supersession package: %w", err)
+	}
+	defer packageFile.Close()
+	if err := decodeOne(packageFile, &package_); err != nil {
+		return nil, fmt.Errorf("decode immutable FLO-167 supersession package: %w", err)
+	}
+	var projection stage1.FLO167CanonicalProjection
+	projectionFile, err := os.Open(projectionPath)
+	if err != nil {
+		return nil, fmt.Errorf("open immutable FLO-167 projection: %w", err)
+	}
+	defer projectionFile.Close()
+	if err := decodeOne(projectionFile, &projection); err != nil {
+		return nil, fmt.Errorf("decode immutable FLO-167 projection: %w", err)
+	}
+	if err := stage1.ValidateFLO167Artifacts(package_, projection); err != nil {
+		return nil, fmt.Errorf("validate immutable FLO-167 artifacts: %w", err)
+	}
+	return &package_, nil
 }
 
 func stage1FinalizationWorkflowID(executionPackage stage1.ExecutionPackage) string {

@@ -1382,6 +1382,18 @@ func (p *Postgres) PrepareProviderJob(
 		if err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
+		flo167Boundary, err := requireFLO167Supersession(
+			ctx, tx, liveAuthority, input, p.now().UTC(),
+		)
+		if err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		// The legacy activation froze a flat estimate. A v3 continuation first
+		// proves the exact duration-normalized binding above, then substitutes
+		// that database value for the legacy compatibility checks below.
+		if flo167Boundary != nil {
+			liveAuthority.Run.PredictedAFPMilli = input.PredictedAFPMilli
+		}
 		planSeriesID := seriesID.String()
 		if liveAuthority != nil {
 			planSeriesID = liveAuthority.ControlSeriesID.String()
@@ -1414,7 +1426,7 @@ func (p *Postgres) PrepareProviderJob(
 		if liveAuthority != nil {
 			if err := requireStage1LiveAuthority(
 				ctx, tx, liveAuthority, input, plan, seriesID, episodeID,
-				episodeRevisionID, shotID, promptID, profileID, promptHash, p.now().UTC(),
+				episodeRevisionID, shotID, promptID, profileID, promptHash, p.now().UTC(), flo167Boundary != nil,
 			); err != nil {
 				return orchestration.PreparedProviderJob{}, err
 			}
@@ -1652,6 +1664,28 @@ func (p *Postgres) PrepareProviderJob(
 				productTruth.BillingMode = input.BillingMode
 				productTruth.ControlledRetryPackageHash = liveAuthority.ControlledRetryPackageHash
 			}
+			if flo167Boundary != nil {
+				pricing := orchestration.DurationPricingBinding{
+					DurationMS:            flo167Boundary.Shot.Pricing.DurationMS,
+					PricingSnapshotID:     flo167Boundary.Shot.Pricing.PricingSnapshotID,
+					PricingSnapshotDigest: flo167Boundary.Shot.Pricing.PricingSnapshotDigest,
+					ReferenceAFPMilli:     flo167Boundary.Shot.Pricing.ReferenceAFPMilli,
+					ReferenceDurationMS:   flo167Boundary.Shot.Pricing.ReferenceDurationMS,
+					ExpectedAFPMilli:      flo167Boundary.Shot.Pricing.ExpectedAFPMilli,
+					PricingRuleVersion:    flo167Boundary.Shot.Pricing.PricingRuleVersion,
+					MaximumDriftBPS:       flo167Boundary.Shot.Pricing.MaximumDriftBPS,
+					NormalizationVersion:  flo167Boundary.Shot.Pricing.NormalizationVersion,
+					RoundingVersion:       flo167Boundary.Shot.Pricing.RoundingVersion,
+				}
+				productTruth.SupersessionPackageHash = flo167Boundary.PackageHash
+				productTruth.DurationPricing = &pricing
+				productTruth.RouteBindingHash = flo167Boundary.Shot.RouteHash
+				productTruth.G1BindingHash = flo167Boundary.Shot.G1Hash
+				productTruth.G2BindingHash = flo167Boundary.Shot.G2Hash
+				productTruth.SafetyBindingHash = flo167Boundary.Shot.SafetyHash
+				productTruth.CanonicalInputHash = flo167Boundary.Shot.CanonicalInputHash
+				productTruth.SemanticInputHash = flo167Boundary.Shot.SemanticInputHash
+			}
 			return orchestration.PreparedProviderJob{
 				Budget: budget, BudgetReservation: reservation,
 				ProductTruth: productTruth,
@@ -1667,7 +1701,7 @@ func (p *Postgres) PrepareProviderJob(
 		// comparison after this transaction commits is too late: it would leave
 		// a reservation/job/cost row for a package that was never authorized.
 		if input.ExpectedProductTruth != nil &&
-			*input.ExpectedProductTruth != prepared.ProductTruth {
+			!input.ExpectedProductTruth.Equal(prepared.ProductTruth) {
 			return orchestration.PreparedProviderJob{}, controlplane.NewConflictError(
 				controlplane.CodeRevisionConflict,
 				"stage 1 frozen product truth differs from the locked PostgreSQL run",
@@ -1774,7 +1808,15 @@ func (p *Postgres) PrepareProviderJob(
 			}
 			prepared.ReconcileOnly = storedJobState != "QUEUED" || hasUpstreamTask
 			if liveAuthority != nil && !prepared.ReconcileOnly {
-				if err := reserveStage1LiveAFP(ctx, tx, liveAuthority, input, p.now().UTC()); err != nil {
+				if flo167Boundary != nil {
+					err = reserveFLO167AFP(ctx, tx, flo167Boundary, liveAuthority, input, p.now().UTC())
+				} else {
+					err = reserveStage1LiveAFP(ctx, tx, liveAuthority, input, p.now().UTC())
+				}
+				if err != nil {
+					return orchestration.PreparedProviderJob{}, err
+				}
+				if err := recordFLO167Submission(ctx, tx, flo167Boundary, attemptID, input, p.now().UTC()); err != nil {
 					return orchestration.PreparedProviderJob{}, err
 				}
 			}
@@ -1804,7 +1846,12 @@ func (p *Postgres) PrepareProviderJob(
 			)
 		}
 		if liveAuthority != nil {
-			if err := reserveStage1LiveAFP(ctx, tx, liveAuthority, input, p.now().UTC()); err != nil {
+			if flo167Boundary != nil {
+				err = reserveFLO167AFP(ctx, tx, flo167Boundary, liveAuthority, input, p.now().UTC())
+			} else {
+				err = reserveStage1LiveAFP(ctx, tx, liveAuthority, input, p.now().UTC())
+			}
+			if err != nil {
 				return orchestration.PreparedProviderJob{}, err
 			}
 		}
@@ -1865,6 +1912,9 @@ func (p *Postgres) PrepareProviderJob(
 		if _, err := verifyProviderDurableCostProjection(
 			ctx, tx, reservationExpectation,
 		); err != nil {
+			return orchestration.PreparedProviderJob{}, err
+		}
+		if err := recordFLO167Submission(ctx, tx, flo167Boundary, attemptID, input, p.now().UTC()); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
 		if _, err := tx.Exec(ctx, `
@@ -2244,6 +2294,9 @@ func (p *Postgres) CompleteProviderJob(
 			); err != nil {
 				return completionOutcome{}, err
 			}
+			if err := recordFLO167Terminal(ctx, tx, attemptID, jobID, result, p.now().UTC()); err != nil {
+				return completionOutcome{}, err
+			}
 			switch runState {
 			case "SUCCEEDED", "PAUSED":
 				return completionOutcome{}, nil
@@ -2585,6 +2638,9 @@ func (p *Postgres) CompleteProviderJob(
 			); err != nil {
 				return completionOutcome{}, err
 			}
+		}
+		if err := recordFLO167Terminal(ctx, tx, attemptID, jobID, result, p.now().UTC()); err != nil {
+			return completionOutcome{}, err
 		}
 		return completionOutcome{}, nil
 	})

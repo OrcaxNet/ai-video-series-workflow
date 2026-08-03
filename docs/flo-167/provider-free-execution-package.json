@@ -1,0 +1,244 @@
+{
+  "schemaVersion": "flo100.batch-a-supersession.v3",
+  "state": "supersession_package_pending_v3",
+  "legacyAuthorizationHash": "7bf55cad2a4f81f54eb6617bbab81fd21f789785ce1176213014f5833ce4ac25",
+  "legacyExecutionPackageHash": "6a7c03ed869c427d23cc6b669e7938ba271c8343b3e4627e85cd93ea50fffd2e",
+  "legacyProjectionHash": "c0d2d316867c79d1ebc419dec3a68fe29c947cd184d21a2b11e45c6224013202",
+  "legacyTerminalLedgerHash": "7ea9cfb63b3c54fa46583cf5abdb0bc67d323eead9ab4f45e9187e9700dcf0e0",
+  "legacyStopEvidenceHash": "dd1954608254791425d7574fe7333d1c1d7cd77cb843572f79d84a3dbeadea76",
+  "authorization": {
+    "completedSet": [
+      "GOLD-A01"
+    ],
+    "allowedSubmitSet": [
+      "GOLD-A02",
+      "GOLD-A03",
+      "GOLD-A04",
+      "GOLD-A05",
+      "GOLD-A06",
+      "GOLD-A07",
+      "GOLD-A08",
+      "GOLD-A09",
+      "GOLD-A10"
+    ],
+    "maximumPrimaryJobs": 10,
+    "maximumControlledRetries": 1,
+    "maximumVideoTokens": 1200000,
+    "maximumVideoAfpMilli": 30306870,
+    "maximumSpeechAfpMilli": 1039,
+    "maximumNonSubscriptionCashMicros": 0
+  },
+  "shots": [
+    {
+      "shotId": "GOLD-A01",
+      "pricing": {
+        "durationMs": 4000,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2003760,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "37f3c2c5774bc3688723d0e9e8dc05a0d21d71e48d472712182d41d079604425",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "1f36ace7814cc56bf53cd12cd44b0e90d5a2051e4b630672da579d7a63ab787b",
+      "semanticInputHash": "7f2dae5f402050ad537bfe7514f55e6dd29c69bfbbe8ecf776c60cf3713cdac8"
+    },
+    {
+      "shotId": "GOLD-A02",
+      "pricing": {
+        "durationMs": 4500,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2254230,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "ee7493791cfe465cd7402a26afa8caf14d655436feef289877ac78f5354b2d3b",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "7f38b57d62953b560392d83e2c75eb08077f13db11e0ceff8ae596a4c8c4b3ee",
+      "semanticInputHash": "0a004fb2e3611b6c4a4d8ac477ae6d7ebab7f29cec3a1bce915e866fb33bb697"
+    },
+    {
+      "shotId": "GOLD-A03",
+      "pricing": {
+        "durationMs": 5000,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2504700,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "cfeb896a7dbeb08f77c1fb13e99c8dd448871667032b1433e1835325ef7336d8",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "f5ec411e39ff3c5f19d9c9bcd707e51035d115cbf7123703722d3b944bd4f87c",
+      "semanticInputHash": "75d13dff743d263a1c319621803d4b2435f961fd3c5adb82d663b5bc8a69ba35"
+    },
+    {
+      "shotId": "GOLD-A04",
+      "pricing": {
+        "durationMs": 5500,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2755170,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "ea9827f441f32360e3546a1fed6837af8fedf825cfdedafeaacf5c1664b035da",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "dd7155d2c90d05ca132428d7a2cdc6ea08b0b071e7371e3943d56de4a8df5f4d",
+      "semanticInputHash": "c4b18dc58133f8f96452dbb656deafebe1f75e0744cf31ebd5a5bfd4e29f4bb7"
+    },
+    {
+      "shotId": "GOLD-A05",
+      "pricing": {
+        "durationMs": 4000,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2003760,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "5d0e3fd256211f0ac171215c60520d06dfd0813eeb05032bb8dbc75e22f6b266",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "8bffdb7eaafd9a5d5146b30f99d68d86fa61f5e385124a6f14267b5abd798301",
+      "semanticInputHash": "4b66714e65eedcf7e03444feea52a8a3094eb9a23db02d10432902fd01fe06fe"
+    },
+    {
+      "shotId": "GOLD-A06",
+      "pricing": {
+        "durationMs": 5000,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2504700,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "e40fd759a9173b49060eb86eafc49ab408f1d3af6199ceb127716dbb0b00e0cd",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "1212e33fdbd2b3fda498041b04c5cce93641a3695ef3e89c8241addec3816bee",
+      "semanticInputHash": "7f7e26eb44d10cec1873b02567273fda1afb9e4289e6e3b10abaf5f4f05d7850"
+    },
+    {
+      "shotId": "GOLD-A07",
+      "pricing": {
+        "durationMs": 4500,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2254230,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "4e2868e6e64c86238204ccb0cdefd4fc5c782826ff87d744f54a6089c2a1db43",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "1beaa5eacb621e3f13cb25a4e93a3a191f12f31a6abb72c0eefa1f9ce3448011",
+      "semanticInputHash": "2ddf42d6da999f2b0c16789e2cc0a80249c827b05a4bfc0420411eecf8929a21"
+    },
+    {
+      "shotId": "GOLD-A08",
+      "pricing": {
+        "durationMs": 5500,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2755170,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "154928813bd0bb3f6e7365a22b8c40c704b7794036e84fc6c77372cc95e07c52",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "50be275911130e5b29a7ab886da894a0a4b35001a7d62a54dca5dc0faba7cbcb",
+      "semanticInputHash": "d373bd1130ca52c53293d9620e060a0244d98bec51e9aa26668c71105412319d"
+    },
+    {
+      "shotId": "GOLD-A09",
+      "pricing": {
+        "durationMs": 4000,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2003760,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "c6a6ff2a253f0c5ea766f184bf7af9364a6a92fb8f29118c4211c03cc1576547",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "63e61d529de027ae86eaf8a232525b49ac9cabb9e1a97575d96cd50395d88210",
+      "semanticInputHash": "d0b2227d23d087171457b392db151e76be6e487c742c9d651305a403596f6f95"
+    },
+    {
+      "shotId": "GOLD-A10",
+      "pricing": {
+        "durationMs": 4500,
+        "pricingSnapshotId": "agent-plan-large-v1",
+        "pricingSnapshotDigest": "8a24f342be8bb84c95001434ea4622eda28e28c6aa77dd049dff8bc1f7f3c42a",
+        "referenceAfpMilli": 2504700,
+        "referenceDurationMs": 5000,
+        "expectedAfpMilli": 2254230,
+        "pricingRuleVersion": "agent-plan-subscription-v1",
+        "maximumDriftBasisPoints": 1000,
+        "normalizationVersion": "duration-normalized-afp/v1",
+        "roundingVersion": "half-up-nonnegative-integer/v1"
+      },
+      "routeHash": "0d1c97d70c7b332940279be334c127fa068069f83d58840fa57b4d3b10166eca",
+      "g1Hash": "e458060085c9585366c4c52abe3f7fc4e52110f60bc73b61765bc3edc226c133",
+      "g2Hash": "fdc27d59ef8ce968cbb732d29ba529adf15e090ed07af8709e2d85e0fb53711a",
+      "safetyHash": "ed8a4852873f8552477a2af1ac5b83900158405286a26fa5f04160de13c3d48f",
+      "canonicalInputHash": "b1980987f0d9c7581127ce4fde0ba6fae90f92bcc211ec34b968b1c6250fa1e9",
+      "semanticInputHash": "1c14ef156f7272e6078b3ca5a219b84db3180b22be2c51969c1f0ff5d9ae2f54"
+    }
+  ],
+  "contentHash": "2d7c87212bf95426794fcdc0c3ee2747dea6d0921c3262c7da58f27e99ba4b70"
+}

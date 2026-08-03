@@ -173,7 +173,7 @@ func TestFixedSample1MaterializationBuildsAuthenticatedCASProviderEnvelope(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prepared.ProductTruth != expectedTruth {
+	if !prepared.ProductTruth.Equal(expectedTruth) {
 		t.Fatal("prepared Provider job differs from the sealed Stage 1 product truth")
 	}
 	request, err := orchestration.BuildProviderJobRequest(

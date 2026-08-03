@@ -1,0 +1,49 @@
+{
+  "schemaVersion": "v1",
+  "batchId": "flo100-gold-a-v1",
+  "videoModel": "doubao-seedance-2.0",
+  "primaryShotIds": [
+    "GOLD-A01",
+    "GOLD-A02",
+    "GOLD-A03",
+    "GOLD-A04",
+    "GOLD-A05",
+    "GOLD-A06",
+    "GOLD-A07",
+    "GOLD-A08",
+    "GOLD-A09",
+    "GOLD-A10"
+  ],
+  "maximumNewProviderJobs": 11,
+  "maximumControlledRetries": 1,
+  "maximumVideoTokens": 1200000,
+  "monthlyBaselineAfpMilli": 0,
+  "monthlyMaximumAfpMilli": 135000000,
+  "referenceJobAfpMilli": 2504700,
+  "maximumAfpDriftBasisPoints": 1000,
+  "maximumNonSubscriptionCashMicros": 0,
+  "maximumDialogueCharacters": 7,
+  "maximumTtsAfpMilli": 1039,
+  "requiredEvidence": [
+    "artifact_hashes",
+    "generation_manifest",
+    "license_consent_gate",
+    "provider_ids",
+    "qc",
+    "redaction_scan",
+    "service_bom",
+    "usage_cost"
+  ],
+  "ttsPreflight": {
+    "completedNoCost": true,
+    "provider": "volcengine_ark",
+    "model": "doubao-seed-tts-2.0",
+    "region": "cn-beijing",
+    "resourceId": "seed-tts-2.0",
+    "credentialReference": "ARK_API_KEY",
+    "credentialAvailable": true,
+    "pricing": "1350_afp_per_10000_chars",
+    "usageAttribution": "provider_usage_tokens_per_request"
+  },
+  "subscriptionIncludedOnly": true
+}

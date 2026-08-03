@@ -23,6 +23,23 @@ func run(args []string, output io.Writer) error {
 	if len(args) < 3 {
 		return packageUsageError()
 	}
+	if args[0] == "verify-flo167" {
+		if len(args) != 3 {
+			return packageUsageError()
+		}
+		var package_ stage1.FLO167SupersessionPackage
+		if err := decodeFile(args[1], &package_); err != nil {
+			return fmt.Errorf("read FLO-167 supersession package: %w", err)
+		}
+		var projection stage1.FLO167CanonicalProjection
+		if err := decodeFile(args[2], &projection); err != nil {
+			return fmt.Errorf("read FLO-167 canonical projection: %w", err)
+		}
+		if err := stage1.ValidateFLO167Artifacts(package_, projection); err != nil {
+			return err
+		}
+		return encodePackage(output, projection)
+	}
 	var plan stage1.Plan
 	if err := decodeFile(args[1], &plan); err != nil {
 		return fmt.Errorf("read stage 1 plan: %w", err)
@@ -85,7 +102,7 @@ func encodePackage(output io.Writer, value any) error {
 }
 
 func packageUsageError() error {
-	return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json> OR verify-revision <plan.json> <parent-package.json> <child-package.json> OR <seal-retry|verify-retry> <plan.json> <package.json> <retry-package.json>")
+	return errors.New("usage: video-stage1-package <seal|verify> <plan.json> <package.json> OR verify-flo167 <supersession-package.json> <projection.json> OR verify-revision <plan.json> <parent-package.json> <child-package.json> OR <seal-retry|verify-retry> <plan.json> <package.json> <retry-package.json>")
 }
 
 func decodeFile(path string, destination any) error {

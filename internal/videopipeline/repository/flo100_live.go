@@ -347,6 +347,7 @@ func requireStage1LiveAuthority(
 	seriesID, episodeID, episodeRevisionID, shotID, promptID, profileID uuid.UUID,
 	promptHash string,
 	now time.Time,
+	superseded bool,
 ) error {
 	if authority == nil {
 		return controlplane.NewPolicyError(
@@ -372,7 +373,7 @@ func requireStage1LiveAuthority(
 		(!authority.IsControlledRetry && input.ExpectedControlledRetryPackageHash != "") ||
 		input.ExpectedSourceCodeCommit != authority.SourceCodeCommit ||
 		input.BillingMode != providercontract.BillingModeSubscriptionIncludedOnly ||
-		!authority.AuthorizationValidUntil.After(now) || authority.ProjectionHash == "" {
+		(!superseded && !authority.AuthorizationValidUntil.After(now)) || authority.ProjectionHash == "" {
 		return controlplane.NewConflictError(
 			controlplane.CodeRevisionConflict,
 			"FLO-100 live dispatch differs from its exact A-only authority",
@@ -414,7 +415,7 @@ func requireStage1LiveAuthority(
 		SELECT EXISTS (
 		  SELECT 1 FROM video_pipeline.stage1_live_submit_authorizations sa
 		  WHERE sa.activation_id=$1 AND sa.source_code_commit=$2
-		    AND sa.execution_package_hash=$3 AND sa.projection_hash=$4 AND sa.valid_until>$5
+		    AND sa.execution_package_hash=$3 AND sa.projection_hash=$4 AND ($13 OR sa.valid_until>$5)
 		    AND sa.authorization_payload->'fixedEvidence'->>'mergeCommit'=$2
 		    AND (sa.authorization_payload->'decision'->>'batchAProviderPostAuthorizedConditionally')::boolean=true
 		    AND (sa.authorization_payload->'decision'->>'batchBProviderPostAuthorized')::boolean=false
@@ -470,7 +471,7 @@ func requireStage1LiveAuthority(
 		authority.ProjectionHash, now, flo100OfflinePackageHash, flo100OfflineExecutionHash,
 		[]uuid.UUID{authority.G1DecisionID, authority.G2DecisionID, authority.SafetyDecisionID},
 		authority.ControlSeriesID, authority.G1DecisionID, authority.G2DecisionID,
-		authority.SafetyDecisionID).Scan(
+		authority.SafetyDecisionID, superseded).Scan(
 		&submitExact, &activationExact, &decisionsExact, &g1Exact, &g2Exact, &safetyExact,
 	); err != nil {
 		return fmt.Errorf("verify FLO-100 live authority projection: %w", err)
