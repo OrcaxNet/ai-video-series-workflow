@@ -448,9 +448,9 @@ func TestServer_SubmitPollDownloadAndCASWithoutTransportLeak(t *testing.T) {
 	if exists, err := store.Exists(artifact.SHA256); err != nil || !exists {
 		t.Fatalf("CAS artifact exists = %v, err = %v", exists, err)
 	}
-	if completed.Cost.ActualMicros == nil || *completed.Cost.ActualMicros != 0 ||
-		!completed.Cost.Verified || completed.Cost.ProviderReported ||
-		completed.Cost.BillingMode != "subscription_included" {
+	if completed.Cost.ActualMicros != nil || completed.Cost.Verified ||
+		completed.Cost.ProviderReported || completed.Cost.Currency != "" ||
+		completed.Cost.BillingMode != "subscription" {
 		t.Fatalf("subscription cost evidence = %#v", completed.Cost)
 	}
 
@@ -506,7 +506,8 @@ func TestServer_CancelPreservesTerminalUsage(t *testing.T) {
 	if response.StatusCode != http.StatusAccepted ||
 		cancelled.State != providercontract.StatusCancelled ||
 		cancelled.Usage.InputTokens != 7 || cancelled.Usage.VideoTokens != 125_000 ||
-		cancelled.Usage.GeneratedMillis != 2_500 || cancelled.Cost.ActualMicros == nil {
+		cancelled.Usage.GeneratedMillis != 2_500 || cancelled.Cost.ActualMicros != nil ||
+		cancelled.Cost.Verified || cancelled.Cost.BillingMode != "subscription" {
 		t.Fatalf("cancelled response = status:%d value:%#v", response.StatusCode, cancelled)
 	}
 }

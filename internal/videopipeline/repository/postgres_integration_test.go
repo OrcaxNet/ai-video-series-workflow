@@ -68,7 +68,7 @@ func TestPostgres_CreateSeriesIdempotencyAndAtomicEvidence(t *testing.T) {
 	if dsn == "" {
 		t.Skip("VIDEO_TEST_POSTGRES_DSN is not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -6619,6 +6619,464 @@ func TestPostgres_CreateSeriesRollsBackIdempotencyOnPolicyFailure(t *testing.T) 
 	if count != 0 {
 		t.Fatalf("rolled-back idempotency rows = %d, want 0", count)
 	}
+}
+
+func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
+	dsn := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
+	if dsn == "" {
+		t.Skip("VIDEO_TEST_POSTGRES_DSN is not configured")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	store := NewForPool(pool)
+	actor := controlplane.Actor{ActorID: "creator-integration-" + uuid.NewString(), Role: "CREATOR"}
+	primaryActor := actor
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_idempotency WHERE scope LIKE $1`, "creator-integration:"+primaryActor.ActorID+"%")
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_runs WHERE actor_id=$1`, primaryActor.ActorID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_plans WHERE actor_id=$1`, primaryActor.ActorID)
+	})
+	capability := providercontract.CapabilitySnapshot{
+		Alias: providercontract.CapabilityVideo,
+		Capability: providercontract.Capability{Provider: "volcengine_ark", ModelFamily: "doubao-seedance-2.0", OutputModality: providercontract.ModalityVideo,
+			Resolutions: []string{"720p"}, AspectRatios: []string{"16:9", "9:16"}, MinDurationMillis: 4000, MaxDurationMillis: 15000, NativeFPS: []int{24}},
+		Configured: true, Enabled: true, Mode: "live", RouteVersion: "agent-plan-large-v1", SnapshotHash: strings.Repeat("a", 64),
+		Limits:          map[string]any{"billingMode": "subscription", "maximumConcurrency": float64(1)},
+		SupportedInputs: []string{"text"},
+	}
+	createPlan := func(index int) (controlplane.CreatorLiveShotPlan, controlplane.Idempotency) {
+		command := controlplane.CreatorLiveShotPlanCommand{Title: fmt.Sprintf("shot-%d", index), SceneText: "雨夜车站", AspectRatio: "16:9", RightsAccepted: true, SourceArtifactHash: strings.Repeat(fmt.Sprint(index%9+1), 64), SourceArtifactURI: "cas://sha256/" + strings.Repeat(fmt.Sprint(index%9+1), 64), Route: capability, Actor: actor}
+		idem := controlplane.Idempotency{Scope: "creator-integration:" + actor.ActorID + ":plan", Key: uuid.NewString(), RequestHash: strings.Repeat(fmt.Sprint((index+3)%9+1), 64)}
+		stored, err := store.CreateCreatorLiveShotPlan(ctx, command, idem, "creator-live-integration")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return stored.Value, idem
+	}
+	plan1, idem1 := createPlan(1)
+	if plan1.State != "AWAITING_CONFIRMATION" || !plan1.Confirmable || plan1.ProviderCallCount != 1 || plan1.ProviderSubmitCount != 0 || plan1.BudgetApprovalID == "" || plan1.SafetyDecisionID == "" {
+		t.Fatalf("creator plan contract=%#v", plan1)
+	}
+	project, err := store.ListCreatorLiveShots(ctx, plan1.SeriesID, actor)
+	if err != nil || project.Plan.PlanID != plan1.PlanID || len(project.Runs) != 0 {
+		t.Fatalf("pre-confirm recovery projection=%#v err=%v", project, err)
+	}
+	var normalizedBindings int
+	if err := pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM video_pipeline.operation_requests WHERE id=$1 AND operation_type='CREATE_CREATOR_LIVE_SHOT_PLAN') +
+		       (SELECT count(*) FROM video_pipeline.review_tasks WHERE id=$2 AND state='APPROVED' AND generation_plan_id=$1) +
+		       (SELECT count(*) FROM video_pipeline.prompt_snapshot_inputs WHERE prompt_snapshot_id=$3)`,
+		plan1.PlanID, plan1.BudgetApprovalID, plan1.PromptSnapshotID).Scan(&normalizedBindings); err != nil || normalizedBindings != 11 {
+		t.Fatalf("normalized creator bindings=%d err=%v", normalizedBindings, err)
+	}
+	replayed, err := store.CreateCreatorLiveShotPlan(ctx, controlplane.CreatorLiveShotPlanCommand{Title: "shot-1", SceneText: "雨夜车站", AspectRatio: "16:9", RightsAccepted: true, SourceArtifactHash: strings.Repeat("2", 64), SourceArtifactURI: "cas://sha256/" + strings.Repeat("2", 64), Route: capability, Actor: actor}, idem1, "creator-live-integration")
+	if err != nil || !replayed.Replayed || replayed.Value.PlanID != plan1.PlanID {
+		t.Fatalf("plan replay=%#v err=%v", replayed, err)
+	}
+	rejectConfirm := func(command controlplane.ConfirmCreatorLiveShotCommand) error {
+		_, err := store.ConfirmCreatorLiveShotPlan(ctx, plan1.PlanID, command, controlplane.Idempotency{Scope: "creator-integration:" + actor.ActorID + ":confirm:" + plan1.PlanID, Key: uuid.NewString(), RequestHash: strings.Repeat("e", 64)}, "creator-live-integration")
+		return err
+	}
+	if err := rejectConfirm(controlplane.ConfirmCreatorLiveShotCommand{Confirmed: false, PlanHash: plan1.PlanHash, LiveCallsEnabled: true, Route: capability, Actor: actor}); asCode(err) != controlplane.CodeValidation {
+		t.Fatalf("unconfirmed error=%v", err)
+	}
+	if err := rejectConfirm(controlplane.ConfirmCreatorLiveShotCommand{Confirmed: true, PlanHash: strings.Repeat("f", 64), LiveCallsEnabled: true, Route: capability, Actor: actor}); asCode(err) != controlplane.CodePlanHashMismatch {
+		t.Fatalf("plan hash drift error=%v", err)
+	}
+	paygo := capability
+	paygo.Limits = map[string]any{"billingMode": "paygo", "maximumConcurrency": float64(1)}
+	if err := rejectConfirm(controlplane.ConfirmCreatorLiveShotCommand{Confirmed: true, PlanHash: plan1.PlanHash, LiveCallsEnabled: true, Route: paygo, Actor: actor}); asCode(err) != controlplane.CodeSubscriptionRouteRequired {
+		t.Fatalf("paygo error=%v", err)
+	}
+	confirm := func(plan controlplane.CreatorLiveShotPlan, key string) (controlplane.Stored[controlplane.CreatorLiveShotRun], error) {
+		return store.ConfirmCreatorLiveShotPlan(ctx, plan.PlanID, controlplane.ConfirmCreatorLiveShotCommand{Confirmed: true, PlanHash: plan.PlanHash, LiveCallsEnabled: true, Route: capability, Actor: actor}, controlplane.Idempotency{Scope: "creator-integration:" + actor.ActorID + ":confirm:" + plan.PlanID, Key: key, RequestHash: strings.Repeat("c", 64)}, "creator-live-integration")
+	}
+	key1 := uuid.NewString()
+	run1, err := confirm(plan1, key1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runReplay, err := confirm(plan1, key1)
+	if err != nil || !runReplay.Replayed || runReplay.Value.RunID != run1.Value.RunID {
+		t.Fatalf("confirm replay=%#v err=%v", runReplay, err)
+	}
+	plan2, _ := createPlan(2)
+	if _, err := confirm(plan2, uuid.NewString()); err == nil || asCode(err) != controlplane.CodeConcurrencyLimit {
+		t.Fatalf("concurrency error=%v", err)
+	}
+
+	var prepared creatorPreparedRequest
+	var reservationID string
+	if err := pool.QueryRow(ctx, `SELECT request_snapshot,reservation_id FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, run1.Value.RunID).Scan(&prepared, &reservationID); err != nil {
+		t.Fatal(err)
+	}
+	workflowRecord, err := store.GetShotWorkflowRecord(ctx, run1.Value.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflowRecord.PromptSnapshotID != prepared.Input.Prompt.ID ||
+		workflowRecord.PromptHash != prepared.Input.Prompt.Digest ||
+		!reflect.DeepEqual(workflowRecord.Prompt, workflowPromptSnapshot(prepared.Input.Prompt)) {
+		t.Fatalf("creator Temporal dispatch lost confirmed prompt: record=%#v confirmed=%#v", workflowRecord.Prompt, prepared.Input.Prompt)
+	}
+	if workflowRecord.Prompt.PositivePrompt == "" || workflowRecord.Prompt.Output.DurationMillis != 5000 ||
+		workflowRecord.Prompt.Context.ShotSnapshotID == "" || len(workflowRecord.Prompt.InputRevisionHashes) == 0 {
+		t.Fatalf("creator Temporal dispatch prompt is partial: %#v", workflowRecord.Prompt)
+	}
+	projectedInput := orchestration.ExecuteProviderJobInput{
+		Run: orchestration.GenerationRunRef{
+			RunID: workflowRecord.Run.RunID, RunSpecDigest: workflowRecord.Run.RunSpecDigest,
+			Attempt: workflowRecord.Run.CreativeAttempt,
+		},
+		Prompt: orchestration.PromptSnapshotRef{
+			ID: workflowRecord.Prompt.ID, Digest: workflowRecord.Prompt.Digest,
+			PositivePrompt: workflowRecord.Prompt.PositivePrompt,
+			NegativePrompt: workflowRecord.Prompt.NegativePrompt,
+			Context:        workflowRecord.Prompt.Context, Assets: workflowRecord.Prompt.Assets,
+			Output:              workflowRecord.Prompt.Output,
+			InputRevisionHashes: workflowRecord.Prompt.InputRevisionHashes,
+		},
+		Route: providercontract.ModelSnapshot{
+			CapabilityAlias: workflowRecord.RouteSnapshot.CapabilityAlias,
+			Provider:        workflowRecord.RouteSnapshot.Provider,
+			ModelID:         workflowRecord.RouteSnapshot.ModelID,
+			EndpointID:      workflowRecord.RouteSnapshot.EndpointID,
+			RouteVersion:    workflowRecord.RouteSnapshot.RouteVersion,
+			CapabilityHash:  workflowRecord.RouteSnapshot.CapabilityHash,
+			Verification:    "control_plane_capability_snapshot",
+		},
+		ProviderProfileID:   workflowRecord.RouteSnapshot.ProviderProfileID,
+		BudgetApprovalID:    workflowRecord.BudgetApprovalID,
+		BudgetMaximumMicros: workflowRecord.BudgetLimit.AmountMicros,
+		BudgetCurrency:      workflowRecord.BudgetLimit.Currency,
+		TraceID:             workflowRecord.Run.TraceID,
+		PersistProductTruth: true,
+	}
+	if projectedInput.BudgetApprovalID != plan1.BudgetApprovalID ||
+		projectedInput.BudgetApprovalID == reservationID {
+		t.Fatalf("creator budget identities collapsed: approval=%q reservation=%q", projectedInput.BudgetApprovalID, reservationID)
+	}
+	if !reflect.DeepEqual(projectedInput, prepared.Input) {
+		t.Fatalf("creator Temporal input differs from confirmed provider intent: projected=%#v confirmed=%#v", projectedInput, prepared.Input)
+	}
+
+	creatorCAS, err := artifactstore.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	creatorArtifact, err := creatorCAS.Put(ctx, bytes.NewReader([]byte("creator live-shot provider fixture")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var providerSubmits atomic.Int32
+	creatorProvider := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/v1/jobs" {
+			http.NotFound(response, request)
+			return
+		}
+		providerSubmits.Add(1)
+		var job providercontract.JobRequest
+		if err := json.NewDecoder(request.Body).Decode(&job); err != nil {
+			http.Error(response, "invalid fixture request", http.StatusBadRequest)
+			return
+		}
+		if request.Header.Get("Idempotency-Key") != job.JobID ||
+			job.BudgetReservation.ReservationID != reservationID ||
+			job.BudgetReservation.ConfirmedBy != plan1.BudgetApprovalID {
+			http.Error(response, "creator budget binding mismatch", http.StatusUnprocessableEntity)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(response).Encode(providercontract.JobResponse{
+			JobID: job.JobID, RunID: job.RunID,
+			UpstreamTaskID: "creator-task-" + creatorArtifact.Digest[:12],
+			RequestID:      "creator-request-" + creatorArtifact.Digest[:12],
+			State:          providercontract.StatusSucceeded, Progress: 100,
+			Model: job.Model, ProviderRegion: "cn-beijing",
+			Artifacts: []providercontract.AssetRef{{
+				ID: "creator-video-" + creatorArtifact.Digest[:12], Revision: creatorArtifact.Digest,
+				Kind: providercontract.ModalityVideo, Role: providercontract.AssetRoleOutput,
+				URI: creatorArtifact.URI, SHA256: creatorArtifact.Digest,
+				LicenseReference: "creator-integration-license", MediaType: "video/mp4",
+				SizeBytes: creatorArtifact.Size, Width: 1280, Height: 720, DurationMillis: 5000,
+			}},
+			Usage: providercontract.Usage{VideoTokens: 250000, GeneratedMillis: 5000},
+			Cost: providercontract.Cost{
+				PricingVersion: "agent-plan-video-token-v1", BillingMode: "subscription",
+				Verified: false,
+			},
+		})
+	}))
+	defer creatorProvider.Close()
+	activities := orchestration.NewProductionActivities(creatorProvider.URL, store, store, creatorCAS)
+	var activitySuite testsuite.WorkflowTestSuite
+	activityEnvironment := activitySuite.NewTestActivityEnvironment()
+	activityEnvironment.RegisterActivity(activities.ExecuteProviderJob)
+	encodedResult, err := activityEnvironment.ExecuteActivity(activities.ExecuteProviderJob, projectedInput)
+	if err != nil {
+		t.Fatalf("confirmed creator dispatch failed before provider submit: %v", err)
+	}
+	var result orchestration.ProviderResult
+	if err := encodedResult.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if providerSubmits.Load() != 1 || result.UpstreamTaskID == "" || result.RequestID == "" {
+		t.Fatalf("creator provider result=%#v submits=%d", result, providerSubmits.Load())
+	}
+	completed, err := store.GetCreatorLiveShotRun(ctx, run1.Value.RunID, actor)
+	if err != nil || completed.State != "SUCCEEDED" || completed.ManifestHash == "" || completed.Manifest == nil || completed.SubmitCount != 1 || completed.Progress == nil || *completed.Progress != 100 || completed.CashCost.AmountMicros != nil || completed.CashCost.Verified {
+		t.Fatalf("completed=%#v err=%v", completed, err)
+	}
+	manifest, err := store.GetCreatorLiveShotManifest(ctx, run1.Value.RunID, actor)
+	if err != nil || manifest.Evidence != "live_provider_call" || manifest.OutputHash != result.ArtifactDigest || manifest.ProviderRegion == nil || *manifest.ProviderRegion != "cn-beijing" || manifest.ProviderJobID == "" || manifest.Budget.ReservedTasks != 1 || manifest.Budget.ReservedVideoTokens != creatorVideoTokenLimit || manifest.Budget.SettledVideoTokens == nil || *manifest.Budget.SettledVideoTokens != 250000 || manifest.CashCost.AmountMicros != nil {
+		t.Fatalf("manifest=%#v err=%v", manifest, err)
+	}
+	var succeededBefore []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, run1.Value.RunID).Scan(&succeededBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, projectedInput, result); err != nil {
+		t.Fatalf("exact creator completion replay: %v", err)
+	}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, orchestration.CancelProviderJobInput{Dispatch: projectedInput}, orchestration.CancelProviderResult{State: "SUCCEEDED", UpstreamTaskID: result.UpstreamTaskID, RequestID: result.RequestID}); err != nil {
+		t.Fatalf("terminal-success cancellation race: %v", err)
+	}
+	var succeededAfter []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, run1.Value.RunID).Scan(&succeededAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(succeededBefore, succeededAfter) {
+		t.Fatalf("exact completion/cancellation replay mutated succeeded evidence\nbefore=%s\nafter=%s", succeededBefore, succeededAfter)
+	}
+	var succeededOperation string
+	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.operation_requests WHERE id=$1`, run1.Value.OperationID).Scan(&succeededOperation); err != nil || succeededOperation != "SUCCEEDED" {
+		t.Fatalf("creator success operation=%q err=%v", succeededOperation, err)
+	}
+	driftedInput := projectedInput
+	driftedInput.TraceID += "-drift"
+	if err := store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, driftedInput, result); asCode(err) != controlplane.CodeRevisionConflict {
+		t.Fatalf("drifted confirmed creator input error=%v", err)
+	}
+	driftedResult := result
+	driftedResult.ArtifactSize++
+	if err := store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, projectedInput, driftedResult); asCode(err) != controlplane.CodeRevisionConflict {
+		t.Fatalf("drifted creator completion error=%v", err)
+	}
+	if _, err := confirm(plan2, uuid.NewString()); err == nil || asCode(err) != controlplane.CodePlanStale {
+		t.Fatalf("plan created under prior concurrency snapshot error=%v", err)
+	}
+	plan3, _ := createPlan(3)
+	third, err := confirm(plan3, uuid.NewString())
+	if err != nil {
+		t.Fatalf("fresh second confirm after terminal: %v", err)
+	}
+	thirdCancel := orchestration.CancelProviderResult{State: "CANCELLED", NoRemoteTask: true}
+	thirdInput := orchestration.CancelProviderJobInput{Dispatch: orchestration.ExecuteProviderJobInput{Run: orchestration.GenerationRunRef{RunID: third.Value.RunID}}}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, thirdCancel); err != nil {
+		t.Fatal(err)
+	}
+	var cancelledBefore []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, third.Value.RunID).Scan(&cancelledBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, thirdCancel); err != nil {
+		t.Fatalf("exact creator cancellation replay: %v", err)
+	}
+	var cancelledAfter []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, third.Value.RunID).Scan(&cancelledAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(cancelledBefore, cancelledAfter) {
+		t.Fatalf("exact cancellation replay mutated terminal evidence\nbefore=%s\nafter=%s", cancelledBefore, cancelledAfter)
+	}
+	var cancelledOperation string
+	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.operation_requests WHERE id=$1`, third.Value.OperationID).Scan(&cancelledOperation); err != nil || cancelledOperation != "CANCELLED" {
+		t.Fatalf("creator cancelled operation=%q err=%v", cancelledOperation, err)
+	}
+	currencyDrift := thirdCancel
+	currencyDrift.Cost = providercontract.Cost{BillingMode: "subscription", Currency: "CNY"}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, currencyDrift); asCode(err) != controlplane.CodeRevisionConflict {
+		t.Fatalf("creator cancellation cost drift error=%v", err)
+	}
+	illegalCash := int64(1)
+	illegalCost := thirdCancel
+	illegalCost.Cost = providercontract.Cost{ActualMicros: &illegalCash, BillingMode: "subscription"}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, illegalCost); asCode(err) != controlplane.CodeCashChargeNotAllowed {
+		t.Fatalf("creator cancellation illegal cash replay error=%v", err)
+	}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, orchestration.CancelProviderResult{State: "FAILED", ErrorCode: "PROVIDER_FAILED"}); asCode(err) != controlplane.CodeRevisionConflict {
+		t.Fatalf("drifted creator cancellation error=%v", err)
+	}
+	plan4, _ := createPlan(4)
+	fourth, err := confirm(plan4, uuid.NewString())
+	if err != nil {
+		t.Fatalf("third project task: %v", err)
+	}
+	fourthInput := orchestration.CancelProviderJobInput{Dispatch: orchestration.ExecuteProviderJobInput{Run: orchestration.GenerationRunRef{RunID: fourth.Value.RunID}}}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, fourthInput, orchestration.CancelProviderResult{State: "UNKNOWN", ErrorCode: "CANCEL_NOT_CONFIRMED"}); err == nil {
+		t.Fatal("unconfirmed creator cancellation error = nil")
+	}
+	var fourthState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, fourth.Value.RunID).Scan(&fourthState); err != nil || fourthState != "RECONCILING" {
+		t.Fatalf("unconfirmed creator cancellation state=%q err=%v", fourthState, err)
+	}
+	fourthFailure := orchestration.CancelProviderResult{State: "FAILED", UpstreamTaskID: "creator-failed-task", RequestID: "creator-failed-request", ErrorCode: "REMOTE_FAILED", Usage: providercontract.Usage{VideoTokens: 1234}, Cost: providercontract.Cost{BillingMode: "subscription", Currency: "VTC"}}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, fourthInput, fourthFailure); err != nil {
+		t.Fatal(err)
+	}
+	var failedBefore []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, fourth.Value.RunID).Scan(&failedBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, fourthInput, fourthFailure); err != nil {
+		t.Fatalf("exact creator failure cancellation replay: %v", err)
+	}
+	if err := store.FinalizeShotRun(ctx, orchestration.WorkflowStep{}, orchestration.FinalizeShotRunInput{OperationID: fourth.Value.OperationID, RunID: fourth.Value.RunID, State: "FAILED", FailureCode: "REMOTE_FAILED"}); err != nil {
+		t.Fatalf("creator failure post-commit finalization replay: %v", err)
+	}
+	var failedAfter []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, fourth.Value.RunID).Scan(&failedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(failedBefore, failedAfter) {
+		t.Fatalf("exact failed replay mutated terminal evidence\nbefore=%s\nafter=%s", failedBefore, failedAfter)
+	}
+	plan5, _ := createPlan(5)
+	if plan5.Confirmable || len(plan5.Blockers) != 1 || plan5.Blockers[0] != string(controlplane.CodeProjectBudgetExceeded) {
+		t.Fatalf("exhausted plan=%#v", plan5)
+	}
+	if _, err := confirm(plan5, uuid.NewString()); asCode(err) != controlplane.CodeProjectBudgetExceeded {
+		t.Fatalf("project budget error=%v", err)
+	}
+	store.now = func() time.Time { return plan5.ExpiresAt.Add(time.Second) }
+	if _, err := confirm(plan5, uuid.NewString()); asCode(err) != controlplane.CodePlanExpired {
+		t.Fatalf("expired creator plan error=%v", err)
+	}
+	var expiredState string
+	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.creator_live_shot_plans WHERE id=$1`, plan5.PlanID).Scan(&expiredState); err != nil || expiredState != "EXPIRED" {
+		t.Fatalf("expired creator plan durable state=%q err=%v", expiredState, err)
+	}
+
+	for _, race := range []struct {
+		name            string
+		completionFirst bool
+		wantState       string
+	}{
+		{name: "completion wins row-lock queue", completionFirst: true, wantState: "SUCCEEDED"},
+		{name: "cancellation wins row-lock queue", completionFirst: false, wantState: "CANCELLED"},
+	} {
+		t.Run(race.name, func(t *testing.T) {
+			actor = controlplane.Actor{ActorID: "creator-race-" + uuid.NewString(), Role: "CREATOR"}
+			raceActor := actor
+			t.Cleanup(func() {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cleanupCancel()
+				_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_idempotency WHERE scope LIKE $1`, "creator-integration:"+raceActor.ActorID+"%")
+				_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_runs WHERE actor_id=$1`, raceActor.ActorID)
+				_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_plans WHERE actor_id=$1`, raceActor.ActorID)
+			})
+			plan, _ := createPlan(6)
+			run, err := confirm(plan, uuid.NewString())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var prepared creatorPreparedRequest
+			if err := pool.QueryRow(ctx, `SELECT request_snapshot FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, run.Value.RunID).Scan(&prepared); err != nil {
+				t.Fatal(err)
+			}
+			digest := strings.Repeat("d", 64)
+			completion := orchestration.ProviderResult{UpstreamTaskID: "race-task", RequestID: "race-request", Model: prepared.Input.Route, ArtifactURI: "cas://sha256/" + digest, ArtifactDigest: digest, MediaType: "video/mp4", ArtifactSize: 10, Width: 1280, Height: 720, DurationMillis: 5000, Usage: providercontract.Usage{VideoTokens: 1000}, Cost: providercontract.Cost{BillingMode: "subscription"}}
+			cancellation := orchestration.CancelProviderResult{State: "CANCELLED", UpstreamTaskID: completion.UpstreamTaskID, RequestID: completion.RequestID, Cost: providercontract.Cost{BillingMode: "subscription"}}
+			cancelInput := orchestration.CancelProviderJobInput{Dispatch: prepared.Input}
+
+			lockTx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = lockTx.Rollback(context.Background()) }()
+			if _, err := lockTx.Exec(ctx, `SELECT 1 FROM video_pipeline.creator_live_shot_runs WHERE id=$1 FOR UPDATE`, run.Value.RunID); err != nil {
+				_ = lockTx.Rollback(ctx)
+				t.Fatal(err)
+			}
+			completeErr := make(chan error, 1)
+			cancelErr := make(chan error, 1)
+			startCompletion := func() {
+				go func() {
+					completeErr <- store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, prepared.Input, completion)
+				}()
+			}
+			startCancellation := func() {
+				go func() {
+					cancelErr <- store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, cancelInput, cancellation)
+				}()
+			}
+			waitForBlocked := func(want int) {
+				t.Helper()
+				deadline := time.Now().Add(3 * time.Second)
+				for time.Now().Before(deadline) {
+					var count int
+					if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'`).Scan(&count); err != nil {
+						t.Fatal(err)
+					}
+					if count >= want {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				t.Fatalf("blocked creator writers=%d not observed", want)
+			}
+			if race.completionFirst {
+				startCompletion()
+				waitForBlocked(1)
+				startCancellation()
+			} else {
+				startCancellation()
+				waitForBlocked(1)
+				startCompletion()
+			}
+			waitForBlocked(2)
+			if err := lockTx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			completionError, cancellationError := <-completeErr, <-cancelErr
+			if race.completionFirst {
+				if completionError != nil || cancellationError != nil {
+					t.Fatalf("completion-first errors: completion=%v cancellation=%v", completionError, cancellationError)
+				}
+			} else {
+				if cancellationError != nil || asCode(completionError) != controlplane.CodeRunTerminal {
+					t.Fatalf("cancellation-first errors: completion=%v cancellation=%v", completionError, cancellationError)
+				}
+			}
+			var runState, operationState string
+			if err := pool.QueryRow(ctx, `
+				SELECT r.state,o.state
+				FROM video_pipeline.creator_live_shot_runs r
+				JOIN video_pipeline.operation_requests o ON o.id=r.operation_id
+				WHERE r.id=$1`, run.Value.RunID).Scan(&runState, &operationState); err != nil {
+				t.Fatal(err)
+			}
+			if runState != race.wantState || operationState != race.wantState {
+				t.Fatalf("concurrent creator truth run=%q operation=%q want=%q", runState, operationState, race.wantState)
+			}
+		})
+	}
+}
+
+func asCode(err error) controlplane.ErrorCode {
+	var domain *controlplane.DomainError
+	if errors.As(err, &domain) {
+		return domain.Code
+	}
+	return ""
 }
 
 func TestPostgres_MigrationV2EnforcesImmutableAndRetentionGuards(t *testing.T) {

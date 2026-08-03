@@ -28,15 +28,20 @@ run_migrate() {
 
 version_before="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_before="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_before}" = "11"
+test "${version_before}" = "12"
 test "${dirty_before}" = "f"
 test "$(psql_value 'SELECT COUNT(*) FROM video_pipeline.stage1_live_activations;')" = "0"
 
-# This regression specifically exercises the v7 guard. Migrations v8-v11
+# This regression specifically exercises the v7 guard. Migrations v8-v12
 # permit rollback only before live/retry activation, so a clean smoke database
 # can move to v7 for the probe and is restored to the latest version afterwards.
-run_migrate down 4 >/dev/null
+run_migrate down 5 >/dev/null
 test "$(psql_value 'SELECT version FROM public.schema_migrations;')" = "7"
+
+# Exercise v7's first-statement rollback guard from the real v7 schema. The
+# force is explicit so the test setup remains correct even after a prior dirty
+# local run; no later migration is claimed as applied at this point.
+run_migrate force 7 >/dev/null
 
 lineage_before="$(psql_value "
   SELECT COUNT(*)
@@ -95,20 +100,29 @@ test "${lineage_after}" = "${lineage_before}"
 test "${prompt_constraint_after}" = "${prompt_constraint_before}"
 test "${manifest_unique_after}" = "${manifest_unique_before}"
 
-# The failed statement was the first guarded statement and both v7 schema
-# invariants are unchanged, so clearing only golang-migrate's dirty marker is
-# safe in this disposable regression database.
+# The failed statement was the first guarded statement: v7 schema/data are
+# unchanged. Clear the dirty marker at v7, then genuinely reapply v8-v12;
+# forcing the marker directly to v12 would leave those schemas absent.
 run_migrate force 7 >/dev/null
-run_migrate up >/dev/null 2>&1
+run_migrate up >/dev/null
 
 version_recovered="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_recovered="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_recovered}" = "11"
+test "${version_recovered}" = "12"
 test "${dirty_recovered}" = "f"
+test "$(psql_value "SELECT to_regclass('video_pipeline.creator_live_shot_runs') IS NOT NULL;")" = "t"
+test "$(psql_value "SELECT to_regprocedure('video_pipeline.guard_creator_live_shot_terminal_update()') IS NOT NULL;")" = "t"
+test "$(psql_value "
+  SELECT COUNT(*)
+  FROM pg_trigger
+  WHERE tgrelid='video_pipeline.creator_live_shot_runs'::regclass
+    AND tgname='creator_live_shot_run_terminal_update'
+    AND NOT tgisinternal;
+")" = "1"
 test "$(psql_value "
   SELECT COUNT(*)
   FROM video_pipeline.prompt_snapshot_inputs
   WHERE input_type = 'GENERATION_PROFILE';
 ")" = "${lineage_before}"
 
-echo "v7 protected rollback dirty-state recovery passed; migration v11 restored"
+echo "v7 protected rollback dirty-state recovery passed; migration v12 restored"

@@ -44,6 +44,10 @@ OrbStack 入口使用独立的 `ai-video-series-*-orbstack` 数据卷，避免�
 | `http://127.0.0.1:18080/health/ready` | 控制面联合就绪 |
 | `http://127.0.0.1:8233` | Temporal UI |
 
+Studio Nginx 通过 Docker 内置 DNS 动态解析 `control-plane`，因此 Control Plane
+容器重建并更换地址后无需重启 Studio 即可自动恢复同源 API。`/health/studio`
+同时代理 Control Plane 的 `/health/ready`，不会在代理链路失效时误报 Studio 健康。
+
 操作台的项目创建、Gate、异常注入和成片锁版仍使用 Mock projection；Provider 状态
 来自控制面并能显示 Agent Plan 已配置。真实 mutation 在加载 series/episode、权利、
 revision、route、budget 和 policy 等不可变绑定前保持 fail closed。
@@ -67,6 +71,10 @@ schema。若已经产生 `GENERATION_PROFILE` lineage 或一 Manifest 对应多�
 publication lock，不允许执行 migration down 或让 v5 worker接管；应先停止写入、
 保留数据库证据并以前向修复恢复。`000007` down 只用于没有这些数据的可丢弃测试
 环境，并会在不安全时主动失败。
+
+`000012_creator_live_shot` 增加 Studio 单镜的短期计划、精确确认、订阅
+task/token reservation、Provider intent、CAS/Manifest 投影和独立幂等表。
+操作与故障恢复见 [creator-live-shot.md](creator-live-shot.md)。
 
 `golang-migrate` 会在执行 down SQL 前先把目标版本写为 dirty。因此，如果上述安全
 闸门拒绝 `000007 down`，即使第一条保护检查已在任何 DDL 前失败，迁移状态也会显示

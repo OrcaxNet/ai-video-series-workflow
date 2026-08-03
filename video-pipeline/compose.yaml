@@ -326,6 +326,8 @@ services:
       VIDEO_ARTIFACT_ROOT: /var/lib/video-pipeline/artifacts
       VIDEO_PROVIDER_ADAPTER_URL: ${VIDEO_PROVIDER_ADAPTER_URL:-http://mock-provider:8090}
       VIDEO_LIVE_PROVIDER_CONFIGURED: ${VIDEO_LIVE_PROVIDER_CONFIGURED:-false}
+      VIDEO_LIVE_CALLS_ENABLED: ${VIDEO_LIVE_CALLS_ENABLED:-false}
+      VIDEO_PROVIDER_SERVICE_AUTH_SECRET: ${VIDEO_PROVIDER_SERVICE_AUTH_SECRET:-}
       VIDEO_REQUIRE_DEPENDENCIES: "true"
     volumes:
       - video-artifacts:/var/lib/video-pipeline/artifacts

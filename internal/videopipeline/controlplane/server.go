@@ -40,12 +40,13 @@ type Dependency struct {
 
 // Server is the dependency-aware HTTP surface.
 type Server struct {
-	config       runtimeconfig.ControlPlane
-	dependencies []Dependency
-	store        Store
-	workflows    WorkflowController
-	artifacts    ArtifactVerifier
-	now          func() time.Time
+	config             runtimeconfig.ControlPlane
+	dependencies       []Dependency
+	store              Store
+	workflows          WorkflowController
+	artifacts          ArtifactVerifier
+	providerHTTPClient *http.Client
+	now                func() time.Time
 }
 
 // ArtifactVerifier proves that a CAS object exists before its immutable
@@ -66,7 +67,7 @@ func New(config runtimeconfig.ControlPlane) *Server {
 
 // NewWithDependencies is used by tests and alternate deployments.
 func NewWithDependencies(config runtimeconfig.ControlPlane, dependencies []Dependency) *Server {
-	return &Server{config: config, dependencies: dependencies, now: time.Now}
+	return &Server{config: config, dependencies: dependencies, providerHTTPClient: http.DefaultClient, now: time.Now}
 }
 
 // NewWithRuntime injects product truth and external orchestration boundaries.
@@ -78,13 +79,24 @@ func NewWithRuntime(
 	artifacts ArtifactVerifier,
 ) *Server {
 	return &Server{
-		config:       config,
-		dependencies: dependencies,
-		store:        store,
-		workflows:    workflows,
-		artifacts:    artifacts,
-		now:          time.Now,
+		config:             config,
+		dependencies:       dependencies,
+		store:              store,
+		workflows:          workflows,
+		artifacts:          artifacts,
+		providerHTTPClient: http.DefaultClient,
+		now:                time.Now,
 	}
+}
+
+// SetProviderHTTPClient installs the credential-isolated Adapter client used
+// only for authenticated capability discovery. Provider secrets remain in the
+// transport and are never serialized into plans or responses.
+func (s *Server) SetProviderHTTPClient(client *http.Client) *Server {
+	if client != nil {
+		s.providerHTTPClient = client
+	}
+	return s
 }
 
 // Handler returns the namespaced HTTP routes.
@@ -95,6 +107,13 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET "+APIBase+"/system/health", s.readiness)
 	mux.HandleFunc("GET "+APIBase+"/system/info", s.systemInfo)
 	mux.HandleFunc("GET "+APIBase+"/providers/status", s.providerStatus)
+	mux.HandleFunc("POST "+APIBase+"/creator/live-shot-plans", s.createCreatorLiveShotPlan)
+	mux.HandleFunc("POST "+APIBase+"/creator/live-shot-plans/{planId}/confirm", s.confirmCreatorLiveShotPlan)
+	mux.HandleFunc("GET "+APIBase+"/creator/live-shots/{seriesId}", s.listCreatorLiveShots)
+	mux.HandleFunc("GET "+APIBase+"/creator/live-shot-runs/{runId}", s.getCreatorLiveShotRun)
+	mux.HandleFunc("GET "+APIBase+"/creator/live-shot-runs/{runId}/artifact", s.getCreatorLiveShotArtifact)
+	mux.HandleFunc("HEAD "+APIBase+"/creator/live-shot-runs/{runId}/artifact", s.getCreatorLiveShotArtifact)
+	mux.HandleFunc("GET "+APIBase+"/creator/live-shot-runs/{runId}/manifest", s.getCreatorLiveShotManifest)
 	mux.HandleFunc("POST "+APIBase+"/series", s.createSeries)
 	mux.HandleFunc("POST "+APIBase+"/series/{seriesId}/sources", s.createSourceRevision)
 	mux.HandleFunc("POST "+APIBase+"/sources/{sourceRevisionId}/compilations", s.startContentCompilation)
@@ -210,9 +229,13 @@ type providerCapabilityStatus struct {
 	LiveEvidence      string   `json:"liveEvidence"`
 	MockEvidence      string   `json:"mockEvidence"`
 	MissingSecretRefs []string `json:"missingSecretRefs,omitempty"`
+	ModelID           string   `json:"modelId,omitempty"`
+	RouteVersion      string   `json:"routeVersion,omitempty"`
+	CapabilityHash    string   `json:"capabilityHash,omitempty"`
+	BillingMode       string   `json:"billingMode,omitempty"`
 }
 
-func (s *Server) providerStatus(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) providerStatus(w http.ResponseWriter, r *http.Request) {
 	// Credential-isolated deployments do not give the control plane the Ark
 	// secret. The non-secret marker is set only when Compose also starts and
 	// routes to the live adapter; it reports configuration, never validation.
@@ -221,14 +244,46 @@ func (s *Server) providerStatus(w http.ResponseWriter, _ *http.Request) {
 	claudeConfigured := anyEnvironmentSet("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 	statuses := []providerCapabilityStatus{
-		capabilityStatus("text.primary", arkConfigured || claudeConfigured, "volcengine_ark", []string{"ARK_API_KEY", "ANTHROPIC_API_KEY_OR_AUTH_TOKEN"}),
-		capabilityStatus("image.primary", arkConfigured, "volcengine_ark", []string{"ARK_API_KEY"}),
-		capabilityStatus("video.primary", arkConfigured, "volcengine_ark", []string{"ARK_API_KEY"}),
-		capabilityStatus("speech.primary", arkConfigured, "volcengine_agent_plan_tts", []string{"ARK_API_KEY"}),
+		capabilityStatus("text.primary", false, "volcengine_ark", []string{"ARK_API_KEY", "ANTHROPIC_API_KEY_OR_AUTH_TOKEN"}),
+		capabilityStatus("image.primary", false, "volcengine_ark", []string{"ARK_API_KEY"}),
+		capabilityStatus("video.primary", false, "volcengine_ark", []string{"ARK_API_KEY"}),
+		capabilityStatus("speech.primary", false, "volcengine_agent_plan_tts", []string{"ARK_API_KEY"}),
+	}
+	if arkConfigured {
+		statuses[1].MissingSecretRefs = nil
+		statuses[2].MissingSecretRefs = nil
+		statuses[3].MissingSecretRefs = nil
+	}
+	if arkConfigured || claudeConfigured {
+		statuses[0].MissingSecretRefs = nil
+	}
+	mode := "disabled"
+	if strings.TrimSpace(s.config.ProviderAdapterURL) != "" {
+		if capability, err := s.liveVideoCapability(r.Context()); err == nil {
+			for index := range statuses {
+				// Studio v1 deliberately arms only video.primary.
+				statuses[index].LiveConfigured = false
+				statuses[index].LiveCallsEnabled = false
+				statuses[index].LiveEvidence = "not_enabled_for_creator_v1"
+				statuses[index].MissingSecretRefs = nil
+			}
+			video := &statuses[2]
+			video.LiveConfigured = true
+			video.LiveCallsEnabled = s.config.LiveCallsEnabled
+			video.LiveEvidence = "authenticated_adapter_snapshot"
+			video.DefaultProvider = capability.Capability.Provider
+			video.ModelID = capability.Capability.ModelFamily
+			video.RouteVersion = capability.RouteVersion
+			video.CapabilityHash = capability.SnapshotHash
+			video.BillingMode, _ = capability.Limits["billingMode"].(string)
+			if s.config.LiveCallsEnabled {
+				mode = "live"
+			}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"schemaVersion": "v1",
-		"mode":          "dry-run",
+		"mode":          mode,
 		"capabilities":  statuses,
 		"secretPolicy": map[string]any{
 			"source":              "explicit-runtime-environment-or-secret-store",

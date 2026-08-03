@@ -4,8 +4,13 @@ import {
   type ApprovalResult,
   type CreateJobAttemptInput,
   type CreateJobAttemptResult,
+  type CreateLiveShotPlanInput,
   type CreateProjectInput,
   type CreateProjectResult,
+  type CreatorLiveShotManifest,
+  type CreatorLiveShotPlan,
+  type CreatorLiveShotProject,
+  type CreatorLiveShotRun,
   type Gate,
   type GateId,
   type ProviderCapability,
@@ -20,6 +25,17 @@ import {
 
 export interface ControlPlaneApi {
   getProviderStatus(): Promise<ProviderCapability[]>;
+  createLiveShotPlan(input: CreateLiveShotPlanInput, idempotencyKey: string): Promise<CreatorLiveShotPlan>;
+  confirmLiveShotPlan(
+    planId: string,
+    planHash: string,
+    idempotencyKey: string,
+  ): Promise<CreatorLiveShotRun>;
+  getLiveShotProject(seriesId: string): Promise<CreatorLiveShotProject>;
+  getLiveShotRun(runId: string, etag?: string): Promise<LiveShotRunResponse>;
+  getLiveShotManifest(runId: string): Promise<CreatorLiveShotManifest>;
+  liveShotArtifactUrl(runId: string): string;
+  liveShotManifestUrl(runId: string): string;
   createSeries(input: CreateProjectInput, idempotencyKey: string): Promise<CreateProjectResult>;
   createApproval(input: ApprovalInput): Promise<ApprovalResult>;
   createJobAttempt(input: CreateJobAttemptInput): Promise<CreateJobAttemptResult>;
@@ -27,6 +43,12 @@ export interface ControlPlaneApi {
   completeMockRun(): Promise<void>;
   regenerateGate(gateId: GateId, expectedRevision: number): Promise<RegenerationResult>;
   simulateConcurrentUpdate(gateId: GateId): Promise<number>;
+}
+
+export interface LiveShotRunResponse {
+  notModified: boolean;
+  run?: CreatorLiveShotRun;
+  etag?: string;
 }
 
 const problem = (
@@ -94,6 +116,14 @@ const liveMutationBlocked = (operation: string) =>
     "先从控制面加载并校验真实 series/episode、rights/profile、immutable revision、route、budget 与 policy 绑定，再开放对应 mutation。",
   );
 
+const liveShotUnavailable = () =>
+  problem(
+    503,
+    "LIVE_CALLS_DISABLED",
+    "当前客户端没有连接真实 Creator control plane。",
+    "启动同源控制面并使用 local-experience 或 live Studio 构建。",
+  );
+
 export class MockControlPlaneApi implements ControlPlaneApi {
   private gates: Record<GateId, Gate>;
   private idempotency = new Map<string, { fingerprint: string; result: ApprovalResult }>();
@@ -122,6 +152,41 @@ export class MockControlPlaneApi implements ControlPlaneApi {
 
   async getProviderStatus() {
     return structuredClone(fixtureCapabilities);
+  }
+
+  async createLiveShotPlan(
+    _input: CreateLiveShotPlanInput,
+    _idempotencyKey: string,
+  ): Promise<CreatorLiveShotPlan> {
+    throw liveShotUnavailable();
+  }
+
+  async confirmLiveShotPlan(
+    _planId: string,
+    _planHash: string,
+    _idempotencyKey: string,
+  ): Promise<CreatorLiveShotRun> {
+    throw liveShotUnavailable();
+  }
+
+  async getLiveShotProject(_seriesId: string): Promise<CreatorLiveShotProject> {
+    throw liveShotUnavailable();
+  }
+
+  async getLiveShotRun(_runId: string, _etag?: string): Promise<LiveShotRunResponse> {
+    throw liveShotUnavailable();
+  }
+
+  async getLiveShotManifest(_runId: string): Promise<CreatorLiveShotManifest> {
+    throw liveShotUnavailable();
+  }
+
+  liveShotArtifactUrl(runId: string): string {
+    return `/api/v1/creator/live-shot-runs/${encodeURIComponent(runId)}/artifact`;
+  }
+
+  liveShotManifestUrl(runId: string): string {
+    return `/api/v1/creator/live-shot-runs/${encodeURIComponent(runId)}/manifest`;
   }
 
   async createSeries(input: CreateProjectInput, idempotencyKey: string): Promise<CreateProjectResult> {
@@ -518,10 +583,37 @@ interface ProviderStatusResponse {
 export class HttpControlPlaneApi implements ControlPlaneApi {
   constructor(private readonly baseUrl = "/api/v1") {}
 
+  private endpoint(path: string) {
+    const value = `${this.baseUrl.replace(/\/$/, "")}${path}`;
+    if (typeof window !== "undefined") {
+      const resolved = new URL(value, window.location.href);
+      if (resolved.origin !== window.location.origin) {
+        throw problem(
+          500,
+          "CROSS_ORIGIN_CONTROL_PLANE_BLOCKED",
+          "Studio 拒绝连接跨域控制面或 Provider 地址。",
+          "把 Creator API 配置为 Studio 同源 /api 路径。",
+        );
+      }
+    }
+    return value;
+  }
+
+  private async jsonRequest<T>(path: string, init: RequestInit): Promise<T> {
+    const response = await fetch(this.endpoint(path), {
+      ...init,
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    });
+    if (!response.ok) throw await this.readProblem(response);
+    return (await response.json()) as T;
+  }
+
   async getProviderStatus(): Promise<ProviderCapability[]> {
-    const response = await fetch(`${this.baseUrl}/providers/status`, {
+    const response = await fetch(this.endpoint("/providers/status"), {
       method: "GET",
       credentials: "omit",
+      referrerPolicy: "no-referrer",
       headers: { Accept: "application/json" },
     });
     if (!response.ok) {
@@ -529,6 +621,82 @@ export class HttpControlPlaneApi implements ControlPlaneApi {
     }
     const body = (await response.json()) as ProviderStatusResponse;
     return body.capabilities;
+  }
+
+  async createLiveShotPlan(
+    input: CreateLiveShotPlanInput,
+    idempotencyKey: string,
+  ): Promise<CreatorLiveShotPlan> {
+    return this.jsonRequest("/creator/live-shot-plans", {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify({ schemaVersion: "v1", ...input }),
+    });
+  }
+
+  async confirmLiveShotPlan(
+    planId: string,
+    planHash: string,
+    idempotencyKey: string,
+  ): Promise<CreatorLiveShotRun> {
+    return this.jsonRequest(`/creator/live-shot-plans/${encodeURIComponent(planId)}/confirm`, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+        "If-Match": `"${planHash}"`,
+      },
+      body: JSON.stringify({ schemaVersion: "v1", planHash, confirmed: true }),
+    });
+  }
+
+  async getLiveShotProject(seriesId: string): Promise<CreatorLiveShotProject> {
+    return this.jsonRequest(`/creator/live-shots/${encodeURIComponent(seriesId)}`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+  }
+
+  async getLiveShotRun(runId: string, etag?: string): Promise<LiveShotRunResponse> {
+    const response = await fetch(
+      this.endpoint(`/creator/live-shot-runs/${encodeURIComponent(runId)}`),
+      {
+        method: "GET",
+        credentials: "omit",
+        referrerPolicy: "no-referrer",
+        headers: {
+          Accept: "application/json",
+          ...(etag ? { "If-None-Match": etag } : {}),
+        },
+      },
+    );
+    if (response.status === 304) return { notModified: true, etag: etag ?? undefined };
+    if (!response.ok) throw await this.readProblem(response);
+    return {
+      notModified: false,
+      run: (await response.json()) as CreatorLiveShotRun,
+      etag: response.headers.get("ETag") ?? undefined,
+    };
+  }
+
+  async getLiveShotManifest(runId: string): Promise<CreatorLiveShotManifest> {
+    return this.jsonRequest(`/creator/live-shot-runs/${encodeURIComponent(runId)}/manifest`, {
+      method: "GET",
+      headers: { Accept: "application/json" },
+    });
+  }
+
+  liveShotArtifactUrl(runId: string): string {
+    return this.endpoint(`/creator/live-shot-runs/${encodeURIComponent(runId)}/artifact`);
+  }
+
+  liveShotManifestUrl(runId: string): string {
+    return this.endpoint(`/creator/live-shot-runs/${encodeURIComponent(runId)}/manifest`);
   }
 
   async createSeries(input: CreateProjectInput, idempotencyKey: string): Promise<CreateProjectResult> {
@@ -600,6 +768,34 @@ export class LocalExperienceControlPlaneApi extends MockControlPlaneApi {
 
   override getProviderStatus(): Promise<ProviderCapability[]> {
     return this.providerStatusApi.getProviderStatus();
+  }
+
+  override createLiveShotPlan(input: CreateLiveShotPlanInput, idempotencyKey: string) {
+    return this.providerStatusApi.createLiveShotPlan(input, idempotencyKey);
+  }
+
+  override confirmLiveShotPlan(planId: string, planHash: string, idempotencyKey: string) {
+    return this.providerStatusApi.confirmLiveShotPlan(planId, planHash, idempotencyKey);
+  }
+
+  override getLiveShotProject(seriesId: string) {
+    return this.providerStatusApi.getLiveShotProject(seriesId);
+  }
+
+  override getLiveShotRun(runId: string, etag?: string) {
+    return this.providerStatusApi.getLiveShotRun(runId, etag);
+  }
+
+  override getLiveShotManifest(runId: string) {
+    return this.providerStatusApi.getLiveShotManifest(runId);
+  }
+
+  override liveShotArtifactUrl(runId: string) {
+    return this.providerStatusApi.liveShotArtifactUrl(runId);
+  }
+
+  override liveShotManifestUrl(runId: string) {
+    return this.providerStatusApi.liveShotManifestUrl(runId);
   }
 }
 

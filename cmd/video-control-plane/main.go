@@ -16,6 +16,7 @@ import (
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/runtimeconfig"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/temporalcontrol"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/volcengineprovider"
 	"go.temporal.io/sdk/client"
 )
 
@@ -52,9 +53,17 @@ func main() {
 		{Name: "artifact_store", Critical: true, Probe: controlplane.DirectoryProbe(cfg.ArtifactRoot)},
 		{Name: "provider_adapter", Critical: true, Probe: controlplane.HTTPProbe(cfg.ProviderAdapterURL + "/health/ready")},
 	}
+	providerHTTPClient := http.DefaultClient
+	if cfg.ProviderServiceAuthSecret != "" {
+		providerHTTPClient, err = volcengineprovider.AuthenticatedHTTPClient(&http.Client{Timeout: cfg.DependencyTimeout}, cfg.ProviderServiceAuthSecret)
+		if err != nil {
+			log.Fatalf("configure provider Adapter authentication: %v", err)
+		}
+	}
+	controlPlane := controlplane.NewWithRuntime(cfg, dependencies, store, workflows, artifacts).SetProviderHTTPClient(providerHTTPClient)
 	server := &http.Server{
 		Addr:              cfg.HTTPAddress,
-		Handler:           controlplane.NewWithRuntime(cfg, dependencies, store, workflows, artifacts).Handler(),
+		Handler:           controlPlane.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      15 * time.Second,
