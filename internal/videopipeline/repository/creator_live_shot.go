@@ -912,7 +912,7 @@ func (p *Postgres) creatorShotWorkflowRecord(ctx context.Context, runID uuid.UUI
 	if err := p.pool.QueryRow(ctx, `
 		SELECT r.id,p.shot_spec_revision_id,r.run_spec_digest,r.state,r.trace_id,r.created_at,
 		       p.prompt_snapshot_id,(r.request_snapshot->'input'->'prompt'->>'digest'),
-		       p.route_snapshot,r.reservation_id,r.workflow_id,p.id
+		       p.route_snapshot,p.budget_approval_id,r.workflow_id,p.id
 		FROM video_pipeline.creator_live_shot_runs r JOIN video_pipeline.creator_live_shot_plans p ON p.id=r.plan_id
 		WHERE r.id=$1`, runID).Scan(&record.Run.RunID, &record.Run.ShotSpecRevisionID, &record.Run.RunSpecDigest,
 		&record.Run.State, &record.Run.TraceID, &createdAt, &record.PromptSnapshotID, &record.PromptHash,

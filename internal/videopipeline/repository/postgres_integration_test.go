@@ -6712,7 +6712,8 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 	}
 
 	var prepared creatorPreparedRequest
-	if err := pool.QueryRow(ctx, `SELECT request_snapshot FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, run1.Value.RunID).Scan(&prepared); err != nil {
+	var reservationID string
+	if err := pool.QueryRow(ctx, `SELECT request_snapshot,reservation_id FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, run1.Value.RunID).Scan(&prepared, &reservationID); err != nil {
 		t.Fatal(err)
 	}
 	workflowRecord, err := store.GetShotWorkflowRecord(ctx, run1.Value.RunID)
@@ -6728,15 +6729,106 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 		workflowRecord.Prompt.Context.ShotSnapshotID == "" || len(workflowRecord.Prompt.InputRevisionHashes) == 0 {
 		t.Fatalf("creator Temporal dispatch prompt is partial: %#v", workflowRecord.Prompt)
 	}
-	if _, err := store.PrepareProviderJob(ctx, orchestration.WorkflowStep{}, prepared.Input); err != nil {
-		t.Fatalf("confirmed creator dispatch rejected before provider submit: %v", err)
+	projectedInput := orchestration.ExecuteProviderJobInput{
+		Run: orchestration.GenerationRunRef{
+			RunID: workflowRecord.Run.RunID, RunSpecDigest: workflowRecord.Run.RunSpecDigest,
+			Attempt: workflowRecord.Run.CreativeAttempt,
+		},
+		Prompt: orchestration.PromptSnapshotRef{
+			ID: workflowRecord.Prompt.ID, Digest: workflowRecord.Prompt.Digest,
+			PositivePrompt: workflowRecord.Prompt.PositivePrompt,
+			NegativePrompt: workflowRecord.Prompt.NegativePrompt,
+			Context:        workflowRecord.Prompt.Context, Assets: workflowRecord.Prompt.Assets,
+			Output:              workflowRecord.Prompt.Output,
+			InputRevisionHashes: workflowRecord.Prompt.InputRevisionHashes,
+		},
+		Route: providercontract.ModelSnapshot{
+			CapabilityAlias: workflowRecord.RouteSnapshot.CapabilityAlias,
+			Provider:        workflowRecord.RouteSnapshot.Provider,
+			ModelID:         workflowRecord.RouteSnapshot.ModelID,
+			EndpointID:      workflowRecord.RouteSnapshot.EndpointID,
+			RouteVersion:    workflowRecord.RouteSnapshot.RouteVersion,
+			CapabilityHash:  workflowRecord.RouteSnapshot.CapabilityHash,
+			Verification:    "control_plane_capability_snapshot",
+		},
+		ProviderProfileID:   workflowRecord.RouteSnapshot.ProviderProfileID,
+		BudgetApprovalID:    workflowRecord.BudgetApprovalID,
+		BudgetMaximumMicros: workflowRecord.BudgetLimit.AmountMicros,
+		BudgetCurrency:      workflowRecord.BudgetLimit.Currency,
+		TraceID:             workflowRecord.Run.TraceID,
+		PersistProductTruth: true,
 	}
-	if err := store.RecordProviderJobObservation(ctx, orchestration.WorkflowStep{}, prepared.Input, orchestration.ProviderJobObservation{State: "RUNNING", UpstreamTaskID: "task-1", RequestID: "request-1"}); err != nil {
+	if projectedInput.BudgetApprovalID != plan1.BudgetApprovalID ||
+		projectedInput.BudgetApprovalID == reservationID {
+		t.Fatalf("creator budget identities collapsed: approval=%q reservation=%q", projectedInput.BudgetApprovalID, reservationID)
+	}
+	if !reflect.DeepEqual(projectedInput, prepared.Input) {
+		t.Fatalf("creator Temporal input differs from confirmed provider intent: projected=%#v confirmed=%#v", projectedInput, prepared.Input)
+	}
+
+	creatorCAS, err := artifactstore.New(t.TempDir())
+	if err != nil {
 		t.Fatal(err)
 	}
-	result := orchestration.ProviderResult{UpstreamTaskID: "task-1", RequestID: "request-1", ProviderRegion: "cn-beijing", ArtifactDigest: strings.Repeat("d", 64), ArtifactURI: "cas://sha256/" + strings.Repeat("d", 64), MediaType: "video/mp4", ArtifactSize: 10, Width: 1280, Height: 720, DurationMillis: 5000, Model: prepared.Input.Route, Usage: providercontract.Usage{VideoTokens: 250000, GeneratedMillis: 5000}, Cost: providercontract.Cost{PricingVersion: "agent-plan-video-token-v1", BillingMode: "subscription", Verified: false}}
-	if err := store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, prepared.Input, result); err != nil {
+	creatorArtifact, err := creatorCAS.Put(ctx, bytes.NewReader([]byte("creator live-shot provider fixture")))
+	if err != nil {
 		t.Fatal(err)
+	}
+	var providerSubmits atomic.Int32
+	creatorProvider := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if request.Method != http.MethodPost || request.URL.Path != "/v1/jobs" {
+			http.NotFound(response, request)
+			return
+		}
+		providerSubmits.Add(1)
+		var job providercontract.JobRequest
+		if err := json.NewDecoder(request.Body).Decode(&job); err != nil {
+			http.Error(response, "invalid fixture request", http.StatusBadRequest)
+			return
+		}
+		if request.Header.Get("Idempotency-Key") != job.JobID ||
+			job.BudgetReservation.ReservationID != reservationID ||
+			job.BudgetReservation.ConfirmedBy != plan1.BudgetApprovalID {
+			http.Error(response, "creator budget binding mismatch", http.StatusUnprocessableEntity)
+			return
+		}
+		response.Header().Set("Content-Type", "application/json")
+		response.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(response).Encode(providercontract.JobResponse{
+			JobID: job.JobID, RunID: job.RunID,
+			UpstreamTaskID: "creator-task-" + creatorArtifact.Digest[:12],
+			RequestID:      "creator-request-" + creatorArtifact.Digest[:12],
+			State:          providercontract.StatusSucceeded, Progress: 100,
+			Model: job.Model, ProviderRegion: "cn-beijing",
+			Artifacts: []providercontract.AssetRef{{
+				ID: "creator-video-" + creatorArtifact.Digest[:12], Revision: creatorArtifact.Digest,
+				Kind: providercontract.ModalityVideo, Role: providercontract.AssetRoleOutput,
+				URI: creatorArtifact.URI, SHA256: creatorArtifact.Digest,
+				LicenseReference: "creator-integration-license", MediaType: "video/mp4",
+				SizeBytes: creatorArtifact.Size, Width: 1280, Height: 720, DurationMillis: 5000,
+			}},
+			Usage: providercontract.Usage{VideoTokens: 250000, GeneratedMillis: 5000},
+			Cost: providercontract.Cost{
+				PricingVersion: "agent-plan-video-token-v1", BillingMode: "subscription",
+				Verified: false,
+			},
+		})
+	}))
+	defer creatorProvider.Close()
+	activities := orchestration.NewProductionActivities(creatorProvider.URL, store, store, creatorCAS)
+	var activitySuite testsuite.WorkflowTestSuite
+	activityEnvironment := activitySuite.NewTestActivityEnvironment()
+	activityEnvironment.RegisterActivity(activities.ExecuteProviderJob)
+	encodedResult, err := activityEnvironment.ExecuteActivity(activities.ExecuteProviderJob, projectedInput)
+	if err != nil {
+		t.Fatalf("confirmed creator dispatch failed before provider submit: %v", err)
+	}
+	var result orchestration.ProviderResult
+	if err := encodedResult.Get(&result); err != nil {
+		t.Fatal(err)
+	}
+	if providerSubmits.Load() != 1 || result.UpstreamTaskID == "" || result.RequestID == "" {
+		t.Fatalf("creator provider result=%#v submits=%d", result, providerSubmits.Load())
 	}
 	completed, err := store.GetCreatorLiveShotRun(ctx, run1.Value.RunID, actor)
 	if err != nil || completed.State != "SUCCEEDED" || completed.ManifestHash == "" || completed.Manifest == nil || completed.SubmitCount != 1 || completed.Progress == nil || *completed.Progress != 100 || completed.CashCost.AmountMicros != nil || completed.CashCost.Verified {
