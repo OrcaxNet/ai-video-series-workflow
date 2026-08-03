@@ -1,4 +1,4 @@
-.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-orbstack-up video-orbstack-status video-orbstack-down video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-cer-test video-stage1-readiness video-stage1-materialize-test video-flo100-materialize-integration-test video-flo100-live-activation-integration-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test
+.PHONY: test provider-preflight video-bootstrap video-up video-up-tools video-orbstack-up video-orbstack-status video-orbstack-down video-down video-logs video-smoke video-integration-test video-postproduction-integration-test video-migration-v7-rollback-guard-test video-flo104-mock-evidence video-cer-test video-stage1-readiness video-stage1-materialize-test video-flo100-materialize-integration-test video-flo100-live-activation-integration-test video-stage1-revoice-test video-stage1-speech-batch-test video-stage1-runner-build video-live-provider-up video-live-probe video-secret-scan video-test web-build web-test web-nginx-recovery-test
 
 VIDEO_ENV := video-pipeline/.env.video
 VIDEO_COMPOSE := docker compose --env-file $(VIDEO_ENV) -f video-pipeline/compose.yaml
@@ -33,6 +33,7 @@ video-orbstack-up: video-bootstrap
 	VIDEO_PROVIDER_ADAPTER_URL="http://volcengine-provider:8091" \
 	VIDEO_SPEECH_PROVIDER_ADAPTER_URL="http://volcengine-provider:8091" \
 	VIDEO_LIVE_PROVIDER_CONFIGURED="true" \
+	VIDEO_LIVE_CALLS_ENABLED="true" \
 	VIDEO_POSTGRES_VOLUME="ai-video-series-postgres-orbstack" \
 	VIDEO_ARTIFACT_VOLUME="ai-video-series-artifacts-orbstack" \
 	$(VIDEO_COMPOSE) up --build --wait --force-recreate \
@@ -123,10 +124,14 @@ video-live-probe: video-bootstrap
 video-secret-scan:
 	./video-pipeline/scripts/check-secrets.sh
 
+web-nginx-recovery-test:
+	./web/scripts/test-nginx-recovery.sh
+
 video-test:
 	go test -race ./...
 	go vet ./...
 	docker compose --env-file video-pipeline/.env.video.example -f video-pipeline/compose.yaml config --quiet
+	./web/scripts/test-nginx-recovery.sh
 	./scripts/flo110-preflight.sh
 	./video-pipeline/scripts/check-secrets.sh
 

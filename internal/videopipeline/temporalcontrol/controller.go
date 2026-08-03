@@ -118,7 +118,13 @@ func (c *Controller) StartShot(
 	if record.BudgetLimit.AmountMicros <= 0 || record.BudgetLimit.Currency == "" {
 		return controlplane.WorkflowStart{}, errors.New("shot generation plan has no positive approved budget limit")
 	}
+	if record.Prompt.ID != record.PromptSnapshotID || record.Prompt.Digest != record.PromptHash {
+		return controlplane.WorkflowStart{}, errors.New("shot workflow prompt projection is incomplete or differs from its immutable identity")
+	}
 	input := shotProductionInput(operation.OperationID, record)
+	if operation.OperationType == "CONFIRM_CREATOR_LIVE_SHOT" {
+		input.RequireShotApproval = false
+	}
 	workflowID := operation.TemporalWorkflowID
 	if workflowID == "" {
 		workflowID = "shot-generation-" + operation.AggregateID
@@ -148,7 +154,12 @@ func shotProductionInput(
 			Attempt: record.Run.CreativeAttempt,
 		},
 		Prompt: orchestration.PromptSnapshotRef{
-			ID: record.PromptSnapshotID, Digest: record.PromptHash,
+			ID: record.Prompt.ID, Digest: record.Prompt.Digest,
+			PositivePrompt: record.Prompt.PositivePrompt,
+			NegativePrompt: record.Prompt.NegativePrompt,
+			Context:        record.Prompt.Context, Assets: record.Prompt.Assets,
+			Output:              record.Prompt.Output,
+			InputRevisionHashes: record.Prompt.InputRevisionHashes,
 		},
 		Route: providercontract.ModelSnapshot{
 			CapabilityAlias: record.RouteSnapshot.CapabilityAlias,

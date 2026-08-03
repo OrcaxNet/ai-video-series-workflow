@@ -320,6 +320,7 @@ type JobResponse struct {
 	RunID          string        `json:"run_id"`
 	UpstreamTaskID string        `json:"upstream_task_id"`
 	RequestID      string        `json:"request_id"`
+	ProviderRegion string        `json:"provider_region,omitempty"`
 	ConnectID      string        `json:"connect_id,omitempty"`
 	LogID          string        `json:"log_id,omitempty"`
 	State          JobStatus     `json:"state"`

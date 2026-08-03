@@ -117,6 +117,23 @@ func (s *Store) Open(digest string) (io.ReadCloser, error) {
 	return file, nil
 }
 
+// OpenSeeker exposes a verified content-addressed file for HTTP Range serving.
+// The returned path is never disclosed; callers publish only a same-origin URL.
+func (s *Store) OpenSeeker(digest string) (interface {
+	io.Reader
+	io.Seeker
+	io.Closer
+}, error) {
+	if !validDigest(digest) {
+		return nil, errors.New("artifact digest must be 64 lowercase hexadecimal characters")
+	}
+	file, err := os.Open(s.pathFor(digest))
+	if err != nil {
+		return nil, fmt.Errorf("open artifact %s: %w", digest, err)
+	}
+	return file, nil
+}
+
 // Resolve verifies an immutable object against its content-addressed identity
 // and returns the local path required by offline media inspectors. Callers must
 // not trust a path derived from a digest without re-hashing the stored bytes:

@@ -13,8 +13,12 @@ import {
   ApiProblem,
   type ApprovalResult,
   type CreateJobAttemptResult,
+  type CreateLiveShotPlanInput,
   type CreateProjectInput,
   type CreateProjectResult,
+  type CreatorLiveShotManifest,
+  type CreatorLiveShotPlan,
+  type CreatorLiveShotRun,
   type Decision,
   type GateId,
   type JobErrorCode,
@@ -31,6 +35,14 @@ type Action =
   | { type: "NAVIGATE"; view: ViewId }
   | { type: "TOGGLE_INSPECTOR" }
   | { type: "CAPABILITIES_LOADED"; capabilities: StudioState["capabilities"] }
+  | { type: "LIVE_SHOT_PLAN_STARTED" }
+  | { type: "LIVE_SHOT_PLAN_READY"; plan: CreatorLiveShotPlan }
+  | { type: "LIVE_SHOT_CONFIRM_STARTED" }
+  | { type: "LIVE_SHOT_RECOVERING"; problem?: ApiProblem }
+  | { type: "LIVE_SHOT_RUN_UPDATED"; run: CreatorLiveShotRun; etag?: string }
+  | { type: "LIVE_SHOT_MANIFEST_LOADED"; manifest: CreatorLiveShotManifest }
+  | { type: "LIVE_SHOT_PROBLEM"; problem: ApiProblem; phase: StudioState["liveShot"]["phase"] }
+  | { type: "LIVE_SHOT_RESET" }
   | { type: "PROJECT_CREATED"; input: CreateProjectInput; result: CreateProjectResult }
   | { type: "BUSY"; busy: boolean }
   | { type: "GATE_DECIDED"; result: ApprovalResult; explanation: string }
@@ -177,6 +189,40 @@ function reducer(state: StudioState, action: Action): StudioState {
       return { ...state, inspectorOpen: !state.inspectorOpen };
     case "CAPABILITIES_LOADED":
       return { ...state, capabilities: action.capabilities };
+    case "LIVE_SHOT_PLAN_STARTED":
+      return { ...state, liveShot: { phase: "PLANNING" } };
+    case "LIVE_SHOT_PLAN_READY":
+      return {
+        ...state,
+        liveShot: { phase: "AWAITING_CONFIRMATION", plan: action.plan },
+      };
+    case "LIVE_SHOT_CONFIRM_STARTED":
+      return { ...state, liveShot: { ...state.liveShot, phase: "CONFIRMING", problem: undefined } };
+    case "LIVE_SHOT_RECOVERING":
+      return { ...state, liveShot: { ...state.liveShot, phase: "RECOVERING", problem: action.problem } };
+    case "LIVE_SHOT_RUN_UPDATED": {
+      const terminal = new Set(["SUCCEEDED", "FAILED", "CANCELLED", "REQUIRES_ACTION"]);
+      return {
+        ...state,
+        liveShot: {
+          ...state.liveShot,
+          phase: terminal.has(action.run.state) ? "TERMINAL" : "TRACKING",
+          plan: state.liveShot.plan,
+          run: action.run,
+          etag: action.etag ?? state.liveShot.etag,
+          problem: undefined,
+        },
+      };
+    }
+    case "LIVE_SHOT_MANIFEST_LOADED":
+      return { ...state, liveShot: { ...state.liveShot, manifest: action.manifest } };
+    case "LIVE_SHOT_PROBLEM":
+      return {
+        ...state,
+        liveShot: { ...state.liveShot, phase: action.phase, problem: action.problem },
+      };
+    case "LIVE_SHOT_RESET":
+      return { ...state, liveShot: { phase: "DRAFT" } };
     case "PROJECT_CREATED": {
       const seed = createInitialState();
       return toast(
@@ -743,7 +789,77 @@ function reducer(state: StudioState, action: Action): StudioState {
   }
 }
 
+const liveShotResumeStorageKey = "studio.live-shot.resume.v1";
+
+interface LiveShotResume {
+  seriesId: string;
+  planId: string;
+  planHash: string;
+  confirmIntentId?: string;
+  confirmationPending?: boolean;
+  runId?: string;
+}
+
+const readLiveShotResume = (): LiveShotResume | undefined => {
+  if (typeof window === "undefined") return undefined;
+  try {
+    const raw = window.localStorage.getItem(liveShotResumeStorageKey);
+    if (!raw) return undefined;
+    const value = JSON.parse(raw) as Partial<LiveShotResume>;
+    if (
+      typeof value.seriesId !== "string" ||
+      typeof value.planId !== "string" ||
+      typeof value.planHash !== "string"
+    ) {
+      window.localStorage.removeItem(liveShotResumeStorageKey);
+      return undefined;
+    }
+    return value as LiveShotResume;
+  } catch {
+    return undefined;
+  }
+};
+
+const writeLiveShotResume = (resume: LiveShotResume) => {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(liveShotResumeStorageKey, JSON.stringify(resume));
+  } catch {
+    // Recovery still works during this page lifetime when storage is unavailable.
+  }
+};
+
+const clearLiveShotResume = () => {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(liveShotResumeStorageKey);
+  } catch {
+    // A blocked storage implementation must not block the live flow itself.
+  }
+};
+
+const normalizeProblem = (error: unknown) =>
+  error instanceof ApiProblem
+    ? error
+    : new ApiProblem({
+        status: 500,
+        errorCode: "CLIENT_RECOVERY_REQUIRED",
+        title: "Creator projection unavailable",
+        detail: error instanceof Error ? error.message : "无法读取真实创作投影。",
+        retryable: true,
+        traceId: "client-recovery",
+        suggestedAction: "恢复同一操作并继续读取状态；不要重新创建任务。",
+      });
+
 interface StudioActions {
+  refreshProviderStatus(): Promise<void>;
+  createLiveShotPlan(input: CreateLiveShotPlanInput): Promise<void>;
+  confirmLiveShotPlan(): Promise<void>;
+  recoverLiveShot(): Promise<void>;
+  refreshLiveShot(): Promise<void>;
+  resetLiveShot(): void;
+  liveShotArtifactUrl(runId: string): string;
+  liveShotManifestUrl(runId: string): string;
   createProject(input: CreateProjectInput): Promise<void>;
   navigate(view: ViewId): void;
   toggleInspector(): void;
@@ -775,6 +891,9 @@ export function StudioProvider({
   const apiRef = useRef(api ?? createControlPlaneApi());
   const jobAttemptIntentsRef = useRef(new Map<string, JobAttemptIntent>());
   const inFlightJobAttemptKeysRef = useRef(new Set<string>());
+  const planningLiveShotRef = useRef(false);
+  const confirmingLiveShotRef = useRef(false);
+  const liveShotResumeRef = useRef<LiveShotResume | undefined>(readLiveShotResume());
 
   const handleProblem = useCallback((error: unknown) => {
     const value =
@@ -799,6 +918,229 @@ export function StudioProvider({
         description: `${value.message} ${value.suggestedAction}`,
       },
     });
+  }, []);
+
+  const refreshProviderStatus = useCallback(async () => {
+    try {
+      const capabilities = await apiRef.current.getProviderStatus();
+      dispatch({ type: "CAPABILITIES_LOADED", capabilities });
+    } catch (error) {
+      handleProblem(error);
+    }
+  }, [handleProblem]);
+
+  const applyLiveShotRun = useCallback(async (run: CreatorLiveShotRun, etag?: string) => {
+    const current = liveShotResumeRef.current;
+    if (
+      (current && run.planHash !== current.planHash) ||
+      run.submitCount > 1 ||
+      run.route.capabilityAlias !== "video.primary" ||
+      run.route.billingMode !== "subscription" ||
+      run.cost.billingMode !== "subscription" ||
+      run.cost.amountMicros !== null ||
+      run.cost.verified !== false
+    ) {
+      dispatch({
+        type: "LIVE_SHOT_PROBLEM",
+        phase: "RECOVERING",
+        problem: new ApiProblem({
+          status: 502,
+          errorCode: "UNSAFE_RUN_PROJECTION",
+          title: "Unsafe run projection",
+          detail: "运行投影与已确认 planHash、单任务或 subscription-only 合同不一致。",
+          retryable: false,
+          traceId: run.traceId,
+          suggestedAction: "保留当前恢复记录并检查同一 operation；不要再次确认。",
+        }),
+      });
+      return;
+    }
+    const resume: LiveShotResume = {
+      seriesId: run.seriesId,
+      planId: run.planId,
+      planHash: run.planHash,
+      confirmIntentId: current?.confirmIntentId,
+      confirmationPending: false,
+      runId: run.runId,
+    };
+    liveShotResumeRef.current = resume;
+    writeLiveShotResume(resume);
+    dispatch({ type: "LIVE_SHOT_RUN_UPDATED", run, etag });
+    if (run.state === "SUCCEEDED" && run.manifest) {
+      try {
+        const manifest = await apiRef.current.getLiveShotManifest(run.runId);
+        dispatch({ type: "LIVE_SHOT_MANIFEST_LOADED", manifest });
+      } catch (error) {
+        dispatch({ type: "LIVE_SHOT_PROBLEM", problem: normalizeProblem(error), phase: "TERMINAL" });
+      }
+    }
+  }, []);
+
+  const recoverFromLiveShotResume = useCallback(
+    async (resume: LiveShotResume) => {
+      dispatch({ type: "LIVE_SHOT_RECOVERING" });
+      try {
+        const project = await apiRef.current.getLiveShotProject(resume.seriesId);
+        const run = project.runs[0];
+        dispatch({ type: "LIVE_SHOT_PLAN_READY", plan: project.plan });
+        if (run) {
+          await applyLiveShotRun(run);
+          return;
+        }
+        if (resume.confirmationPending && resume.confirmIntentId) {
+          const recoveredRun = await apiRef.current.confirmLiveShotPlan(
+            resume.planId,
+            resume.planHash,
+            resume.confirmIntentId,
+          );
+          await applyLiveShotRun(recoveredRun);
+        }
+      } catch (error) {
+        dispatch({
+          type: "LIVE_SHOT_PROBLEM",
+          problem: normalizeProblem(error),
+          phase: "RECOVERING",
+        });
+      }
+    },
+    [applyLiveShotRun],
+  );
+
+  const createLiveShotPlan = useCallback(
+    async (input: CreateLiveShotPlanInput) => {
+      if (planningLiveShotRef.current) return;
+      const video = state.capabilities.find((capability) => capability.alias === "video.primary");
+      if (!video?.liveCallsEnabled) {
+        dispatch({
+          type: "LIVE_SHOT_PROBLEM",
+          phase: "DRAFT",
+          problem: new ApiProblem({
+            status: 503,
+            errorCode: "LIVE_CALLS_DISABLED",
+            title: "Live video is unavailable",
+            detail: "video.primary 尚未通过真实能力快照和运维开关校验。",
+            retryable: false,
+            traceId: "client-live-disabled",
+            suggestedAction: "启用 Agent Plan 视频能力后重新读取状态。",
+          }),
+        });
+        return;
+      }
+      planningLiveShotRef.current = true;
+      clearLiveShotResume();
+      liveShotResumeRef.current = undefined;
+      dispatch({ type: "LIVE_SHOT_PLAN_STARTED" });
+      try {
+        const plan = await apiRef.current.createLiveShotPlan(input, crypto.randomUUID());
+        if (
+          plan.providerSubmitCount !== 0 ||
+          plan.providerCallCount !== 1 ||
+          plan.route.capabilityAlias !== "video.primary" ||
+          plan.route.billingMode !== "subscription" ||
+          plan.budget.cashAmountMaximum !== null ||
+          plan.budget.maxTasksThisConfirmation !== 1 ||
+          plan.budget.maxVideoTokensThisConfirmation > 1_000_000 ||
+          plan.budget.projectTaskLimit > 3 ||
+          plan.budget.projectTokenLimit > 3_000_000 ||
+          plan.spec.candidates !== 1 ||
+          plan.spec.durationSeconds !== 5 ||
+          plan.spec.resolution !== "720p" ||
+          plan.spec.audio !== false ||
+          plan.spec.aspectRatio !== input.aspectRatio ||
+          !/^[a-f0-9]{64}$/.test(plan.planHash)
+        ) {
+          throw new ApiProblem({
+            status: 502,
+            errorCode: "UNSAFE_PLAN_CONTRACT",
+            title: "Unsafe plan projection",
+            detail: "计划不满足零提交、单任务、Agent Plan subscription-only 合同。",
+            retryable: false,
+            traceId: plan.traceId,
+            suggestedAction: "停止确认并检查 Creator API 版本。",
+          });
+        }
+        const resume: LiveShotResume = {
+          seriesId: plan.seriesId,
+          planId: plan.planId,
+          planHash: plan.planHash,
+        };
+        liveShotResumeRef.current = resume;
+        writeLiveShotResume(resume);
+        dispatch({ type: "LIVE_SHOT_PLAN_READY", plan });
+      } catch (error) {
+        dispatch({ type: "LIVE_SHOT_PROBLEM", problem: normalizeProblem(error), phase: "DRAFT" });
+      } finally {
+        planningLiveShotRef.current = false;
+      }
+    },
+    [state.capabilities],
+  );
+
+  const confirmLiveShotPlan = useCallback(async () => {
+    const plan = state.liveShot.plan;
+    if (!plan || !plan.confirmable || confirmingLiveShotRef.current) return;
+    confirmingLiveShotRef.current = true;
+    const current = liveShotResumeRef.current;
+    const resume: LiveShotResume = {
+      seriesId: plan.seriesId,
+      planId: plan.planId,
+      planHash: plan.planHash,
+      confirmIntentId:
+        current?.planId === plan.planId && current.confirmIntentId
+          ? current.confirmIntentId
+          : crypto.randomUUID(),
+      confirmationPending: true,
+      runId: current?.runId,
+    };
+    liveShotResumeRef.current = resume;
+    writeLiveShotResume(resume);
+    dispatch({ type: "LIVE_SHOT_CONFIRM_STARTED" });
+    try {
+      const run = await apiRef.current.confirmLiveShotPlan(
+        plan.planId,
+        plan.planHash,
+        resume.confirmIntentId!,
+      );
+      await applyLiveShotRun(run);
+    } catch (error) {
+      const value = normalizeProblem(error);
+      if (value.retryable || value.errorCode === "CLIENT_RECOVERY_REQUIRED") {
+        await recoverFromLiveShotResume(resume);
+      } else {
+        const rejected = { ...resume, confirmationPending: false };
+        liveShotResumeRef.current = rejected;
+        writeLiveShotResume(rejected);
+        dispatch({ type: "LIVE_SHOT_PROBLEM", problem: value, phase: "AWAITING_CONFIRMATION" });
+      }
+    } finally {
+      confirmingLiveShotRef.current = false;
+    }
+  }, [applyLiveShotRun, recoverFromLiveShotResume, state.liveShot.plan]);
+
+  const recoverLiveShot = useCallback(async () => {
+    const resume = liveShotResumeRef.current ?? readLiveShotResume();
+    if (!resume) return;
+    await recoverFromLiveShotResume(resume);
+  }, [recoverFromLiveShotResume]);
+
+  const refreshLiveShot = useCallback(async () => {
+    const run = state.liveShot.run;
+    if (!run) {
+      await recoverLiveShot();
+      return;
+    }
+    try {
+      const result = await apiRef.current.getLiveShotRun(run.runId, state.liveShot.etag);
+      if (!result.notModified && result.run) await applyLiveShotRun(result.run, result.etag);
+    } catch (error) {
+      dispatch({ type: "LIVE_SHOT_RECOVERING", problem: normalizeProblem(error) });
+    }
+  }, [applyLiveShotRun, recoverLiveShot, state.liveShot.etag, state.liveShot.run]);
+
+  const resetLiveShot = useCallback(() => {
+    clearLiveShotResume();
+    liveShotResumeRef.current = undefined;
+    dispatch({ type: "LIVE_SHOT_RESET" });
   }, []);
 
   const decideGate = useCallback(
@@ -1051,22 +1393,52 @@ export function StudioProvider({
   );
 
   useEffect(() => {
+    void refreshProviderStatus();
+  }, [refreshProviderStatus]);
+
+  useEffect(() => {
+    const resume = liveShotResumeRef.current;
+    if (resume) void recoverFromLiveShotResume(resume);
+  }, [recoverFromLiveShotResume]);
+
+  useEffect(() => {
+    const run = state.liveShot.run;
+    if (!run || ["SUCCEEDED", "FAILED", "CANCELLED", "REQUIRES_ACTION"].includes(run.state)) {
+      return;
+    }
     let active = true;
-    void apiRef.current
-      .getProviderStatus()
-      .then((capabilities) => {
-        if (active) dispatch({ type: "CAPABILITIES_LOADED", capabilities });
-      })
-      .catch((error: unknown) => {
-        if (active) handleProblem(error);
-      });
+    let polling = false;
+    const poll = async () => {
+      if (polling) return;
+      polling = true;
+      try {
+        const result = await apiRef.current.getLiveShotRun(run.runId, state.liveShot.etag);
+        if (active && !result.notModified && result.run) {
+          await applyLiveShotRun(result.run, result.etag);
+        }
+      } catch (error) {
+        if (active) dispatch({ type: "LIVE_SHOT_RECOVERING", problem: normalizeProblem(error) });
+      } finally {
+        polling = false;
+      }
+    };
+    const timer = window.setInterval(() => void poll(), 2_000);
     return () => {
       active = false;
+      window.clearInterval(timer);
     };
-  }, [handleProblem]);
+  }, [applyLiveShotRun, state.liveShot.etag, state.liveShot.run]);
 
   const actions = useMemo<StudioActions>(
     () => ({
+      refreshProviderStatus,
+      createLiveShotPlan,
+      confirmLiveShotPlan,
+      recoverLiveShot,
+      refreshLiveShot,
+      resetLiveShot,
+      liveShotArtifactUrl: (runId) => apiRef.current.liveShotArtifactUrl(runId),
+      liveShotManifestUrl: (runId) => apiRef.current.liveShotManifestUrl(runId),
       createProject,
       navigate: (view) => dispatch({ type: "NAVIGATE", view }),
       toggleInspector: () => dispatch({ type: "TOGGLE_INSPECTOR" }),
@@ -1088,13 +1460,19 @@ export function StudioProvider({
     }),
     [
       completeMockRun,
+      confirmLiveShotPlan,
       confirmCancelJob,
       createJobAttempt,
+      createLiveShotPlan,
       createProject,
       decideGate,
       injectScenario,
       lockAssetRevision,
       regenerateGate,
+      recoverLiveShot,
+      refreshProviderStatus,
+      refreshLiveShot,
+      resetLiveShot,
       retryJob,
       simulateConcurrentUpdate,
       synchronizeGate,

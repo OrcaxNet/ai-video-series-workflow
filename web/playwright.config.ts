@@ -14,7 +14,7 @@ export default defineConfig({
     screenshot: "only-on-failure",
   },
   webServer: {
-    command: "npm run dev -- --host 127.0.0.1 --port 4174 --strictPort",
+    command: "VITE_STUDIO_MODE=local-experience VITE_STUDIO_INITIAL_VIEW=overview npm run dev -- --host 127.0.0.1 --port 4174 --strictPort",
     url: e2eBaseURL,
     reuseExistingServer: false,
   },

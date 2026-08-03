@@ -2,8 +2,10 @@ package temporalcontrol
 
 import (
 	"context"
+	"reflect"
 	"testing"
 
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"go.temporal.io/sdk/client"
@@ -68,6 +70,27 @@ type storeFixture struct {
 	operation controlplane.Operation
 }
 
+func workflowPromptFixture(id, digest string) controlplane.WorkflowPromptSnapshot {
+	return controlplane.WorkflowPromptSnapshot{
+		ID: id, Digest: digest,
+		PositivePrompt: "rainy station, consistent heroine",
+		NegativePrompt: "watermark, subtitles",
+		Context: providercontract.ContextRefs{
+			SeriesSnapshotID: "series-context", EpisodeSnapshotID: "episode-context",
+			SceneSnapshotID: "scene-context", ShotSnapshotID: "shot-context",
+		},
+		Assets: []providercontract.AssetRef{{
+			ID: "heroine", Revision: "heroine-v1", Kind: providercontract.ModalityImage,
+			Role: providercontract.AssetRoleReferenceImage, SHA256: "asset-hash",
+		}},
+		Output: providercontract.OutputSpec{
+			Width: 1280, Height: 720, Resolution: "720p", AspectRatio: "16:9",
+			FPS: 24, DurationMillis: 5000, Format: "mp4",
+		},
+		InputRevisionHashes: map[string]string{"shotSpec": "shot-hash", "generationProfile": "profile-hash"},
+	}
+}
+
 func (f *storeFixture) GetShotWorkflowRecord(context.Context, string) (controlplane.ShotWorkflowRecord, error) {
 	return f.shot, nil
 }
@@ -85,6 +108,7 @@ func TestControllerStartShotUsesStablePersistedWorkflowAndDispatch(t *testing.T)
 			RunSpecDigest: "digest-1", CreativeAttempt: 2, TraceID: "trace-1",
 		},
 		PromptSnapshotID: "prompt-1", PromptHash: "prompt-digest-1",
+		Prompt: workflowPromptFixture("prompt-1", "prompt-digest-1"),
 		RouteSnapshot: controlplane.ModelRouteSnapshot{
 			CapabilityAlias: "video.primary", ProviderProfileID: "provider-profile-1",
 			Provider: "MOCK", ModelID: "fixture-video-v1", RouteVersion: "route-v1",
@@ -118,12 +142,69 @@ func TestControllerStartShotUsesStablePersistedWorkflowAndDispatch(t *testing.T)
 	if !ok {
 		t.Fatalf("input type = %T", call.input)
 	}
+	expectedPrompt := workflowPromptFixture("prompt-1", "prompt-digest-1")
 	if input.Run.RunID != "run-1" || input.Run.Attempt != 2 ||
-		input.Prompt.Digest != "prompt-digest-1" ||
+		!reflect.DeepEqual(input.Prompt, orchestration.PromptSnapshotRef{
+			ID: expectedPrompt.ID, Digest: expectedPrompt.Digest,
+			PositivePrompt: expectedPrompt.PositivePrompt, NegativePrompt: expectedPrompt.NegativePrompt,
+			Context: expectedPrompt.Context, Assets: expectedPrompt.Assets, Output: expectedPrompt.Output,
+			InputRevisionHashes: expectedPrompt.InputRevisionHashes,
+		}) ||
 		input.ProviderProfileID != "provider-profile-1" ||
 		input.BudgetApprovalID != "budget-approval-1" ||
 		!input.PersistProductTruth {
 		t.Fatalf("shot input = %#v", input)
+	}
+}
+
+func TestControllerStartCreatorLiveShotSkipsManualQ1(t *testing.T) {
+	t.Parallel()
+	temporalClient := &clientFixture{}
+	store := &storeFixture{shot: controlplane.ShotWorkflowRecord{
+		Run:              controlplane.GenerationRun{RunID: "creator-run", ShotSpecRevisionID: "creator-shot", RunSpecDigest: "digest", CreativeAttempt: 1, TraceID: "trace"},
+		PromptSnapshotID: "prompt", PromptHash: "prompt-hash",
+		Prompt:           workflowPromptFixture("prompt", "prompt-hash"),
+		RouteSnapshot:    controlplane.ModelRouteSnapshot{CapabilityAlias: "video.primary", ProviderProfileID: "profile", Provider: "volcengine_ark", ModelID: "model", RouteVersion: "agent-plan-large-v1", CapabilityHash: "hash"},
+		BudgetApprovalID: "reservation", BudgetLimit: controlplane.BudgetLimit{AmountMicros: 1_000_000, Currency: "VTC"},
+	}}
+	controller, err := New(temporalClient, "queue", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = controller.StartShot(t.Context(), controlplane.Operation{OperationID: "operation", OperationType: "CONFIRM_CREATOR_LIVE_SHOT", AggregateID: "creator-run", TemporalWorkflowID: "creator-live-shot-creator-run"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := temporalClient.executions[0].input.(orchestration.ShotProductionInput)
+	if input.RequireShotApproval {
+		t.Fatal("creator live shot unexpectedly waits for Q1")
+	}
+}
+
+func TestControllerStartShotRejectsPartialPromptProjection(t *testing.T) {
+	t.Parallel()
+	temporalClient := &clientFixture{}
+	store := &storeFixture{shot: controlplane.ShotWorkflowRecord{
+		Run: controlplane.GenerationRun{
+			RunID: "run-1", ShotSpecRevisionID: "shot-1", RunSpecDigest: "run-digest", CreativeAttempt: 1,
+		},
+		PromptSnapshotID: "prompt-1", PromptHash: "prompt-digest-1",
+		RouteSnapshot: controlplane.ModelRouteSnapshot{
+			CapabilityAlias: "video.primary", ProviderProfileID: "profile-1",
+			Provider: "MOCK", ModelID: "fixture-video-v1", RouteVersion: "route-v1", CapabilityHash: "hash-1",
+		},
+		BudgetApprovalID: "budget-1",
+		BudgetLimit:      controlplane.BudgetLimit{AmountMicros: 1, Currency: "VTC"},
+	}}
+	controller, err := New(temporalClient, "queue", store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.StartShot(t.Context(), controlplane.Operation{OperationID: "operation-1", AggregateID: "run-1"}); err == nil {
+		t.Fatal("StartShot() accepted an ID/digest-only prompt projection")
+	}
+	if len(temporalClient.executions) != 0 {
+		t.Fatalf("partial prompt started %d workflows", len(temporalClient.executions))
 	}
 }
 
@@ -169,6 +250,7 @@ func TestControllerStartsStableReconciliationAfterOriginalWorkflowClosed(t *test
 				FailureCode: "CANCEL_NOT_CONFIRMED", TraceID: "trace-1",
 			},
 			PromptSnapshotID: "prompt-1", PromptHash: "prompt-digest-1",
+			Prompt: workflowPromptFixture("prompt-1", "prompt-digest-1"),
 			RouteSnapshot: controlplane.ModelRouteSnapshot{
 				CapabilityAlias: "video.primary", ProviderProfileID: "provider-profile-1",
 				Provider: "MOCK", ModelID: "fixture-video-v1", RouteVersion: "route-v1",

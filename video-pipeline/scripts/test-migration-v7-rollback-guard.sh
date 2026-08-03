@@ -28,15 +28,20 @@ run_migrate() {
 
 version_before="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_before="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_before}" = "11"
+test "${version_before}" = "12"
 test "${dirty_before}" = "f"
 test "$(psql_value 'SELECT COUNT(*) FROM video_pipeline.stage1_live_activations;')" = "0"
 
-# This regression specifically exercises the v7 guard. Migrations v8-v11
+# This regression specifically exercises the v7 guard. Migrations v8-v12
 # permit rollback only before live/retry activation, so a clean smoke database
 # can move to v7 for the probe and is restored to the latest version afterwards.
-run_migrate down 4 >/dev/null
+run_migrate down 5 >/dev/null
 test "$(psql_value 'SELECT version FROM public.schema_migrations;')" = "7"
+
+# v12 owns creator data that this guard must not delete. Temporarily point only
+# golang-migrate's version marker at v7; the v12 schema remains untouched while
+# we exercise v7's first-statement rollback guard below.
+run_migrate force 7 >/dev/null
 
 lineage_before="$(psql_value "
   SELECT COUNT(*)
@@ -95,15 +100,13 @@ test "${lineage_after}" = "${lineage_before}"
 test "${prompt_constraint_after}" = "${prompt_constraint_before}"
 test "${manifest_unique_after}" = "${manifest_unique_before}"
 
-# The failed statement was the first guarded statement and both v7 schema
-# invariants are unchanged, so clearing only golang-migrate's dirty marker is
-# safe in this disposable regression database.
-run_migrate force 7 >/dev/null
-run_migrate up >/dev/null 2>&1
+# The failed statement was the first guarded statement: v7 and v12 schema/data
+# are unchanged, so restore only golang-migrate's v12 version marker.
+run_migrate force 12 >/dev/null
 
 version_recovered="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_recovered="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
-test "${version_recovered}" = "11"
+test "${version_recovered}" = "12"
 test "${dirty_recovered}" = "f"
 test "$(psql_value "
   SELECT COUNT(*)
@@ -111,4 +114,4 @@ test "$(psql_value "
   WHERE input_type = 'GENERATION_PROFILE';
 ")" = "${lineage_before}"
 
-echo "v7 protected rollback dirty-state recovery passed; migration v11 restored"
+echo "v7 protected rollback dirty-state recovery passed; migration v12 restored"

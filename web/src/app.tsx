@@ -3,6 +3,7 @@ import {
   Aperture,
   Boxes,
   ChevronDown,
+  Clapperboard,
   CircleHelp,
   CloudOff,
   Eye,
@@ -31,6 +32,7 @@ import { AssetsPage } from "./pages/assets";
 import { DeliveryPage } from "./pages/delivery";
 import { JobsPage } from "./pages/jobs";
 import { LineagePage } from "./pages/lineage";
+import { LiveShotPage } from "./pages/live-shot";
 import { OverviewPage } from "./pages/overview";
 import { StoryboardPage } from "./pages/storyboard";
 
@@ -41,6 +43,7 @@ const navigation: Array<{
   icon: typeof LayoutDashboard;
   gate?: string;
 }> = [
+  { id: "live-shot", label: "真实单镜预览", shortLabel: "Live", icon: Clapperboard },
   { id: "overview", label: "片场总览", shortLabel: "总览", icon: LayoutDashboard },
   { id: "assets", label: "内容与资产", shortLabel: "资产", icon: Boxes, gate: "G1" },
   { id: "storyboard", label: "剧本与分镜", shortLabel: "分镜", icon: Aperture, gate: "G2" },
@@ -50,6 +53,7 @@ const navigation: Array<{
 ];
 
 const pages: Record<ViewId, ComponentType> = {
+  "live-shot": LiveShotPage,
   overview: OverviewPage,
   assets: AssetsPage,
   storyboard: StoryboardPage,
@@ -65,6 +69,10 @@ export function App() {
   const closeProjectDialog = useCallback(() => setProjectDialogOpen(false), []);
   const CurrentPage = pages[state.view];
   const agentPlanConfigured = state.capabilities.some((capability) => capability.liveConfigured);
+  const liveVideoEnabled = state.capabilities.some(
+    (capability) => capability.alias === "video.primary" && capability.liveCallsEnabled,
+  );
+  const liveView = state.view === "live-shot";
 
   return (
     <div className={`studio-shell ${state.inspectorOpen ? "with-inspector" : ""}`}>
@@ -83,33 +91,45 @@ export function App() {
           <strong>场记</strong>
           <span>AI 剧集创作操作台</span>
         </div>
-        <button
-          ref={projectSwitcherRef}
-          className="project-switcher"
-          type="button"
-          aria-label="切换或新建项目"
-          onClick={() => setProjectDialogOpen(true)}
-        >
-          <span className="project-thumb">潮</span>
-          <span>
-            <strong>{state.project.title}</strong>
-            <small>{state.project.episode} · {state.project.episodeTitle}</small>
-          </span>
-          <ChevronDown size={14} aria-hidden="true" />
-        </button>
+        {liveView ? (
+          <div className="project-switcher project-switcher-live" aria-label="当前真实单镜项目">
+            <span className="project-thumb"><Clapperboard size={15} /></span>
+            <span>
+              <strong>{state.liveShot.plan?.title ?? "新的真实单镜"}</strong>
+              <small>LIVE · 1 候选 / 5 秒 / 720p</small>
+            </span>
+          </div>
+        ) : (
+          <button
+            ref={projectSwitcherRef}
+            className="project-switcher"
+            type="button"
+            aria-label="切换或新建项目"
+            onClick={() => setProjectDialogOpen(true)}
+          >
+            <span className="project-thumb">潮</span>
+            <span>
+              <strong>{state.project.title}</strong>
+              <small>{state.project.episode} · {state.project.episodeTitle}</small>
+            </span>
+            <ChevronDown size={14} aria-hidden="true" />
+          </button>
+        )}
         <div className="topbar-actions">
           <div
             className="mode-pill"
             title={
-              agentPlanConfigured
-                ? "Agent Plan 凭据仅注入后端；当前界面操作仍是可复现演练"
-                : "当前不进行真实 Provider 调用"
+              liveView
+                ? liveVideoEnabled
+                  ? "video.primary 已由控制面确认可真实调用"
+                  : "video.primary 尚未同时通过能力快照与运维开关"
+                : "当前区域是独立 Mock 演练，不会产生真实 Provider 调用"
             }
           >
-            {agentPlanConfigured ? <ShieldCheck size={14} aria-hidden="true" /> : <CloudOff size={14} aria-hidden="true" />}
+            {liveView && liveVideoEnabled ? <ShieldCheck size={14} aria-hidden="true" /> : <CloudOff size={14} aria-hidden="true" />}
             <span>
-              <strong>{agentPlanConfigured ? "Agent Plan 已配置" : "Mock only"}</strong>
-              <small>{agentPlanConfigured ? "交互仍为安全演练" : "live pending_key"}</small>
+              <strong>{liveView ? (liveVideoEnabled ? "Live 已就绪" : "Live 未启用") : "Mock only"}</strong>
+              <small>{liveView ? "video.primary" : agentPlanConfigured ? "与真实项目隔离" : "live pending_key"}</small>
             </span>
           </div>
           <button className="icon-button" type="button" aria-label="搜索">
@@ -118,26 +138,29 @@ export function App() {
           <button className="icon-button" type="button" aria-label="帮助">
             <CircleHelp size={17} />
           </button>
-          <button
-            className={`icon-button ${state.inspectorOpen ? "active" : ""}`}
-            type="button"
-            aria-label={state.inspectorOpen ? "关闭证据检查器" : "打开证据检查器"}
-            aria-pressed={state.inspectorOpen}
-            onClick={() => actions.toggleInspector()}
-          >
-            {state.inspectorOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
-          </button>
+          {!liveView && (
+            <button
+              className={`icon-button ${state.inspectorOpen ? "active" : ""}`}
+              type="button"
+              aria-label={state.inspectorOpen ? "关闭证据检查器" : "打开证据检查器"}
+              aria-pressed={state.inspectorOpen}
+              onClick={() => actions.toggleInspector()}
+            >
+              {state.inspectorOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
+            </button>
+          )}
           <span className="avatar" title="本地导演">岚</span>
         </div>
       </header>
 
       <aside className="studio-sidebar">
         <nav aria-label="生产工作区">
-          <span className="nav-section-label">制作流程</span>
+          <span className="nav-section-label">真实创作</span>
           {navigation.map((item) => {
             const Icon = item.icon;
             const gate = item.gate ? state.gates[item.gate as "G1" | "G2" | "G3"] : undefined;
-            return (
+            return [
+              item.id === "overview" ? <span className="nav-section-label nav-section-spacer" key="mock-label">Mock 演练</span> : null,
               <button
                 type="button"
                 className={state.view === item.id ? "active" : ""}
@@ -147,9 +170,10 @@ export function App() {
               >
                 <Icon size={17} aria-hidden="true" />
                 <span>{item.label}</span>
+                {item.id === "live-shot" && <small className={`nav-live-dot ${liveVideoEnabled ? "ready" : ""}`} aria-label={liveVideoEnabled ? "可真实调用" : "未启用"} />}
                 {item.gate && <small className={`nav-gate nav-gate-${gate?.state.toLowerCase()}`}>{item.gate}</small>}
-              </button>
-            );
+              </button>,
+            ];
           })}
         </nav>
         <div className="sidebar-footer">
@@ -171,7 +195,7 @@ export function App() {
         <CurrentPage />
       </main>
 
-      {state.inspectorOpen && <EvidenceInspector />}
+      {state.inspectorOpen && !liveView && <EvidenceInspector />}
 
       <nav className="mobile-bottom-nav" aria-label="移动端生产工作区">
         {navigation.map((item) => {
@@ -204,7 +228,7 @@ export function App() {
           </div>
         ))}
       </div>
-      {projectDialogOpen && (
+      {projectDialogOpen && !liveView && (
         <ProjectDialog onClose={closeProjectDialog} returnFocusRef={projectSwitcherRef} />
       )}
     </div>

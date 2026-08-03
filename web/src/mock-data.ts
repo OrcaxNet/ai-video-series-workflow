@@ -8,6 +8,7 @@ import type {
   ProviderJob,
   Shot,
   StudioState,
+  ViewId,
 } from "./domain";
 
 const hash = (seed: string) =>
@@ -533,8 +534,16 @@ export const activity: Activity[] = [
   { id: "act-4", at: "09:36", actor: "编剧 Agent", action: "创建 revision", detail: "分镜 r9 · Prompt r4" },
 ];
 
+const initialStudioView = (): ViewId => {
+  if (import.meta.env.VITE_STUDIO_INITIAL_VIEW === "overview") return "overview";
+  if (["local-experience", "live"].includes(import.meta.env.VITE_STUDIO_MODE ?? "")) {
+    return "live-shot";
+  }
+  return "overview";
+};
+
 export const createInitialState = (): StudioState => ({
-  view: "overview",
+  view: initialStudioView(),
   inspectorOpen: false,
   busy: false,
   project: {
@@ -560,4 +569,5 @@ export const createInitialState = (): StudioState => ({
   selectedAssetId: "asset-jilan",
   activity: structuredClone(activity),
   toasts: [],
+  liveShot: { phase: "DRAFT" },
 });

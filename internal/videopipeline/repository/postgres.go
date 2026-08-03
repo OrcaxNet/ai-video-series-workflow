@@ -1462,6 +1462,13 @@ func (p *Postgres) GetShotWorkflowRecord(
 	)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
+			creator, creatorErr := p.creatorShotWorkflowRecord(ctx, runID)
+			if creatorErr == nil {
+				return creator, nil
+			}
+			if !errors.Is(creatorErr, pgx.ErrNoRows) {
+				return controlplane.ShotWorkflowRecord{}, creatorErr
+			}
 			return controlplane.ShotWorkflowRecord{}, controlplane.NewNotFoundError("generation run workflow projection", runIDRaw)
 		}
 		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("read shot workflow projection: %w", err)
@@ -1487,6 +1494,11 @@ func (p *Postgres) GetShotWorkflowRecord(
 	}
 	record.RouteSnapshot = plan.Plan.RouteSnapshot
 	record.BudgetLimit = plan.BudgetLimit
+	prompt, err := p.ResolvePromptSnapshot(ctx, record.PromptSnapshotID)
+	if err != nil {
+		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("read shot workflow prompt snapshot: %w", err)
+	}
+	record.Prompt = workflowPromptSnapshot(prompt)
 	return record, nil
 }
 

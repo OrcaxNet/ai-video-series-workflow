@@ -1,5 +1,31 @@
 import { expect, test, type Page } from "@playwright/test";
 
+test.beforeEach(async ({ page }) => {
+  await page.route("**/api/v1/providers/status", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        schemaVersion: "v1",
+        mode: "disabled",
+        capabilities: [
+          {
+            alias: "video.primary",
+            liveConfigured: false,
+            liveCallsEnabled: false,
+            dryRunAvailable: true,
+            mockAvailable: true,
+            defaultProvider: "volcengine_ark",
+            liveEvidence: "not_enabled_for_creator_v1",
+            mockEvidence: "mock_only",
+          },
+        ],
+        secretPolicy: { browserReceivesCredential: false },
+      }),
+    }),
+  );
+});
+
 async function approveG1AndG2(page: Page) {
   await page.getByRole("button", { name: "内容与资产 G1" }).click();
   await page.getByRole("button", { name: "开始审核" }).click();
