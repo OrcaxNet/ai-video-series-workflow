@@ -1030,24 +1030,30 @@ func (p *Postgres) completeCreatorProviderJob(ctx context.Context, runID uuid.UU
 	}
 	type completionResult struct{ exists bool }
 	_, err := withSerializable(ctx, p.pool, func(tx pgx.Tx) (completionResult, error) {
-		var planID, providerJobID, reservationID uuid.UUID
+		var planID, providerJobID, reservationID, operationID uuid.UUID
 		var reservedVideoTokens int64
 		var planHash, requestHash, state, upstreamTaskID, requestID string
 		var route providercontract.ModelSnapshot
+		var confirmed creatorPreparedRequest
 		var createdAt time.Time
 		if err := tx.QueryRow(ctx, `
-			SELECT r.plan_id,r.provider_job_id,r.reservation_id,r.reserved_video_tokens,
+			SELECT r.plan_id,r.provider_job_id,r.reservation_id,r.operation_id,r.reserved_video_tokens,
 			       p.plan_hash,r.request_hash,r.state,p.route_snapshot,
-			       COALESCE(r.upstream_task_id,''),COALESCE(r.upstream_request_id,''),r.created_at
+			       r.request_snapshot,COALESCE(r.upstream_task_id,''),
+			       COALESCE(r.upstream_request_id,''),r.created_at
 			FROM video_pipeline.creator_live_shot_runs r
 			JOIN video_pipeline.creator_live_shot_plans p ON p.id=r.plan_id
 			WHERE r.id=$1 FOR UPDATE OF r`, runID,
-		).Scan(&planID, &providerJobID, &reservationID, &reservedVideoTokens, &planHash,
-			&requestHash, &state, &route, &upstreamTaskID, &requestID, &createdAt); err != nil {
+		).Scan(&planID, &providerJobID, &reservationID, &operationID, &reservedVideoTokens,
+			&planHash, &requestHash, &state, &route, &confirmed, &upstreamTaskID,
+			&requestID, &createdAt); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return completionResult{}, nil
 			}
 			return completionResult{exists: true}, fmt.Errorf("lock creator completion: %w", err)
+		}
+		if !reflect.DeepEqual(confirmed.Input, input) {
+			return completionResult{exists: true}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "provider completion input differs from the confirmed immutable request")
 		}
 		if (upstreamTaskID != "" && upstreamTaskID != result.UpstreamTaskID) ||
 			(requestID != "" && requestID != result.RequestID) {
@@ -1092,6 +1098,9 @@ func (p *Postgres) completeCreatorProviderJob(ctx context.Context, runID uuid.UU
 			if !exact {
 				return completionResult{exists: true}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "provider completion replay differs from immutable terminal evidence")
 			}
+			if err := settleCreatorOperation(ctx, tx, operationID, "SUCCEEDED"); err != nil {
+				return completionResult{exists: true}, err
+			}
 			return completionResult{exists: true}, nil
 		}
 		if state == "FAILED" || state == "CANCELLED" {
@@ -1112,6 +1121,9 @@ func (p *Postgres) completeCreatorProviderJob(ctx context.Context, runID uuid.UU
 		}
 		if tag.RowsAffected() != 1 {
 			return completionResult{exists: true}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "creator run changed before completion commit")
+		}
+		if err := settleCreatorOperation(ctx, tx, operationID, "SUCCEEDED"); err != nil {
+			return completionResult{exists: true}, err
 		}
 		return completionResult{exists: true}, nil
 	})
@@ -1158,20 +1170,76 @@ func (p *Postgres) finalizeCreatorRun(ctx context.Context, runID, operationID uu
 		}
 		return true, nil
 	}
-	_, err := p.pool.Exec(ctx, `
-		WITH changed AS (
-			UPDATE video_pipeline.creator_live_shot_runs SET state='FAILED',error_code=NULLIF($2,''),updated_at=now(),terminal_at=now()
-			WHERE id=$1 AND state NOT IN ('SUCCEEDED','CANCELLED') RETURNING operation_id
-		)
-		UPDATE video_pipeline.operation_requests SET state='FAILED',updated_at=now()
-		WHERE id IN (SELECT operation_id FROM changed) AND state IN ('ACCEPTED','RUNNING')`, runID, input.FailureCode)
+	type finalizationResult struct{}
+	_, err := withSerializable(ctx, p.pool, func(tx pgx.Tx) (finalizationResult, error) {
+		var state, errorCode string
+		if err := tx.QueryRow(ctx, `
+			SELECT state,COALESCE(error_code,'')
+			FROM video_pipeline.creator_live_shot_runs
+			WHERE id=$1 AND operation_id=$2 FOR UPDATE`, runID, operationID,
+		).Scan(&state, &errorCode); err != nil {
+			return finalizationResult{}, fmt.Errorf("lock creator failure finalization: %w", err)
+		}
+		failureCode := strings.TrimSpace(input.FailureCode)
+		if state == "FAILED" {
+			if errorCode != failureCode {
+				return finalizationResult{}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "creator failure finalization replay differs from immutable terminal evidence")
+			}
+			if err := settleCreatorOperation(ctx, tx, operationID, "FAILED"); err != nil {
+				return finalizationResult{}, err
+			}
+			return finalizationResult{}, nil
+		}
+		if state == "SUCCEEDED" || state == "CANCELLED" {
+			return finalizationResult{}, controlplane.NewConflictError(controlplane.CodeRunTerminal, "creator failure finalization cannot reverse terminal truth")
+		}
+		tag, err := tx.Exec(ctx, `
+			UPDATE video_pipeline.creator_live_shot_runs
+			SET state='FAILED',error_code=NULLIF($2,''),updated_at=now(),terminal_at=now()
+			WHERE id=$1 AND state=$3`, runID, failureCode, state)
+		if err != nil {
+			return finalizationResult{}, fmt.Errorf("commit creator failure finalization: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return finalizationResult{}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "creator run changed before failure finalization")
+		}
+		if err := settleCreatorOperation(ctx, tx, operationID, "FAILED"); err != nil {
+			return finalizationResult{}, err
+		}
+		return finalizationResult{}, nil
+	})
 	return true, err
+}
+
+func settleCreatorOperation(ctx context.Context, tx pgx.Tx, operationID uuid.UUID, state string) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE video_pipeline.operation_requests
+		SET state=$2,updated_at=now()
+		WHERE id=$1 AND state IN ('ACCEPTED','RUNNING','CANCEL_REQUESTED')`, operationID, state)
+	if err != nil {
+		return fmt.Errorf("settle creator operation: %w", err)
+	}
+	if tag.RowsAffected() == 1 {
+		return nil
+	}
+	var stored string
+	if err := tx.QueryRow(ctx, `SELECT state FROM video_pipeline.operation_requests WHERE id=$1 FOR SHARE`, operationID).Scan(&stored); err != nil {
+		return fmt.Errorf("verify creator operation replay: %w", err)
+	}
+	if stored != state {
+		return controlplane.NewConflictError(controlplane.CodeRevisionConflict, "creator operation terminal state differs from the run")
+	}
+	return nil
 }
 
 func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID, result orchestration.CancelProviderResult) (bool, error) {
 	var exists bool
 	if err := p.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM video_pipeline.creator_live_shot_runs WHERE id=$1)`, runID).Scan(&exists); err != nil || !exists {
 		return exists, err
+	}
+	expectedCash, err := creatorCancellationCashCost(result.Cost)
+	if err != nil {
+		return true, err
 	}
 	type cancellationResult struct {
 		exists      bool
@@ -1192,9 +1260,6 @@ func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID
 			}
 			return cancellationResult{exists: true}, fmt.Errorf("lock creator cancellation: %w", err)
 		}
-		if state == "SUCCEEDED" {
-			return cancellationResult{exists: true}, nil
-		}
 		if (upstreamTaskID != "" && result.UpstreamTaskID != "" && upstreamTaskID != result.UpstreamTaskID) ||
 			(requestID != "" && result.RequestID != "" && requestID != result.RequestID) {
 			return cancellationResult{exists: true}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "provider cancellation differs from the durable upstream identity")
@@ -1211,6 +1276,12 @@ func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID
 		if result.RequestID == "" {
 			result.RequestID = requestID
 		}
+		if state == "SUCCEEDED" {
+			if err := settleCreatorOperation(ctx, tx, operationID, "SUCCEEDED"); err != nil {
+				return cancellationResult{exists: true}, err
+			}
+			return cancellationResult{exists: true}, nil
+		}
 		if state == "CANCELLED" || state == "FAILED" {
 			expectedState := result.State
 			expectedCode := strings.TrimSpace(result.ErrorCode)
@@ -1220,8 +1291,12 @@ func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID
 				expectedCode = "PROVIDER_FAILED"
 			}
 			if state != expectedState || upstreamTaskID != result.UpstreamTaskID || requestID != result.RequestID ||
-				errorCode != expectedCode || !reflect.DeepEqual(usage, result.Usage) {
+				errorCode != expectedCode || !reflect.DeepEqual(usage, result.Usage) ||
+				!reflect.DeepEqual(cashCost, expectedCash) {
 				return cancellationResult{exists: true}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "provider cancellation replay differs from immutable terminal evidence")
+			}
+			if err := settleCreatorOperation(ctx, tx, operationID, state); err != nil {
+				return cancellationResult{exists: true}, err
 			}
 			return cancellationResult{exists: true}, nil
 		}
@@ -1242,10 +1317,6 @@ func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID
 		default:
 			return cancellationResult{exists: true}, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "provider cancellation returned an invalid state")
 		}
-		cash := controlplane.CreatorCashCost{AmountMicros: nil, Verified: false, BillingMode: creatorBillingMode}
-		if result.Cost.ActualMicros != nil || result.Cost.Verified || (result.Cost.BillingMode != "" && result.Cost.BillingMode != creatorBillingMode) {
-			return cancellationResult{exists: true}, controlplane.NewPolicyError(controlplane.CodeCashChargeNotAllowed, "subscription cancellation evidence must not contain a cash charge", "reconcile the Agent Plan task before settling")
-		}
 		terminalAt := "NULL"
 		if terminalState == "CANCELLED" || terminalState == "FAILED" {
 			terminalAt = "now()"
@@ -1256,7 +1327,7 @@ func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID
 			    usage=$5,cash_cost=$6,error_code=NULLIF($7,''),updated_at=now(),terminal_at=%s
 			WHERE id=$1 AND state=$8`, terminalAt)
 		tag, err := tx.Exec(ctx, query, runID, terminalState, result.UpstreamTaskID, result.RequestID,
-			result.Usage, cash, terminalCode, state)
+			result.Usage, expectedCash, terminalCode, state)
 		if err != nil {
 			return cancellationResult{exists: true}, fmt.Errorf("commit creator cancellation: %w", err)
 		}
@@ -1269,8 +1340,8 @@ func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID
 		} else if terminalState == "FAILED" {
 			operationState = "FAILED"
 		}
-		if _, err := tx.Exec(ctx, `UPDATE video_pipeline.operation_requests SET state=$2,updated_at=now() WHERE id=$1 AND state IN ('ACCEPTED','RUNNING','CANCEL_REQUESTED')`, operationID, operationState); err != nil {
-			return cancellationResult{exists: true}, fmt.Errorf("update creator cancellation operation: %w", err)
+		if err := settleCreatorOperation(ctx, tx, operationID, operationState); err != nil {
+			return cancellationResult{exists: true}, err
 		}
 		return cancellationResult{exists: true, unconfirmed: unconfirmed}, nil
 	})
@@ -1281,6 +1352,21 @@ func (p *Postgres) cancelCreatorProviderJob(ctx context.Context, runID uuid.UUID
 		return true, errors.New("provider cancellation remains unconfirmed for the creator run")
 	}
 	return txResult.exists, nil
+}
+
+func creatorCancellationCashCost(cost providercontract.Cost) (controlplane.CreatorCashCost, error) {
+	billingMode := strings.TrimSpace(cost.BillingMode)
+	if billingMode == "" {
+		billingMode = creatorBillingMode
+	}
+	if cost.ActualMicros != nil || cost.Verified || billingMode != creatorBillingMode {
+		return controlplane.CreatorCashCost{}, controlplane.NewPolicyError(controlplane.CodeCashChargeNotAllowed, "subscription cancellation evidence must not contain a cash charge", "reconcile the Agent Plan task before settling")
+	}
+	var currency *string
+	if value := strings.TrimSpace(cost.Currency); value != "" {
+		currency = &value
+	}
+	return controlplane.CreatorCashCost{AmountMicros: nil, Currency: currency, Verified: false, BillingMode: billingMode}, nil
 }
 
 func stringValue(v *string) string {

@@ -38,9 +38,9 @@ test "$(psql_value 'SELECT COUNT(*) FROM video_pipeline.stage1_live_activations;
 run_migrate down 5 >/dev/null
 test "$(psql_value 'SELECT version FROM public.schema_migrations;')" = "7"
 
-# v12 owns creator data that this guard must not delete. Temporarily point only
-# golang-migrate's version marker at v7; the v12 schema remains untouched while
-# we exercise v7's first-statement rollback guard below.
+# Exercise v7's first-statement rollback guard from the real v7 schema. The
+# force is explicit so the test setup remains correct even after a prior dirty
+# local run; no later migration is claimed as applied at this point.
 run_migrate force 7 >/dev/null
 
 lineage_before="$(psql_value "
@@ -100,14 +100,25 @@ test "${lineage_after}" = "${lineage_before}"
 test "${prompt_constraint_after}" = "${prompt_constraint_before}"
 test "${manifest_unique_after}" = "${manifest_unique_before}"
 
-# The failed statement was the first guarded statement: v7 and v12 schema/data
-# are unchanged, so restore only golang-migrate's v12 version marker.
-run_migrate force 12 >/dev/null
+# The failed statement was the first guarded statement: v7 schema/data are
+# unchanged. Clear the dirty marker at v7, then genuinely reapply v8-v12;
+# forcing the marker directly to v12 would leave those schemas absent.
+run_migrate force 7 >/dev/null
+run_migrate up >/dev/null
 
 version_recovered="$(psql_value 'SELECT version FROM public.schema_migrations;')"
 dirty_recovered="$(psql_value 'SELECT dirty FROM public.schema_migrations;')"
 test "${version_recovered}" = "12"
 test "${dirty_recovered}" = "f"
+test "$(psql_value "SELECT to_regclass('video_pipeline.creator_live_shot_runs') IS NOT NULL;")" = "t"
+test "$(psql_value "SELECT to_regprocedure('video_pipeline.guard_creator_live_shot_terminal_update()') IS NOT NULL;")" = "t"
+test "$(psql_value "
+  SELECT COUNT(*)
+  FROM pg_trigger
+  WHERE tgrelid='video_pipeline.creator_live_shot_runs'::regclass
+    AND tgname='creator_live_shot_run_terminal_update'
+    AND NOT tgisinternal;
+")" = "1"
 test "$(psql_value "
   SELECT COUNT(*)
   FROM video_pipeline.prompt_snapshot_inputs

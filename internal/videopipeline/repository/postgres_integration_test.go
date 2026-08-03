@@ -68,7 +68,7 @@ func TestPostgres_CreateSeriesIdempotencyAndAtomicEvidence(t *testing.T) {
 	if dsn == "" {
 		t.Skip("VIDEO_TEST_POSTGRES_DSN is not configured")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -6635,12 +6635,13 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 	t.Cleanup(pool.Close)
 	store := NewForPool(pool)
 	actor := controlplane.Actor{ActorID: "creator-integration-" + uuid.NewString(), Role: "CREATOR"}
+	primaryActor := actor
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cleanupCancel()
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_idempotency WHERE scope LIKE $1`, "creator-integration:"+actor.ActorID+"%")
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_runs WHERE actor_id=$1`, actor.ActorID)
-		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_plans WHERE actor_id=$1`, actor.ActorID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_idempotency WHERE scope LIKE $1`, "creator-integration:"+primaryActor.ActorID+"%")
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_runs WHERE actor_id=$1`, primaryActor.ActorID)
+		_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_plans WHERE actor_id=$1`, primaryActor.ActorID)
 	})
 	capability := providercontract.CapabilitySnapshot{
 		Alias: providercontract.CapabilityVideo,
@@ -6855,6 +6856,15 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 	if !bytes.Equal(succeededBefore, succeededAfter) {
 		t.Fatalf("exact completion/cancellation replay mutated succeeded evidence\nbefore=%s\nafter=%s", succeededBefore, succeededAfter)
 	}
+	var succeededOperation string
+	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.operation_requests WHERE id=$1`, run1.Value.OperationID).Scan(&succeededOperation); err != nil || succeededOperation != "SUCCEEDED" {
+		t.Fatalf("creator success operation=%q err=%v", succeededOperation, err)
+	}
+	driftedInput := projectedInput
+	driftedInput.TraceID += "-drift"
+	if err := store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, driftedInput, result); asCode(err) != controlplane.CodeRevisionConflict {
+		t.Fatalf("drifted confirmed creator input error=%v", err)
+	}
 	driftedResult := result
 	driftedResult.ArtifactSize++
 	if err := store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, projectedInput, driftedResult); asCode(err) != controlplane.CodeRevisionConflict {
@@ -6887,6 +6897,21 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 	if !bytes.Equal(cancelledBefore, cancelledAfter) {
 		t.Fatalf("exact cancellation replay mutated terminal evidence\nbefore=%s\nafter=%s", cancelledBefore, cancelledAfter)
 	}
+	var cancelledOperation string
+	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.operation_requests WHERE id=$1`, third.Value.OperationID).Scan(&cancelledOperation); err != nil || cancelledOperation != "CANCELLED" {
+		t.Fatalf("creator cancelled operation=%q err=%v", cancelledOperation, err)
+	}
+	currencyDrift := thirdCancel
+	currencyDrift.Cost = providercontract.Cost{BillingMode: "subscription", Currency: "CNY"}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, currencyDrift); asCode(err) != controlplane.CodeRevisionConflict {
+		t.Fatalf("creator cancellation cost drift error=%v", err)
+	}
+	illegalCash := int64(1)
+	illegalCost := thirdCancel
+	illegalCost.Cost = providercontract.Cost{ActualMicros: &illegalCash, BillingMode: "subscription"}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, illegalCost); asCode(err) != controlplane.CodeCashChargeNotAllowed {
+		t.Fatalf("creator cancellation illegal cash replay error=%v", err)
+	}
 	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, thirdInput, orchestration.CancelProviderResult{State: "FAILED", ErrorCode: "PROVIDER_FAILED"}); asCode(err) != controlplane.CodeRevisionConflict {
 		t.Fatalf("drifted creator cancellation error=%v", err)
 	}
@@ -6903,8 +6928,26 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, fourth.Value.RunID).Scan(&fourthState); err != nil || fourthState != "RECONCILING" {
 		t.Fatalf("unconfirmed creator cancellation state=%q err=%v", fourthState, err)
 	}
-	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, fourthInput, orchestration.CancelProviderResult{State: "UNKNOWN", NoRemoteTask: true}); err != nil {
+	fourthFailure := orchestration.CancelProviderResult{State: "FAILED", UpstreamTaskID: "creator-failed-task", RequestID: "creator-failed-request", ErrorCode: "REMOTE_FAILED", Usage: providercontract.Usage{VideoTokens: 1234}, Cost: providercontract.Cost{BillingMode: "subscription", Currency: "VTC"}}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, fourthInput, fourthFailure); err != nil {
 		t.Fatal(err)
+	}
+	var failedBefore []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, fourth.Value.RunID).Scan(&failedBefore); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, fourthInput, fourthFailure); err != nil {
+		t.Fatalf("exact creator failure cancellation replay: %v", err)
+	}
+	if err := store.FinalizeShotRun(ctx, orchestration.WorkflowStep{}, orchestration.FinalizeShotRunInput{OperationID: fourth.Value.OperationID, RunID: fourth.Value.RunID, State: "FAILED", FailureCode: "REMOTE_FAILED"}); err != nil {
+		t.Fatalf("creator failure post-commit finalization replay: %v", err)
+	}
+	var failedAfter []byte
+	if err := pool.QueryRow(ctx, `SELECT to_jsonb(r) FROM video_pipeline.creator_live_shot_runs r WHERE id=$1`, fourth.Value.RunID).Scan(&failedAfter); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(failedBefore, failedAfter) {
+		t.Fatalf("exact failed replay mutated terminal evidence\nbefore=%s\nafter=%s", failedBefore, failedAfter)
 	}
 	plan5, _ := createPlan(5)
 	if plan5.Confirmable || len(plan5.Blockers) != 1 || plan5.Blockers[0] != string(controlplane.CodeProjectBudgetExceeded) {
@@ -6920,6 +6963,111 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 	var expiredState string
 	if err := pool.QueryRow(ctx, `SELECT state FROM video_pipeline.creator_live_shot_plans WHERE id=$1`, plan5.PlanID).Scan(&expiredState); err != nil || expiredState != "EXPIRED" {
 		t.Fatalf("expired creator plan durable state=%q err=%v", expiredState, err)
+	}
+
+	for _, race := range []struct {
+		name            string
+		completionFirst bool
+		wantState       string
+	}{
+		{name: "completion wins row-lock queue", completionFirst: true, wantState: "SUCCEEDED"},
+		{name: "cancellation wins row-lock queue", completionFirst: false, wantState: "CANCELLED"},
+	} {
+		t.Run(race.name, func(t *testing.T) {
+			actor = controlplane.Actor{ActorID: "creator-race-" + uuid.NewString(), Role: "CREATOR"}
+			raceActor := actor
+			t.Cleanup(func() {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cleanupCancel()
+				_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_idempotency WHERE scope LIKE $1`, "creator-integration:"+raceActor.ActorID+"%")
+				_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_runs WHERE actor_id=$1`, raceActor.ActorID)
+				_, _ = pool.Exec(cleanupCtx, `DELETE FROM video_pipeline.creator_live_shot_plans WHERE actor_id=$1`, raceActor.ActorID)
+			})
+			plan, _ := createPlan(6)
+			run, err := confirm(plan, uuid.NewString())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var prepared creatorPreparedRequest
+			if err := pool.QueryRow(ctx, `SELECT request_snapshot FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, run.Value.RunID).Scan(&prepared); err != nil {
+				t.Fatal(err)
+			}
+			digest := strings.Repeat("d", 64)
+			completion := orchestration.ProviderResult{UpstreamTaskID: "race-task", RequestID: "race-request", Model: prepared.Input.Route, ArtifactURI: "cas://sha256/" + digest, ArtifactDigest: digest, MediaType: "video/mp4", ArtifactSize: 10, Width: 1280, Height: 720, DurationMillis: 5000, Usage: providercontract.Usage{VideoTokens: 1000}, Cost: providercontract.Cost{BillingMode: "subscription"}}
+			cancellation := orchestration.CancelProviderResult{State: "CANCELLED", UpstreamTaskID: completion.UpstreamTaskID, RequestID: completion.RequestID, Cost: providercontract.Cost{BillingMode: "subscription"}}
+			cancelInput := orchestration.CancelProviderJobInput{Dispatch: prepared.Input}
+
+			lockTx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = lockTx.Rollback(context.Background()) }()
+			if _, err := lockTx.Exec(ctx, `SELECT 1 FROM video_pipeline.creator_live_shot_runs WHERE id=$1 FOR UPDATE`, run.Value.RunID); err != nil {
+				_ = lockTx.Rollback(ctx)
+				t.Fatal(err)
+			}
+			completeErr := make(chan error, 1)
+			cancelErr := make(chan error, 1)
+			startCompletion := func() {
+				go func() {
+					completeErr <- store.CompleteProviderJob(ctx, orchestration.WorkflowStep{}, prepared.Input, completion)
+				}()
+			}
+			startCancellation := func() {
+				go func() {
+					cancelErr <- store.RecordProviderCancellation(ctx, orchestration.WorkflowStep{}, cancelInput, cancellation)
+				}()
+			}
+			waitForBlocked := func(want int) {
+				t.Helper()
+				deadline := time.Now().Add(3 * time.Second)
+				for time.Now().Before(deadline) {
+					var count int
+					if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() AND wait_event_type='Lock'`).Scan(&count); err != nil {
+						t.Fatal(err)
+					}
+					if count >= want {
+						return
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				t.Fatalf("blocked creator writers=%d not observed", want)
+			}
+			if race.completionFirst {
+				startCompletion()
+				waitForBlocked(1)
+				startCancellation()
+			} else {
+				startCancellation()
+				waitForBlocked(1)
+				startCompletion()
+			}
+			waitForBlocked(2)
+			if err := lockTx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			completionError, cancellationError := <-completeErr, <-cancelErr
+			if race.completionFirst {
+				if completionError != nil || cancellationError != nil {
+					t.Fatalf("completion-first errors: completion=%v cancellation=%v", completionError, cancellationError)
+				}
+			} else {
+				if cancellationError != nil || asCode(completionError) != controlplane.CodeRunTerminal {
+					t.Fatalf("cancellation-first errors: completion=%v cancellation=%v", completionError, cancellationError)
+				}
+			}
+			var runState, operationState string
+			if err := pool.QueryRow(ctx, `
+				SELECT r.state,o.state
+				FROM video_pipeline.creator_live_shot_runs r
+				JOIN video_pipeline.operation_requests o ON o.id=r.operation_id
+				WHERE r.id=$1`, run.Value.RunID).Scan(&runState, &operationState); err != nil {
+				t.Fatal(err)
+			}
+			if runState != race.wantState || operationState != race.wantState {
+				t.Fatalf("concurrent creator truth run=%q operation=%q want=%q", runState, operationState, race.wantState)
+			}
+		})
 	}
 }
 
