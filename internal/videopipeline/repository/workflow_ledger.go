@@ -1818,7 +1818,7 @@ func (p *Postgres) PrepareProviderJob(
 				}
 				if err := recordFLO167Submission(
 					ctx, tx, flo167Boundary, attemptID, input,
-					liveAuthority.IsControlledRetry, p.now().UTC(),
+					liveAuthority != nil && liveAuthority.IsControlledRetry, p.now().UTC(),
 				); err != nil {
 					return orchestration.PreparedProviderJob{}, err
 				}
@@ -1919,7 +1919,7 @@ func (p *Postgres) PrepareProviderJob(
 		}
 		if err := recordFLO167Submission(
 			ctx, tx, flo167Boundary, attemptID, input,
-			liveAuthority.IsControlledRetry, p.now().UTC(),
+			liveAuthority != nil && liveAuthority.IsControlledRetry, p.now().UTC(),
 		); err != nil {
 			return orchestration.PreparedProviderJob{}, err
 		}
