@@ -1494,6 +1494,11 @@ func (p *Postgres) GetShotWorkflowRecord(
 	}
 	record.RouteSnapshot = plan.Plan.RouteSnapshot
 	record.BudgetLimit = plan.BudgetLimit
+	prompt, err := p.ResolvePromptSnapshot(ctx, record.PromptSnapshotID)
+	if err != nil {
+		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("read shot workflow prompt snapshot: %w", err)
+	}
+	record.Prompt = workflowPromptSnapshot(prompt)
 	return record, nil
 }
 

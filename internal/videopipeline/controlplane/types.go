@@ -243,9 +243,25 @@ type ShotWorkflowRecord struct {
 	Run              GenerationRun
 	PromptSnapshotID string
 	PromptHash       string
+	Prompt           WorkflowPromptSnapshot
 	RouteSnapshot    ModelRouteSnapshot
 	BudgetApprovalID string
 	BudgetLimit      BudgetLimit
+}
+
+// WorkflowPromptSnapshot carries the complete immutable prompt through the
+// control-plane/Temporal boundary. ID and digest alone are insufficient for a
+// paid dispatch because the provider intent also binds the resolved context,
+// assets, output specification, and every input revision hash.
+type WorkflowPromptSnapshot struct {
+	ID                  string                       `json:"id"`
+	Digest              string                       `json:"digest"`
+	PositivePrompt      string                       `json:"positivePrompt"`
+	NegativePrompt      string                       `json:"negativePrompt,omitempty"`
+	Context             providercontract.ContextRefs `json:"context"`
+	Assets              []providercontract.AssetRef  `json:"assets,omitempty"`
+	Output              providercontract.OutputSpec  `json:"output"`
+	InputRevisionHashes map[string]string            `json:"inputRevisionHashes"`
 }
 
 type FreshnessImpact struct {

@@ -926,6 +926,11 @@ func (p *Postgres) creatorShotWorkflowRecord(ctx context.Context, runID uuid.UUI
 		Provider: route.Provider, ModelID: route.ModelID, EndpointID: route.EndpointID, RouteVersion: route.RouteVersion, CapabilityHash: route.CapabilityHash,
 	}
 	record.BudgetLimit = controlplane.BudgetLimit{AmountMicros: creatorVideoTokenLimit, Currency: "VTC"}
+	prompt, err := p.creatorPromptSnapshot(ctx, uuid.MustParse(record.PromptSnapshotID))
+	if err != nil {
+		return controlplane.ShotWorkflowRecord{}, fmt.Errorf("read creator workflow prompt snapshot: %w", err)
+	}
+	record.Prompt = workflowPromptSnapshot(prompt)
 	_ = planID
 	return record, nil
 }

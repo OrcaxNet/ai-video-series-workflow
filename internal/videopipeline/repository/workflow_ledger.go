@@ -260,6 +260,15 @@ func (p *Postgres) ResolvePromptSnapshot(
 	})
 }
 
+func workflowPromptSnapshot(snapshot orchestration.PromptSnapshotRef) controlplane.WorkflowPromptSnapshot {
+	return controlplane.WorkflowPromptSnapshot{
+		ID: snapshot.ID, Digest: snapshot.Digest,
+		PositivePrompt: snapshot.PositivePrompt, NegativePrompt: snapshot.NegativePrompt,
+		Context: snapshot.Context, Assets: snapshot.Assets, Output: snapshot.Output,
+		InputRevisionHashes: snapshot.InputRevisionHashes,
+	}
+}
+
 func loadExactPromptSnapshot(
 	ctx context.Context,
 	tx pgx.Tx,

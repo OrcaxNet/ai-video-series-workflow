@@ -6715,6 +6715,22 @@ func TestPostgres_CreatorLiveShotIdempotencyQuotaAndManifest(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT request_snapshot FROM video_pipeline.creator_live_shot_runs WHERE id=$1`, run1.Value.RunID).Scan(&prepared); err != nil {
 		t.Fatal(err)
 	}
+	workflowRecord, err := store.GetShotWorkflowRecord(ctx, run1.Value.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if workflowRecord.PromptSnapshotID != prepared.Input.Prompt.ID ||
+		workflowRecord.PromptHash != prepared.Input.Prompt.Digest ||
+		!reflect.DeepEqual(workflowRecord.Prompt, workflowPromptSnapshot(prepared.Input.Prompt)) {
+		t.Fatalf("creator Temporal dispatch lost confirmed prompt: record=%#v confirmed=%#v", workflowRecord.Prompt, prepared.Input.Prompt)
+	}
+	if workflowRecord.Prompt.PositivePrompt == "" || workflowRecord.Prompt.Output.DurationMillis != 5000 ||
+		workflowRecord.Prompt.Context.ShotSnapshotID == "" || len(workflowRecord.Prompt.InputRevisionHashes) == 0 {
+		t.Fatalf("creator Temporal dispatch prompt is partial: %#v", workflowRecord.Prompt)
+	}
+	if _, err := store.PrepareProviderJob(ctx, orchestration.WorkflowStep{}, prepared.Input); err != nil {
+		t.Fatalf("confirmed creator dispatch rejected before provider submit: %v", err)
+	}
 	if err := store.RecordProviderJobObservation(ctx, orchestration.WorkflowStep{}, prepared.Input, orchestration.ProviderJobObservation{State: "RUNNING", UpstreamTaskID: "task-1", RequestID: "request-1"}); err != nil {
 		t.Fatal(err)
 	}
