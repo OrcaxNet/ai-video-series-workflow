@@ -89,6 +89,46 @@ func TestFLO167MaterializesIdenticallyAcrossFreshPostgresAndReplay(t *testing.T)
 			pool.Close()
 			t.Fatalf("database %d authorization replay: %v", index+1, err)
 		}
+		expectedShots := make(map[string]stage1.FLO167ShotBinding, len(package_.Shots))
+		for _, shot := range package_.Shots {
+			expectedShots[shot.ShotID] = shot
+		}
+		rows, err := pool.Query(ctx, `SELECT shot_id,duration_ms,expected_afp_milli
+			FROM video_pipeline.stage1_live_supersession_shots ORDER BY ordinal`)
+		if err != nil {
+			pool.Close()
+			t.Fatal(err)
+		}
+		seenDurations := make(map[int64]bool)
+		storedShotCount := 0
+		for rows.Next() {
+			var shotID string
+			var duration, expectedAFP int64
+			if err := rows.Scan(&shotID, &duration, &expectedAFP); err != nil {
+				rows.Close()
+				pool.Close()
+				t.Fatal(err)
+			}
+			shot, ok := expectedShots[shotID]
+			if !ok || duration != shot.Pricing.DurationMS || expectedAFP != shot.Pricing.ExpectedAFPMilli {
+				rows.Close()
+				pool.Close()
+				t.Fatalf("database %d stored shot %s duration/AFP=%d/%d, want %#v", index+1, shotID, duration, expectedAFP, shot.Pricing)
+			}
+			seenDurations[duration] = true
+			storedShotCount++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			pool.Close()
+			t.Fatal(err)
+		}
+		rows.Close()
+		if storedShotCount != len(package_.Shots) || !seenDurations[4_000] || !seenDurations[4_500] ||
+			!seenDurations[5_000] || !seenDurations[5_500] || len(seenDurations) != 4 {
+			pool.Close()
+			t.Fatalf("database %d stored %d shots with duration set %v", index+1, storedShotCount, seenDurations)
+		}
 		var stored []byte
 		if err := pool.QueryRow(ctx, `SELECT jsonb_build_object(
 			'package',package,'projection',canonical_projection,'packageHash',execution_package_hash,
@@ -136,22 +176,24 @@ func TestFLO167RunnerPaidBoundary(t *testing.T) {
 		{name: "quota exceeded", mutate: func(_ *testing.T, _ *pgxpool.Pool, quota *orchestration.SubscriptionQuotaSnapshot) {
 			quota.FiveHourUsedAFPMilli = quota.FiveHourTotalAFPMilli - 1
 		}},
-		{name: "duration pricing drift", mutate: func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
-			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersession_shots DISABLE TRIGGER USER`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersession_shots
-				DROP CONSTRAINT stage1_live_supersession_shots_check`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := pool.Exec(ctx, `UPDATE video_pipeline.stage1_live_supersession_shots
-				SET expected_afp_milli=expected_afp_milli+1 WHERE shot_id='GOLD-A02'`); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersession_shots ENABLE TRIGGER USER`); err != nil {
-				t.Fatal(err)
-			}
-		}},
+		{name: "duration drift", mutate: flo167ShotDrift("duration")},
+		{name: "pricing snapshot id drift", mutate: flo167ShotDrift("pricing snapshot id")},
+		{name: "pricing snapshot digest drift", mutate: flo167ShotDrift("pricing snapshot digest")},
+		{name: "reference AFP drift", mutate: flo167ShotDrift("reference AFP")},
+		{name: "reference duration drift", mutate: flo167ShotDrift("reference duration")},
+		{name: "expected AFP drift", mutate: flo167ShotDrift("expected AFP")},
+		{name: "pricing rule drift", mutate: flo167ShotDrift("pricing rule")},
+		{name: "maximum drift BPS drift", mutate: flo167ShotDrift("maximum drift BPS")},
+		{name: "normalization version drift", mutate: flo167ShotDrift("normalization version")},
+		{name: "rounding version drift", mutate: flo167ShotDrift("rounding version")},
+		{name: "route drift", mutate: flo167ShotDrift("route")},
+		{name: "G1 drift", mutate: flo167ShotDrift("G1")},
+		{name: "G2 drift", mutate: flo167ShotDrift("G2")},
+		{name: "SAFETY drift", mutate: flo167ShotDrift("SAFETY")},
+		{name: "canonical input drift", mutate: flo167ShotDrift("canonical input")},
+		{name: "semantic input drift", mutate: flo167ShotDrift("semantic input")},
+		{name: "completed set drift", mutate: flo167SetDrift("completed")},
+		{name: "allowed submit set drift", mutate: flo167SetDrift("allowed")},
 		{name: "supersession hash drift", mutate: func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
 			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersessions DISABLE TRIGGER USER`); err != nil {
 				t.Fatal(err)
@@ -280,14 +322,14 @@ func TestFLO167RunnerPaidBoundary(t *testing.T) {
 			before := flo167PaidBoundaryCounts(t, ctx, pool)
 			beforeFLO167 := flo167ProjectionState(t, ctx, pool, materialization.LegacyActivationID)
 			if test.wantSuccess {
-				for _, forbiddenShot := range []string{"GOLD-A01", "GOLD-B01"} {
+				for _, forbiddenShot := range []string{"GOLD-A01", "GOLD-B01", "GOLD-C01"} {
 					if _, err := runner.Submit(ctx, stage1.SubmitInput{ShotID: forbiddenShot, QuotaSnapshot: &quota}); err == nil {
 						t.Fatalf("Runner accepted forbidden %s submission", forbiddenShot)
 					}
 				}
 				if gets.Load() != 0 || posts.Load() != 0 || flo167PaidBoundaryCounts(t, ctx, pool) != before ||
 					flo167ProjectionState(t, ctx, pool, materialization.LegacyActivationID) != beforeFLO167 {
-					t.Fatal("A01/B01 rejection crossed a paid boundary")
+					t.Fatal("A01/B01/C01 rejection crossed a paid boundary")
 				}
 			}
 			result, submitErr := runner.Submit(ctx, stage1.SubmitInput{ShotID: "GOLD-A02", QuotaSnapshot: &quota})
@@ -359,6 +401,165 @@ func TestFLO167RunnerPaidBoundary(t *testing.T) {
 	}
 }
 
+func TestFLO167RunnerTerminalBoundaries(t *testing.T) {
+	primaryDSN := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
+	if primaryDSN == "" {
+		t.Skip("VIDEO_TEST_POSTGRES_DSN is required")
+	}
+	const expectedAFPMilli int64 = 2_254_230
+	for index, test := range []struct {
+		name           string
+		actualAFPMilli int64
+		actualCash     int64
+		wantSuccess    bool
+	}{
+		{name: "positive ten percent inclusive", actualAFPMilli: 2_479_653, wantSuccess: true},
+		{name: "negative ten percent inclusive", actualAFPMilli: 2_028_807, wantSuccess: true},
+		{name: "positive ten percent plus one", actualAFPMilli: 2_479_654},
+		{name: "negative ten percent minus one", actualAFPMilli: 2_028_806},
+		{name: "nonzero cash", actualAFPMilli: expectedAFPMilli, actualCash: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := t.Context()
+			package_, projection, legacy, plan := loadFLO167RunnerFixtures(t)
+			dsn := newFLO167FixtureDatabase(t, ctx, primaryDSN, index+100)
+			pool, err := pgxpool.New(ctx, dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pool.Close()
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			activationID := "142952f1-8dd1-5ebe-99c8-f2cb538ac702"
+			if err := MaterializeFLO167Supersession(ctx, pool, FLO167Materialization{
+				LegacyActivationID: activationID, Package: package_, Projection: projection, CreatedAt: now,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			payload, err := json.Marshal(map[string]any{
+				"schemaVersion":           "flo100.batch-a-continuation-authorization.v3",
+				"supersessionPackageHash": package_.ContentHash, "canonicalProjectionHash": projection.ContentHash,
+				"pricingSnapshotDigest": package_.Shots[0].Pricing.PricingSnapshotDigest,
+				"decision": map[string]bool{"a02A10ProviderPostAuthorizedConditionally": true,
+					"batchBProviderPostAuthorized": false, "batchCProviderPostAuthorized": false, "stage4Authorized": false},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := AuthorizeFLO167Supersession(ctx, pool, FLO167Authorization{
+				LegacyActivationID: activationID, Payload: payload, IssuedAt: now, ValidUntil: now.Add(time.Hour),
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			gate, err := stage1.Open(plan, filepath.Join(t.TempDir(), "ledger.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := gate.BindExecutionPackage(legacy.ContentHash); err != nil {
+				t.Fatal(err)
+			}
+			a01, a02 := legacy.PrimaryJobs[0], legacy.PrimaryJobs[1]
+			if _, err := gate.Authorize(stage1.Attempt{
+				AttemptID: a01.AttemptID, ShotID: a01.ShotID, IdempotencyKey: a01.IdempotencyKey,
+				EstimatedVideoTokens: a01.EstimatedVideoTokens, PredictedAFPMilli: a01.PredictedAFPMilli,
+				EstimatedNonSubscriptionCashMicros: a01.EstimatedNonSubscriptionCashMicros,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := gate.Complete(a01.IdempotencyKey, stage1.Completion{
+				State: "TERMINAL_SUCCEEDED", ProviderTaskID: "legacy-a01", ActualVideoTokens: 87_300,
+				ActualAFPMilli: 2_007_900, EvidenceComplete: true,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			var submitted atomic.Bool
+			digest := strings.Repeat("a", 64)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if request.Method == http.MethodGet {
+					if !submitted.Load() {
+						w.WriteHeader(http.StatusNotFound)
+						_ = json.NewEncoder(w).Encode(map[string]any{"error": &providercontract.Error{
+							Code: providercontract.CodeNotFound, SafeMessage: "job not found",
+						}})
+						return
+					}
+					cash := test.actualCash
+					_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+						JobID: a02.IdempotencyKey, RunID: a02.Run.RunID, UpstreamTaskID: "provider-a02",
+						RequestID: "request-a02", State: providercontract.StatusSucceeded, Progress: 100, Model: a02.Route,
+						Artifacts: []providercontract.AssetRef{{ID: "video-a02", Revision: digest,
+							Kind: providercontract.ModalityVideo, Role: providercontract.AssetRoleOutput,
+							URI: "cas://sha256/" + digest, SHA256: digest, LicenseReference: "license-a02",
+							MediaType: "video/mp4", SizeBytes: 10}},
+						Usage: providercontract.Usage{VideoTokens: 87_300}, Cost: providercontract.Cost{
+							ActualMicros: &cash, Currency: "CNY", PricingVersion: "agent-plan-subscription-v1",
+							BillingMode: "subscription_included", Verified: true,
+						},
+					})
+					return
+				}
+				if request.Method == http.MethodPost {
+					submitted.Store(true)
+					_ = json.NewEncoder(w).Encode(providercontract.JobResponse{
+						JobID: a02.IdempotencyKey, RunID: a02.Run.RunID, UpstreamTaskID: "provider-a02",
+						State: providercontract.StatusQueued, Model: a02.Route,
+					})
+					return
+				}
+				http.Error(w, "unexpected method", http.StatusMethodNotAllowed)
+			}))
+			defer server.Close()
+			adapter, err := stage1.NewAdapterSubmitter(server.URL, server.Client())
+			if err != nil {
+				t.Fatal(err)
+			}
+			runner, err := stage1.NewRunnerWithFLO167Supersession(
+				gate, adapter, flo167ArtifactVerifier{}, repository.NewForPool(pool), legacy, package_)
+			if err != nil {
+				t.Fatal(err)
+			}
+			quota := orchestration.SubscriptionQuotaSnapshot{
+				SchemaVersion: "ark.agent-plan-quota.v1", Source: "integration-test", CapturedAt: now,
+				AccountID: "flo167-test-account", Profile: "agent-plan_cn-beijing_personal", Region: "cn-beijing",
+				BillingMode: "subscription_included_only", FiveHourTotalAFPMilli: 135_000_000,
+				WeeklyTotalAFPMilli: 135_000_000, MonthlyTotalAFPMilli: 135_000_000,
+			}
+			if _, err := runner.Submit(ctx, stage1.SubmitInput{ShotID: "GOLD-A02", QuotaSnapshot: &quota}); err != nil {
+				t.Fatal(err)
+			}
+			before := flo167PaidBoundaryCounts(t, ctx, pool)
+			beforeProjection := flo167ProjectionState(t, ctx, pool, activationID)
+			result, completeErr := runner.Complete(ctx, stage1.CompleteInput{
+				IdempotencyKey: a02.IdempotencyKey, ActualAFPMilli: test.actualAFPMilli, EvidenceComplete: true,
+			})
+			var terminalRows int64
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM video_pipeline.stage1_live_supersession_terminal_ledger`).Scan(&terminalRows); err != nil {
+				t.Fatal(err)
+			}
+			if test.wantSuccess {
+				if completeErr != nil {
+					t.Fatal(completeErr)
+				}
+				if result.State != "TERMINAL_SUCCEEDED" || result.ActualAFPMilli != test.actualAFPMilli || terminalRows != 1 {
+					t.Fatalf("completion=%#v terminal rows=%d", result, terminalRows)
+				}
+			} else {
+				if completeErr == nil {
+					t.Fatal("Runner accepted terminal evidence outside the frozen boundary")
+				}
+				after := flo167PaidBoundaryCounts(t, ctx, pool)
+				afterProjection := flo167ProjectionState(t, ctx, pool, activationID)
+				if terminalRows != 0 || after != before || afterProjection != beforeProjection {
+					t.Fatalf("rejected terminal evidence changed durable PostgreSQL state: terminal=%d counts %v -> %v projection %#v -> %#v",
+						terminalRows, before, after, beforeProjection, afterProjection)
+				}
+			}
+		})
+	}
+}
+
 type flo167ArtifactVerifier struct{}
 
 func (flo167ArtifactVerifier) Exists(string) (bool, error) { return true, nil }
@@ -384,6 +585,77 @@ func loadFLO167RunnerFixtures(t *testing.T) (stage1.FLO167SupersessionPackage, s
 		}
 	}
 	return package_, projection, legacy, plan
+}
+
+func flo167ShotDrift(name string) func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot) {
+	type mutation struct {
+		constraint string
+		query      string
+	}
+	mutations := map[string]mutation{
+		"duration":                {constraint: "stage1_live_supersession_shots_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET duration_ms=duration_ms+1 WHERE shot_id='GOLD-A02'`},
+		"pricing snapshot id":     {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET pricing_snapshot_id=pricing_snapshot_id||'-drift' WHERE shot_id='GOLD-A02'`},
+		"pricing snapshot digest": {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET pricing_snapshot_digest=repeat('f',64) WHERE shot_id='GOLD-A02'`},
+		"reference AFP":           {constraint: "stage1_live_supersession_shots_reference_afp_milli_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET reference_afp_milli=reference_afp_milli+1 WHERE shot_id='GOLD-A02'`},
+		"reference duration":      {constraint: "stage1_live_supersession_shots_reference_duration_ms_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET reference_duration_ms=reference_duration_ms+1 WHERE shot_id='GOLD-A02'`},
+		"expected AFP":            {constraint: "stage1_live_supersession_shots_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET expected_afp_milli=expected_afp_milli+1 WHERE shot_id='GOLD-A02'`},
+		"pricing rule":            {constraint: "stage1_live_supersession_shots_pricing_rule_version_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET pricing_rule_version='drift' WHERE shot_id='GOLD-A02'`},
+		"maximum drift BPS":       {constraint: "stage1_live_supersession_shots_maximum_drift_basis_points_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET maximum_drift_basis_points=maximum_drift_basis_points+1 WHERE shot_id='GOLD-A02'`},
+		"normalization version":   {constraint: "stage1_live_supersession_shots_normalization_version_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET normalization_version='drift' WHERE shot_id='GOLD-A02'`},
+		"rounding version":        {constraint: "stage1_live_supersession_shots_rounding_version_check", query: `UPDATE video_pipeline.stage1_live_supersession_shots SET rounding_version='drift' WHERE shot_id='GOLD-A02'`},
+		"route":                   {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET route_hash=repeat('f',64) WHERE shot_id='GOLD-A02'`},
+		"G1":                      {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET g1_hash=repeat('f',64) WHERE shot_id='GOLD-A02'`},
+		"G2":                      {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET g2_hash=repeat('f',64) WHERE shot_id='GOLD-A02'`},
+		"SAFETY":                  {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET safety_hash=repeat('f',64) WHERE shot_id='GOLD-A02'`},
+		"canonical input":         {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET canonical_input_hash=repeat('f',64) WHERE shot_id='GOLD-A02'`},
+		"semantic input":          {query: `UPDATE video_pipeline.stage1_live_supersession_shots SET semantic_input_hash=repeat('f',64) WHERE shot_id='GOLD-A02'`},
+	}
+	selected, ok := mutations[name]
+	if !ok {
+		panic("unknown FLO-167 shot drift: " + name)
+	}
+	return func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
+		t.Helper()
+		ctx := t.Context()
+		if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersession_shots DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+		if selected.constraint != "" {
+			query := "ALTER TABLE video_pipeline.stage1_live_supersession_shots DROP CONSTRAINT " + pgx.Identifier{selected.constraint}.Sanitize()
+			if _, err := pool.Exec(ctx, query); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := pool.Exec(ctx, selected.query); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func flo167SetDrift(name string) func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot) {
+	return func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
+		t.Helper()
+		constraint, column := "", ""
+		switch name {
+		case "completed":
+			constraint, column = "stage1_live_supersessions_completed_set_check", "completed_set"
+		case "allowed":
+			constraint, column = "stage1_live_supersessions_allowed_submit_set_check", "allowed_submit_set"
+		default:
+			t.Fatalf("unknown FLO-167 set drift %q", name)
+		}
+		ctx := t.Context()
+		if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersessions DISABLE TRIGGER USER`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, "ALTER TABLE video_pipeline.stage1_live_supersessions DROP CONSTRAINT "+pgx.Identifier{constraint}.Sanitize()); err != nil {
+			t.Fatal(err)
+		}
+		query := "UPDATE video_pipeline.stage1_live_supersessions SET " + pgx.Identifier{column}.Sanitize() + "='[]'::jsonb"
+		if _, err := pool.Exec(ctx, query); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func flo167PaidBoundaryCounts(t *testing.T, ctx context.Context, pool *pgxpool.Pool) [3]int64 {

@@ -151,18 +151,27 @@ func MaterializeFLO167Supersession(ctx context.Context, pool *pgxpool.Pool, inpu
 		}
 	}
 	var storedHash, storedProjection string
-	var storedPackageJSON, storedProjectionJSON []byte
-	if err := tx.QueryRow(ctx, `SELECT execution_package_hash,canonical_projection_hash,package,canonical_projection
+	var storedPackageJSON, storedProjectionJSON, storedCompletedSetJSON, storedAllowedSetJSON []byte
+	if err := tx.QueryRow(ctx, `SELECT execution_package_hash,canonical_projection_hash,package,canonical_projection,
+		completed_set,allowed_submit_set
 		FROM video_pipeline.stage1_live_supersessions WHERE id=$1 FOR SHARE`, supersessionID).Scan(
-		&storedHash, &storedProjection, &storedPackageJSON, &storedProjectionJSON); err != nil {
+		&storedHash, &storedProjection, &storedPackageJSON, &storedProjectionJSON,
+		&storedCompletedSetJSON, &storedAllowedSetJSON); err != nil {
 		return err
 	}
 	var storedPackage stage1.FLO167SupersessionPackage
 	var storedProjectionValue stage1.FLO167CanonicalProjection
+	var storedCompletedSet, storedAllowedSet []string
 	if json.Unmarshal(storedPackageJSON, &storedPackage) != nil || storedHash != input.Package.ContentHash ||
 		json.Unmarshal(storedProjectionJSON, &storedProjectionValue) != nil ||
+		json.Unmarshal(storedCompletedSetJSON, &storedCompletedSet) != nil ||
+		json.Unmarshal(storedAllowedSetJSON, &storedAllowedSet) != nil ||
 		storedProjection != input.Projection.ContentHash || !reflect.DeepEqual(storedPackage, input.Package) ||
-		!reflect.DeepEqual(storedProjectionValue, input.Projection) {
+		!reflect.DeepEqual(storedProjectionValue, input.Projection) ||
+		!reflect.DeepEqual(storedCompletedSet, input.Package.Authorization.CompletedSet) ||
+		!reflect.DeepEqual(storedCompletedSet, input.Projection.CompletedSet) ||
+		!reflect.DeepEqual(storedAllowedSet, input.Package.Authorization.AllowedSubmitSet) ||
+		!reflect.DeepEqual(storedAllowedSet, input.Projection.AllowedSubmitSet) {
 		return errors.New("existing FLO-167 materialization differs from exact replay")
 	}
 	var shotCount int

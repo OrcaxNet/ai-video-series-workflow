@@ -63,7 +63,7 @@ func requireFLO167Supersession(
 	var result flo167PaidBoundary
 	var state, packageHash, projectionHash string
 	var legacyAuthorizationHash, legacyExecutionHash, legacyProjectionHash, legacyStopHash string
-	var packageJSON, projectionJSON, completedSetJSON []byte
+	var packageJSON, projectionJSON, completedSetJSON, allowedSubmitSetJSON []byte
 	var authHash *string
 	var authPackageHash, authProjectionHash *string
 	var rootAuthorizationHash, authPricingDigest *string
@@ -74,7 +74,8 @@ func requireFLO167Supersession(
 	err := tx.QueryRow(ctx, `
 		SELECT s.id,s.state,s.execution_package_hash,s.canonical_projection_hash,
 		       s.legacy_authorization_hash,s.legacy_execution_package_hash,
-		       s.legacy_projection_hash,s.legacy_stop_evidence_hash,s.package,s.canonical_projection,s.completed_set,
+		       s.legacy_projection_hash,s.legacy_stop_evidence_hash,s.package,s.canonical_projection,
+		       s.completed_set,s.allowed_submit_set,
 		       ss.shot_id,ss.duration_ms,ss.pricing_snapshot_id,ss.pricing_snapshot_digest,
 		       ss.reference_afp_milli,ss.reference_duration_ms,ss.expected_afp_milli,
 		       ss.pricing_rule_version,ss.maximum_drift_basis_points,
@@ -90,7 +91,7 @@ func requireFLO167Supersession(
 		FOR UPDATE OF s`, authority.ActivationID, authority.Run.Ordinal).Scan(
 		&result.SupersessionID, &state, &packageHash, &projectionHash,
 		&legacyAuthorizationHash, &legacyExecutionHash, &legacyProjectionHash, &legacyStopHash,
-		&packageJSON, &projectionJSON, &completedSetJSON, &shot.ShotID, &pricing.DurationMS,
+		&packageJSON, &projectionJSON, &completedSetJSON, &allowedSubmitSetJSON, &shot.ShotID, &pricing.DurationMS,
 		&pricing.PricingSnapshotID, &pricing.PricingSnapshotDigest, &pricing.ReferenceAFPMilli,
 		&pricing.ReferenceDurationMS, &pricing.ExpectedAFPMilli, &pricing.PricingRuleVersion,
 		&pricing.MaximumDriftBPS, &pricing.NormalizationVersion, &pricing.RoundingVersion,
@@ -191,9 +192,14 @@ func requireFLO167Supersession(
 			return nil, controlplane.NewPolicyError(controlplane.CodeForbidden, "FLO-167 continuation has an unfinished prior shot", "complete each shot in ordinal order")
 		}
 	}
-	var completedSet []string
-	if err := json.Unmarshal(completedSetJSON, &completedSet); err != nil {
-		return nil, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "FLO-167 completed set is invalid")
+	var completedSet, allowedSubmitSet []string
+	if json.Unmarshal(completedSetJSON, &completedSet) != nil ||
+		json.Unmarshal(allowedSubmitSetJSON, &allowedSubmitSet) != nil ||
+		!reflect.DeepEqual(completedSet, package_.Authorization.CompletedSet) ||
+		!reflect.DeepEqual(completedSet, projection.CompletedSet) ||
+		!reflect.DeepEqual(allowedSubmitSet, package_.Authorization.AllowedSubmitSet) ||
+		!reflect.DeepEqual(allowedSubmitSet, projection.AllowedSubmitSet) {
+		return nil, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "FLO-167 completed or allowed-submit set drifted")
 	}
 	completedHash, err := digestValue(completedSet)
 	if err != nil {
@@ -390,6 +396,10 @@ func recordFLO167Terminal(
 	}
 	if result.ActualAFPMilli <= 0 || result.Usage.VideoTokens <= 0 || result.Cost.ActualMicros == nil || *result.Cost.ActualMicros != 0 {
 		return controlplane.NewPolicyError(controlplane.CodeBudgetExceeded, "FLO-167 terminal usage evidence is incomplete", "supply independently measured AFP, video tokens, and zero-cash attribution")
+	}
+	withinDrift, driftErr := stage1.AFPWithinDrift(result.ActualAFPMilli, expectedAFP, maximumDrift)
+	if driftErr != nil || !withinDrift {
+		return controlplane.NewPolicyError(controlplane.CodeBudgetExceeded, "FLO-167 terminal AFP exceeded the frozen duration-normalized drift boundary", "stop the continuation and reconcile independently measured AFP")
 	}
 	terminal := struct {
 		SupersessionID    string `json:"supersessionId"`
