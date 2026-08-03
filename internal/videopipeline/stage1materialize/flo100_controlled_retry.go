@@ -42,6 +42,32 @@ func BindFLO100LiveControlledRetry(
 	primary stage1.ExecutionPackage,
 	retry stage1.ControlledRetryPackage,
 ) error {
+	return bindFLO100LiveControlledRetry(ctx, pool, plan, primary, retry, nil)
+}
+
+// BindFLO167ControlledRetry binds the one explicit Batch A retry to both the
+// legacy activation and the exact duration-normalized v3 supersession. The
+// supersession authorization is revalidated while its row is locked, before
+// the retry Run or attempt can be created.
+func BindFLO167ControlledRetry(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	plan stage1.Plan,
+	primary stage1.ExecutionPackage,
+	supersession stage1.FLO167SupersessionPackage,
+	retry stage1.ControlledRetryPackage,
+) error {
+	return bindFLO100LiveControlledRetry(ctx, pool, plan, primary, retry, &supersession)
+}
+
+func bindFLO100LiveControlledRetry(
+	ctx context.Context,
+	pool *pgxpool.Pool,
+	plan stage1.Plan,
+	primary stage1.ExecutionPackage,
+	retry stage1.ControlledRetryPackage,
+	supersession *stage1.FLO167SupersessionPackage,
+) error {
 	if pool == nil {
 		return errors.New("PostgreSQL pool is required")
 	}
@@ -78,10 +104,26 @@ func BindFLO100LiveControlledRetry(
 	if retry.Job.PromptSnapshotID != original.PromptSnapshotID ||
 		retry.Job.PromptSnapshotHash != original.PromptSnapshotHash ||
 		retry.Job.EstimatedVideoTokens != original.EstimatedVideoTokens ||
-		retry.Job.PredictedAFPMilli != original.PredictedAFPMilli ||
 		retry.Job.EstimatedNonSubscriptionCashMicros != original.EstimatedNonSubscriptionCashMicros ||
 		retry.Job.BillingMode != original.BillingMode {
 		return errors.New("FLO-100 controlled retry must reuse the approved primary prompt and estimates")
+	}
+	if supersession == nil {
+		if retry.Job.PredictedAFPMilli != original.PredictedAFPMilli {
+			return errors.New("FLO-100 controlled retry must reuse the approved primary AFP estimate")
+		}
+	} else {
+		if err := supersession.Validate(); err != nil {
+			return fmt.Errorf("validate FLO-167 controlled retry supersession: %w", err)
+		}
+		binding, found := supersession.Shot(retry.Job.ShotID)
+		if !found || retry.Job.ShotID == "GOLD-A01" ||
+			retry.Job.PredictedAFPMilli != binding.Pricing.ExpectedAFPMilli ||
+			supersession.LegacyExecutionPackageHash != primary.ContentHash ||
+			primary.LiveActivation == nil ||
+			supersession.LegacyAuthorizationHash != primary.LiveActivation.SourceAuthorizationHash {
+			return errors.New("FLO-167 controlled retry differs from its exact A02-A10 duration-normalized authority")
+		}
 	}
 
 	packageJSON, err := json.Marshal(retry)
@@ -122,7 +164,7 @@ func BindFLO100LiveControlledRetry(
 		return fmt.Errorf("lock controlled retry activation: %w", err)
 	}
 	if executionHash != primary.ContentHash || sourceCommit != primary.LiveActivation.SourceCodeCommit ||
-		!submitValidUntil.After(time.Now().UTC()) {
+		(supersession == nil && !submitValidUntil.After(time.Now().UTC())) {
 		return errors.New("controlled retry parent package, commit, or submit authorization drifted")
 	}
 	var envelope liveAuthorization
@@ -136,6 +178,47 @@ func BindFLO100LiveControlledRetry(
 		return errors.New("controlled retry authority is not the exact manual Batch A +1 envelope")
 	}
 
+	var supersessionID uuid.UUID
+	var supersessionProjectionHash, supersessionAuthorizationHash, supersessionPricingDigest string
+	if supersession != nil {
+		var state, storedPackageHash, authorizationPackageHash, authorizationProjectionHash string
+		var authorizationPricingDigest string
+		var authorizationPayload json.RawMessage
+		var authorizationValidUntil time.Time
+		var storedExpectedAFP int64
+		if err := tx.QueryRow(ctx, `
+			SELECT s.id,s.state,s.execution_package_hash,s.canonical_projection_hash,
+			       s.authorization_hash,ss.pricing_snapshot_digest,ss.expected_afp_milli,
+			       sa.execution_package_hash,sa.projection_hash,sa.pricing_snapshot_digest,
+			       sa.payload,sa.valid_until
+			FROM video_pipeline.stage1_live_supersessions s
+			JOIN video_pipeline.stage1_live_supersession_shots ss
+			  ON ss.supersession_id=s.id AND ss.shot_id=$2
+			JOIN video_pipeline.stage1_live_supersession_authorizations sa
+			  ON sa.supersession_id=s.id AND sa.authorization_hash=s.authorization_hash
+			WHERE s.legacy_activation_id=$1
+			FOR UPDATE OF s`, activationID, retry.Job.ShotID).Scan(
+			&supersessionID, &state, &storedPackageHash, &supersessionProjectionHash,
+			&supersessionAuthorizationHash, &supersessionPricingDigest, &storedExpectedAFP,
+			&authorizationPackageHash, &authorizationProjectionHash, &authorizationPricingDigest,
+			&authorizationPayload, &authorizationValidUntil,
+		); err != nil {
+			return fmt.Errorf("lock FLO-167 controlled retry authority: %w", err)
+		}
+		var authorization flo167AuthorizationPayload
+		if state != "A02_submitted" || storedPackageHash != supersession.ContentHash ||
+			authorizationPackageHash != storedPackageHash || authorizationProjectionHash != supersessionProjectionHash ||
+			authorizationPricingDigest != supersessionPricingDigest || storedExpectedAFP != retry.Job.PredictedAFPMilli ||
+			!authorizationValidUntil.After(time.Now().UTC()) ||
+			json.Unmarshal(authorizationPayload, &authorization) != nil ||
+			authorization.SupersessionPackageHash != storedPackageHash ||
+			authorization.CanonicalProjectionHash != supersessionProjectionHash ||
+			authorization.PricingSnapshotDigest != supersessionPricingDigest ||
+			!authorization.Decision.A02A10 || authorization.Decision.B || authorization.Decision.C || authorization.Decision.Stage4 {
+			return errors.New("FLO-167 controlled retry authorization is absent, expired, or drifted")
+		}
+	}
+
 	var existingHash string
 	existingErr := tx.QueryRow(ctx, `SELECT controlled_retry_package_hash
 		FROM video_pipeline.stage1_live_controlled_retries WHERE activation_id=$1 FOR SHARE`, activationID).
@@ -144,7 +227,19 @@ func BindFLO100LiveControlledRetry(
 		if existingHash != retry.ContentHash {
 			return errors.New("Batch A live activation is already bound to another controlled retry")
 		}
-		return verifyControlledRetryReplay(ctx, tx, activationID, retry, packageJSON)
+		if err := verifyControlledRetryReplay(ctx, tx, activationID, retry, packageJSON); err != nil {
+			return err
+		}
+		if supersession != nil {
+			if err := verifyFLO167ControlledRetryReplay(
+				ctx, tx, supersessionID, activationID, supersession.ContentHash,
+				supersessionProjectionHash, supersessionAuthorizationHash,
+				supersessionPricingDigest, retry,
+			); err != nil {
+				return err
+			}
+		}
+		return tx.Commit(ctx)
 	}
 	if !errors.Is(existingErr, pgx.ErrNoRows) {
 		return fmt.Errorf("read existing controlled retry authority: %w", existingErr)
@@ -186,6 +281,18 @@ func BindFLO100LiveControlledRetry(
 		evidence.ReservationStatus != "SETTLED" || evidence.CostEvidenceCount < 1 ||
 		!terminalFailureSnapshotExact(evidence.ErrorSnapshot, evidence.ErrorCode) {
 		return errors.New("controlled retry requires an evidence-complete primary terminal failure")
+	}
+	if supersession != nil {
+		var submittedAttemptID uuid.UUID
+		if err := tx.QueryRow(ctx, `SELECT attempt_id
+			FROM video_pipeline.stage1_live_supersession_submissions
+			WHERE supersession_id=$1 AND shot_id=$2 FOR SHARE`,
+			supersessionID, retry.Job.ShotID).Scan(&submittedAttemptID); err != nil {
+			return fmt.Errorf("verify FLO-167 failed primary submission: %w", err)
+		}
+		if submittedAttemptID != primaryAttemptID {
+			return errors.New("FLO-167 controlled retry does not replace the exact failed v3 primary submission")
+		}
 	}
 	evidenceHash, err := digest(evidence)
 	if err != nil {
@@ -237,6 +344,20 @@ func BindFLO100LiveControlledRetry(
 		retry.Approval.FailureClass, evidenceHash, retryRunID, retryAttemptID, approvalID,
 		duplicateEvidenceID, retry.ContentHash, packageJSON, primary.ContentHash, actorID, time.Now().UTC()); err != nil {
 		return fmt.Errorf("insert controlled retry authority: %w", err)
+	}
+	if supersession != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO video_pipeline.stage1_live_supersession_controlled_retries
+			(supersession_id,activation_id,shot_id,primary_attempt_id,retry_attempt_id,
+			 retry_approval_id,duplicate_task_evidence_id,controlled_retry_package_hash,
+			 supersession_package_hash,canonical_projection_hash,authorization_hash,
+			 pricing_snapshot_digest,created_at)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+			supersessionID, activationID, retry.Job.ShotID, primaryAttemptID, retryAttemptID,
+			approvalID, duplicateEvidenceID, retry.ContentHash, supersession.ContentHash,
+			supersessionProjectionHash, supersessionAuthorizationHash, supersessionPricingDigest,
+			time.Now().UTC()); err != nil {
+			return fmt.Errorf("insert FLO-167 controlled retry authority: %w", err)
+		}
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO video_pipeline.audit_events
 		(id,occurred_at,actor_id,actor_role,action,aggregate_type,aggregate_id,reason_code,trace_id,payload)
@@ -313,5 +434,39 @@ func verifyControlledRetryReplay(
 	if !exact || strings.TrimSpace(packageHash) == "" {
 		return errors.New("controlled retry replay Run projection drifted")
 	}
-	return tx.Commit(ctx)
+	return nil
+}
+
+func verifyFLO167ControlledRetryReplay(
+	ctx context.Context,
+	tx pgx.Tx,
+	supersessionID, activationID uuid.UUID,
+	supersessionHash, projectionHash, authorizationHash, pricingDigest string,
+	retry stage1.ControlledRetryPackage,
+) error {
+	var storedActivationID uuid.UUID
+	var shotID, retryHash, storedSupersessionHash, storedProjectionHash string
+	var storedAuthorizationHash, storedPricingDigest string
+	var retryAttemptID, approvalID, duplicateEvidenceID uuid.UUID
+	if err := tx.QueryRow(ctx, `SELECT activation_id,shot_id,retry_attempt_id,retry_approval_id,
+		duplicate_task_evidence_id,controlled_retry_package_hash,supersession_package_hash,
+		canonical_projection_hash,authorization_hash,pricing_snapshot_digest
+		FROM video_pipeline.stage1_live_supersession_controlled_retries
+		WHERE supersession_id=$1 FOR SHARE`, supersessionID).Scan(
+		&storedActivationID, &shotID, &retryAttemptID, &approvalID, &duplicateEvidenceID,
+		&retryHash, &storedSupersessionHash, &storedProjectionHash,
+		&storedAuthorizationHash, &storedPricingDigest,
+	); err != nil {
+		return fmt.Errorf("verify FLO-167 controlled retry replay: %w", err)
+	}
+	wantAttemptID := uuid.NewSHA1(mustUUID(retry.Job.Run.RunID), []byte("attempt:1"))
+	if storedActivationID != activationID || shotID != retry.Job.ShotID || retryAttemptID != wantAttemptID ||
+		approvalID.String() != retry.Approval.ApprovalID ||
+		duplicateEvidenceID.String() != retry.Approval.DuplicateTaskEvidenceID ||
+		retryHash != retry.ContentHash || storedSupersessionHash != supersessionHash ||
+		storedProjectionHash != projectionHash || storedAuthorizationHash != authorizationHash ||
+		storedPricingDigest != pricingDigest {
+		return errors.New("FLO-167 controlled retry replay differs from its immutable v3 authority")
+	}
+	return nil
 }

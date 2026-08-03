@@ -29,8 +29,8 @@ func run(
 	output io.Writer,
 	lookup func(string) (string, bool),
 ) error {
-	if len(args) != 3 {
-		return errors.New("usage: video-stage1-retry-bind <plan.json> <primary-package.json> <controlled-retry-package.json>")
+	if len(args) != 3 && len(args) != 4 {
+		return errors.New("usage: video-stage1-retry-bind <plan.json> <primary-package.json> <controlled-retry-package.json> [flo167-supersession-package.json]")
 	}
 	var plan stage1.Plan
 	var primary stage1.ExecutionPackage
@@ -56,15 +56,27 @@ func run(
 	if err := pool.Ping(ctx); err != nil {
 		return fmt.Errorf("ping PostgreSQL: %w", err)
 	}
-	if err := stage1materialize.BindFLO100LiveControlledRetry(
+	result := map[string]any{
+		"status": "BOUND", "controlledRetryPackageHash": retry.ContentHash,
+		"retryRunId": retry.Job.Run.RunID,
+	}
+	if len(args) == 4 {
+		var supersession stage1.FLO167SupersessionPackage
+		if err := decodeFile(args[3], &supersession); err != nil {
+			return fmt.Errorf("read FLO-167 supersession package: %w", err)
+		}
+		if err := stage1materialize.BindFLO167ControlledRetry(
+			ctx, pool, plan, primary, supersession, retry,
+		); err != nil {
+			return err
+		}
+		result["supersessionPackageHash"] = supersession.ContentHash
+	} else if err := stage1materialize.BindFLO100LiveControlledRetry(
 		ctx, pool, plan, primary, retry,
 	); err != nil {
 		return err
 	}
-	return json.NewEncoder(output).Encode(map[string]any{
-		"status": "BOUND", "controlledRetryPackageHash": retry.ContentHash,
-		"retryRunId": retry.Job.Run.RunID,
-	})
+	return json.NewEncoder(output).Encode(result)
 }
 
 func decodeFile(path string, destination any) error {
