@@ -150,12 +150,13 @@ func MaterializeFLO167Supersession(ctx context.Context, pool *pgxpool.Pool, inpu
 			return fmt.Errorf("insert FLO-167 shot %s: %w", shot.ShotID, err)
 		}
 	}
-	var storedHash, storedProjection string
+	var storedHash, storedProjection, storedLegacyTerminalHash string
 	var storedPackageJSON, storedProjectionJSON, storedCompletedSetJSON, storedAllowedSetJSON []byte
-	if err := tx.QueryRow(ctx, `SELECT execution_package_hash,canonical_projection_hash,package,canonical_projection,
+	if err := tx.QueryRow(ctx, `SELECT execution_package_hash,canonical_projection_hash,legacy_terminal_ledger_hash,
+		package,canonical_projection,
 		completed_set,allowed_submit_set
 		FROM video_pipeline.stage1_live_supersessions WHERE id=$1 FOR SHARE`, supersessionID).Scan(
-		&storedHash, &storedProjection, &storedPackageJSON, &storedProjectionJSON,
+		&storedHash, &storedProjection, &storedLegacyTerminalHash, &storedPackageJSON, &storedProjectionJSON,
 		&storedCompletedSetJSON, &storedAllowedSetJSON); err != nil {
 		return err
 	}
@@ -168,6 +169,9 @@ func MaterializeFLO167Supersession(ctx context.Context, pool *pgxpool.Pool, inpu
 		json.Unmarshal(storedAllowedSetJSON, &storedAllowedSet) != nil ||
 		storedProjection != input.Projection.ContentHash || !reflect.DeepEqual(storedPackage, input.Package) ||
 		!reflect.DeepEqual(storedProjectionValue, input.Projection) ||
+		storedLegacyTerminalHash != flo167LegacyTerminalHash ||
+		storedLegacyTerminalHash != input.Package.LegacyTerminalLedgerHash ||
+		storedLegacyTerminalHash != input.Projection.A01Terminal.LedgerSHA256 ||
 		!reflect.DeepEqual(storedCompletedSet, input.Package.Authorization.CompletedSet) ||
 		!reflect.DeepEqual(storedCompletedSet, input.Projection.CompletedSet) ||
 		!reflect.DeepEqual(storedAllowedSet, input.Package.Authorization.AllowedSubmitSet) ||

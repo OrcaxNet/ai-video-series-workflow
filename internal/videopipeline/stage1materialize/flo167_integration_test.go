@@ -5,6 +5,7 @@ package stage1materialize
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/providercontract"
+	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/controlplane"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/orchestration"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/repository"
 	"github.com/OrcaxNet/ai-video-series-workflow/internal/videopipeline/stage1"
@@ -156,6 +158,38 @@ func TestFLO167MaterializesIdenticallyAcrossFreshPostgresAndReplay(t *testing.T)
 	}
 }
 
+func TestFLO167MaterializationRejectsLegacyTerminalHashDriftOnReplay(t *testing.T) {
+	primaryDSN := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
+	if primaryDSN == "" {
+		t.Skip("VIDEO_TEST_POSTGRES_DSN is required")
+	}
+	ctx := t.Context()
+	package_, projection, _, _ := loadFLO167RunnerFixtures(t)
+	dsn := newFLO167FixtureDatabase(t, ctx, primaryDSN, 2)
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	input := FLO167Materialization{
+		LegacyActivationID: "142952f1-8dd1-5ebe-99c8-f2cb538ac702",
+		Package:            package_, Projection: projection, CreatedAt: time.Now().UTC().Truncate(time.Microsecond),
+	}
+	if err := MaterializeFLO167Supersession(ctx, pool, input); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersessions DISABLE TRIGGER USER`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE video_pipeline.stage1_live_supersessions
+		SET legacy_terminal_ledger_hash=$1 WHERE legacy_activation_id=$2`, strings.Repeat("f", 64), input.LegacyActivationID); err != nil {
+		t.Fatal(err)
+	}
+	if err := MaterializeFLO167Supersession(ctx, pool, input); err == nil {
+		t.Fatal("exact replay accepted drifted persisted legacy terminal hash")
+	}
+}
+
 func TestFLO167RunnerPaidBoundary(t *testing.T) {
 	primaryDSN := os.Getenv("VIDEO_TEST_POSTGRES_DSN")
 	if primaryDSN == "" {
@@ -165,9 +199,10 @@ func TestFLO167RunnerPaidBoundary(t *testing.T) {
 	package_, projection, legacy, plan := loadFLO167RunnerFixtures(t)
 
 	for index, test := range []struct {
-		name        string
-		wantSuccess bool
-		mutate      func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot)
+		name                 string
+		wantSuccess          bool
+		wantRevisionConflict bool
+		mutate               func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot)
 	}{
 		{name: "valid A02", wantSuccess: true, mutate: func(*testing.T, *pgxpool.Pool, *orchestration.SubscriptionQuotaSnapshot) {}},
 		{name: "stale quota", mutate: func(_ *testing.T, _ *pgxpool.Pool, quota *orchestration.SubscriptionQuotaSnapshot) {
@@ -194,6 +229,16 @@ func TestFLO167RunnerPaidBoundary(t *testing.T) {
 		{name: "semantic input drift", mutate: flo167ShotDrift("semantic input")},
 		{name: "completed set drift", mutate: flo167SetDrift("completed")},
 		{name: "allowed submit set drift", mutate: flo167SetDrift("allowed")},
+		{name: "legacy terminal ledger hash drift", wantRevisionConflict: true, mutate: func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
+			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersessions DISABLE TRIGGER USER`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE video_pipeline.stage1_live_supersessions
+				SET legacy_terminal_ledger_hash=$1 WHERE legacy_activation_id=$2`, strings.Repeat("f", 64),
+				"142952f1-8dd1-5ebe-99c8-f2cb538ac702"); err != nil {
+				t.Fatal(err)
+			}
+		}},
 		{name: "supersession hash drift", mutate: func(t *testing.T, pool *pgxpool.Pool, _ *orchestration.SubscriptionQuotaSnapshot) {
 			if _, err := pool.Exec(ctx, `ALTER TABLE video_pipeline.stage1_live_supersessions DISABLE TRIGGER USER`); err != nil {
 				t.Fatal(err)
@@ -373,6 +418,12 @@ func TestFLO167RunnerPaidBoundary(t *testing.T) {
 			} else {
 				if submitErr == nil {
 					t.Fatal("Runner accepted rejected PostgreSQL preparation")
+				}
+				if test.wantRevisionConflict {
+					var domain *controlplane.DomainError
+					if !errors.As(submitErr, &domain) || domain.Code != controlplane.CodeRevisionConflict {
+						t.Fatalf("terminal lineage drift error=%#v, want %s", submitErr, controlplane.CodeRevisionConflict)
+					}
 				}
 				if gets.Load() != 0 || posts.Load() != 0 {
 					t.Fatalf("provider HTTP GET/POST=%d/%d, want 0/0", gets.Load(), posts.Load())

@@ -62,7 +62,7 @@ func requireFLO167Supersession(
 	}
 	var result flo167PaidBoundary
 	var state, packageHash, projectionHash string
-	var legacyAuthorizationHash, legacyExecutionHash, legacyProjectionHash, legacyStopHash string
+	var legacyAuthorizationHash, legacyExecutionHash, legacyProjectionHash, legacyTerminalHash, legacyStopHash string
 	var packageJSON, projectionJSON, completedSetJSON, allowedSubmitSetJSON []byte
 	var authHash *string
 	var authPackageHash, authProjectionHash *string
@@ -74,7 +74,8 @@ func requireFLO167Supersession(
 	err := tx.QueryRow(ctx, `
 		SELECT s.id,s.state,s.execution_package_hash,s.canonical_projection_hash,
 		       s.legacy_authorization_hash,s.legacy_execution_package_hash,
-		       s.legacy_projection_hash,s.legacy_stop_evidence_hash,s.package,s.canonical_projection,
+		       s.legacy_projection_hash,s.legacy_terminal_ledger_hash,s.legacy_stop_evidence_hash,
+		       s.package,s.canonical_projection,
 		       s.completed_set,s.allowed_submit_set,
 		       ss.shot_id,ss.duration_ms,ss.pricing_snapshot_id,ss.pricing_snapshot_digest,
 		       ss.reference_afp_milli,ss.reference_duration_ms,ss.expected_afp_milli,
@@ -90,7 +91,7 @@ func requireFLO167Supersession(
 		WHERE s.legacy_activation_id=$1
 		FOR UPDATE OF s`, authority.ActivationID, authority.Run.Ordinal).Scan(
 		&result.SupersessionID, &state, &packageHash, &projectionHash,
-		&legacyAuthorizationHash, &legacyExecutionHash, &legacyProjectionHash, &legacyStopHash,
+		&legacyAuthorizationHash, &legacyExecutionHash, &legacyProjectionHash, &legacyTerminalHash, &legacyStopHash,
 		&packageJSON, &projectionJSON, &completedSetJSON, &allowedSubmitSetJSON, &shot.ShotID, &pricing.DurationMS,
 		&pricing.PricingSnapshotID, &pricing.PricingSnapshotDigest, &pricing.ReferenceAFPMilli,
 		&pricing.ReferenceDurationMS, &pricing.ExpectedAFPMilli, &pricing.PricingRuleVersion,
@@ -125,6 +126,7 @@ func requireFLO167Supersession(
 	result.PackageHash, result.ProjectionHash, result.Shot = packageHash, projectionHash, shot
 	if legacyAuthorizationHash != authority.SourceAuthorizationHash ||
 		legacyExecutionHash != authority.ExecutionPackageHash || legacyProjectionHash != authority.ProjectionHash ||
+		legacyTerminalHash != flo167LegacyTerminalHash ||
 		legacyStopHash != "dd1954608254791425d7574fe7333d1c1d7cd77cb843572f79d84a3dbeadea76" {
 		return nil, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "FLO-167 legacy lineage drifted")
 	}
@@ -136,7 +138,7 @@ func requireFLO167Supersession(
 		!reflect.DeepEqual(projection.Shots, package_.Shots) ||
 		package_.ContentHash != packageHash || package_.LegacyExecutionPackageHash != authority.ExecutionPackageHash ||
 		package_.LegacyProjectionHash != authority.ProjectionHash || package_.LegacyAuthorizationHash != authority.SourceAuthorizationHash ||
-		package_.LegacyTerminalLedgerHash != flo167LegacyTerminalHash {
+		package_.LegacyTerminalLedgerHash != legacyTerminalHash || projection.A01Terminal.LedgerSHA256 != legacyTerminalHash {
 		return nil, controlplane.NewConflictError(controlplane.CodeRevisionConflict, "FLO-167 package is invalid or differs from legacy lineage")
 	}
 	packageShot, ok := package_.Shot(shot.ShotID)
